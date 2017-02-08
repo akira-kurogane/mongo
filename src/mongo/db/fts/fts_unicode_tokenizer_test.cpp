@@ -241,5 +241,20 @@ TEST(FtsUnicodeTokenizer, FrenchStopWordsAndDiacriticSensitive) {
     ASSERT_EQUALS("excit", terms[4]);
 }
 
+// Ensure that stop words are only removed if they contain the correct diacritics.
+TEST(FtsUnicodeTokenizer, Japanese) {
+    std::vector<std::string> terms =
+        tokenizeString("すもももももももものうち", "japanese", FTSTokenizer::kNone);
+
+    ASSERT_EQUALS(7U, terms.size());
+    ASSERT_EQUALS("すもも", terms[0]);
+    ASSERT_EQUALS("も", terms[1]);
+    ASSERT_EQUALS("もも", terms[2]);
+    ASSERT_EQUALS("も", terms[3]);
+    ASSERT_EQUALS("もも", terms[4]);
+    ASSERT_EQUALS("の", terms[5]);
+    ASSERT_EQUALS("うち", terms[6]);
+}
+
 }  // namespace fts
 }  // namespace mongo
