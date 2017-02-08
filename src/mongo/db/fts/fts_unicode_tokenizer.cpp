@@ -44,7 +44,7 @@ namespace fts {
 
 using std::string;
 
-UnicodeFTSTokenizer::UnicodeFTSTokenizer(const FTSLanguage* language)
+UnicodeSnowballFTSTokenizer::UnicodeSnowballFTSTokenizer(const FTSLanguage* language)
     : _language(language),
       _stemmer(language),
       _stopWords(StopWords::getStopWords(language)),
@@ -54,7 +54,7 @@ UnicodeFTSTokenizer::UnicodeFTSTokenizer(const FTSLanguage* language)
       _caseFoldMode(_language->str() == "turkish" ? unicode::CaseFoldMode::kTurkish
                                                   : unicode::CaseFoldMode::kNormal) {}
 
-void UnicodeFTSTokenizer::reset(StringData document, Options options) {
+void UnicodeSnowballFTSTokenizer::reset(StringData document, Options options) {
     _options = options;
     _pos = 0;
     _document.resetData(document);  // Validates that document is valid UTF8.
@@ -63,7 +63,7 @@ void UnicodeFTSTokenizer::reset(StringData document, Options options) {
     _skipDelimiters();
 }
 
-bool UnicodeFTSTokenizer::moveNext() {
+bool UnicodeSnowballFTSTokenizer::moveNext() {
     while (true) {
         if (_pos >= _document.size()) {
             _word = "";
@@ -106,11 +106,11 @@ bool UnicodeFTSTokenizer::moveNext() {
     }
 }
 
-StringData UnicodeFTSTokenizer::get() const {
+StringData UnicodeSnowballFTSTokenizer::get() const {
     return _word;
 }
 
-void UnicodeFTSTokenizer::_skipDelimiters() {
+void UnicodeSnowballFTSTokenizer::_skipDelimiters() {
     while (_pos < _document.size() &&
            unicode::codepointIsDelimiter(_document[_pos], _delimListLanguage)) {
         ++_pos;
