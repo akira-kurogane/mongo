@@ -126,3 +126,6 @@ env.CppUnitTest( "fts_unicode_phrase_matcher_test", "fts_unicode_phrase_matcher_
 
 env.CppUnitTest( "fts_unicode_tokenizer_test", "fts_unicode_tokenizer_test.cpp",
                  LIBDEPS=["base"] )
+
+env.CppUnitTest( "mecab_tokenizer_test", "mecab_tokenizer_test.cpp",
+                 LIBDEPS=["base"] )
