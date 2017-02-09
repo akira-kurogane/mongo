@@ -21,6 +21,7 @@ class MecabFTSTokenizer : public FTSTokenizer {
 
 public:
     MecabFTSTokenizer();
+    ~MecabFTSTokenizer();
 
     void reset(StringData document, Options options) final;
 
@@ -39,12 +40,14 @@ private:
      */
     void _skipDelimiters();
 
-    unicode::String _document;
+    //unicode::String _document;
+    StringData _document;
     size_t _pos;
     StringData _word;
     Options _options;
 
     StackBufBuilder _wordBuf;
+
 };
 
 }  // namespace fts
