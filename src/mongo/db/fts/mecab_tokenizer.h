@@ -6,6 +6,7 @@
 
 #include "mongo/db/fts/fts_tokenizer.h"
 //TODELETE? #include "mongo/util/stringutils.h"
+#include "mongo/db/fts/unicode/string.h"
 
 namespace mongo {
 namespace fts {
@@ -32,7 +33,18 @@ public:
     StringData get() const final;
 
 private:
+    /**
+     * Helper that moves the tokenizer past all delimiters that shouldn't be considered part of
+     * tokens. Copied from UnicodeFTSTokenizer verbatim
+     */
+    void _skipDelimiters();
+
+    unicode::String _document;
+    size_t _pos;
+    StringData _word;
     Options _options;
+
+    StackBufBuilder _wordBuf;
 };
 
 }  // namespace fts
