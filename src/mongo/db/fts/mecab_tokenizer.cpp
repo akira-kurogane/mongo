@@ -5,6 +5,7 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
+#include "mongo/util/text.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/util/log.h"
 
@@ -42,13 +43,22 @@ bool MecabFTSTokenizer::moveNext() {
     if (!node) {
         return false;
     }
-    while (node && node->stat != MECAB_NOR_NODE) {
+    while (node &&
+           (node->stat != MECAB_NOR_NODE || strncmp(node->feature, "助詞", 6) == 0 ||
+            strncmp(node->feature, "記号", 6) == 0 ||
+            strncmp(node->surface, "いる", 6) == 0)) {  // IPADic puts it as separate verb; dull;
         node = node->next;
     }
     if (!node) {
         return false;
     }
-    _word = _document.substr(node->surface - lattice->sentence(), node->length);
+    if (strncmp(node->feature, "動詞", 6) == 0) {
+       //TODO: find 7th comma-delimited field and insert that instead of the 'surface'
+       std::vector<std::string> x = StringSplitter::split(node->feature, ",");
+       _word = x[6];
+    } else {
+        _word = _document.substr(node->surface - lattice->sentence(), node->length);
+    }
     node = node->next;
     return true;
 }
@@ -58,7 +68,9 @@ StringData MecabFTSTokenizer::get() const {
 }
 
 MecabFTSTokenizer::~MecabFTSTokenizer() {
+    delete lattice;
     delete tagger;
+    delete model;
 }
 
 }  // namespace fts

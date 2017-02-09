@@ -57,16 +57,37 @@ TEST(MecabTokenizer, JapaneseSumomo) {
     std::vector<std::string> terms =
         tokenizeString("すもももももももものうち", FTSTokenizer::kNone);
 
-    ASSERT_EQUALS(7U, terms.size());
+    ASSERT_EQUALS(4U, terms.size());
     ASSERT_EQUALS("すもも", terms[0]);
-    ASSERT_EQUALS("も", terms[1]);
+    //ASSERT_EQUALS("も", terms[1]);
     ASSERT_EQUALS("もも", terms[2]);
-    ASSERT_EQUALS("も", terms[3]);
+    //ASSERT_EQUALS("も", terms[3]);
     ASSERT_EQUALS("もも", terms[4]);
-    ASSERT_EQUALS("の", terms[5]);
+    //ASSERT_EQUALS("の", terms[5]);
     ASSERT_EQUALS("うち", terms[6]);
 }
 
+TEST(MecabTokenizer, JapaneseTaroJiro) {
+    std::vector<std::string> terms =
+        tokenizeString("太郎は次郎が持っている本を花子に渡した。", FTSTokenizer::kNone);
+
+    ASSERT_EQUALS(7U, terms.size());
+    ASSERT_EQUALS("太郎", terms[0]);
+    // ASSERT_EQUALS("は", terms[1]);
+    ASSERT_EQUALS("次郎", terms[2]);
+    // ASSERT_EQUALS("が", terms[3]);
+    ASSERT_EQUALS("持つ", terms[4]);  // N.b. not "持っ"
+    // ASSERT_EQUALS("て", terms[5]);
+    // ASSERT_EQUALS("いる", terms[6]);
+    ASSERT_EQUALS("本", terms[7]);
+    // ASSERT_EQUALS("を", terms[8]);
+    ASSERT_EQUALS("花", terms[9]);
+    ASSERT_EQUALS("子", terms[10]);
+    // ASSERT_EQUALS("に", terms[11]);
+    ASSERT_EQUALS("渡す", terms[12]);  // N.b. not "渡し"
+    // ASSERT_EQUALS("た", terms[13]);
+    // ASSERT_EQUALS("。", terms[14]);
+}
 
 
 }  // namespace fts
