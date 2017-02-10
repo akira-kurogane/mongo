@@ -23,6 +23,8 @@ MeCab::Tagger *tagger;
 MeCab::Lattice *lattice;
 const MeCab::Node* node;
 
+std::string _lastFeatureField7; // var to cache the data of node->feature between moveNext() and get() calls
+
 MecabFTSTokenizer::MecabFTSTokenizer() {
     model = MeCab::createModel(0, (char**)NULL);  // should only be one globally; TODO move to mecab_init.cpp etc.
     tagger = MeCab::createTagger("");
@@ -46,16 +48,17 @@ bool MecabFTSTokenizer::moveNext() {
     while (node &&
            (node->stat != MECAB_NOR_NODE || strncmp(node->feature, "助詞", 6) == 0 ||
             strncmp(node->feature, "記号", 6) == 0 ||
-            strncmp(node->surface, "いる", 6) == 0)) {  // IPADic puts it as separate verb; dull;
+            strncmp(node->feature, "助動詞", 9) == 0 ||
+            strncmp(node->surface, "いる", 6) == 0)) {
         node = node->next;
     }
     if (!node) {
         return false;
     }
     if (strncmp(node->feature, "動詞", 6) == 0) {
-       //TODO: find 7th comma-delimited field and insert that instead of the 'surface'
-       std::vector<std::string> x = StringSplitter::split(node->feature, ",");
-       _word = x[6];
+        std::vector<std::string> x = StringSplitter::split(node->feature, ",");
+        _lastFeatureField7 = x[6];
+        _word = _lastFeatureField7;
     } else {
         _word = _document.substr(node->surface - lattice->sentence(), node->length);
     }
