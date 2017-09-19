@@ -53,7 +53,7 @@ std::vector<std::string> tokenizeString(const char* str, FTSTokenizer::Options o
     return terms;
 }
 
-TEST(MecabTokenizer, JapaneseSumomo) {
+TEST(FtsUnicodeTokenizer, Japanese) {
     std::vector<std::string> terms =
         tokenizeString("すもももももももものうち", FTSTokenizer::kNone);
 
