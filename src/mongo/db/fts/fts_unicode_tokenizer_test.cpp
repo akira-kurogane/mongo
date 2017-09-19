@@ -41,7 +41,7 @@ std::vector<std::string> tokenizeString(const char* str,
     StatusWithFTSLanguage swl = FTSLanguage::make(language, TEXT_INDEX_VERSION_3);
     ASSERT_OK(swl);
 
-    UnicodeSnowballFTSTokenizer tokenizer(swl.getValue());
+    UnicodeFTSTokenizer tokenizer(swl.getValue());
 
     tokenizer.reset(str, options);
 

@@ -152,7 +152,7 @@ private:
 };
 
 /**
- * FTSLanguage implementation that returns a UnicodeSnowballFTSTokenizer and UnicodeFTSPhraseMatcher for
+ * FTSLanguage implementation that returns a UnicodeFTSTokenizer and UnicodeFTSPhraseMatcher for
  * Unicode aware case folding and diacritic removal in FTS.
  */
 class UnicodeFTSLanguage : public FTSLanguage {
