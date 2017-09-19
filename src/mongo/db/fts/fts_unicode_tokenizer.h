@@ -42,7 +42,7 @@ class FTSLanguage;
 class StopWords;
 
 /**
- * UnicodeFTSTokenizer
+ * UnicodeSnowballFTSTokenizer
  * A iterator of "documents" where a document contains words delimited by a predefined set of
  * Unicode delimiters (see gen_delimiter_list.py)
  * Uses
@@ -54,11 +54,11 @@ class StopWords;
  * For each word returns a stem version of a word optimized for full text indexing.
  * Optionally supports returning case sensitive search terms.
  */
-class UnicodeFTSTokenizer final : public FTSTokenizer {
-    MONGO_DISALLOW_COPYING(UnicodeFTSTokenizer);
+class UnicodeSnowballFTSTokenizer final : public FTSTokenizer {
+    MONGO_DISALLOW_COPYING(UnicodeSnowballFTSTokenizer);
 
 public:
-    UnicodeFTSTokenizer(const FTSLanguage* language);
+    UnicodeSnowballFTSTokenizer(const FTSLanguage* language);
 
     void reset(StringData document, Options options) override;
 
