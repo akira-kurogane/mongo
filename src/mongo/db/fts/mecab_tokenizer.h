@@ -40,6 +40,7 @@ private:
      */
     void _skipDelimiters();
 
+    //unicode::String _document;
     StringData _document;
     size_t _pos;
     StringData _word;
