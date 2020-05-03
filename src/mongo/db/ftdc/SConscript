@@ -108,3 +108,13 @@ env.CppUnitTest(
         'ftdc',
     ],
 )
+
+env.Program(
+    target='ftdc_dump',
+    source=[
+        'ftdc_dump.cpp',
+    ],
+    LIBDEPS=[
+        'ftdc',
+    ],
+)
