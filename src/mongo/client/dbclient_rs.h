@@ -1,37 +1,41 @@
-/** @file dbclient_rs.h Connect to a Replica Set, from C++ */
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+/**
+ * Connect to a Replica Set, from C++.
+ */
+
 #include <utility>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -53,8 +57,8 @@ typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 class DBClientReplicaSet : public DBClientBase {
 public:
     using DBClientBase::query;
-    using DBClientBase::update;
     using DBClientBase::remove;
+    using DBClientBase::update;
 
     /** Call connect() after constructing. autoReconnect is always on for DBClientReplicaSet
      * connections. */
@@ -63,7 +67,6 @@ public:
                        StringData applicationName,
                        double so_timeout = 0,
                        MongoURI uri = {});
-    virtual ~DBClientReplicaSet();
 
     /**
      * Returns false if no member of the set were reachable. This object
@@ -72,6 +75,8 @@ public:
      */
     bool connect();
 
+    Status authenticateInternalUser() override;
+
     /**
      * Logs out the connection for the given database.
      *
@@ -79,36 +84,52 @@ public:
      * @param info the result object for the logout command (provided for backwards
      *     compatibility with mongo shell)
      */
-    virtual void logout(const std::string& dbname, BSONObj& info);
+    void logout(const std::string& dbname, BSONObj& info) override;
 
     // ----------- simple functions --------------
 
     /** throws userassertion "no master found" */
-    virtual std::unique_ptr<DBClientCursor> query(const std::string& ns,
-                                                  Query query,
-                                                  int nToReturn = 0,
-                                                  int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = 0,
-                                                  int queryOptions = 0,
-                                                  int batchSize = 0);
+    std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) override;
 
     /** throws userassertion "no master found" */
-    virtual BSONObj findOne(const std::string& ns,
-                            const Query& query,
-                            const BSONObj* fieldsToReturn = 0,
-                            int queryOptions = 0);
+    BSONObj findOne(const std::string& ns,
+                    const Query& query,
+                    const BSONObj* fieldsToReturn = nullptr,
+                    int queryOptions = 0,
+                    boost::optional<BSONObj> readConcernObj = boost::none) override;
 
-    virtual void insert(const std::string& ns, BSONObj obj, int flags = 0);
+    void insert(const std::string& ns,
+                BSONObj obj,
+                int flags = 0,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     /** insert multiple objects.  Note that single object insert is asynchronous, so this version
         is only nominally faster and not worth a special effort to try to use.  */
-    virtual void insert(const std::string& ns, const std::vector<BSONObj>& v, int flags = 0);
+    void insert(const std::string& ns,
+                const std::vector<BSONObj>& v,
+                int flags = 0,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    virtual void remove(const std::string& ns, Query obj, int flags);
+    void remove(const std::string& ns,
+                Query obj,
+                int flags,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    virtual void update(const std::string& ns, Query query, BSONObj obj, int flags);
+    void update(const std::string& ns,
+                Query query,
+                BSONObj obj,
+                int flags,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    virtual void killCursor(const NamespaceString& ns, long long cursorID);
+    void killCursor(const NamespaceString& ns, long long cursorID) override;
 
     // ---- access raw connections ----
 
@@ -131,12 +152,12 @@ public:
 
     // ---- callback pieces -------
 
-    virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
-    virtual bool recv(Message& toRecv, int lastRequestId);
-    virtual void checkResponse(const std::vector<BSONObj>& batch,
-                               bool networkError,
-                               bool* retry = NULL,
-                               std::string* targetHost = NULL);
+    void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
+    Status recv(Message& toRecv, int lastRequestId) override;
+    void checkResponse(const std::vector<BSONObj>& batch,
+                       bool networkError,
+                       bool* retry = nullptr,
+                       std::string* targetHost = nullptr) override;
 
     /* this is the callback from our underlying connections to notify us that we got a "not master"
      * error.
@@ -149,10 +170,10 @@ public:
 
     // ----- status ------
 
-    virtual bool isFailed() const {
+    bool isFailed() const override {
         return !_master || _master->isFailed();
     }
-    bool isStillConnected();
+    bool isStillConnected() override;
 
     // ----- informational ----
 
@@ -169,25 +190,27 @@ public:
      */
     HostAndPort getSuspectedPrimaryHostAndPort() const;
 
-    double getSoTimeout() const {
+    double getSoTimeout() const override {
         return _so_timeout;
     }
 
-    std::string toString() const {
+    std::string toString() const override {
         return getServerAddress();
     }
 
-    std::string getServerAddress() const;
+    std::string getServerAddress() const override;
 
-    virtual ConnectionString::ConnectionType type() const {
+    ConnectionString::ConnectionType type() const override {
         return ConnectionString::SET;
     }
-    virtual bool lazySupported() const {
+    bool lazySupported() const override {
         return true;
     }
 
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) final;
+    std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> runCommandWithTarget(
+        OpMsgRequest request, std::shared_ptr<DBClientBase> me) final;
     DBClientBase* runFireAndForgetCommand(OpMsgRequest request) final;
 
     void setRequestMetadataWriter(rpc::RequestMetadataWriter writer) final;
@@ -198,7 +221,10 @@ public:
     int getMaxWireVersion() final;
     // ---- low level ------
 
-    virtual bool call(Message& toSend, Message& response, bool assertOk, std::string* actualServer);
+    bool call(Message& toSend,
+              Message& response,
+              bool assertOk,
+              std::string* actualServer) override;
 
     /**
      * Returns whether a query or command can be sent to secondaries based on the query object
@@ -216,7 +242,11 @@ public:
      * Performs a "soft reset" by clearing all states relating to secondary nodes and
      * returning secondary connections to the pool.
      */
-    virtual void reset();
+    void reset() override;
+
+    bool isReplicaSetMember() const override {
+        return true;
+    }
 
     bool isMongos() const override {
         return false;
@@ -230,8 +260,8 @@ public:
 
 protected:
     /** Authorize.  Authorizes all nodes as needed
-    */
-    virtual void _auth(const BSONObj& params);
+     */
+    void _auth(const BSONObj& params) override;
 
 private:
     /**
@@ -244,6 +274,9 @@ private:
     std::unique_ptr<DBClientCursor> checkSlaveQueryResult(std::unique_ptr<DBClientCursor> result);
 
     DBClientConnection* checkMaster();
+
+    template <typename Authenticate>
+    Status _runAuthLoop(Authenticate authCb);
 
     /**
      * Helper method for selecting a node based on the read preference. Will advance
@@ -300,7 +333,7 @@ private:
     std::shared_ptr<ReplicaSetMonitor> _rsm;
 
     HostAndPort _masterHost;
-    std::unique_ptr<DBClientConnection> _master;
+    std::shared_ptr<DBClientConnection> _master;
 
     // Last used host in a slaveOk query (can be a primary).
     HostAndPort _lastSlaveOkHost;
@@ -308,7 +341,7 @@ private:
     // Connection can either be owned here or returned to the connection pool. Note that
     // if connection is primary, it is owned by _master so it is incorrect to return
     // it to the pool.
-    std::unique_ptr<DBClientConnection> _lastSlaveOkConn;
+    std::shared_ptr<DBClientConnection> _lastSlaveOkConn;
     std::shared_ptr<ReadPreferenceSetting> _lastReadPref;
 
     double _so_timeout;
@@ -317,6 +350,7 @@ private:
     // we can re-auth
     // this could be a security issue, as the password is stored in memory
     // not sure if/how we should handle
+    bool _internalAuthRequested = false;
     std::map<std::string, BSONObj> _auths;  // dbName -> auth parameters
 
     MongoURI _uri;
@@ -327,7 +361,7 @@ protected:
      */
     class LazyState {
     public:
-        LazyState() : _lastClient(NULL), _lastOp(-1), _secondaryQueryOk(false), _retries(0) {}
+        LazyState() : _lastClient(nullptr), _lastOp(-1), _secondaryQueryOk(false), _retries(0) {}
         DBClientConnection* _lastClient;
         int _lastOp;
         bool _secondaryQueryOk;
@@ -335,4 +369,4 @@ protected:
 
     } _lazyState;
 };
-}
+}  // namespace mongo

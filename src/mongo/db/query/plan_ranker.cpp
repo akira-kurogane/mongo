@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,11 +41,10 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace {
 
@@ -65,10 +65,9 @@ using std::endl;
 using std::vector;
 
 // static
-size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRankingDecision* why) {
+StatusWith<std::unique_ptr<PlanRankingDecision>> PlanRanker::pickBestPlan(
+    const vector<CandidatePlan>& candidates) {
     invariant(!candidates.empty());
-    invariant(why);
-
     // A plan that hits EOF is automatically scored above
     // its peers. If multiple plans hit EOF during the same
     // set of round-robin calls to work(), then all such plans
@@ -89,27 +88,61 @@ size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRan
     // Holds (score, candidateInndex).
     // Used to derive scores and candidate ordering.
     vector<std::pair<double, size_t>> scoresAndCandidateindices;
+    vector<size_t> failed;
 
     // Compute score for each tree.  Record the best.
     for (size_t i = 0; i < statTrees.size(); ++i) {
-        LOG(5) << "Scoring plan " << i << ":" << endl
-               << redact(candidates[i].solution->toString()) << "Stats:\n"
-               << redact(Explain::statsToBSON(*statTrees[i]).jsonString(Strict, true));
-        LOG(2) << "Scoring query plan: " << redact(Explain::getPlanSummary(candidates[i].root))
-               << " planHitEOF=" << statTrees[i]->common.isEOF;
+        if (!candidates[i].failed) {
+            LOGV2_DEBUG(
+                20956,
+                5,
+                "Scoring plan "
+                "{i}:\n{candidates_i_solution}Stats:\n{Explain_statsToBSON_statTrees_i_jsonString_"
+                "ExtendedRelaxedV2_0_0_true}",
+                "i"_attr = i,
+                "candidates_i_solution"_attr = redact(candidates[i].solution->toString()),
+                "Explain_statsToBSON_statTrees_i_jsonString_ExtendedRelaxedV2_0_0_true"_attr =
+                    redact(Explain::statsToBSON(*statTrees[i])
+                               .jsonString(ExtendedRelaxedV2_0_0, true)));
+            LOGV2_DEBUG(20957,
+                        2,
+                        "Scoring query plan: {Explain_getPlanSummary_candidates_i_root} "
+                        "planHitEOF={statTrees_i_common_isEOF}",
+                        "Explain_getPlanSummary_candidates_i_root"_attr =
+                            Explain::getPlanSummary(candidates[i].root),
+                        "statTrees_i_common_isEOF"_attr = statTrees[i]->common.isEOF);
 
-        double score = scoreTree(statTrees[i].get());
-        LOG(5) << "score = " << score;
-        if (statTrees[i]->common.isEOF) {
-            LOG(5) << "Adding +" << eofBonus << " EOF bonus to score.";
-            score += 1;
+            double score = scoreTree(statTrees[i].get());
+            LOGV2_DEBUG(20958, 5, "score = {score}", "score"_attr = score);
+            if (statTrees[i]->common.isEOF) {
+                LOGV2_DEBUG(
+                    20959, 5, "Adding +{eofBonus} EOF bonus to score.", "eofBonus"_attr = eofBonus);
+                score += 1;
+            }
+
+            scoresAndCandidateindices.push_back(std::make_pair(score, i));
+        } else {
+            failed.push_back(i);
+            LOGV2_DEBUG(20960,
+                        2,
+                        "Not scording plan: {Explain_getPlanSummary_candidates_i_root} because the "
+                        "plan failed.",
+                        "Explain_getPlanSummary_candidates_i_root"_attr =
+                            Explain::getPlanSummary(candidates[i].root));
         }
-        scoresAndCandidateindices.push_back(std::make_pair(score, i));
+    }
+
+    // If there isn't a viable plan we should error.
+    if (scoresAndCandidateindices.size() == 0U) {
+        return {ErrorCodes::Error(31157),
+                "No viable plan was found because all candidate plans failed."};
     }
 
     // Sort (scores, candidateIndex). Get best child and populate candidate ordering.
     std::stable_sort(
         scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(), scoreComparator);
+
+    auto why = std::make_unique<PlanRankingDecision>();
 
     // Determine whether plans tied for the win.
     if (scoresAndCandidateindices.size() > 1U) {
@@ -124,6 +157,7 @@ size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRan
     why->stats.clear();
     why->scores.clear();
     why->candidateOrder.clear();
+    why->failedCandidates = std::move(failed);
     for (size_t i = 0; i < scoresAndCandidateindices.size(); ++i) {
         double score = scoresAndCandidateindices[i].first;
         size_t candidateIndex = scoresAndCandidateindices[i].second;
@@ -155,9 +189,11 @@ size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRan
         why->scores.push_back(score);
         why->candidateOrder.push_back(candidateIndex);
     }
+    for (auto& i : why->failedCandidates) {
+        why->stats.push_back(std::move(statTrees[i]));
+    }
 
-    size_t bestChild = scoresAndCandidateindices[0].second;
-    return bestChild;
+    return StatusWith<std::unique_ptr<PlanRankingDecision>>(std::move(why));
 }
 
 // TODO: Move this out.  This is a signal for ranking but will become its own complicated
@@ -207,19 +243,16 @@ double PlanRanker::scoreTree(const PlanStageStats* stats) {
     // plan doesn't lose to a less productive plan due to tie breaking.
     const double epsilon = std::min(1.0 / static_cast<double>(10 * workUnits), 1e-4);
 
-    // We prefer covered projections.
-    //
-    // We only do this when we have a projection stage because we have so many jstests that
-    // check bounds even when a collscan plan is just as good as the ixscan'd plan :(
+    // We prefer queries that don't require a fetch stage.
     double noFetchBonus = epsilon;
-    if (hasStage(STAGE_PROJECTION, stats) && hasStage(STAGE_FETCH, stats)) {
+    if (hasStage(STAGE_FETCH, stats)) {
         noFetchBonus = 0;
     }
 
     // In the case of ties, prefer solutions without a blocking sort
     // to solutions with a blocking sort.
     double noSortBonus = epsilon;
-    if (hasStage(STAGE_SORT, stats)) {
+    if (hasStage(STAGE_SORT_DEFAULT, stats) || hasStage(STAGE_SORT_SIMPLE, stats)) {
         noSortBonus = 0;
     }
 
@@ -240,21 +273,26 @@ double PlanRanker::scoreTree(const PlanStageStats* stats) {
     double tieBreakers = noFetchBonus + noSortBonus + noIxisectBonus;
     double score = baseScore + productivity + tieBreakers;
 
-    mongoutils::str::stream ss;
-    ss << "score(" << score << ") = baseScore(" << baseScore << ")"
+    StringBuilder sb;
+    sb << "score(" << str::convertDoubleToString(score) << ") = baseScore("
+       << str::convertDoubleToString(baseScore) << ")"
        << " + productivity((" << stats->common.advanced << " advanced)/(" << stats->common.works
-       << " works) = " << productivity << ")"
-       << " + tieBreakers(" << noFetchBonus << " noFetchBonus + " << noSortBonus
-       << " noSortBonus + " << noIxisectBonus << " noIxisectBonus = " << tieBreakers << ")";
-    std::string scoreStr = ss;
-    LOG(2) << scoreStr;
+       << " works) = " << str::convertDoubleToString(productivity) << ")"
+       << " + tieBreakers(" << str::convertDoubleToString(noFetchBonus) << " noFetchBonus + "
+       << str::convertDoubleToString(noSortBonus) << " noSortBonus + "
+       << str::convertDoubleToString(noIxisectBonus)
+       << " noIxisectBonus = " << str::convertDoubleToString(tieBreakers) << ")";
+    LOGV2_DEBUG(20961, 2, "{sb_str}", "sb_str"_attr = sb.str());
 
     if (internalQueryForceIntersectionPlans.load()) {
         if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
             // The boost should be >2.001 to make absolutely sure the ixisect plan will win due
             // to the combination of 1) productivity, 2) eof bonus, and 3) no ixisect bonus.
             score += 3;
-            LOG(5) << "Score boosted to " << score << " due to intersection forcing.";
+            LOGV2_DEBUG(20962,
+                        5,
+                        "Score boosted to {score} due to intersection forcing.",
+                        "score"_attr = score);
         }
     }
 

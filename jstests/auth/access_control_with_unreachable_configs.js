@@ -2,15 +2,19 @@
 // localhost exception does not apply.  That is, if mongos cannot verify that there
 // are user documents stored in the configuration information, it must assume that
 // there are.
+// @tags: [requires_sharding]
 
-var dopts = {smallfiles: "", nopreallocj: ""};
+// The config servers are not reachable at shutdown.
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+TestData.skipCheckOrphans = true;
+
 var st = new ShardingTest({
     shards: 1,
     mongos: 1,
     config: 1,
     keyFile: 'jstests/libs/key1',
     useHostname: false,  // Needed when relying on the localhost exception
-    other: {shardOptions: dopts, configOptions: dopts, mongosOptions: {verbose: 1}}
+    other: {mongosOptions: {verbose: 1}}
 });
 var mongos = st.s;
 var config = st.config0;
@@ -44,3 +48,4 @@ var db2 = conn2.getDB('admin');
 
 // should fail since user is not authorized.
 assert.commandFailedWithCode(db2.adminCommand('serverStatus'), authzErrorCode);
+st.stop();

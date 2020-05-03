@@ -1,6 +1,13 @@
-// Cannot implicitly shard accessed collections because the explain output from a mongod when run
-// against a sharded collection is wrapped in a "shards" object with keys for each shard.
-// @tags: [assumes_unsharded_collection]
+/**
+ * Cannot implicitly shard accessed collections because the explain output from a mongod when run
+ * against a sharded collection is wrapped in a "shards" object with keys for each shard.
+ *
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   does_not_support_stepdowns,
+ *   requires_fastcount,
+ * ]
+ */
 
 // Tests for the .explain() shell helper, which provides syntactic sugar for the explain command.
 
@@ -117,40 +124,46 @@ assert.commandWorked(explain);
 // .sort()
 explain = t.explain().find().sort({b: -1}).finish();
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "SORT"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "SORT"));
 explain = t.find().sort({b: -1}).explain();
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "SORT"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "SORT"));
 
 // .hint()
 explain = t.explain().find().hint({a: 1}).finish();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
 explain = t.explain().find().hint("a_1").finish();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
 explain = t.find().hint({a: 1}).explain();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
 explain = t.find().hint("a_1").explain();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
 
 // .min()
-explain = t.explain().find().min({a: 1}).finish();
+explain = t.explain().find().min({a: 1}).hint({a: 1}).finish();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
-explain = t.find().min({a: 1}).explain();
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
+explain = t.find().min({a: 1}).hint({a: 1}).explain();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
 
 // .max()
-explain = t.explain().find().max({a: 1}).finish();
+explain = t.explain().find().max({a: 1}).hint({a: 1}).finish();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
-explain = t.find().max({a: 1}).explain();
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
+explain = t.find().max({a: 1}).hint({a: 1}).explain();
 assert.commandWorked(explain);
-assert(isIxscan(explain.queryPlanner.winningPlan));
+assert(isIxscan(db, explain.queryPlanner.winningPlan));
+
+// .allowDiskUse()
+explain = t.explain().find().allowDiskUse().finish();
+assert.commandWorked(explain);
+explain = t.find().allowDiskUse().explain();
+assert.commandWorked(explain);
 
 // .showDiskLoc()
 explain = t.explain().find().showDiskLoc().finish();
@@ -176,12 +189,6 @@ assert.commandWorked(explain);
 explain = t.find().comment("test .comment").explain();
 assert.commandWorked(explain);
 
-// .snapshot()
-explain = t.explain().find().snapshot().finish();
-assert.commandWorked(explain);
-explain = t.find().snapshot().explain();
-assert.commandWorked(explain);
-
 // .next()
 explain = t.explain().find().next();
 assert.commandWorked(explain);
@@ -205,26 +212,26 @@ assert.commandWorked(results[0]);
 // .aggregate()
 //
 
-explain = t.explain().aggregate([{$match: {a: 3}}]);
+explain = t.explain().aggregate([{$match: {a: 3}}, {$group: {_id: null}}]);
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 // Legacy varargs format.
-explain = t.explain().aggregate({$match: {a: 3}});
+explain = t.explain().aggregate({$group: {_id: null}});
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
-explain = t.explain().aggregate({$match: {a: 3}}, {$project: {a: 1}});
+explain = t.explain().aggregate({$project: {a: 3}}, {$group: {_id: null}});
 assert.commandWorked(explain);
 assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 // Options already provided.
-explain = t.explain().aggregate([{$match: {a: 3}}], {allowDiskUse: true});
+explain = t.explain().aggregate([{$match: {a: 3}}, {$group: {_id: null}}], {allowDiskUse: true});
 assert.commandWorked(explain);
-assert.eq(1, explain.stages.length);
+assert.eq(2, explain.stages.length);
 assert("queryPlanner" in explain.stages[0].$cursor);
 
 //
@@ -234,7 +241,7 @@ assert("queryPlanner" in explain.stages[0].$cursor);
 // Basic count.
 explain = t.explain().count();
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "COUNT"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "RECORD_STORE_FAST_COUNT"));
 
 // Tests for applySkipLimit argument to .count. When we don't apply the skip, we
 // count one result. When we do apply the skip we count zero.
@@ -254,23 +261,16 @@ assert.eq(0, stage.nCounted);
 // Count with hint.
 explain = t.explain().find({a: 3}).hint({a: 1}).count();
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "COUNT"));
-assert(planHasStage(explain.queryPlanner.winningPlan, "COUNT_SCAN"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "COUNT"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "COUNT_SCAN"));
 
 // Explainable count with hint.
 assert.commandWorked(t.ensureIndex({c: 1}, {sparse: true}));
 explain = t.explain().count({c: {$exists: false}}, {hint: "c_1"});
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "IXSCAN"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "IXSCAN"));
 assert.eq(getPlanStage(explain.queryPlanner.winningPlan, "IXSCAN").indexName, "c_1");
 assert.commandWorked(t.dropIndex({c: 1}));
-
-//
-// .group()
-//
-
-explain = t.explain().group({key: "a", initial: {}, reduce: function() {}});
-assert.commandWorked(explain);
 
 //
 // .distinct()
@@ -278,17 +278,17 @@ assert.commandWorked(explain);
 
 explain = t.explain().distinct('_id');
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "PROJECTION"));
-assert(planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION_COVERED"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
 
 explain = t.explain().distinct('a');
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "PROJECTION"));
-assert(planHasStage(explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION_COVERED"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
 
 explain = t.explain().distinct('b');
 assert.commandWorked(explain);
-assert(planHasStage(explain.queryPlanner.winningPlan, "COLLSCAN"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "COLLSCAN"));
 
 //
 // .remove()
@@ -443,11 +443,6 @@ assert.throws(function() {
 // Can't add fourth arg when using document-style specification of update options.
 assert.throws(function() {
     t.explain().update({a: 3}, {$set: {b: 4}}, {multi: true}, true);
-});
-
-// Missing "initial" for explaining a group.
-assert.throws(function() {
-    t.explain().group({key: "a", reduce: function() {}});
 });
 
 // Can't specify both remove and update in a findAndModify

@@ -1,5 +1,6 @@
 /**
  * This tests that the proper access control is enforced around modifications to user and role data.
+ * @tags: [requires_sharding]
  */
 
 function runTest(conn) {
@@ -69,7 +70,6 @@ function runTest(conn) {
         var roleObj = adminUserAdmin.system.roles.findOne({role: "readWrite", db: "admin"});
         // double check that no role object named "readWrite" has been created
         assert(!roleObj, "user-defined \"readWrite\" role was created: " + tojson(roleObj));
-
     })();
 
     (function testViewUser() {

@@ -16,7 +16,9 @@
  */
 "use strict";
 
-load("jstests/libs/check_log.js");  // For 'checkLog'.
+load("jstests/libs/fail_point_util.js");
+load("jstests/libs/fixture_helpers.js");      // For 'FixtureHelpers'.
+load("jstests/aggregation/extras/utils.js");  // For 'arrayEq'.
 
 class TwoPhaseDropCollectionTest {
     constructor(testName, dbName) {
@@ -34,12 +36,32 @@ class TwoPhaseDropCollectionTest {
     }
 
     /**
+     * Returns true if the replica set supports two phase drops that use 'system.drop' namespaces.
+     * Since 4.2, 'system.drop' drop pending collections will be disabled on storage engines that
+     * support drop pending idents natively. See serverStatus().storageEngine.supportsPendingDrops.
+     */
+    static supportsDropPendingNamespaces(replSetTest) {
+        const primaryDB = replSetTest.getPrimary().getDB('admin');
+        const serverStatus = assert.commandWorked(primaryDB.serverStatus());
+        const storageEngineSection = serverStatus.storageEngine;
+        TwoPhaseDropCollectionTest._testLog('Storage engine features (from serverStatus()): ' +
+                                            tojson(storageEngineSection));
+        return !storageEngineSection.supportsPendingDrops;
+    }
+
+    /**
+     * Instance method version of supportsDropPendingNamespaces().
+     */
+    supportsDropPendingNamespaces() {
+        return TwoPhaseDropCollectionTest.supportsDropPendingNamespaces(this.replTest);
+    }
+
+    /**
      * Pause oplog application on a specified node.
      */
     pauseOplogApplication(node) {
-        assert.commandWorked(node.adminCommand(
-            {configureFailPoint: this.oplogApplicationFailpoint, mode: "alwaysOn"}));
-        checkLog.contains(node, this.oplogApplicationFailpoint + " fail point enabled");
+        let failPoint = configureFailPoint(node, this.oplogApplicationFailpoint);
+        failPoint.wait();
     }
 
     /**
@@ -59,6 +81,31 @@ class TwoPhaseDropCollectionTest {
         let failMsg = "'listCollections' command failed";
         let res = assert.commandWorked(database.runCommand("listCollections", args), failMsg);
         return res.cursor.firstBatch;
+    }
+
+    /**
+     * Waits for all collections pending drop to be completely dropped on the given connection.
+     */
+    static waitForAllCollectionDropsToComplete(conn) {
+        assert.soon(function() {
+            const dbNames = conn.getDBNames();
+            for (let dbName of dbNames) {
+                const currDB = conn.getDB(dbName);
+                let collectionsWithPending =
+                    TwoPhaseDropCollectionTest.listCollections(currDB, {includePendingDrops: true});
+                let collectionsNoPending = TwoPhaseDropCollectionTest.listCollections(currDB);
+                if (!arrayEq(collectionsWithPending, collectionsNoPending)) {
+                    // Do a write on the primary to ensure that the commit point advances.
+                    let cmd = {
+                        appendOplogNote: 1,
+                        data: {id: "waitForAllCollectionDropsToCompleteHelper"}
+                    };
+                    FixtureHelpers.runCommandOnEachPrimary({db: conn.getDB("admin"), cmdObj: cmd});
+                    return false;
+                }
+            }
+            return true;
+        }, "Not all collection drops completed on " + conn.host);
     }
 
     /**
@@ -134,11 +181,19 @@ class TwoPhaseDropCollectionTest {
             TwoPhaseDropCollectionTest.listCollections(db, {includePendingDrops: true});
 
         TwoPhaseDropCollectionTest._testLog("Checking presence of drop-pending collection for " +
-                                            collName + " in the collection list: " +
-                                            tojson(collections));
+                                            collName +
+                                            " in the collection list: " + tojson(collections));
 
         let pendingDropRegex = TwoPhaseDropCollectionTest.pendingDropRegex(collName);
         return collections.find(c => pendingDropRegex.test(c.name));
+    }
+
+    /**
+     * Waits until 'collName' in database 'db' is not in drop pending state.
+     */
+    static waitForDropToComplete(db, collName) {
+        assert.soon(
+            () => !TwoPhaseDropCollectionTest.collectionIsPendingDropInDatabase(db, collName));
     }
 
     /**

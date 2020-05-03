@@ -1,33 +1,36 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/util/options_parser/environment.h"
 
 #include <iostream>
+#include <yaml-cpp/yaml.h>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
@@ -210,6 +213,9 @@ bool Environment::count(const Key& key) const {
 Value Environment::operator[](const Key& key) const {
     Value value;
     Status ret = get(key, &value);
+    if (!ret.isOK()) {
+        return Value();
+    }
     return value;
 }
 
@@ -357,6 +363,54 @@ Status valueMapToBSON(const std::map<Key, Value>& params,
     }
     return Status::OK();
 }
+
+void buildYAMLNode(YAML::Emitter& out, const BSONObj& in, bool isMap = true) {
+    if (isMap) {
+        out << YAML::BeginMap;
+    } else {
+        out << YAML::BeginSeq;
+    }
+
+    for (const auto& elem : in) {
+        if (isMap) {
+            out << YAML::Key << elem.fieldName();
+            out << YAML::Value;
+        }
+        switch (elem.type()) {
+            case BSONType::Bool:
+                out << elem.Bool();
+                break;
+            case BSONType::NumberInt:
+                out << elem.Int();
+                break;
+            case BSONType::NumberLong:
+                out << elem.Long();
+                break;
+            case BSONType::NumberDouble:
+                out << elem.Double();
+                break;
+            case BSONType::String:
+                out << elem.String();
+                break;
+            case BSONType::Array:
+                buildYAMLNode(out, elem.Obj(), false);
+                break;
+            case BSONType::Object:
+                buildYAMLNode(out, elem.Obj(), true);
+                break;
+            default:
+                // Other types should not be produced by MOE.
+                uasserted(ErrorCodes::BadValue,
+                          str::stream() << "Invalid type encountered in config: " << elem.type());
+        }
+    }
+
+    if (isMap) {
+        out << YAML::EndMap;
+    } else {
+        out << YAML::EndSeq;
+    }
+}
 }  // namespace
 
 BSONObj Environment::toBSON() const {
@@ -366,6 +420,13 @@ BSONObj Environment::toBSON() const {
         return BSONObj();
     }
     return builder.obj();
+}
+
+std::string Environment::toYAML() const {
+    auto bson = toBSON();
+    YAML::Emitter root;
+    buildYAMLNode(root, bson);
+    return root.c_str();
 }
 
 }  // namespace optionenvironment

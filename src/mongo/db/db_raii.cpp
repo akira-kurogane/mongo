@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,107 +27,69 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/db_raii.h"
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/uuid_catalog.h"
-#include "mongo/db/client.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/db_raii_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/stats/top.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
-
 namespace {
-MONGO_FP_DECLARE(setAutoGetCollectionWait);
+
+const boost::optional<int> kDoNotChangeProfilingLevel = boost::none;
+
+// TODO: SERVER-44105 remove
+// If set to false, secondary reads should wait behind the PBW lock.
+// Does nothing if gAllowSecondaryReadsDuringBatchApplication setting is false.
+const auto allowSecondaryReadsDuringBatchApplication_DONT_USE =
+    OperationContext::declareDecoration<boost::optional<bool>>();
+
 }  // namespace
-
-AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData ns, LockMode mode)
-    : _dbLock(opCtx, ns, mode), _db(dbHolder().get(opCtx, ns)) {}
-
-AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData ns, Lock::DBLock lock)
-    : _dbLock(std::move(lock)), _db(dbHolder().get(opCtx, ns)) {}
-
-AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     LockMode modeDB,
-                                     LockMode modeColl,
-                                     ViewMode viewMode)
-    : AutoGetCollection(opCtx, nss, modeColl, viewMode, Lock::DBLock(opCtx, nss.db(), modeDB)) {}
-
-AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     LockMode modeColl,
-                                     ViewMode viewMode,
-                                     Lock::DBLock lock)
-    : _viewMode(viewMode),
-      _autoDb(opCtx, nss.db(), std::move(lock)),
-      _collLock(opCtx->lockState(), nss.ns(), modeColl),
-      _coll(_autoDb.getDb() ? _autoDb.getDb()->getCollection(opCtx, nss) : nullptr) {
-    Database* db = _autoDb.getDb();
-    // If the database exists, but not the collection, check for views.
-    if (_viewMode == ViewMode::kViewsForbidden && db && !_coll &&
-        db->getViewCatalog()->lookup(opCtx, nss.ns()))
-        uasserted(ErrorCodes::CommandNotSupportedOnView,
-                  str::stream() << "Namespace " << nss.ns() << " is a view, not a collection");
-
-    // Wait for a configured amount of time after acquiring locks if the failpoint is enabled.
-    MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
-        const BSONObj& data = customWait.getData();
-        sleepFor(Milliseconds(data["waitForMillis"].numberInt()));
-    }
-}
-
-AutoGetCollectionOrView::AutoGetCollectionOrView(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 LockMode modeAll)
-    : _autoColl(opCtx, nss, modeAll, modeAll, AutoGetCollection::ViewMode::kViewsPermitted),
-      _view(_autoColl.getDb() && !_autoColl.getCollection()
-                ? _autoColl.getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
-                : nullptr) {}
-
-AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx, StringData ns, LockMode mode)
-    : _dbLock(opCtx, ns, mode), _db(dbHolder().get(opCtx, ns)) {
-    invariant(mode == MODE_IX || mode == MODE_X);
-    _justCreated = false;
-    // If the database didn't exist, relock in MODE_X
-    if (_db == NULL) {
-        if (mode != MODE_X) {
-            _dbLock.relockWithMode(MODE_X);
-        }
-        _db = dbHolder().openDb(opCtx, ns);
-        _justCreated = true;
-    }
-}
 
 AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    Top::LockType lockType,
-                                   boost::optional<int> dbProfilingLevel)
-    : _opCtx(opCtx), _lockType(lockType) {
+                                   LogMode logMode,
+                                   boost::optional<int> dbProfilingLevel,
+                                   Date_t deadline)
+    : _opCtx(opCtx), _lockType(lockType), _nss(nss), _logMode(logMode) {
+    if (_logMode == LogMode::kUpdateTop) {
+        return;
+    }
+
     if (!dbProfilingLevel) {
         // No profiling level was determined, attempt to read the profiling level from the Database
-        // object.
-        AutoGetDb autoDb(_opCtx, nss.db(), MODE_IS);
+        // object. Since we are only reading the in-memory profiling level out of the database
+        // object (which is configured on a per-node basis and not replicated or persisted), we
+        // never need to conflict with secondary batch application.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
+        AutoGetDb autoDb(_opCtx, _nss.db(), MODE_IS, deadline);
         if (autoDb.getDb()) {
             dbProfilingLevel = autoDb.getDb()->getProfilingLevel();
         }
     }
+
     stdx::lock_guard<Client> clientLock(*_opCtx->getClient());
-    CurOp::get(_opCtx)->enter_inlock(nss.ns().c_str(), dbProfilingLevel);
+    CurOp::get(_opCtx)->enter_inlock(_nss.ns().c_str(), dbProfilingLevel);
 }
 
 AutoStatsTracker::~AutoStatsTracker() {
+    if (_logMode == LogMode::kUpdateCurOp) {
+        return;
+    }
+
     auto curOp = CurOp::get(_opCtx);
     Top::get(_opCtx->getServiceContext())
         .record(_opCtx,
-                curOp->getNS(),
+                _nss.ns(),
                 curOp->getLogicalOp(),
                 _lockType,
                 durationCount<Microseconds>(curOp->elapsedTimeExcludingPauses()),
@@ -135,193 +98,302 @@ AutoStatsTracker::~AutoStatsTracker() {
 }
 
 AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
-                                                   const StringData dbName,
-                                                   const UUID& uuid) {
-    // Lock the database since a UUID will always be in the same database even though its
-    // collection name may change.
-    Lock::DBLock dbSLock(opCtx, dbName, MODE_IS);
-
-    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
-
-    // If the UUID doesn't exist, we leave _autoColl to be boost::none.
-    if (!nss.isEmpty()) {
-        _autoColl.emplace(
-            opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsForbidden, std::move(dbSLock));
-
-        // Note: this can yield.
-        _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
-    }
-}
-
-AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
-                                                   AutoGetCollection::ViewMode viewMode) {
-    _autoColl.emplace(opCtx, nss, MODE_IS, MODE_IS, viewMode);
-
-    // Note: this can yield.
-    _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
-}
-
-AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
+                                                   const NamespaceStringOrUUID& nsOrUUID,
                                                    AutoGetCollection::ViewMode viewMode,
-                                                   Lock::DBLock lock) {
-    _autoColl.emplace(opCtx, nss, MODE_IS, viewMode, std::move(lock));
+                                                   Date_t deadline) {
+    // Don't take the ParallelBatchWriterMode lock when the server parameter is set and our
+    // storage engine supports snapshot reads.
+    if (gAllowSecondaryReadsDuringBatchApplication.load() &&
+        allowSecondaryReadsDuringBatchApplication_DONT_USE(opCtx).value_or(true) &&
+        opCtx->getServiceContext()->getStorageEngine()->supportsReadConcernSnapshot()) {
+        _shouldNotConflictWithSecondaryBatchApplicationBlock.emplace(opCtx->lockState());
+    }
+    const auto collectionLockMode = getLockModeForQuery(opCtx, nsOrUUID.nss());
+    _autoColl.emplace(opCtx, nsOrUUID, collectionLockMode, viewMode, deadline);
 
-    // Note: this can yield.
-    _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
-}
-void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const NamespaceString& nss,
-                                                                       OperationContext* opCtx) {
-    while (true) {
-        auto coll = _autoColl->getCollection();
-        if (!coll) {
-            return;
-        }
+    // If the read source is explicitly set to kNoTimestamp, we read the most up to date data and do
+    // not consider reading at last applied (e.g. FTDC needs that).
+    if (opCtx->recoveryUnit()->getTimestampReadSource() == RecoveryUnit::ReadSource::kNoTimestamp)
+        return;
+
+    repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    const auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
+
+    // If the collection doesn't exist or disappears after releasing locks and waiting, there is no
+    // need to check for pending catalog changes.
+    while (auto coll = _autoColl->getCollection()) {
+
+        auto readSource = opCtx->recoveryUnit()->getTimestampReadSource();
         auto minSnapshot = coll->getMinimumVisibleSnapshot();
-        if (!minSnapshot) {
-            return;
+        auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+
+        // TODO(SERVER-47824): Also ban transaction snapshot reads on capped collections.
+        uassert(ErrorCodes::SnapshotUnavailable,
+                "Reading from capped collections with readConcern snapshot is not supported "
+                "outside of transactions",
+                !coll->isCapped() ||
+                    readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern ||
+                    opCtx->inMultiDocumentTransaction());
+
+        // If we are reading at a provided timestamp earlier than the latest catalog changes,
+        // then we must return an error.
+        if (readSource == RecoveryUnit::ReadSource::kProvided && minSnapshot &&
+            (*mySnapshot < *minSnapshot)) {
+            uasserted(ErrorCodes::SnapshotUnavailable,
+                      str::stream()
+                          << "Unable to read from a snapshot due to pending collection catalog "
+                             "changes; please retry the operation. Snapshot timestamp is "
+                          << mySnapshot->toString() << ". Collection minimum is "
+                          << minSnapshot->toString());
         }
-        auto mySnapshot = opCtx->recoveryUnit()->getMajorityCommittedSnapshot();
-        if (!mySnapshot) {
-            return;
+
+        // During batch application on secondaries, there is a potential to read inconsistent states
+        // that would normally be protected by the PBWM lock. In order to serve secondary reads
+        // during this period, we default to not acquiring the lock (by setting
+        // _shouldNotConflictWithSecondaryBatchApplicationBlock). On primaries, we always read at a
+        // consistent time, so not taking the PBWM lock is not a problem. On secondaries, we have to
+        // guarantee we read at a consistent state, so we must read at the last applied timestamp,
+        // which is set after each complete batch.
+        //
+        // If an attempt to read at the last applied timestamp is unsuccessful because there are
+        // pending catalog changes that occur after the last applied timestamp, we release our locks
+        // and try again with the PBWM lock (by unsetting
+        // _shouldNotConflictWithSecondaryBatchApplicationBlock).
+
+        const NamespaceString nss = coll->ns();
+
+        bool readAtLastAppliedTimestamp =
+            _shouldReadAtLastAppliedTimestamp(opCtx, nss, readConcernLevel);
+
+        if (readAtLastAppliedTimestamp) {
+            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
+            readSource = opCtx->recoveryUnit()->getTimestampReadSource();
         }
-        if (mySnapshot >= minSnapshot) {
+
+        // This timestamp could be earlier than the timestamp seen when the transaction is opened
+        // because it is set asynchonously. This is not problematic because holding the collection
+        // lock guarantees no metadata changes will occur in that time.
+        auto lastAppliedTimestamp = readAtLastAppliedTimestamp
+            ? boost::optional<Timestamp>(replCoord->getMyLastAppliedOpTime().getTimestamp())
+            : boost::none;
+
+        if (!_conflictingCatalogChanges(opCtx, minSnapshot, lastAppliedTimestamp)) {
             return;
         }
 
-        // Yield locks.
+        invariant(lastAppliedTimestamp ||
+                  // The kMajorityCommitted and kNoOverlap read sources already read from timestamps
+                  // that are safe with respect to concurrent secondary batch application.
+                  readSource == RecoveryUnit::ReadSource::kMajorityCommitted ||
+                  readSource == RecoveryUnit::ReadSource::kNoOverlap);
+        invariant(readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern);
+
+        // Yield locks in order to do the blocking call below.
         _autoColl = boost::none;
 
-        repl::ReplicationCoordinator::get(opCtx)->waitUntilSnapshotCommitted(opCtx, *minSnapshot);
+        // If there are pending catalog changes, we should conflict with any in-progress batches (by
+        // taking the PBWM lock) and choose not to read from the last applied timestamp by unsetting
+        // _shouldNotConflictWithSecondaryBatchApplicationBlock. Index builds on secondaries can
+        // complete at timestamps later than the lastAppliedTimestamp during initial sync. After
+        // initial sync finishes, if we waited instead of retrying, readers would block indefinitely
+        // waiting for the lastAppliedTimestamp to move forward. Instead we force the reader take
+        // the PBWM lock and retry.
+        if (lastAppliedTimestamp) {
+            LOGV2(20576,
+                  "tried reading at last-applied time: {lastAppliedTimestamp} on ns: {nss_ns}, but "
+                  "future catalog changes are pending at time {minSnapshot}. Trying again without "
+                  "reading at last-applied time.",
+                  "lastAppliedTimestamp"_attr = *lastAppliedTimestamp,
+                  "nss_ns"_attr = nss.ns(),
+                  "minSnapshot"_attr = *minSnapshot);
+            // Destructing the block sets _shouldConflictWithSecondaryBatchApplication back to the
+            // previous value. If the previous value is false (because there is another
+            // shouldNotConflictWithSecondaryBatchApplicationBlock outside of this function), this
+            // does not take the PBWM lock.
+            _shouldNotConflictWithSecondaryBatchApplicationBlock = boost::none;
 
-        uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+            // As alluded to above, if we are AutoGetting multiple collections, it
+            // is possible that our "reaquire the PBWM" trick doesn't work, since we've already done
+            // some reads and locked in our snapshot.  At this point, the only way out is to fail
+            // the operation. The client application will need to retry.
+            uassert(
+                ErrorCodes::SnapshotUnavailable,
+                str::stream() << "Unable to read from a snapshot due to pending collection catalog "
+                                 "changes; please retry the operation. Snapshot timestamp is "
+                              << (mySnapshot ? mySnapshot->toString() : "(none)")
+                              << ". Collection minimum is " << minSnapshot->toString(),
+                opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
+
+            // Cannot change ReadSource while a RecoveryUnit is active, which may result from
+            // calling getPointInTimeReadTimestamp().
+            opCtx->recoveryUnit()->abandonSnapshot();
+            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+        }
+
+        // If there are pending catalog changes when using a no-overlap read source, we choose to
+        // take the PBWM lock to conflict with any in-progress batches. This prevents us from idly
+        // spinning in this loop trying to get a new read timestamp ahead of the minimum visible
+        // snapshot. This helps us guarantee liveness (i.e. we can eventually get a suitable read
+        // timestamp) but should not be necessary for correctness.
+        if (readSource == RecoveryUnit::ReadSource::kNoOverlap) {
+            invariant(!lastAppliedTimestamp);  // no-overlap read source selects its own timestamp.
+            _shouldNotConflictWithSecondaryBatchApplicationBlock = boost::none;
+            invariant(opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
+
+            // Abandon our snapshot but don't change our read source, so that we can select a new
+            // read timestamp on the next loop iteration.
+            opCtx->recoveryUnit()->abandonSnapshot();
+        }
+
+        if (readSource == RecoveryUnit::ReadSource::kMajorityCommitted) {
+            replCoord->waitUntilSnapshotCommitted(opCtx, *minSnapshot);
+            uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        }
 
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             CurOp::get(opCtx)->yielded();
         }
 
-        // Relock.
-        _autoColl.emplace(opCtx, nss, MODE_IS);
+        _autoColl.emplace(opCtx, nsOrUUID, collectionLockMode, viewMode, deadline);
     }
+}
+
+bool AutoGetCollectionForRead::_shouldReadAtLastAppliedTimestamp(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    repl::ReadConcernLevel readConcernLevel) const {
+
+    // If this block is unset, then the operation did not opt-out of the PBWM lock, implying that it
+    // cannot read at lastApplied. It's important to note that it is possible for this to be set,
+    // but still be holding the PBWM lock, explained below.
+    if (!_shouldNotConflictWithSecondaryBatchApplicationBlock) {
+        return false;
+    }
+
+    // If we are already holding the PBWM lock, do not read at last-applied. This is because once an
+    // operation reads without a timestamp (effectively seeing all writes), it is no longer safe to
+    // start reading at a timestamp, as writes or catalog operations may appear to vanish.
+    // This may occur when multiple collection locks are held concurrently, which is often the case
+    // when DBDirectClient is used.
+    if (opCtx->lockState()->isLockHeldForMode(resourceIdParallelBatchWriterMode, MODE_IS)) {
+        LOGV2_DEBUG(20577, 1, "not reading at last-applied because the PBWM lock is held");
+        return false;
+    }
+
+    // Majority and snapshot readConcern levels should not read from lastApplied; these read
+    // concerns already have a designated timestamp to read from.
+    if (readConcernLevel != repl::ReadConcernLevel::kLocalReadConcern &&
+        readConcernLevel != repl::ReadConcernLevel::kAvailableReadConcern) {
+        return false;
+    }
+
+    // If we are in a replication state (like secondary or primary catch-up) where we are not
+    // accepting writes, we should read at lastApplied. If this node can accept writes, then no
+    // conflicting replication batches are being applied and we can read from the default snapshot.
+    if (repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx, "admin")) {
+        return false;
+    }
+
+    // Non-replicated collections do not need to read at lastApplied, as those collections are not
+    // written by the replication system.  However, the oplog is special, as it *is* written by the
+    // replication system.
+    if (!nss.isReplicated() && !nss.isOplog()) {
+        return false;
+    }
+
+    return true;
+}
+
+bool AutoGetCollectionForRead::_conflictingCatalogChanges(
+    OperationContext* opCtx,
+    boost::optional<Timestamp> minSnapshot,
+    boost::optional<Timestamp> lastAppliedTimestamp) const {
+    // This is the timestamp of the most recent catalog changes to this collection. If this is
+    // greater than any point in time read timestamps, we should either wait or return an error.
+    if (!minSnapshot) {
+        return false;
+    }
+
+    // If we are reading from the lastAppliedTimestamp and it is up-to-date with any catalog
+    // changes, we can return.
+    if (lastAppliedTimestamp &&
+        (lastAppliedTimestamp->isNull() || *lastAppliedTimestamp >= *minSnapshot)) {
+        return false;
+    }
+
+    // This can be set when readConcern is "snapshot" or "majority".
+    auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+
+    // If we do not have a point in time to conflict with minSnapshot, return.
+    if (!mySnapshot && !lastAppliedTimestamp) {
+        return false;
+    }
+
+    // Return if there are no conflicting catalog changes with mySnapshot.
+    if (mySnapshot && *mySnapshot >= *minSnapshot) {
+        return false;
+    }
+
+    return true;
 }
 
 AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
     OperationContext* opCtx,
-    const NamespaceString& nss,
+    const NamespaceStringOrUUID& nsOrUUID,
     AutoGetCollection::ViewMode viewMode,
-    Lock::DBLock lock) {
-    _autoCollForRead.emplace(opCtx, nss, viewMode, std::move(lock));
-    const int doNotChangeProfilingLevel = 0;
-    _statsTracker.emplace(opCtx,
-                          nss,
-                          Top::LockType::ReadLocked,
-                          _autoCollForRead->getDb() ? _autoCollForRead->getDb()->getProfilingLevel()
-                                                    : doNotChangeProfilingLevel);
+    Date_t deadline,
+    AutoStatsTracker::LogMode logMode)
+    : _autoCollForRead(opCtx, nsOrUUID, viewMode, deadline),
+      _statsTracker(opCtx,
+                    _autoCollForRead.getNss(),
+                    Top::LockType::ReadLocked,
+                    logMode,
+                    _autoCollForRead.getDb() ? _autoCollForRead.getDb()->getProfilingLevel()
+                                             : kDoNotChangeProfilingLevel,
+                    deadline) {
 
-    // We have both the DB and collection locked, which is the prerequisite to do a stable shard
-    // version check, but we'd like to do the check after we have a satisfactory snapshot.
-    auto css = CollectionShardingState::get(opCtx, nss);
-    css->checkShardVersionOrThrow(opCtx);
-}
-
-AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
-    OperationContext* opCtx, const NamespaceString& nss, AutoGetCollection::ViewMode viewMode)
-    : AutoGetCollectionForReadCommand(
-          opCtx, nss, viewMode, Lock::DBLock(opCtx, nss.db(), MODE_IS)) {}
-
-AutoGetCollectionOrViewForReadCommand::AutoGetCollectionOrViewForReadCommand(
-    OperationContext* opCtx, const NamespaceString& nss)
-    : AutoGetCollectionForReadCommand(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted),
-      _view(_autoCollForRead->getDb() && !getCollection()
-                ? _autoCollForRead->getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
-                : nullptr) {}
-
-AutoGetCollectionOrViewForReadCommand::AutoGetCollectionOrViewForReadCommand(
-    OperationContext* opCtx, const NamespaceString& nss, Lock::DBLock lock)
-    : AutoGetCollectionForReadCommand(
-          opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted, std::move(lock)),
-      _view(_autoCollForRead->getDb() && !getCollection()
-                ? _autoCollForRead->getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
-                : nullptr) {}
-
-AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(OperationContext* opCtx,
-                                                                 const StringData dbName,
-                                                                 const UUID& uuid) {
-    _autoCollForRead.emplace(opCtx, dbName, uuid);
-    if (_autoCollForRead->getCollection()) {
-        _statsTracker.emplace(opCtx,
-                              _autoCollForRead->getCollection()->ns(),
-                              Top::LockType::ReadLocked,
-                              _autoCollForRead->getDb()->getProfilingLevel());
-
-        // We have both the DB and collection locked, which is the prerequisite to do a stable shard
-        // version check, but we'd like to do the check after we have a satisfactory snapshot.
-        auto css = CollectionShardingState::get(opCtx, _autoCollForRead->getCollection()->ns());
+    if (!_autoCollForRead.getView()) {
+        auto* const css = CollectionShardingState::get(opCtx, _autoCollForRead.getNss());
         css->checkShardVersionOrThrow(opCtx);
     }
 }
 
-void AutoGetCollectionOrViewForReadCommand::releaseLocksForView() noexcept {
-    invariant(_view);
-    _view = nullptr;
-    _autoCollForRead = boost::none;
-}
-
-OldClientContext::OldClientContext(OperationContext* opCtx,
-                                   const std::string& ns,
-                                   Database* db,
-                                   bool justCreated)
-    : _justCreated(justCreated), _doVersion(true), _ns(ns), _db(db), _opCtx(opCtx) {
-    _finishInit();
-}
-
-OldClientContext::OldClientContext(OperationContext* opCtx,
-                                   const std::string& ns,
-                                   bool doVersion)
-    : _justCreated(false),  // set for real in finishInit
-      _doVersion(doVersion),
-      _ns(ns),
-      _db(NULL),
-      _opCtx(opCtx) {
-    _finishInit();
-}
-
-void OldClientContext::_finishInit() {
-    _db = dbHolder().get(_opCtx, _ns);
-    if (_db) {
-        _justCreated = false;
-    } else {
-        invariant(_opCtx->lockState()->isDbLockedForMode(nsToDatabaseSubstring(_ns), MODE_X));
-        _db = dbHolder().openDb(_opCtx, _ns, &_justCreated);
+OldClientContext::OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion)
+    : _opCtx(opCtx), _db(DatabaseHolder::get(opCtx)->getDb(opCtx, ns)) {
+    if (!_db) {
+        const auto dbName = nsToDatabaseSubstring(ns);
+        _db = DatabaseHolder::get(opCtx)->openDb(_opCtx, dbName, &_justCreated);
         invariant(_db);
     }
 
-    if (_doVersion) {
-        _checkNotStale();
+    auto const currentOp = CurOp::get(_opCtx);
+
+    if (doVersion) {
+        switch (currentOp->getNetworkOp()) {
+            case dbGetMore:  // getMore is special and should be handled elsewhere
+            case dbUpdate:   // update & delete check shard version as part of the write executor
+            case dbDelete:   // path, so no need to check them here as well
+                break;
+            default:
+                CollectionShardingState::get(_opCtx, NamespaceString(ns))
+                    ->checkShardVersionOrThrow(_opCtx);
+                break;
+        }
     }
 
     stdx::lock_guard<Client> lk(*_opCtx->getClient());
-    CurOp::get(_opCtx)->enter_inlock(_ns.c_str(), _db->getProfilingLevel());
-}
-
-void OldClientContext::_checkNotStale() const {
-    switch (CurOp::get(_opCtx)->getNetworkOp()) {
-        case dbGetMore:  // getMore is special and should be handled elsewhere.
-        case dbUpdate:   // update & delete check shard version in instance.cpp, so don't check
-        case dbDelete:   // here as well.
-            break;
-        default:
-            auto css = CollectionShardingState::get(_opCtx, _ns);
-            css->checkShardVersionOrThrow(_opCtx);
-    }
+    currentOp->enter_inlock(ns.c_str(), _db->getProfilingLevel());
 }
 
 OldClientContext::~OldClientContext() {
-    // Lock must still be held
-    invariant(_opCtx->lockState()->isLocked());
+    // If in an interrupt, don't record any stats.
+    // It is possible to have no lock after saving the lock state and being interrupted while
+    // waiting to restore.
+    if (_opCtx->getKillStatus() != ErrorCodes::OK)
+        return;
 
+    invariant(_opCtx->lockState()->isLocked());
     auto currentOp = CurOp::get(_opCtx);
     Top::get(_opCtx->getClient()->getServiceContext())
         .record(_opCtx,
@@ -334,20 +406,31 @@ OldClientContext::~OldClientContext() {
                 currentOp->getReadWriteType());
 }
 
+LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<NamespaceString>& nss) {
+    invariant(opCtx);
 
-OldClientWriteContext::OldClientWriteContext(OperationContext* opCtx, const std::string& ns)
-    : _opCtx(opCtx),
-      _nss(ns),
-      _autodb(opCtx, _nss.db(), MODE_IX),
-      _collk(opCtx->lockState(), ns, MODE_IX),
-      _c(opCtx, ns, _autodb.getDb(), _autodb.justCreated()) {
-    _collection = _c.db()->getCollection(opCtx, ns);
-    if (!_collection && !_autodb.justCreated()) {
-        // relock database in MODE_X to allow collection creation
-        _collk.relockAsDatabaseExclusive(_autodb.lock());
-        Database* db = dbHolder().get(_opCtx, ns);
-        invariant(db == _c.db());
+    // Use IX locks for multi-statement transactions; otherwise, use IS locks.
+    if (opCtx->inMultiDocumentTransaction()) {
+        uassert(51071,
+                "Cannot query system.views within a transaction",
+                !nss || !nss->isSystemDotViews());
+        return MODE_IX;
     }
+    return MODE_IS;
+}
+
+BlockSecondaryReadsDuringBatchApplication_DONT_USE::
+    BlockSecondaryReadsDuringBatchApplication_DONT_USE(OperationContext* opCtx)
+    : _opCtx(opCtx) {
+    auto allowSecondaryReads = &allowSecondaryReadsDuringBatchApplication_DONT_USE(opCtx);
+    allowSecondaryReads->swap(_originalSettings);
+    *allowSecondaryReads = false;
+}
+
+BlockSecondaryReadsDuringBatchApplication_DONT_USE::
+    ~BlockSecondaryReadsDuringBatchApplication_DONT_USE() {
+    auto allowSecondaryReads = &allowSecondaryReadsDuringBatchApplication_DONT_USE(_opCtx);
+    allowSecondaryReads->swap(_originalSettings);
 }
 
 }  // namespace mongo

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -34,6 +34,12 @@ from suite_subprocess import suite_subprocess
 import wiredtiger, wttest
 from wiredtiger import stat
 from wtdataset import SimpleDataSet, ComplexDataSet, ComplexLSMDataSet
+try:
+    # Windows does not getrlimit/setrlimit so we must catch the resource
+    # module load.
+    import resource
+except:
+    None
 
 # test_backup06.py
 #    Test that opening a backup cursor does not open file handles.
@@ -80,10 +86,20 @@ class test_backup06(wttest.WiredTigerTestCase, suite_subprocess):
 
     # Test that the open handle count does not change.
     def test_cursor_open_handles(self):
+        if os.name == "nt":
+            self.skipTest('Unix specific test skipped on Windows')
+
+        limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if limits[0] < 1024:
+            new = (1024, limits[1])
+            resource.setrlimit(resource.RLIMIT_NOFILE, new)
         self.populate_many()
         # Close and reopen the connection so the populate dhandles are
         # not in the list.
         self.reopen_conn()
+
+        new = (limits[0], limits[1])
+        resource.setrlimit(resource.RLIMIT_NOFILE, new)
 
         # Confirm that opening a backup cursor does not open
         # file handles.
@@ -95,8 +111,8 @@ class test_backup06(wttest.WiredTigerTestCase, suite_subprocess):
         dh_after = stat_cursor[stat.conn.dh_conn_handle_count][2]
         stat_cursor.close()
         if (dh_before != dh_after):
-            print "Dhandles open before backup open: " + str(dh_before)
-            print "Dhandles open after backup open: " + str(dh_after)
+            print("Dhandles open before backup open: " + str(dh_before))
+            print("Dhandles open after backup open: " + str(dh_after))
         self.assertEqual(dh_after == dh_before, True)
         cursor.close()
 

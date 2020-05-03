@@ -1,3 +1,25 @@
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 """Dagger allows SCons to track it's internal build dependency data for the
 MongoDB project. The tool stores this information in a Graph object, which
 is then exported to a pickle/JSON file once the build is complete.
@@ -40,25 +62,15 @@ import sys
 
 import SCons
 
-import graph
-import graph_consts
+from . import graph
+from . import graph_consts
 
 
-LIB_DB = [] # Stores every SCons library nodes
-OBJ_DB = [] # Stores every SCons object file node
-EXE_DB = {} # Stores every SCons executable node, with the object files that build into it {Executable: [object files]}
-
-
-class DependencyCycleError(SCons.Errors.UserError):
-    """Exception representing a cycle discovered in library dependencies."""
-
-    def __init__(self, first_node):
-        super(DependencyCycleError, self).__init__()
-        self.cycle_nodes = [first_node]
-
-    def __str__(self):
-        return "Library dependency cycle detected: " + " => ".join(
-            str(n) for n in self.cycle_nodes)
+LIB_DB = []  # Stores every SCons library nodes
+OBJ_DB = []  # Stores every SCons object file node
+EXE_DB = (
+    {}
+)  # Stores every SCons executable node, with the object files that build into it {Executable: [object files]}
 
 
 def list_process(items):
@@ -70,12 +82,12 @@ def list_process(items):
     for l in items:
         if isinstance(l, list):
             for i in l:
-                if i.startswith('.L'):
+                if i.startswith(".L"):
                     continue
                 else:
                     r.append(str(i))
         else:
-            if l.startswith('.L'):
+            if l.startswith(".L"):
                 continue
             else:
                 r.append(str(l))
@@ -88,28 +100,26 @@ def get_symbol_worker(object_file, task):
     """From WIL, launches a worker subprocess which collects either symbols defined
     or symbols required by an object file"""
 
-    platform = 'linux' if sys.platform.startswith('linux') else 'darwin'
+    platform = "linux" if sys.platform.startswith("linux") else "darwin"
 
-    if platform == 'linux':
-        if task == 'used':
+    if platform == "linux":
+        if task == "used":
             cmd = r'nm "' + object_file + r'" | grep -e "U " | c++filt'
-        elif task == 'defined':
+        elif task == "defined":
             cmd = r'nm "' + object_file + r'" | grep -v -e "U " | c++filt'
-    elif platform == 'darwin':
-        if task == 'used':
+    elif platform == "darwin":
+        if task == "used":
             cmd = "nm -u " + object_file + " | c++filt"
-        elif task == 'defined':
+        elif task == "defined":
             cmd = "nm -jU " + object_file + " | c++filt"
 
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
     uses = p.communicate()[0].decode()
 
-    if platform == 'linux':
-        return list_process([use[19:] for use in uses.split('\n')
-                             if use != ''])
-    elif platform == 'darwin':
-        return list_process([use.strip() for use in uses.split('\n')
-                             if use != ''])
+    if platform == "linux":
+        return list_process([use[19:] for use in uses.split("\n") if use != ""])
+    elif platform == "darwin":
+        return list_process([use.strip() for use in uses.split("\n") if use != ""])
 
 
 def emit_obj_db_entry(target, source, env):
@@ -122,6 +132,7 @@ def emit_obj_db_entry(target, source, env):
         OBJ_DB.append(t)
     return target, source
 
+
 def emit_prog_db_entry(target, source, env):
     for t in target:
         if str(t) is None:
@@ -129,6 +140,7 @@ def emit_prog_db_entry(target, source, env):
         EXE_DB[t] = [str(s) for s in source]
 
     return target, source
+
 
 def emit_lib_db_entry(target, source, env):
     """Emitter for libraries. We add each library
@@ -146,28 +158,12 @@ def __compute_libdeps(node):
     the attribute that it uses is populated by the Libdeps.py script
     """
 
-    if getattr(node.attributes, 'libdeps_exploring', False):
-        raise DependencyCycleError(node)
-
     env = node.get_env()
     deps = set()
-    node.attributes.libdeps_exploring = True
-    try:
-        try:
-            for child in env.Flatten(getattr(node.attributes, 'libdeps_direct',
-                                             [])):
-                if not child:
-                    continue
-                deps.add(child)
-
-        except DependencyCycleError as e:
-            if len(e.cycle_nodes) == 1 or e.cycle_nodes[0] != e.cycle_nodes[
-                    -1]:
-                e.cycle_nodes.insert(0, node)
-
-            logging.error("Found a dependency cycle" + str(e.cycle_nodes))
-    finally:
-        node.attributes.libdeps_exploring = False
+    for child in env.Flatten(getattr(node.attributes, "libdeps_direct", [])):
+        if not child:
+            continue
+        deps.add(child)
 
     return deps
 
@@ -239,6 +235,7 @@ def __generate_file_rels(obj, g):
         for obj in objs:
             g.add_edge(graph_consts.FIL_FIL, file_node.id, obj)
 
+
 def __generate_exe_rels(exe, g):
     """Generates all executable to library relationships, and populates the
     contained files field in each NodeExe object"""
@@ -251,6 +248,7 @@ def __generate_exe_rels(exe, g):
         g.add_edge(graph_consts.EXE_LIB, exe_node.id, lib_node.id)
 
     exe_node.contained_files = set(EXE_DB[exe])
+
 
 def write_obj_db(target, source, env):
     """The bulk of the tool. This method takes all the objects and libraries
@@ -269,7 +267,7 @@ def write_obj_db(target, source, env):
     for obj in OBJ_DB:
         __generate_file_rels(obj, g)
 
-    for exe in EXE_DB.keys():
+    for exe in list(EXE_DB.keys()):
         __generate_exe_rels(exe, g)
 
     # target is given as a list of target SCons nodes - this builder is only responsible for

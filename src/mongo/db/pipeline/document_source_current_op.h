@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,59 +33,101 @@
 
 namespace mongo {
 
-class DocumentSourceCurrentOp final : public DocumentSourceNeedsMongod {
+class DocumentSourceCurrentOp final : public DocumentSource {
 public:
+    using TruncationMode = MongoProcessInterface::CurrentOpTruncateMode;
+    using ConnMode = MongoProcessInterface::CurrentOpConnectionsMode;
+    using LocalOpsMode = MongoProcessInterface::CurrentOpLocalOpsMode;
+    using SessionMode = MongoProcessInterface::CurrentOpSessionsMode;
+    using UserMode = MongoProcessInterface::CurrentOpUserMode;
+    using CursorMode = MongoProcessInterface::CurrentOpCursorMode;
+    using BacktraceMode = MongoProcessInterface::CurrentOpBacktraceMode;
+
+    static constexpr StringData kStageName = "$currentOp"_sd;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        explicit LiteParsed(bool allUsers) : _allUsers(allUsers) {}
+        LiteParsed(std::string parseTimeName, UserMode allUsers, LocalOpsMode localOps)
+            : LiteParsedDocumentSource(std::move(parseTimeName)),
+              _allUsers(allUsers),
+              _localOps(localOps) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
             PrivilegeVector privileges;
 
-            // In a sharded cluster, we always need the inprog privilege to run $currentOp.
-            if (isMongos || _allUsers) {
+            // In a sharded cluster, we always need the inprog privilege to run $currentOp on the
+            // shards. If we are only looking up local mongoS operations, we do not need inprog to
+            // view our own ops but *do* require it to view other users' ops.
+            if (_allUsers == UserMode::kIncludeAll ||
+                (isMongos && _localOps == LocalOpsMode::kRemoteShardOps)) {
                 privileges.push_back({ResourcePattern::forClusterResource(), ActionType::inprog});
             }
 
             return privileges;
         }
 
+        bool allowedToPassthroughFromMongos() const final {
+            return _localOps == LocalOpsMode::kRemoteShardOps;
+        }
+
         bool isInitialSource() const final {
             return true;
         }
 
-    private:
-        const bool _allUsers;
-    };
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+            return onlyReadConcernLocalSupported(kStageName, level);
+        }
 
-    using TruncationMode = MongodInterface::CurrentOpTruncateMode;
-    using ConnMode = MongodInterface::CurrentOpConnectionsMode;
-    using UserMode = MongodInterface::CurrentOpUserMode;
+        void assertSupportsMultiDocumentTransaction() const {
+            transactionNotSupported(kStageName);
+        }
+
+    private:
+        const UserMode _allUsers;
+        const LocalOpsMode _localOps;
+    };
 
     static boost::intrusive_ptr<DocumentSourceCurrentOp> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
+        SessionMode includeIdleSessions = SessionMode::kIncludeIdle,
         UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
-        TruncationMode truncateOps = TruncationMode::kNoTruncation);
-
-    GetNextResult getNext() final;
+        LocalOpsMode showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps,
+        TruncationMode truncateOps = TruncationMode::kNoTruncation,
+        CursorMode idleCursors = CursorMode::kExcludeCursors,
+        BacktraceMode backtrace = BacktraceMode::kExcludeBacktrace);
 
     const char* getSourceName() const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
-        constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     (_showLocalOpsOnMongoS == LocalOpsMode::kLocalMongosOps
+                                          ? HostTypeRequirement::kLocalOnly
+                                          : HostTypeRequirement::kAnyShard),
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed,
+                                     (_showLocalOpsOnMongoS == LocalOpsMode::kLocalMongosOps
+                                          ? UnionRequirement::kNotAllowed
+                                          : UnionRequirement::kAllowed));
+
         constraints.isIndependentOfAnyCollection = true;
+        constraints.requiresInputDocSource = false;
         return constraints;
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
     }
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -94,17 +137,31 @@ public:
 
 private:
     DocumentSourceCurrentOp(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-                            ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
-                            UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
-                            TruncationMode truncateOps = TruncationMode::kNoTruncation)
-        : DocumentSourceNeedsMongod(pExpCtx),
+                            ConnMode includeIdleConnections,
+                            SessionMode includeIdleSessions,
+                            UserMode includeOpsFromAllUsers,
+                            LocalOpsMode showLocalOpsOnMongoS,
+                            TruncationMode truncateOps,
+                            CursorMode idleCursors,
+                            BacktraceMode backtrace)
+        : DocumentSource(kStageName, pExpCtx),
           _includeIdleConnections(includeIdleConnections),
+          _includeIdleSessions(includeIdleSessions),
           _includeOpsFromAllUsers(includeOpsFromAllUsers),
-          _truncateOps(truncateOps) {}
+          _showLocalOpsOnMongoS(showLocalOpsOnMongoS),
+          _truncateOps(truncateOps),
+          _idleCursors(idleCursors),
+          _backtrace(backtrace) {}
+
+    GetNextResult doGetNext() final;
 
     ConnMode _includeIdleConnections = ConnMode::kExcludeIdle;
+    SessionMode _includeIdleSessions = SessionMode::kIncludeIdle;
     UserMode _includeOpsFromAllUsers = UserMode::kExcludeOthers;
+    LocalOpsMode _showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps;
     TruncationMode _truncateOps = TruncationMode::kNoTruncation;
+    CursorMode _idleCursors = CursorMode::kExcludeCursors;
+    BacktraceMode _backtrace = BacktraceMode::kExcludeBacktrace;
 
     std::string _shardName;
 

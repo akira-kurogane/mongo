@@ -5,6 +5,8 @@
 // with no failures.
 //
 // Related to SERVER-9824.
+//
+// @tags: [operations_longer_than_stepdown_interval_in_txns]
 
 var testDB = db.getSiblingDB('grow_hash_table');
 
@@ -23,7 +25,7 @@ var doTest = function(count) {
     }
 
     // Store the document
-    assert.writeOK(testDB.collection.insert(doc));
+    assert.commandWorked(testDB.collection.insert(doc));
 
     // Try to read the document using a large projection
     try {

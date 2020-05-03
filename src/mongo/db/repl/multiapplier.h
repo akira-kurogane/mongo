@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,22 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -51,30 +52,17 @@ namespace repl {
 class OpTime;
 
 class MultiApplier {
-    MONGO_DISALLOW_COPYING(MultiApplier);
+    MultiApplier(const MultiApplier&) = delete;
+    MultiApplier& operator=(const MultiApplier&) = delete;
 
 public:
     /**
-     * Operations sorted by timestamp in ascending order.
-     */
-    using Operations = std::vector<OplogEntry>;
-
-    using OperationPtrs = std::vector<const OplogEntry*>;
-
-    /**
      * Callback function to report final status of applying operations.
      */
-    using CallbackFn = stdx::function<void(const Status&)>;
+    using CallbackFn = unique_function<void(const Status&)>;
 
-    /**
-     * Type of function to to apply a single operation. In production, this function
-     * would have the same outcome as calling SyncTail::syncApply() ('inSteadyStateReplication'
-     * value will be embedded in the function implementation).
-     */
-    using ApplyOperationFn = stdx::function<Status(OperationPtrs*)>;
-
-    using MultiApplyFn = stdx::function<StatusWith<OpTime>(
-        OperationContext*, MultiApplier::Operations, MultiApplier::ApplyOperationFn)>;
+    using MultiApplyFn =
+        std::function<StatusWith<OpTime>(OperationContext*, std::vector<OplogEntry>)>;
 
     /**
      * Creates MultiApplier in inactive state.
@@ -90,10 +78,9 @@ public:
      * contained in 'operations' are not validated.
      */
     MultiApplier(executor::TaskExecutor* executor,
-                 const Operations& operations,
-                 const ApplyOperationFn& applyOperation,
+                 const std::vector<OplogEntry>& operations,
                  const MultiApplyFn& multiApply,
-                 const CallbackFn& onCompletion);
+                 CallbackFn onCompletion);
 
     /**
      * Blocks while applier is active.
@@ -150,13 +137,12 @@ private:
     // Not owned by us.
     executor::TaskExecutor* _executor;
 
-    Operations _operations;
-    ApplyOperationFn _applyOperation;
+    std::vector<OplogEntry> _operations;
     MultiApplyFn _multiApply;
     CallbackFn _onCompletion;
 
     // Protects member data of this MultiApplier.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiApplier::_mutex");
 
     stdx::condition_variable _condition;
 

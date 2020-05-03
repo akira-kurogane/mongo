@@ -1,28 +1,30 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,38 +33,32 @@
 #include <string>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
 
-namespace mongoutils {
+namespace mongo {
+
 namespace str {
 class stream;
 }  // namespace str
-}  // namespace mongoutils
 
-namespace mongo {
+// Including builder.h here would cause a cycle.
+template <typename Allocator>
+class StringBuilderImpl;
 
 /**
  * Status represents an error state or the absence thereof.
  *
- * A Status uses the standardized error codes -- from file 'error_codes.h' -- to
+ * A Status uses the standardized error codes -- from file 'error_codes.err' -- to
  * determine an error's cause. It further clarifies the error with a textual
- * description.
- *
- * Example usage:
- *
- *    Status sumAB(int a, int b, int* c) {
- *       if (overflowIfSum(a,b)) {
- *           return Status(ErrorCodes::ERROR_OVERFLOW, "overflow in sumAB", 16494);
- *       }
- *
- *       *c = a+b;
- *       return Status::OK();
- *   }
+ * description, and code-specific extra info (a subclass of ErrorExtraInfo).
  */
 class MONGO_WARN_UNUSED_RESULT_CLASS Status {
 public:
-    // Short-hand for returning an OK status.
+    /**
+     * This is the best way to construct an OK status.
+     */
     static inline Status OK();
 
     /**
@@ -71,12 +67,32 @@ public:
      *
      * For OK Statuses prefer using Status::OK(). If code is OK, the remaining arguments are
      * ignored.
+     *
+     * For adding context to the reason string, use withContext/addContext rather than making a new
+     * Status manually.
+     *
+     * If the status comes from a command reply, use getStatusFromCommandResult() instead of manual
+     * parsing. If the status is round-tripping through non-command BSON, use the constructor that
+     * takes a BSONObj so that it can extract the extra info if the code is supposed to have any.
      */
-    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, std::string reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const std::string& reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const char* reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, StringData reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const str::stream& reason);
     MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
-                                        const mongoutils::str::stream& reason);
+                                        StringData message,
+                                        const BSONObj& extraInfoHolder);
+
+    /**
+     * Constructs a Status with a subclass of ErrorExtraInfo.
+     */
+    template <typename T, typename = stdx::enable_if_t<std::is_base_of<ErrorExtraInfo, T>::value>>
+    MONGO_COMPILER_COLD_FUNCTION Status(T&& detail, StringData message)
+        : Status(T::code,
+                 message,
+                 std::make_shared<const std::remove_reference_t<T>>(std::forward<T>(detail))) {
+        MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorExtraInfoFor<T::code>, T>());
+    }
 
     inline Status(const Status& other);
     inline Status& operator=(const Status& other);
@@ -85,6 +101,27 @@ public:
     inline Status& operator=(Status&& other) noexcept;
 
     inline ~Status();
+
+    /**
+     * Returns a new Status with the same data as this, but with the reason string replaced with
+     * newReason.  The new reason is not visible to any other Statuses that share the same ErrorInfo
+     * object.
+     *
+     * No-op when called on an OK status.
+     */
+    Status withReason(StringData newReason) const;
+
+    /**
+     * Returns a new Status with the same data as this, but with the reason string prefixed with
+     * reasonPrefix and our standard " :: caused by :: " separator. The new reason is not visible to
+     * any other Statuses that share the same ErrorInfo object.
+     *
+     * No-op when called on an OK status.
+     */
+    Status withContext(StringData reasonPrefix) const;
+    void addContext(StringData reasonPrefix) {
+        *this = this->withContext(reasonPrefix);
+    }
 
     /**
      * Only compares codes. Ignores reason strings.
@@ -128,15 +165,54 @@ public:
         return empty;
     }
 
-    std::string toString() const;
+    /**
+     * Returns the generic ErrorExtraInfo if present.
+     */
+    const ErrorExtraInfo* extraInfo() const {
+        return isOK() ? nullptr : _error->extra.get();
+    }
 
     /**
-     * Call this method to indicate that it is your intention to ignore a returned status. Ignoring
-     * is only possible if the value being ignored is an xvalue -- it is not appropriate to create a
-     * status variable and then ignore it.
+     * Returns a specific subclass of ErrorExtraInfo if the error code matches that type.
      */
-    inline void ignore() && noexcept {}
-    inline void ignore() const& noexcept = delete;
+    template <typename T>
+    const T* extraInfo() const {
+        MONGO_STATIC_ASSERT(std::is_base_of<ErrorExtraInfo, T>());
+        MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorExtraInfoFor<T::code>, T>());
+
+        if (isOK())
+            return nullptr;
+        if (code() != T::code)
+            return nullptr;
+
+        // Can't use checked_cast due to include cycle.
+        invariant(_error->extra);
+        dassert(dynamic_cast<const T*>(_error->extra.get()));
+        return static_cast<const T*>(_error->extra.get());
+    }
+
+    std::string toString() const;
+
+    void serialize(BSONObjBuilder* builder) const;
+
+    /**
+     * May only be called if the status is *not OK*. Serializes the code, code name and reason in
+     * the canonical code/codeName/errmsg format used in the server command responses.
+     */
+    void serializeErrorToBSON(BSONObjBuilder* builder) const;
+
+    /**
+     * Returns true if this Status's code is a member of the given category.
+     */
+    template <ErrorCategory category>
+    bool isA() const {
+        return ErrorCodes::isA<category>(*this);
+    }
+
+    /**
+     * Call this method to indicate that it is your intention to ignore a returned status.
+     */
+    void ignore() const noexcept {}
 
     /**
      * This method is a transitional tool, to facilitate transition to compile-time enforced status
@@ -148,26 +224,33 @@ public:
      * encounter a compiler error from ignoring the result of a status-returning function be sure to
      * check the return value, or deliberately ignore the return value.
      */
-    inline void transitional_ignore() && noexcept {};
-    inline void transitional_ignore() const& noexcept = delete;
+    void transitional_ignore() && noexcept {};
+    void transitional_ignore() const& noexcept = delete;
 
     //
     // Below interface used for testing code only.
     //
 
-    inline AtomicUInt32::WordType refCount() const;
+    inline unsigned refCount() const;
 
 private:
+    // Private since it could result in a type mismatch between code and extraInfo.
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
+                                        StringData reason,
+                                        std::shared_ptr<const ErrorExtraInfo>);
     inline Status();
 
     struct ErrorInfo {
-        AtomicUInt32 refs;             // reference counter
+        AtomicWord<unsigned> refs;     // reference counter
         const ErrorCodes::Error code;  // error code
         const std::string reason;      // description of error cause
+        const std::shared_ptr<const ErrorExtraInfo> extra;
 
-        static ErrorInfo* create(ErrorCodes::Error code, std::string reason);
+        static ErrorInfo* create(ErrorCodes::Error code,
+                                 StringData reason,
+                                 std::shared_ptr<const ErrorExtraInfo> extra);
 
-        ErrorInfo(ErrorCodes::Error code, std::string reason);
+        ErrorInfo(ErrorCodes::Error code, StringData reason, std::shared_ptr<const ErrorExtraInfo>);
     };
 
     ErrorInfo* _error;
@@ -187,6 +270,74 @@ inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs);
 
 std::ostream& operator<<(std::ostream& os, const Status& status);
 
-}  // namespace mongo
+// This is only implemented for StringBuilder, not StackStringBuilder.
+template <typename Allocator>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const Status& status);
 
-#include "mongo/base/status-inl.h"
+inline Status Status::OK() {
+    return Status();
+}
+
+inline Status::Status(const Status& other) : _error(other._error) {
+    ref(_error);
+}
+
+inline Status& Status::operator=(const Status& other) {
+    ref(other._error);
+    unref(_error);
+    _error = other._error;
+    return *this;
+}
+
+inline Status::Status(Status&& other) noexcept : _error(other._error) {
+    other._error = nullptr;
+}
+
+inline Status& Status::operator=(Status&& other) noexcept {
+    unref(_error);
+    _error = other._error;
+    other._error = nullptr;
+    return *this;
+}
+
+inline Status::~Status() {
+    unref(_error);
+}
+
+inline bool Status::isOK() const {
+    return !_error;
+}
+
+inline ErrorCodes::Error Status::code() const {
+    return _error ? _error->code : ErrorCodes::OK;
+}
+
+inline std::string Status::codeString() const {
+    return ErrorCodes::errorString(code());
+}
+
+inline unsigned Status::refCount() const {
+    return _error ? _error->refs.load() : 0;
+}
+
+inline Status::Status() : _error(nullptr) {}
+
+inline void Status::ref(ErrorInfo* error) {
+    if (error)
+        error->refs.fetchAndAdd(1);
+}
+
+inline void Status::unref(ErrorInfo* error) {
+    if (error && (error->refs.subtractAndFetch(1) == 0))
+        delete error;
+}
+
+inline bool operator==(const ErrorCodes::Error lhs, const Status& rhs) {
+    return rhs == lhs;
+}
+
+inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs) {
+    return rhs != lhs;
+}
+
+}  // namespace mongo

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,6 +34,7 @@
 #include <numeric>
 
 #include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/update/update_internal_node.h"
@@ -80,9 +82,19 @@ Status checkSortClause(const BSONObj& sortObject) {
     return Status::OK();
 }
 
+/**
+ * std::abs(LLONG_MIN) results in undefined behavior on 2's complement systems because the
+ * absolute value of LLONG_MIN cannot be represented in a 'long long'.
+ *
+ * If the input is LLONG_MIN, will return std::abs(LLONG_MIN + 1).
+ */
+long long safeApproximateAbs(long long val) {
+    return val == std::numeric_limits<decltype(val)>::min() ? std::abs(val + 1) : std::abs(val);
+}
+
 }  // namespace
 
-Status PushNode::init(BSONElement modExpr, const CollatorInterface* collator) {
+Status PushNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
 
     if (modExpr.type() == BSONType::Object && modExpr[kEachClauseName]) {
@@ -128,7 +140,7 @@ Status PushNode::init(BSONElement modExpr, const CollatorInterface* collator) {
         auto sliceIt = clausesFound.find(kSliceClauseName);
         if (sliceIt != clausesFound.end()) {
             auto sliceClause = sliceIt->second;
-            auto parsedSliceValue = MatchExpressionParser::parseIntegerElementToLong(sliceClause);
+            auto parsedSliceValue = sliceClause.parseIntegerElementToLong();
             if (parsedSliceValue.isOK()) {
                 _slice = parsedSliceValue.getValue();
             } else {
@@ -148,14 +160,14 @@ Status PushNode::init(BSONElement modExpr, const CollatorInterface* collator) {
                 auto status = checkSortClause(sortClause.embeddedObject());
 
                 if (status.isOK()) {
-                    _sort = PatternElementCmp(sortClause.embeddedObject(), collator);
+                    _sort = PatternElementCmp(sortClause.embeddedObject(), expCtx->getCollator());
                 } else {
                     return status;
                 }
             } else if (sortClause.isNumber()) {
                 double orderVal = sortClause.Number();
                 if (orderVal == -1 || orderVal == 1) {
-                    _sort = PatternElementCmp(BSON("" << orderVal), collator);
+                    _sort = PatternElementCmp(BSON("" << orderVal), expCtx->getCollator());
                 } else {
                     return Status(ErrorCodes::BadValue,
                                   "The $sort element value must be either 1 or -1");
@@ -171,8 +183,7 @@ Status PushNode::init(BSONElement modExpr, const CollatorInterface* collator) {
         auto positionIt = clausesFound.find(kPositionClauseName);
         if (positionIt != clausesFound.end()) {
             auto positionClause = positionIt->second;
-            auto parsedPositionValue =
-                MatchExpressionParser::parseIntegerElementToLong(positionClause);
+            auto parsedPositionValue = positionClause.parseIntegerElementToLong();
             if (parsedPositionValue.isOK()) {
                 _position = parsedPositionValue.getValue();
             } else {
@@ -190,8 +201,36 @@ Status PushNode::init(BSONElement modExpr, const CollatorInterface* collator) {
     return Status::OK();
 }
 
+BSONObj PushNode::operatorValue() const {
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder subBuilder(bob.subobjStart(""));
+        {
+            // This serialization function always produces $each regardless of whether the input
+            // contained it.
+            BSONObjBuilder eachBuilder(subBuilder.subarrayStart("$each"));
+            for (const auto value : _valuesToPush)
+                eachBuilder << value;
+        }
+        if (_slice)
+            subBuilder << "$slice" << _slice.get();
+        if (_position)
+            subBuilder << "$position" << _position.get();
+        if (_sort) {
+            // The sort pattern is stored in a dummy enclosing object that we must unwrap.
+            if (_sort->useWholeValue)
+                subBuilder << "$sort" << _sort->sortPattern.firstElement();
+            else
+                subBuilder << "$sort" << _sort->sortPattern;
+        }
+    }
+    return bob.obj();
+}
+
 ModifierNode::ModifyResult PushNode::insertElementsWithPosition(
-    mutablebson::Element* array, long long position, const std::vector<BSONElement>& valuesToPush) {
+    mutablebson::Element* array,
+    boost::optional<long long> position,
+    const std::vector<BSONElement>& valuesToPush) {
     if (valuesToPush.empty()) {
         return ModifyResult::kNoOp;
     }
@@ -207,34 +246,40 @@ ModifierNode::ModifyResult PushNode::insertElementsWithPosition(
     // variable.
     ModifyResult result;
     if (arraySize == 0) {
-        invariantOK(array->pushBack(firstElementToInsert));
+        invariant(array->pushBack(firstElementToInsert));
         result = ModifyResult::kNormalUpdate;
-    } else if (position > arraySize) {
-        invariantOK(array->pushBack(firstElementToInsert));
+    } else if (!position || position.get() > arraySize) {
+        invariant(array->pushBack(firstElementToInsert));
         result = ModifyResult::kArrayAppendUpdate;
-    } else if (position > 0) {
-        auto insertAfter = getNthChild(*array, position - 1);
-        invariantOK(insertAfter.addSiblingRight(firstElementToInsert));
+    } else if (position.get() > 0) {
+        auto insertAfter = getNthChild(*array, position.get() - 1);
+        invariant(insertAfter.addSiblingRight(firstElementToInsert));
         result = ModifyResult::kNormalUpdate;
-    } else if (position < 0 && -position < arraySize) {
-        auto insertAfter = getNthChild(*array, arraySize - (-position) - 1);
-        invariantOK(insertAfter.addSiblingRight(firstElementToInsert));
+    } else if (position.get() < 0 && safeApproximateAbs(position.get()) < arraySize) {
+        auto insertAfter = getNthChild(*array, arraySize - safeApproximateAbs(position.get()) - 1);
+        invariant(insertAfter.addSiblingRight(firstElementToInsert));
         result = ModifyResult::kNormalUpdate;
     } else {
-        invariantOK(array->pushFront(firstElementToInsert));
+        invariant(array->pushFront(firstElementToInsert));
         result = ModifyResult::kNormalUpdate;
     }
 
-    // We insert all the rest of the elements after the one we just inserted.
-    std::accumulate(std::next(valuesToPush.begin()),
-                    valuesToPush.end(),
-                    firstElementToInsert,
-                    [&document](auto& insertAfter, auto& valueToInsert) {
-                        auto nextElementToInsert =
-                            document.makeElementWithNewFieldName(StringData(), valueToInsert);
-                        invariantOK(insertAfter.addSiblingRight(nextElementToInsert));
-                        return nextElementToInsert;
-                    });
+    // We insert all the rest of the elements after the one we just
+    // inserted.
+    //
+    // TODO: The use of std::accumulate here is maybe questionable
+    // given that we are ignoring the return value. MSVC flagged this,
+    // and we worked around by tagging the result as unused.
+    MONGO_COMPILER_VARIABLE_UNUSED auto ignored =
+        std::accumulate(std::next(valuesToPush.begin()),
+                        valuesToPush.end(),
+                        firstElementToInsert,
+                        [&document](auto& insertAfter, auto& valueToInsert) {
+                            auto nextElementToInsert =
+                                document.makeElementWithNewFieldName(StringData(), valueToInsert);
+                            invariant(insertAfter.addSiblingRight(nextElementToInsert));
+                            return nextElementToInsert;
+                        });
 
     return result;
 }
@@ -247,10 +292,8 @@ ModifierNode::ModifyResult PushNode::performPush(mutablebson::Element* element,
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "The field '" << elementPath->dottedField() << "'"
                                 << " must be an array but is of type "
-                                << typeName(element->getType())
-                                << " in document {"
-                                << (idElem.ok() ? idElem.toString() : "no id")
-                                << "}");
+                                << typeName(element->getType()) << " in document {"
+                                << (idElem.ok() ? idElem.toString() : "no id") << "}");
     }
 
     auto result = insertElementsWithPosition(element, _position, _valuesToPush);
@@ -260,14 +303,18 @@ ModifierNode::ModifyResult PushNode::performPush(mutablebson::Element* element,
         sortChildren(*element, *_sort);
     }
 
-    while (static_cast<long long>(countChildren(*element)) > std::abs(_slice)) {
-        result = ModifyResult::kNormalUpdate;
-        if (_slice >= 0) {
-            invariantOK(element->popBack());
-        } else {
-            // A negative value in '_slice' trims the array down to abs(_slice) but removes entries
-            // from the front of the array instead of the back.
-            invariantOK(element->popFront());
+    if (_slice) {
+        const auto sliceAbs = safeApproximateAbs(_slice.get());
+
+        while (static_cast<long long>(countChildren(*element)) > sliceAbs) {
+            result = ModifyResult::kNormalUpdate;
+            if (_slice.get() >= 0) {
+                invariant(element->popBack());
+            } else {
+                // A negative value in '_slice' trims the array down to abs(_slice) but removes
+                // entries from the front of the array instead of the back.
+                invariant(element->popFront());
+            }
         }
     }
 
@@ -310,7 +357,7 @@ void PushNode::logUpdate(LogBuilder* logBuilder,
 
 void PushNode::setValueForNewElement(mutablebson::Element* element) const {
     BSONObj emptyArray;
-    invariantOK(element->setValueArray(emptyArray));
+    invariant(element->setValueArray(emptyArray));
     (void)performPush(element, nullptr);
 }
 

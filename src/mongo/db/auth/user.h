@@ -1,28 +1,30 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -30,15 +32,17 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/restriction_set.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/unordered_map.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
 
@@ -57,9 +61,13 @@ namespace mongo {
  * user from the AuthorizationManager.
  */
 class User {
-    MONGO_DISALLOW_COPYING(User);
+    User(const User&) = delete;
+    User& operator=(const User&) = delete;
 
 public:
+    using UserId = std::vector<std::uint8_t>;
+
+    template <typename HashBlock>
     struct SCRAMCredentials {
         SCRAMCredentials() : iterationCount(0), salt(""), serverKey(""), storedKey("") {}
 
@@ -67,29 +75,66 @@ public:
         std::string salt;
         std::string serverKey;
         std::string storedKey;
+
+        bool isValid() const {
+            constexpr auto kEncodedHashLength = base64::encodedLength(HashBlock::kHashLength);
+            constexpr auto kEncodedSaltLength = base64::encodedLength(HashBlock::kHashLength - 4);
+
+            return (iterationCount > 0) && (salt.size() == kEncodedSaltLength) &&
+                base64::validate(salt) && (serverKey.size() == kEncodedHashLength) &&
+                base64::validate(serverKey) && (storedKey.size() == kEncodedHashLength) &&
+                base64::validate(storedKey);
+        }
+
+        bool empty() const {
+            return !iterationCount && salt.empty() && serverKey.empty() && storedKey.empty();
+        }
     };
+
     struct CredentialData {
-        CredentialData() : password(""), scram(), isExternal(false) {}
+        CredentialData() : scram_sha1(), scram_sha256(), isExternal(false) {}
 
-        std::string password;
-        SCRAMCredentials scram;
+        SCRAMCredentials<SHA1Block> scram_sha1;
+        SCRAMCredentials<SHA256Block> scram_sha256;
         bool isExternal;
+
+        // Select the template determined version of SCRAMCredentials.
+        // For example: creds.scram<SHA1Block>().isValid()
+        // is equivalent to creds.scram_sha1.isValid()
+        template <typename HashBlock>
+        SCRAMCredentials<HashBlock>& scram();
+
+        template <typename HashBlock>
+        const SCRAMCredentials<HashBlock>& scram() const;
     };
 
-    typedef unordered_map<ResourcePattern, Privilege> ResourcePrivilegeMap;
+    using ResourcePrivilegeMap = stdx::unordered_map<ResourcePattern, Privilege>;
 
     explicit User(const UserName& name);
-    ~User();
+    User(User&&) = default;
+    User& operator=(User&&) = default;
+
+    const UserId& getID() const {
+        return _id;
+    }
+
+    void setID(UserId id) {
+        _id = std::move(id);
+    }
 
     /**
      * Returns the user name for this user.
      */
-    const UserName& getName() const;
+    const UserName& getName() const {
+        return _name;
+    }
 
     /**
      * Returns a digest of the user's identity
      */
-    const SHA256Block& getDigest() const;
+    const SHA256Block& getDigest() const {
+        return _digest;
+    }
 
     /**
      * Returns an iterator over the names of the user's direct roles
@@ -124,17 +169,9 @@ public:
     const ActionSet getActionsForResource(const ResourcePattern& resource) const;
 
     /**
-     * Returns true if this copy of information about this user is still valid. If this returns
-     * false, this object should no longer be used and should be returned to the
-     * AuthorizationManager and a new User object for this user should be requested.
+     * Returns true if the user has is allowed to perform an action on the given resource.
      */
-    bool isValid() const;
-
-    /**
-     * This returns the reference count for this User.  The AuthorizationManager should be the
-     * only caller of this.
-     */
-    uint32_t getRefCount() const;
+    bool hasActionsForResource(const ResourcePattern& resource) const;
 
     // Mutators below.  Mutation functions should *only* be called by the AuthorizationManager
 
@@ -192,32 +229,11 @@ public:
     }
     void getRestrictions() && = delete;
 
-    /**
-     * Marks this instance of the User object as invalid, most likely because information about
-     * the user has been updated and needs to be reloaded from the AuthorizationManager.
-     *
-     * This method should *only* be called by the AuthorizationManager.
-     */
-    void invalidate();
-
-    /**
-     * Increments the reference count for this User object, which records how many threads have
-     * a reference to it.
-     *
-     * This method should *only* be called by the AuthorizationManager.
-     */
-    void incrementRefCount();
-
-    /**
-     * Decrements the reference count for this User object, which records how many threads have
-     * a reference to it.  Once the reference count goes to zero, the AuthorizationManager is
-     * allowed to destroy this instance.
-     *
-     * This method should *only* be called by the AuthorizationManager.
-     */
-    void decrementRefCount();
-
 private:
+    // Unique ID (often UUID) for this user. May be empty for legacy users.
+    UserId _id;
+
+    // The full user name (as specified by the administrator)
     UserName _name;
 
     // Digest of the full username
@@ -227,7 +243,7 @@ private:
     ResourcePrivilegeMap _privileges;
 
     // Roles the user has privileges from
-    unordered_set<RoleName> _roles;
+    stdx::unordered_set<RoleName> _roles;
 
     // Roles that the user indirectly has privileges from, due to role inheritance.
     std::vector<RoleName> _indirectRoles;
@@ -237,12 +253,39 @@ private:
 
     // Restrictions which must be met by a Client in order to authenticate as this user.
     RestrictionDocuments _restrictions;
-
-    // _refCount and _isInvalidated are modified exclusively by the AuthorizationManager
-    // _isInvalidated can be read by any consumer of User, but _refCount can only be
-    // meaningfully read by the AuthorizationManager, as _refCount is guarded by the AM's _lock
-    uint32_t _refCount;
-    AtomicUInt32 _isValid;  // Using as a boolean
 };
+
+/**
+ * Represents the properties required to request a UserHandle.
+ * This type is hashable and may be used as a key describing requests
+ */
+struct UserRequest {
+    UserRequest(const UserName& name, boost::optional<std::set<RoleName>> roles)
+        : name(name), roles(std::move(roles)) {}
+
+
+    template <typename H>
+    friend H AbslHashValue(H h, const UserRequest& key) {
+        auto state = H::combine(std::move(h), key.name);
+        if (key.roles) {
+            for (const auto& role : *key.roles) {
+                state = H::combine(std::move(state), role);
+            }
+        }
+        return state;
+    }
+
+    bool operator==(const UserRequest& key) const {
+        return name == key.name && roles == key.roles;
+    }
+
+    // The name of the requested user
+    UserName name;
+    // Any authorization grants which should override and be used in favor of roles acquisition.
+    boost::optional<std::set<RoleName>> roles;
+};
+
+using UserCache = ReadThroughCache<UserRequest, User>;
+using UserHandle = UserCache::ValueHandle;
 
 }  // namespace mongo

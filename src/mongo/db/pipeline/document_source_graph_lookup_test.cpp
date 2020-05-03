@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,15 +32,15 @@
 #include <algorithm>
 #include <deque>
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/stub_mongod_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -53,25 +54,20 @@ using DocumentSourceGraphLookUpTest = AggregationContextFixture;
 //
 
 /**
- * A MongodInterface use for testing that supports making pipelines with an initial
+ * A MongoProcessInterface use for testing that supports making pipelines with an initial
  * DocumentSourceMock source.
  */
-class MockMongodImplementation final : public StubMongodInterface {
+class MockMongoInterface final : public StubMongoProcessInterface {
 public:
-    MockMongodImplementation(std::deque<DocumentSource::GetNextResult> results)
+    MockMongoInterface(std::deque<DocumentSource::GetNextResult> results)
         : _results(std::move(results)) {}
 
-    StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) final {
-        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-        if (!pipeline.isOK()) {
-            return pipeline.getStatus();
-        }
-
-        pipeline.getValue()->addInitialSource(DocumentSourceMock::create(_results));
-        pipeline.getValue()->optimizePipeline();
-
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        Pipeline* ownedPipeline, bool allowTargetingShards) final {
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
+            ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
+        pipeline->addInitialSource(
+            DocumentSourceMock::createForTest(_results, pipeline->getContext()));
         return pipeline;
     }
 
@@ -82,14 +78,15 @@ private:
 TEST_F(DocumentSourceGraphLookUpTest,
        ShouldErrorWhenDoingInitialMatchIfDocumentInFromCollectionIsMissingId) {
     auto expCtx = getExpCtx();
-
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{Document{{"to", 0}}};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -102,9 +99,6 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           boost::none,
                                           boost::none);
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
-
     ASSERT_THROWS_CODE(graphLookupStage->getNext(), AssertionException, 40271);
 }
 
@@ -113,13 +107,15 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"to", 1}}};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -132,8 +128,6 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           boost::none,
                                           boost::none);
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
 
     ASSERT_THROWS_CODE(graphLookupStage->getNext(), AssertionException, 40271);
 }
@@ -143,12 +137,14 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{Document{{"to", 0}}};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto unwindStage = DocumentSourceUnwind::create(expCtx, "results", false, boost::none);
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
@@ -161,8 +157,6 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           boost::none,
                                           boost::none,
                                           unwindStage);
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
     graphLookupStage->setSource(inputMock.get());
 
     ASSERT_THROWS_CODE(graphLookupStage->getNext(), AssertionException, 40271);
@@ -182,7 +176,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     Document to0from1{{"_id", "a"_sd}, {"to", 0}, {"from", 1}};
     Document to0from2{{"_id", "a"_sd}, {"to", 0}, {"from", 2}};
@@ -192,7 +186,9 @@ TEST_F(DocumentSourceGraphLookUpTest,
         Document(to1), Document(to2), Document(to0from1), Document(to0from2)};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -205,14 +201,12 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           boost::none,
                                           boost::none);
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
     graphLookupStage->setSource(inputMock.get());
 
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(2U, next.getDocument().size());
+    ASSERT_EQ(2ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -237,10 +231,8 @@ TEST_F(DocumentSourceGraphLookUpTest,
         ASSERT(next.isEOF());
     } else {
         FAIL(str::stream() << "Expected either [ " << to0from1.toString() << " ] or [ "
-                           << to0from2.toString()
-                           << " ] but found [ "
-                           << next.getDocument().toString()
-                           << " ]");
+                           << to0from2.toString() << " ] but found [ "
+                           << next.getDocument().toString() << " ]");
     }
 }
 
@@ -248,16 +240,19 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePauses) {
     auto expCtx = getExpCtx();
 
     auto inputMock =
-        DocumentSourceMock::create({Document{{"startPoint", 0}},
-                                    DocumentSource::GetNextResult::makePauseExecution(),
-                                    Document{{"startPoint", 0}},
-                                    DocumentSource::GetNextResult::makePauseExecution()});
+        DocumentSourceMock::createForTest({Document{{"startPoint", 0}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"startPoint", 0}},
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"_id", "b"_sd}, {"to", 1}}};
 
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -271,9 +266,6 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePauses) {
                                           boost::none);
 
     graphLookupStage->setSource(inputMock.get());
-
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
 
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
@@ -316,16 +308,21 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePausesWhileUnwinding) {
 
     // Set up the $graphLookup stage
     auto inputMock =
-        DocumentSourceMock::create({Document{{"startPoint", 0}},
-                                    DocumentSource::GetNextResult::makePauseExecution(),
-                                    Document{{"startPoint", 0}},
-                                    DocumentSource::GetNextResult::makePauseExecution()});
+        DocumentSourceMock::createForTest({Document{{"startPoint", 0}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"startPoint", 0}},
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"_id", "b"_sd}, {"to", 1}}};
 
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
 
     const bool preserveNullAndEmptyArrays = false;
     const boost::optional<std::string> includeArrayIndex = boost::none;
@@ -345,9 +342,6 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePausesWhileUnwinding) {
                                           unwindStage);
 
     graphLookupStage->setSource(inputMock.get());
-
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
 
     // Assert it has the expected results. Note the results can be in either order.
     auto expectedA =
@@ -390,7 +384,10 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePausesWhileUnwinding) {
 TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportAsFieldIsModified) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -412,7 +409,10 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportAsFieldIsModified) 
 TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportFieldsModifiedByAbsorbedUnwind) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
     auto unwindStage =
         DocumentSourceUnwind::create(expCtx, "results", false, std::string("arrIndex"));
     auto graphLookupStage =
@@ -437,12 +437,15 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportFieldsModifiedByAbs
 TEST_F(DocumentSourceGraphLookUpTest, GraphLookupWithComparisonExpressionForStartWith) {
     auto expCtx = getExpCtx();
 
-    auto inputMock = DocumentSourceMock::create(Document({{"_id", 0}, {"a", 1}, {"b", 2}}));
+    auto inputMock =
+        DocumentSourceMock::createForTest(Document({{"_id", 0}, {"a", 1}, {"b", 2}}), expCtx);
 
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
     std::deque<DocumentSource::GetNextResult> fromContents{Document{{"_id", 0}, {"to", true}},
                                                            Document{{"_id", 1}, {"to", false}}};
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
 
     auto graphLookupStage = DocumentSourceGraphLookUp::create(
         expCtx,
@@ -460,8 +463,6 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupWithComparisonExpressionForStar
         boost::none);
 
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
 
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
@@ -481,7 +482,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}, {"startVal", 0}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     /* Make the following graph:
      *   ,> 1 .
@@ -506,7 +507,9 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
                                                            Document(sinkDoc)};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -519,14 +522,12 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
                                           boost::none,
                                           boost::none);
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
     graphLookupStage->setSource(inputMock.get());
 
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -549,7 +550,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
 
     std::deque<DocumentSource::GetNextResult> inputs{
         Document{{"_id", 0}, {"startVal", makeTupleValue(0, 0)}}};
-    auto inputMock = DocumentSourceMock::create(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     // Make the following graph:
     //
@@ -579,7 +580,9 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
         Document(startDoc), Document(target1), Document(target2), Document(soloDoc)};
 
     NamespaceString fromNs("test", "graph_lookup");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(std::move(fromContents));
     auto graphLookupStage =
         DocumentSourceGraphLookUp::create(expCtx,
                                           fromNs,
@@ -592,14 +595,12 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
                                           boost::none,
                                           boost::none);
     graphLookupStage->setSource(inputMock.get());
-    graphLookupStage->injectMongodInterface(
-        std::make_shared<MockMongodImplementation>(std::move(fromContents)));
     graphLookupStage->setSource(inputMock.get());
 
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");

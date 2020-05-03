@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,100 +37,94 @@
 #include <gperftools/malloc_extension.h>
 #include <valgrind/valgrind.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
+#include "mongo/util/tcmalloc_parameters_gen.h"
 
 namespace mongo {
 namespace {
+constexpr auto kMaxTotalThreadCacheBytesPropertyName = "tcmalloc.max_total_thread_cache_bytes"_sd;
+constexpr auto kAggressiveMemoryDecommitPropertyName = "tcmalloc.aggressive_memory_decommit"_sd;
 
-class TcmallocNumericPropertyServerParameter : public ServerParameter {
-    MONGO_DISALLOW_COPYING(TcmallocNumericPropertyServerParameter);
-
-public:
-    explicit TcmallocNumericPropertyServerParameter(const std::string& serverParameterName,
-                                                    const std::string& tcmallocPropertyName);
-
-    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name);
-    virtual Status set(const BSONElement& newValueElement);
-    virtual Status setFromString(const std::string& str);
-
-private:
-    const std::string _tcmallocPropertyName;
-};
-
-TcmallocNumericPropertyServerParameter::TcmallocNumericPropertyServerParameter(
-    const std::string& serverParameterName, const std::string& tcmallocPropertyName)
-    : ServerParameter(ServerParameterSet::getGlobal(),
-                      serverParameterName,
-                      true /* change at startup */,
-                      true /* change at runtime */),
-      _tcmallocPropertyName(tcmallocPropertyName) {}
-
-void TcmallocNumericPropertyServerParameter::append(OperationContext* opCtx,
-                                                    BSONObjBuilder& b,
-                                                    const std::string& name) {
+StatusWith<size_t> getProperty(StringData propname) {
     size_t value;
-    if (MallocExtension::instance()->GetNumericProperty(_tcmallocPropertyName.c_str(), &value)) {
-        b.appendNumber(name, value);
+    if (!MallocExtension::instance()->GetNumericProperty(propname.toString().c_str(), &value)) {
+        return {ErrorCodes::InternalError,
+                str::stream() << "Failed to retreive tcmalloc prop: " << propname};
     }
+    return value;
 }
 
-Status TcmallocNumericPropertyServerParameter::set(const BSONElement& newValueElement) {
-    if (!newValueElement.isNumber()) {
-        return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected server parameter " << newValueElement.fieldName()
-                                    << " to have numeric type, but found "
-                                    << newValueElement.toString(false)
-                                    << " of type "
-                                    << typeName(newValueElement.type()));
-    }
-    long long valueAsLongLong = newValueElement.safeNumberLong();
-    if (valueAsLongLong < 0 ||
-        static_cast<unsigned long long>(valueAsLongLong) > std::numeric_limits<size_t>::max()) {
-        return Status(
-            ErrorCodes::BadValue,
-            str::stream() << "Value " << newValueElement.toString(false) << " is out of range for "
-                          << newValueElement.fieldName()
-                          << "; expected a value between 0 and "
-                          << std::min<unsigned long long>(std::numeric_limits<size_t>::max(),
-                                                          std::numeric_limits<long long>::max()));
-    }
+Status setProperty(StringData propname, size_t value) {
     if (!RUNNING_ON_VALGRIND) {
-        if (!MallocExtension::instance()->SetNumericProperty(
-                _tcmallocPropertyName.c_str(), static_cast<size_t>(valueAsLongLong))) {
-            return Status(ErrorCodes::InternalError,
-                          str::stream() << "Failed to set internal tcmalloc property "
-                                        << _tcmallocPropertyName);
+        if (!MallocExtension::instance()->SetNumericProperty(propname.toString().c_str(), value)) {
+            return {ErrorCodes::InternalError,
+                    str::stream() << "Failed to set internal tcmalloc property " << propname};
         }
     }
     return Status::OK();
 }
 
-Status TcmallocNumericPropertyServerParameter::setFromString(const std::string& str) {
-    long long valueAsLongLong;
-    Status status = parseNumberFromString(str, &valueAsLongLong);
-    if (!status.isOK()) {
-        return status;
+StatusWith<size_t> validateTCMallocValue(StringData name, const BSONElement& newValueElement) {
+    if (!newValueElement.isNumber()) {
+        return {ErrorCodes::TypeMismatch,
+                str::stream() << "Expected server parameter " << name
+                              << " to have numeric type, but found "
+                              << newValueElement.toString(false) << " of type "
+                              << typeName(newValueElement.type())};
     }
-    BSONObjBuilder builder;
-    builder.append(name(), valueAsLongLong);
-    return set(builder.done().firstElement());
+    long long valueAsLongLong = newValueElement.safeNumberLong();
+    if (valueAsLongLong < 0 ||
+        static_cast<unsigned long long>(valueAsLongLong) > std::numeric_limits<size_t>::max()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Value " << newValueElement.toString(false) << " is out of range for "
+                          << name << "; expected a value between 0 and "
+                          << std::min<unsigned long long>(std::numeric_limits<size_t>::max(),
+                                                          std::numeric_limits<long long>::max()));
+    }
+    return static_cast<size_t>(valueAsLongLong);
 }
 
-TcmallocNumericPropertyServerParameter tcmallocMaxTotalThreadCacheBytesParameter(
-    "tcmallocMaxTotalThreadCacheBytes", "tcmalloc.max_total_thread_cache_bytes");
+}  // namespace
 
-TcmallocNumericPropertyServerParameter tcmallocAggressiveMemoryDecommit(
-    "tcmallocAggressiveMemoryDecommit", "tcmalloc.aggressive_memory_decommit");
+#define TCMALLOC_SP_METHODS(cls)                                                     \
+    void TCMalloc##cls##ServerParameter::append(                                     \
+        OperationContext*, BSONObjBuilder& b, const std::string& name) {             \
+        auto swValue = getProperty(k##cls##PropertyName);                            \
+        if (swValue.isOK()) {                                                        \
+            b.appendNumber(name, swValue.getValue());                                \
+        }                                                                            \
+    }                                                                                \
+    Status TCMalloc##cls##ServerParameter::set(const BSONElement& newValueElement) { \
+        auto swValue = validateTCMallocValue(name(), newValueElement);               \
+        if (!swValue.isOK()) {                                                       \
+            return swValue.getStatus();                                              \
+        }                                                                            \
+        return setProperty(k##cls##PropertyName, swValue.getValue());                \
+    }                                                                                \
+    Status TCMalloc##cls##ServerParameter::setFromString(const std::string& str) {   \
+        size_t value;                                                                \
+        Status status = NumberParser{}(str, &value);                                 \
+        if (!status.isOK()) {                                                        \
+            return status;                                                           \
+        }                                                                            \
+        return setProperty(k##cls##PropertyName, value);                             \
+    }
+
+TCMALLOC_SP_METHODS(MaxTotalThreadCacheBytes)
+TCMALLOC_SP_METHODS(AggressiveMemoryDecommit)
+#undef TCMALLOC_SP_METHODS
+
+namespace {
 
 MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults,
-                          ("SystemInfo"),
+                          MONGO_NO_PREREQUISITES,
                           ("BeginStartupOptionHandling"))
 (InitializerContext*) {
     // Before processing the command line options, if the user has not specified a value in via
@@ -145,8 +140,33 @@ MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults,
         (systemMemorySizeMB / 8) * 1024 * 1024;  // 1/8 of system memory in bytes
     size_t cacheSize = std::min(defaultTcMallocCacheSize, derivedTcMallocCacheSize);
 
-    return tcmallocMaxTotalThreadCacheBytesParameter.setFromString(std::to_string(cacheSize));
+    return setProperty(kMaxTotalThreadCacheBytesPropertyName, cacheSize);
 }
 
 }  // namespace
+
+// setParameter for tcmalloc_release_rate
+void TCMallocReleaseRateServerParameter::append(OperationContext*,
+                                                BSONObjBuilder& builder,
+                                                const std::string& fieldName) {
+    auto value = MallocExtension::instance()->GetMemoryReleaseRate();
+    builder.append(fieldName, value);
+}
+
+Status TCMallocReleaseRateServerParameter::setFromString(const std::string& tcmalloc_release_rate) {
+    double value;
+    Status status = NumberParser{}(tcmalloc_release_rate, &value);
+    if (!status.isOK()) {
+        return status;
+    }
+    if (value < 0) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "tcmallocReleaseRate cannot be negative: "
+                              << tcmalloc_release_rate};
+    }
+
+    MallocExtension::instance()->SetMemoryReleaseRate(value);
+    return Status::OK();
+}
+
 }  // namespace mongo

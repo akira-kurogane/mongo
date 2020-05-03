@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,19 +29,23 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
+#include "mongo/db/catalog/index_builds.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 /**
- * This rollback algorithm requires featureCompatibilityVersion 3.6.
+ * This rollback algorithm is used when the storage engine does not support recovering to a stable
+ * timestamp, or if the forceRollbackViaRefetch parameter is set to true.
  *
- * Rollback Overview:
+ * Rollback via Refetch Overview:
  *
  * Rollback occurs when a node's oplog diverges from its sync source's oplog and needs to regain
  * consistency with the sync source's oplog.
@@ -74,7 +79,7 @@
  *     R : a b c d e f g                -> a b c d q r s t u v w x z
  *     S : a b c d q r s t u v w x z
  *
- * Rollback Algorithm:
+ * Rollback via Refetch Algorithm:
  *
  * We will continue to use the notation of R as the node whose oplog is inconsistent with
  * its sync source and S as the sync source of R. We will also represent the common point
@@ -146,7 +151,7 @@ void rollback(OperationContext* opCtx,
               int requiredRBID,
               ReplicationCoordinator* replCoord,
               ReplicationProcess* replicationProcess,
-              stdx::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
+              std::function<void(int)> sleepSecsFn = [](int secs) { sleepsecs(secs); });
 
 /**
  * Initiates the rollback process after transition to ROLLBACK.
@@ -176,6 +181,7 @@ void rollback(OperationContext* opCtx,
 Status syncRollback(OperationContext* opCtx,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
+                    const IndexBuilds& stoppedIndexBuilds,
                     int requiredRBID,
                     ReplicationCoordinator* replCoord,
                     ReplicationProcess* replicationProcess);
@@ -257,8 +263,16 @@ struct FixUpInfo {
     // collection.
     stdx::unordered_map<UUID, std::set<std::string>, UUID::Hash> indexesToDrop;
 
+    // Key is the UUID of the collection. Value is the set of unfinished indexes by name to drop.
+    stdx::unordered_map<UUID, std::set<std::string>, UUID::Hash> unfinishedIndexesToDrop;
+
     // Key is the UUID of the collection. Value is a map from indexName to indexSpec for the index.
     stdx::unordered_map<UUID, std::map<std::string, BSONObj>, UUID::Hash> indexesToCreate;
+
+    // Set of index builds to restart. These are index builds that will be restarted in the
+    // background, but not completed. They will wait for a replicated commit or abort before
+    // finishing.
+    IndexBuilds indexBuildsToRestart;
 
     // UUIDs of collections that need to have their metadata resynced from the sync source.
     stdx::unordered_set<UUID, UUID::Hash> collectionsToResyncMetadata;
@@ -282,6 +296,9 @@ struct FixUpInfo {
     // True if rollback requires re-fetching documents in the session transaction table. If true,
     // after rollback the in-memory transaction table is cleared.
     bool refetchTransactionDocs = false;
+
+    // The local node's top of oplog prior to entering rollback.
+    OpTime localTopOfOplog;
 
     OpTime commonPoint;
     RecordId commonPointOurDiskloc;
@@ -312,10 +329,9 @@ struct FixUpInfo {
     void removeRedundantOperations();
 
     /**
-     * Removes any redundant index commands. An example is if we create
-     * an index with name "a_1" and then later proceed to drop that index.
-     * We return true if a redundant index command was found and false
-     * if it was not.
+     * Removes any redundant index commands. For example, if we create an index with name "a_1" and
+     * then later proceed to drop that index, we can ignore the first index creation. We return true
+     * if a redundant index command was removed and false if it was not.
      */
     bool removeRedundantIndexCommands(UUID uuid, std::string indexName);
 
@@ -356,7 +372,11 @@ private:
  * rolling back node from after the common point. "ourObj" is the oplog document that needs
  * to be reverted.
  */
-Status updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInfo, const BSONObj& ourObj);
+Status updateFixUpInfoFromLocalOplogEntry(OperationContext* opCtx,
+                                          const OplogInterface& localOplog,
+                                          FixUpInfo& fixUpInfo,
+                                          const BSONObj& ourObj,
+                                          bool isNestedApplyOpsCommand);
 
 /**
  * This function uses the FixUpInfo struct to undo all of the operations that occurred after the

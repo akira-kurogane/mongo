@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -35,53 +35,44 @@
 void
 stats(void)
 {
-	FILE *fp;
-	WT_CURSOR *cursor;
-	WT_SESSION *session;
-	uint64_t v;
-	int ret;
-	char name[64];
-	const char *pval, *desc;
+    FILE *fp;
+    WT_CURSOR *cursor;
+    WT_SESSION *session;
+    uint64_t v;
+    int ret;
+    char name[64];
+    const char *desc, *pval;
 
-	if ((ret = conn->open_session(conn, NULL, NULL, &session)) != 0)
-		testutil_die(ret, "conn.session");
+    testutil_check(conn->open_session(conn, NULL, NULL, &session));
 
-	if ((fp = fopen(FNAME_STAT, "w")) == NULL)
-		testutil_die(errno, "fopen " FNAME_STAT);
+    if ((fp = fopen(FNAME_STAT, "w")) == NULL)
+        testutil_die(errno, "fopen " FNAME_STAT);
 
-	/* Connection statistics. */
-	if ((ret = session->open_cursor(session,
-	    "statistics:", NULL, NULL, &cursor)) != 0)
-		testutil_die(ret, "session.open_cursor");
+    /* Connection statistics. */
+    testutil_check(session->open_cursor(session, "statistics:", NULL, NULL, &cursor));
 
-	while ((ret = cursor->next(cursor)) == 0 &&
-	    (ret = cursor->get_value(cursor, &desc, &pval, &v)) == 0)
-		(void)fprintf(fp, "%s=%s\n", desc, pval);
+    while (
+      (ret = cursor->next(cursor)) == 0 && (ret = cursor->get_value(cursor, &desc, &pval, &v)) == 0)
+        (void)fprintf(fp, "%s=%s\n", desc, pval);
 
-	if (ret != WT_NOTFOUND)
-		testutil_die(ret, "cursor.next");
-	if ((ret = cursor->close(cursor)) != 0)
-		testutil_die(ret, "cursor.close");
+    if (ret != WT_NOTFOUND)
+        testutil_die(ret, "cursor.next");
+    testutil_check(cursor->close(cursor));
 
-	/* File statistics. */
-	if (!multiple_files) {
-		testutil_check(__wt_snprintf(
-		    name, sizeof(name), "statistics:" FNAME, 0));
-		if ((ret = session->open_cursor(
-		    session, name, NULL, NULL, &cursor)) != 0)
-			testutil_die(ret, "session.open_cursor");
+    /* File statistics. */
+    if (!multiple_files) {
+        testutil_check(__wt_snprintf(name, sizeof(name), "statistics:" FNAME, 0));
+        testutil_check(session->open_cursor(session, name, NULL, NULL, &cursor));
 
-		while ((ret = cursor->next(cursor)) == 0 &&
-		    (ret = cursor->get_value(cursor, &desc, &pval, &v)) == 0)
-			(void)fprintf(fp, "%s=%s\n", desc, pval);
+        while ((ret = cursor->next(cursor)) == 0 &&
+          (ret = cursor->get_value(cursor, &desc, &pval, &v)) == 0)
+            (void)fprintf(fp, "%s=%s\n", desc, pval);
 
-		if (ret != WT_NOTFOUND)
-			testutil_die(ret, "cursor.next");
-		if ((ret = cursor->close(cursor)) != 0)
-			testutil_die(ret, "cursor.close");
+        if (ret != WT_NOTFOUND)
+            testutil_die(ret, "cursor.next");
+        testutil_check(cursor->close(cursor));
 
-		if ((ret = session->close(session, NULL)) != 0)
-			testutil_die(ret, "session.close");
-	}
-	(void)fclose(fp);
+        testutil_check(session->close(session, NULL));
+    }
+    (void)fclose(fp);
 }

@@ -1,46 +1,47 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/accumulator.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
 
-REGISTER_ACCUMULATOR(stdDevPop, AccumulatorStdDevPop::create);
-REGISTER_ACCUMULATOR(stdDevSamp, AccumulatorStdDevSamp::create);
+REGISTER_ACCUMULATOR(stdDevPop, genericParseSingleExpressionAccumulator<AccumulatorStdDevPop>);
+REGISTER_ACCUMULATOR(stdDevSamp, genericParseSingleExpressionAccumulator<AccumulatorStdDevSamp>);
 REGISTER_EXPRESSION(stdDevPop, ExpressionFromAccumulator<AccumulatorStdDevPop>::parse);
 REGISTER_EXPRESSION(stdDevSamp, ExpressionFromAccumulator<AccumulatorStdDevSamp>::parse);
 
@@ -95,20 +96,20 @@ Value AccumulatorStdDev::getValue(bool toBeMerged) {
     }
 }
 
-intrusive_ptr<Accumulator> AccumulatorStdDevSamp::create(
+intrusive_ptr<AccumulatorState> AccumulatorStdDevSamp::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new AccumulatorStdDevSamp(expCtx);
 }
 
-intrusive_ptr<Accumulator> AccumulatorStdDevPop::create(
+intrusive_ptr<AccumulatorState> AccumulatorStdDevPop::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new AccumulatorStdDevPop(expCtx);
 }
 
 AccumulatorStdDev::AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                      bool isSamp)
-    : Accumulator(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
-    // This is a fixed size Accumulator so we never need to update this
+    : AccumulatorState(expCtx), _isSamp(isSamp), _count(0), _mean(0), _m2(0) {
+    // This is a fixed size AccumulatorState so we never need to update this
     _memUsageBytes = sizeof(*this);
 }
 
@@ -117,4 +118,4 @@ void AccumulatorStdDev::reset() {
     _mean = 0;
     _m2 = 0;
 }
-}
+}  // namespace mongo

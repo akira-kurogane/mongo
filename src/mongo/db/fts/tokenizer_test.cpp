@@ -1,32 +1,31 @@
-// tokenizer_test.cpp
-
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -37,13 +36,22 @@
 namespace mongo {
 namespace fts {
 
+namespace {
+const FTSLanguage* languageEnglishV2() {
+    return &FTSLanguage::make("english", TEXT_INDEX_VERSION_2);
+}
+const FTSLanguage* languageFrenchV2() {
+    return &FTSLanguage::make("french", TEXT_INDEX_VERSION_2);
+}
+}  // namespace
+
 TEST(Tokenizer, Empty1) {
-    Tokenizer i(&languageEnglishV2, "");
+    Tokenizer i(languageEnglishV2(), "");
     ASSERT(!i.more());
 }
 
 TEST(Tokenizer, Basic1) {
-    Tokenizer i(&languageEnglishV2, "blue red green");
+    Tokenizer i(languageEnglishV2(), "blue red green");
 
     ASSERT(i.more());
     ASSERT_EQUALS(i.next().data.toString(), "blue");
@@ -58,7 +66,7 @@ TEST(Tokenizer, Basic1) {
 }
 
 TEST(Tokenizer, Basic2) {
-    Tokenizer i(&languageEnglishV2, "blue-red");
+    Tokenizer i(languageEnglishV2(), "blue-red");
 
     Token a = i.next();
     Token b = i.next();
@@ -76,7 +84,7 @@ TEST(Tokenizer, Basic2) {
 }
 
 TEST(Tokenizer, Basic3) {
-    Tokenizer i(&languageEnglishV2, "blue -red");
+    Tokenizer i(languageEnglishV2(), "blue -red");
 
     Token a = i.next();
     Token b = i.next();
@@ -98,7 +106,7 @@ TEST(Tokenizer, Basic3) {
 }
 
 TEST(Tokenizer, Quote1English) {
-    Tokenizer i(&languageEnglishV2, "eliot's car");
+    Tokenizer i(languageEnglishV2(), "eliot's car");
 
     Token a = i.next();
     Token b = i.next();
@@ -108,7 +116,7 @@ TEST(Tokenizer, Quote1English) {
 }
 
 TEST(Tokenizer, Quote1French) {
-    Tokenizer i(&languageFrenchV2, "eliot's car");
+    Tokenizer i(languageFrenchV2(), "eliot's car");
 
     Token a = i.next();
     Token b = i.next();
@@ -118,5 +126,5 @@ TEST(Tokenizer, Quote1French) {
     ASSERT_EQUALS("s", b.data.toString());
     ASSERT_EQUALS("car", c.data.toString());
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

@@ -1,20 +1,15 @@
-#!/usr/bin/env python
-"""
-Converts silent test failures into non-silent failures.
+#!/usr/bin/env python3
+"""Convert silent test failures into non-silent failures.
 
 Any test files with at least 2 executions in the report.json file that have a "silentfail" status,
 this script will change the outputted report to have a "fail" status instead.
 """
-
-from __future__ import absolute_import
-from __future__ import print_function
 
 import collections
 import json
 import optparse
 import os
 import sys
-
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -23,20 +18,21 @@ if __name__ == "__main__" and __package__ is None:
 
 
 def read_json_file(json_file):
+    """Return contents of a JSON file."""
     with open(json_file) as json_data:
         return json.load(json_data)
 
 
 def main():
+    """Execute Main program."""
 
     usage = "usage: %prog [options] report.json"
     parser = optparse.OptionParser(usage=usage)
-    parser.add_option("-o", "--output-file",
-                      dest="outfile",
-                      default="-",
-                      help="If '-', then the report file is written to stdout."
-                           " Any other value is treated as the output file name. By default,"
-                           " output is written to stdout.")
+    parser.add_option(
+        "-o", "--output-file", dest="outfile", default="-",
+        help=("If '-', then the report file is written to stdout."
+              " Any other value is treated as the output file name. By default,"
+              " output is written to stdout."))
 
     (options, args) = parser.parse_args()
 
@@ -49,20 +45,21 @@ def main():
     # Count number of "silentfail" per test file.
     status_dict = collections.defaultdict(int)
     for test_info in test_report.test_infos:
-        if test_info.status == "silentfail":
+        if test_info.evergreen_status == "silentfail":
             status_dict[test_info.test_id] += 1
 
     # For test files with more than 1 "silentfail", convert status to "fail".
     for test_info in test_report.test_infos:
         if status_dict[test_info.test_id] >= 2:
-            test_info.status = "fail"
+            test_info.evergreen_status = "fail"
 
-    result_report = test_report.as_dict();
+    result_report = test_report.as_dict()
     if options.outfile != "-":
         with open(options.outfile, "w") as fp:
             json.dump(result_report, fp)
     else:
         print(json.dumps(result_report))
+
 
 if __name__ == "__main__":
     main()

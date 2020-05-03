@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,6 +34,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/stage_types.h"
 
@@ -44,15 +46,14 @@ class WorkingSetMember;
 
 /**
  * Passes results from the child through after adding the sort key for each result as
- * WorkingSetMember computed data.
+ * WorkingSetMember metadata.
  */
 class SortKeyGeneratorStage final : public PlanStage {
 public:
-    SortKeyGeneratorStage(OperationContext* opCtx,
-                          PlanStage* child,
+    SortKeyGeneratorStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                          std::unique_ptr<PlanStage> child,
                           WorkingSet* ws,
-                          const BSONObj& sortSpecObj,
-                          const CollatorInterface* collator);
+                          const BSONObj& sortSpecObj);
 
     bool isEOF() final;
 
@@ -70,16 +71,9 @@ protected:
     StageState doWork(WorkingSetID* out) final;
 
 private:
-    StatusWith<BSONObj> getSortKeyFromIndexKey(const WorkingSetMember& member) const;
-
     WorkingSet* const _ws;
 
-    // The raw sort pattern as expressed by the user.
-    const BSONObj _sortSpec;
-
-    const CollatorInterface* _collator;
-
-    std::unique_ptr<SortKeyGenerator> _sortKeyGen;
+    SortKeyGenerator _sortKeyGen;
 };
 
 }  // namespace mongo

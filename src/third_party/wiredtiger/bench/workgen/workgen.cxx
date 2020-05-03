@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -27,6 +27,7 @@
  */
 
 #define __STDC_LIMIT_MACROS   // needed to get UINT64_MAX in C++
+#define __STDC_FORMAT_MACROS  // needed to get PRIuXX macros in C++
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -34,7 +35,6 @@
 #include "wiredtiger.h"
 #include "workgen.h"
 #include "workgen_int.h"
-#include "workgen_time.h"
 extern "C" {
 // Include some specific WT files, as some files included by wt_internal.h
 // have some C-ism's that don't work in C++.
@@ -42,12 +42,11 @@ extern "C" {
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <errno.h>
-#include <math.h>
 #include "error.h"
 #include "misc.h"
 }
+#define BUF_SIZE 100
 
 #define LATENCY_US_BUCKETS 1000
 #define LATENCY_MS_BUCKETS 1000
@@ -55,11 +54,11 @@ extern "C" {
 
 #define THROTTLE_PER_SEC  20     // times per sec we will throttle
 
-#define MIN(a, b)		((a) < (b) ? (a) : (b))
-#define MAX(a, b)		((a) < (b) ? (b) : (a))
-#define TIMESPEC_DOUBLE(ts)	((double)(ts).tv_sec + ts.tv_nsec * 0.000000001)
-#define PCT(n, total)		((total) == 0 ? 0 : ((n) * 100) / (total))
-#define OPS_PER_SEC(ops, ts)	(int) ((ts) == 0 ? 0.0 : \
+#define MIN(a, b)        ((a) < (b) ? (a) : (b))
+#define MAX(a, b)        ((a) < (b) ? (b) : (a))
+#define TIMESPEC_DOUBLE(ts)    ((double)(ts).tv_sec + ts.tv_nsec * 0.000000001)
+#define PCT(n, total)        ((total) == 0 ? 0 : ((n) * 100) / (total))
+#define OPS_PER_SEC(ops, ts)    (int) ((ts) == 0 ? 0.0 : \
     (ops) / TIMESPEC_DOUBLE(ts))
 
 // Get the value of a STL container, even if it is not present
@@ -101,6 +100,12 @@ extern "C" {
 
 namespace workgen {
 
+
+struct WorkloadRunnerConnection {
+    WorkloadRunner *runner;
+    WT_CONNECTION *connection;
+};
+
 // The number of contexts.  Normally there is one context created, but it will
 // be possible to use several eventually.  More than one is not yet
 // implemented, but we must at least guard against the caller creating more
@@ -115,6 +120,48 @@ static void *thread_runner_main(void *arg) {
         runner->_exception = wge;
     }
     return (NULL);
+}
+
+static void *thread_workload(void *arg) {
+
+    WorkloadRunnerConnection *runnerConnection = (WorkloadRunnerConnection *) arg;
+    WorkloadRunner *runner = runnerConnection->runner;
+    WT_CONNECTION *connection = runnerConnection->connection;
+
+    try {
+        runner->increment_timestamp(connection);
+    } catch (WorkgenException &wge) {
+        std::cerr << "Exception while incrementing timestamp." << std::endl;
+    }
+
+    return (NULL);
+}
+
+/*
+ * This function will sleep for "timestamp_advance" seconds, increment and set oldest_timestamp,
+ * stable_timestamp with the specified lag until stopping is set to true
+ */
+int WorkloadRunner::increment_timestamp(WT_CONNECTION *conn) {
+    char buf[BUF_SIZE];
+    uint64_t time_us;
+
+    while (!stopping)
+    {
+        if (_workload->options.oldest_timestamp_lag > 0) {
+            time_us = WorkgenTimeStamp::get_timestamp_lag(_workload->options.oldest_timestamp_lag);
+            sprintf(buf, "oldest_timestamp=%" PRIu64, time_us);
+            conn->set_timestamp(conn, buf);
+        }
+
+        if (_workload->options.stable_timestamp_lag > 0) {
+            time_us = WorkgenTimeStamp::get_timestamp_lag(_workload->options.stable_timestamp_lag);
+            sprintf(buf, "stable_timestamp=%" PRIu64, time_us);
+            conn->set_timestamp(conn, buf);
+        }
+
+        WorkgenTimeStamp::sleep(_workload->options.timestamp_advance);
+    }
+    return 0;
 }
 
 static void *monitor_main(void *arg) {
@@ -240,7 +287,8 @@ Context& Context::operator=(const Context &other) {
 }
 
 ContextInternal::ContextInternal() : _tint(), _table_names(),
-    _recno(NULL), _recno_alloced(0), _tint_last(0), _context_count(0) {
+    _table_runtime(NULL), _runtime_alloced(0), _tint_last(0),
+    _context_count(0) {
     uint32_t count;
     if ((count = workgen_atomic_add32(&context_count, 1)) != 1)
         THROW("multiple Contexts not supported");
@@ -248,20 +296,19 @@ ContextInternal::ContextInternal() : _tint(), _table_names(),
 }
 
 ContextInternal::~ContextInternal() {
-    if (_recno != NULL)
-        delete _recno;
+    if (_table_runtime != NULL)
+        delete _table_runtime;
 }
 
 int ContextInternal::create_all() {
-    if (_recno_alloced != _tint_last) {
+    if (_runtime_alloced < _tint_last) {
         // The array references are 1-based, we'll waste one entry.
-        uint64_t *new_recno = new uint64_t[_tint_last + 1];
-        memcpy(new_recno, _recno, sizeof(uint64_t) * _recno_alloced);
-        memset(&new_recno[_recno_alloced], 0,
-          sizeof(uint64_t) * (_tint_last - _recno_alloced + 1));
-        delete _recno;
-        _recno = new_recno;
-        _recno_alloced = _tint_last;
+        TableRuntime *new_table_runtime = new TableRuntime[_tint_last + 1];
+        for (uint32_t i = 0; i < _runtime_alloced; i++)
+            new_table_runtime[i + 1] = _table_runtime[i + 1];
+        delete _table_runtime;
+        _table_runtime = new_table_runtime;
+        _runtime_alloced = _tint_last;
     }
     return (0);
 }
@@ -278,6 +325,7 @@ int Monitor::run() {
     Stats prev_totals;
     WorkloadOptions *options = &_wrunner._workload->options;
     uint64_t latency_max = (uint64_t)options->max_latency;
+    size_t buf_size;
     bool first;
 
     (*_out) << "#time,"
@@ -300,9 +348,30 @@ int Monitor::run() {
     first = true;
     workgen_version(version, sizeof(version));
     Stats prev_interval;
+
+    // The whole and fractional part of sample_interval are separated,
+    // we don't want to sleep longer than a second.
+    int sample_secs = ms_to_sec(options->sample_interval_ms);
+    useconds_t sample_usecs =
+      ms_to_us(options->sample_interval_ms) - sec_to_us(sample_secs);
+
     while (!_stop) {
-        for (int i = 0; i < options->sample_interval && !_stop; i++)
+        int waitsecs;
+        useconds_t waitusecs;
+
+        if (first && options->warmup > 0) {
+            waitsecs = options->warmup;
+            waitusecs = 0;
+        } else {
+            waitsecs = sample_secs;
+            waitusecs = sample_usecs;
+        }
+        for (int i = 0; i < waitsecs && !_stop; i++)
             sleep(1);
+        if (_stop)
+            break;
+        if (waitusecs > 0)
+            usleep(waitusecs);
         if (_stop)
             break;
 
@@ -316,12 +385,13 @@ int Monitor::run() {
             new_totals.add(tr->_stats, true);
         Stats interval(new_totals);
         interval.subtract(prev_totals);
-        interval.smooth(prev_interval);
 
-        int interval_secs = options->sample_interval;
-        uint64_t cur_reads = interval.read.ops / interval_secs;
-        uint64_t cur_inserts = interval.insert.ops / interval_secs;
-        uint64_t cur_updates = interval.update.ops / interval_secs;
+        double interval_secs = options->sample_interval_ms / 1000.0;
+        uint64_t cur_reads = (uint64_t)(interval.read.ops / interval_secs);
+        uint64_t cur_inserts = (uint64_t)(interval.insert.ops / interval_secs);
+        uint64_t cur_updates = (uint64_t)(interval.update.ops / interval_secs);
+        bool checkpointing = new_totals.checkpoint.ops_in_progress > 0 ||
+          interval.checkpoint.ops > 0;
 
         uint64_t totalsec = ts_sec(t - _wrunner._start);
         (*_out) << time_buf
@@ -329,7 +399,7 @@ int Monitor::run() {
                 << "," << cur_reads
                 << "," << cur_inserts
                 << "," << cur_updates
-                << "," << 'N'   // checkpoint in progress
+                << "," << (checkpointing ? 'Y' : 'N')
                 << "," << interval.read.average_latency()
                 << "," << interval.read.min_latency
                 << "," << interval.read.max_latency
@@ -342,17 +412,31 @@ int Monitor::run() {
                 << std::endl;
 
         if (_json != NULL) {
-#define	WORKGEN_TIMESTAMP_JSON		"%Y-%m-%dT%H:%M:%S.000Z"
-            (void)strftime(time_buf, sizeof(time_buf),
+#define    WORKGEN_TIMESTAMP_JSON        "%Y-%m-%dT%H:%M:%S"
+            buf_size = strftime(time_buf, sizeof(time_buf),
               WORKGEN_TIMESTAMP_JSON, tm);
+            ASSERT(buf_size <= sizeof(time_buf));
+            snprintf(&time_buf[buf_size], sizeof(time_buf) - buf_size,
+              ".%3.3" PRIu64 "Z", (uint64_t)ns_to_ms(t.tv_nsec));
 
-#define TRACK_JSON(name, t)                                        \
-            "\"" << (name) << "\":{"                               \
-            << "\"ops per sec\":" << ((t).ops / interval_secs)     \
-            << ",\"average latency\":" << (t).average_latency()    \
-            << ",\"min latency\":" << (t).min_latency              \
-            << ",\"max latency\":" << (t).max_latency              \
-            << "}"
+            // Note: we could allow this to be configurable.
+            int percentiles[4] = {50, 95, 99, 0};
+
+#define TRACK_JSON(f, name, t, percentiles, extra)                         \
+            do {                                                           \
+                int _i;                                                    \
+                (f) << "\"" << (name) << "\":{" << extra                   \
+                    << "\"ops per sec\":"                                  \
+                    << (uint64_t)((t).ops / interval_secs)                 \
+                    << ",\"rollbacks\":" << ((t).rollbacks)                \
+                    << ",\"average latency\":" << (t).average_latency()    \
+                    << ",\"min latency\":" << (t).min_latency              \
+                    << ",\"max latency\":" << (t).max_latency;             \
+                for (_i = 0; (percentiles)[_i] != 0; _i++)                 \
+                    (f) << ",\"" << (percentiles)[_i] << "% latency\":"    \
+                        << (t).percentile_latency(percentiles[_i]);        \
+                (f) << "}";                                                \
+            } while(0)
 
             (*_json) << "{";
             if (first) {
@@ -360,11 +444,16 @@ int Monitor::run() {
                 first = false;
             }
             (*_json) << "\"localTime\":\"" << time_buf
-                     << "\",\"workgen\":{"
-                     << TRACK_JSON("read", interval.read) << ","
-                     << TRACK_JSON("insert", interval.insert) << ","
-                     << TRACK_JSON("update", interval.update)
-                     << "}}" << std::endl;
+                     << "\",\"workgen\":{";
+            TRACK_JSON(*_json, "read", interval.read, percentiles, "");
+            (*_json) << ",";
+            TRACK_JSON(*_json, "insert", interval.insert, percentiles, "");
+            (*_json) << ",";
+            TRACK_JSON(*_json, "update", interval.update, percentiles, "");
+            (*_json) << ",";
+            TRACK_JSON(*_json, "checkpoint", interval.checkpoint, percentiles,
+              "\"active\":" << (checkpointing ? "1," : "0,"));
+            (*_json) << "}}" << std::endl;
         }
 
         uint64_t read_max = interval.read.max_latency;
@@ -387,11 +476,28 @@ int Monitor::run() {
     return (0);
 }
 
+ParetoOptions ParetoOptions::DEFAULT;
+ParetoOptions::ParetoOptions(int param_arg) : param(param_arg), range_low(0.0),
+    range_high(1.0), _options() {
+    _options.add_int("param", param,
+      "0 is disabled, otherwise a range from 1 (most aggressive) to "
+      "100 (least aggressive)");
+    _options.add_double("range_low", range_low,
+      "between 0.0 and 1.0, starting range of the pareto distribution");
+    _options.add_double("range_high", range_high,
+      "between 0.0 and 1.0, ending range of the pareto distribution");
+}
+ParetoOptions::ParetoOptions(const ParetoOptions &other) :
+    param(other.param), range_low(other.range_low),
+    range_high(other.range_high), _options(other._options) {}
+ParetoOptions::~ParetoOptions() {}
+
 ThreadRunner::ThreadRunner() :
     _errno(0), _exception(), _thread(NULL), _context(NULL), _icontext(NULL),
     _workload(NULL), _wrunner(NULL), _rand_state(NULL),
     _throttle(NULL), _throttle_ops(0), _throttle_limit(0),
-    _in_transaction(false), _number(0), _stats(false), _table_usage(),
+    _in_transaction(false), _start_time_us(0), _op_time_us(0),
+    _number(0), _stats(false), _table_usage(),
     _cursors(NULL), _stop(false), _session(NULL), _keybuf(NULL),
     _valuebuf(NULL), _repeat(false) {
 }
@@ -405,9 +511,11 @@ int ThreadRunner::create_all(WT_CONNECTION *conn) {
 
     WT_RET(close_all());
     ASSERT(_session == NULL);
-    WT_RET(conn->open_session(conn, NULL, NULL, &_session));
+    if (_thread->options.synchronized)
+        _thread->_op.synchronized_check();
+    WT_RET(conn->open_session(conn, NULL, _thread->options.session_config.c_str(), &_session));
     _table_usage.clear();
-    _stats.track_latency(_workload->options.sample_interval > 0);
+    _stats.track_latency(_workload->options.sample_interval_ms > 0);
     WT_RET(workgen_random_alloc(_session, &_rand_state));
     _throttle_ops = 0;
     _throttle_limit = 0;
@@ -503,6 +611,11 @@ int ThreadRunner::run() {
     ThreadOptions *options = &_thread->options;
     std::string name = options->name;
 
+    timespec start_time;
+    workgen_epoch(&start_time);
+    _start_time_us = ts_us(start_time);
+    _op_time_us = _start_time_us;
+
     VERBOSE(*this, "thread " << name << " running");
     if (options->throttle != 0) {
         _throttle = new Throttle(*this, options->throttle,
@@ -535,10 +648,13 @@ void ThreadRunner::op_create_all(Operation *op, size_t &keysize,
     tint_t tint;
 
     op->create_all();
-    if (op->_optype != Operation::OP_NONE) {
-        op->kv_compute_max(true);
+    if (op->is_table_op()) {
+        op->kv_compute_max(true, false);
         if (OP_HAS_VALUE(op))
-            op->kv_compute_max(false);
+            op->kv_compute_max(false, op->_table.options.random_value);
+        if (op->_key._keytype == Key::KEYGEN_PARETO &&
+          op->_key._pareto.param == 0)
+            THROW("Key._pareto value must be set if KEYGEN_PARETO specified");
         op->kv_size_buffer(true, keysize);
         op->kv_size_buffer(false, valuesize);
 
@@ -575,17 +691,66 @@ void ThreadRunner::op_create_all(Operation *op, size_t &keysize,
             op_create_all(&*i, keysize, valuesize);
 }
 
-uint64_t ThreadRunner::op_get_key_recno(Operation *op, tint_t tint) {
+
+#define    PARETO_SHAPE    1.5
+
+// Return a value within the interval [ 0, recno_max )
+// that is weighted toward lower numbers with pareto_param at 0 (the minimum),
+// and more evenly distributed with pareto_param at 100 (the maximum).
+//
+static uint64_t
+pareto_calculation(uint32_t randint, uint64_t recno_max,
+  ParetoOptions &pareto) {
+    double S1, S2, U;
+    uint32_t result;
+    double r;
+
+    r = (double)randint;
+    if (pareto.range_high != 1.0 || pareto.range_low != 0.0) {
+        if (pareto.range_high <= pareto.range_low ||
+          pareto.range_high > 1.0 || pareto.range_low < 0.0)
+            THROW("Pareto illegal range");
+        r = (pareto.range_low * (double)UINT32_MAX) +
+          r * (pareto.range_high - pareto.range_low);
+    }
+    S1 = (-1 / PARETO_SHAPE);
+    S2 = recno_max * (pareto.param / 100.0) * (PARETO_SHAPE - 1);
+    U = 1 - r / (double)UINT32_MAX;    // interval [0, 1)
+    result = (uint64_t)((pow(U, S1) - 1) * S2);
+
+    // This Pareto calculation chooses out of range values less than 20%
+    // of the time, depending on pareto_param.  For param of 0, it is
+    // never out of range, for param of 100, 19.2%. For the default
+    // pareto_param of 20, it will be out of range 2.7% of the time.
+    // Out of range values are channelled into the first key,
+    // making it "hot".  Unfortunately, that means that using a higher
+    // param can get a lot lumped into the first bucket.
+    //
+    // XXX This matches the behavior of wtperf, we may consider instead
+    // retrying (modifying the random number) until we get a good value.
+    //
+    if (result > recno_max)
+        result = 0;
+    return (result);
+}
+
+uint64_t ThreadRunner::op_get_key_recno(Operation *op, uint64_t range,
+  tint_t tint) {
     uint64_t recno_count;
-    uint32_t rand;
+    uint32_t rval;
 
     (void)op;
-    recno_count = _icontext->_recno[tint];
+    if (range > 0)
+        recno_count = range;
+    else
+        recno_count = _icontext->_table_runtime[tint]._max_recno;
     if (recno_count == 0)
         // The file has no entries, returning 0 forces a WT_NOTFOUND return.
         return (0);
-    rand = workgen_random(_rand_state);
-    return (rand % recno_count + 1);  // recnos are one-based.
+    rval = random_value();
+    if (op->_key._keytype == Key::KEYGEN_PARETO)
+        rval = pareto_calculation(rval, recno_count, op->_key._pareto);
+    return (rval % recno_count + 1);  // recnos are one-based.
 }
 
 int ThreadRunner::op_run(Operation *op) {
@@ -594,19 +759,30 @@ int ThreadRunner::op_run(Operation *op) {
     WT_CURSOR *cursor;
     WT_DECL_RET;
     uint64_t recno;
-    bool measure_latency, own_cursor;
+    uint64_t range;
+    bool measure_latency, own_cursor, retry_op;
+    timespec start_time;
+    uint64_t time_us;
+    char buf[BUF_SIZE];
 
     track = NULL;
     cursor = NULL;
     recno = 0;
     own_cursor = false;
+    retry_op = true;
+    range = op->_table.options.range;
     if (_throttle != NULL) {
-        if (_throttle_ops >= _throttle_limit && !_in_transaction) {
-            WT_ERR(_throttle->throttle(_throttle_ops,
-              &_throttle_limit));
+        while (_throttle_ops >= _throttle_limit && !_in_transaction && !_stop) {
+            // Calling throttle causes a sleep until the next time division,
+            // and we are given a new batch of operations to do before calling
+            // throttle again.  If the number of operations in the batch is
+            // zero, we'll need to go around and throttle again.
+            WT_ERR(_throttle->throttle(_throttle_ops, &_throttle_limit));
             _throttle_ops = 0;
+            if (_throttle_limit != 0)
+                break;
         }
-        if (op->_optype != Operation::OP_NONE)
+        if (op->is_table_op())
             ++_throttle_ops;
     }
 
@@ -619,28 +795,41 @@ int ThreadRunner::op_run(Operation *op) {
     // (and most likely when the threads are first beginning).  Any
     // WT_NOTFOUND returns are allowed and get their own statistic bumped.
     switch (op->_optype) {
+    case Operation::OP_CHECKPOINT:
+        recno = 0;
+        track = &_stats.checkpoint;
+        break;
     case Operation::OP_INSERT:
         track = &_stats.insert;
-        recno = workgen_atomic_add64(&_icontext->_recno[tint], 1);
+        if (op->_key._keytype == Key::KEYGEN_APPEND ||
+          op->_key._keytype == Key::KEYGEN_AUTO)
+            recno = workgen_atomic_add64(
+              &_icontext->_table_runtime[tint]._max_recno, 1);
+        else
+            recno = op_get_key_recno(op, range, tint);
+        break;
+    case Operation::OP_LOG_FLUSH:
+    case Operation::OP_NONE:
+    case Operation::OP_NOOP:
+        recno = 0;
         break;
     case Operation::OP_REMOVE:
         track = &_stats.remove;
-        recno = op_get_key_recno(op, tint);
+        recno = op_get_key_recno(op, range, tint);
         break;
     case Operation::OP_SEARCH:
         track = &_stats.read;
-        recno = op_get_key_recno(op, tint);
+        recno = op_get_key_recno(op, range, tint);
         break;
     case Operation::OP_UPDATE:
         track = &_stats.update;
-        recno = op_get_key_recno(op, tint);
+        recno = op_get_key_recno(op, range, tint);
         break;
-    case Operation::OP_NONE:
+    case Operation::OP_SLEEP:
         recno = 0;
         break;
     }
-    if ((op->_flags & WORKGEN_OP_REOPEN) != 0 &&
-      op->_optype != Operation::OP_NONE) {
+    if ((op->_internal->_flags & WORKGEN_OP_REOPEN) != 0) {
         WT_ERR(_session->open_cursor(_session, op->_table._uri.c_str(), NULL,
           NULL, &cursor));
         own_cursor = true;
@@ -651,68 +840,148 @@ int ThreadRunner::op_run(Operation *op) {
       track->track_latency() &&
       (track->ops % _workload->options.sample_rate == 0);
 
+    VERBOSE(*this, "OP " << op->_optype << " " << op->_table._uri.c_str() << ", recno=" << recno);
     timespec start;
     if (measure_latency)
         workgen_epoch(&start);
 
-    if (op->_transaction != NULL) {
-        if (_in_transaction)
-            THROW("nested transactions not supported");
-        _session->begin_transaction(_session,
-          op->_transaction->_begin_config.c_str());
-        _in_transaction = true;
-    }
-    if (op->_optype != Operation::OP_NONE) {
-        op->kv_gen(true, recno, _keybuf);
+    // Whether or not we are measuring latency, we track how many operations
+    // are in progress, or that complete.
+    if (track != NULL)
+        track->begin();
+
+    // Set up the key and value first, outside the transaction which may
+    // be retried.
+    if (op->is_table_op()) {
+        op->kv_gen(this, true, 100, recno, _keybuf);
         cursor->set_key(cursor, _keybuf);
         if (OP_HAS_VALUE(op)) {
-            op->kv_gen(false, recno, _valuebuf);
+            uint64_t compressibility = op->_table.options.random_value ?
+                0 : op->_table.options.value_compressibility;
+            op->kv_gen(this, false, compressibility, recno, _valuebuf);
             cursor->set_value(cursor, _valuebuf);
         }
-        switch (op->_optype) {
-        case Operation::OP_INSERT:
-            WT_ERR(cursor->insert(cursor));
-            break;
-        case Operation::OP_REMOVE:
-            WT_ERR_NOTFOUND_OK(cursor->remove(cursor));
-            break;
-        case Operation::OP_SEARCH:
-            ret = cursor->search(cursor);
-            break;
-        case Operation::OP_UPDATE:
-            WT_ERR_NOTFOUND_OK(cursor->update(cursor));
-            break;
-        default:
-            ASSERT(false);
-        }
-        if (ret != 0) {
-            ASSERT(ret == WT_NOTFOUND);
-            track = &_stats.not_found;
-            ret = 0;  // WT_NOTFOUND allowed.
-        }
-        cursor->reset(cursor);
     }
+    // Retry on rollback until success.
+    while (retry_op) {
+        if (op->transaction != NULL) {
+            if (_in_transaction)
+                THROW("nested transactions not supported");
+            if (op->transaction->use_commit_timestamp && op->transaction->use_prepare_timestamp)
+            {
+                THROW("Either use_prepare_timestamp or use_commit_timestamp must be set.");
+            }
+            if (op->transaction->read_timestamp_lag > 0) {
+                uint64_t read = WorkgenTimeStamp::get_timestamp_lag(op->transaction->read_timestamp_lag);
+                sprintf(buf, "%s=%" PRIu64, op->transaction->_begin_config.c_str(), read);
+            }
+            else {
+                sprintf(buf, "%s", op->transaction->_begin_config.c_str());
+            }
+            WT_ERR(_session->begin_transaction(_session, buf));
+
+            _in_transaction = true;
+        }
+        if (op->is_table_op()) {
+            switch (op->_optype) {
+            case Operation::OP_INSERT:
+                ret = cursor->insert(cursor);
+                break;
+            case Operation::OP_REMOVE:
+                ret = cursor->remove(cursor);
+                if (ret == WT_NOTFOUND)
+                    ret = 0;
+                break;
+            case Operation::OP_SEARCH:
+                ret = cursor->search(cursor);
+                if (ret == WT_NOTFOUND) {
+                    ret = 0;
+                    track = &_stats.not_found;
+                }
+                break;
+            case Operation::OP_UPDATE:
+                ret = cursor->update(cursor);
+                if (ret == WT_NOTFOUND)
+                    ret = 0;
+                break;
+            default:
+                ASSERT(false);
+            }
+            // Assume success and no retry unless ROLLBACK.
+            retry_op = false;
+            if (ret != 0 && ret != WT_ROLLBACK)
+                WT_ERR(ret);
+            if (ret == 0)
+                cursor->reset(cursor);
+            else {
+                retry_op = true;
+                track->rollbacks++;
+                WT_ERR(_session->rollback_transaction(_session, NULL));
+                _in_transaction = false;
+                ret = 0;
+            }
+        } else {
+            // Never retry on an internal op.
+            retry_op = false;
+            WT_ERR(op->_internal->run(this, _session));
+            _op_time_us += op->_internal->sync_time_us();
+        }
+    }
+
     if (measure_latency) {
         timespec stop;
         workgen_epoch(&stop);
-        track->incr_with_latency(ts_us(stop - start));
+        track->complete_with_latency(ts_us(stop - start));
     } else if (track != NULL)
-        track->incr();
+        track->complete();
 
-    if (op->_group != NULL)
-        for (int count = 0; !_stop && count < op->_repeatgroup; count++)
-            for (std::vector<Operation>::iterator i = op->_group->begin();
-              i != op->_group->end(); i++)
-                WT_ERR(op_run(&*i));
+    if (op->_group != NULL) {
+        uint64_t endtime = 0;
+        timespec now;
+
+        if (op->_timed != 0.0)
+            endtime = _op_time_us + secs_us(op->_timed);
+
+        VERBOSE(*this, "GROUP operation " << op->_timed << " secs, "
+          << op->_repeatgroup << "times");
+
+        do {
+            for (int count = 0; !_stop && count < op->_repeatgroup; count++) {
+                for (std::vector<Operation>::iterator i = op->_group->begin();
+                     i != op->_group->end(); i++)
+                    WT_ERR(op_run(&*i));
+            }
+            workgen_epoch(&now);
+        } while (!_stop && ts_us(now) < endtime);
+
+        if (op->_timed != 0.0)
+            _op_time_us = endtime;
+    }
 err:
     if (own_cursor)
         WT_TRET(cursor->close(cursor));
-    if (op->_transaction != NULL) {
-        if (ret != 0 || op->_transaction->_rollback)
+    if (op->transaction != NULL) {
+        if (ret != 0 || op->transaction->_rollback)
             WT_TRET(_session->rollback_transaction(_session, NULL));
-        else
-            ret = _session->commit_transaction(_session,
-              op->_transaction->_commit_config.c_str());
+        else if (_in_transaction) {
+            // Set prepare, commit and durable timestamp if prepare is set.
+            if (op->transaction->use_prepare_timestamp) {
+                time_us = WorkgenTimeStamp::get_timestamp();
+                sprintf(buf, "prepare_timestamp=%" PRIu64, time_us);
+                ret = _session->prepare_transaction(_session, buf);
+                sprintf(buf, "commit_timestamp=%" PRIu64 ",durable_timestamp=%" PRIu64, time_us, time_us);
+                ret = _session->commit_transaction(_session, buf);
+            }
+            else if (op->transaction->use_commit_timestamp) {
+                uint64_t commit_time_us = WorkgenTimeStamp::get_timestamp();
+                sprintf(buf, "commit_timestamp=%" PRIu64, commit_time_us);
+                ret = _session->commit_transaction(_session, buf);     
+            }
+            else {
+                ret = _session->commit_transaction(_session,
+                    op->transaction->_commit_config.c_str());
+            }
+        }
         _in_transaction = false;
     }
     return (ret);
@@ -724,31 +993,46 @@ std::string ThreadRunner::get_debug() {
 }
 #endif
 
+uint32_t ThreadRunner::random_value() {
+    return (workgen_random(_rand_state));
+}
+
+// Generate a random 32-bit value then return a float value equally distributed
+// between -1.0 and 1.0.
+float ThreadRunner::random_signed() {
+    uint32_t r = random_value();
+    int sign = ((r & 0x1) == 0 ? 1 : -1);
+    return (((float)r * sign) / UINT32_MAX);
+}
+
 Throttle::Throttle(ThreadRunner &runner, double throttle,
     double throttle_burst) : _runner(runner), _throttle(throttle),
     _burst(throttle_burst), _next_div(), _ops_delta(0), _ops_prev(0),
-    _ops_per_div(0), _ms_per_div(0), _started(false) {
+    _ops_per_div(0), _ms_per_div(0), _ops_left_this_second(throttle),
+    _div_pos(0), _started(false) {
+
+    // Our throttling is done by dividing each second into THROTTLE_PER_SEC
+    // parts (we call the parts divisions). In each division, we perform
+    // a certain number of operations. This number is approximately
+    // throttle/THROTTLE_PER_SEC, except that throttle is not necessarily
+    // a multiple of THROTTLE_PER_SEC, nor is it even necessarily an integer.
+    // (That way we can have 1000 threads each inserting 0.5 a second).
     ts_clear(_next_div);
-    _ms_per_div = (uint64_t)ceill(1000.0 / THROTTLE_PER_SEC);
+    ASSERT(1000 % THROTTLE_PER_SEC == 0);    // must evenly divide
+    _ms_per_div = 1000 / THROTTLE_PER_SEC;
     _ops_per_div = (uint64_t)ceill(_throttle / THROTTLE_PER_SEC);
 }
 
 Throttle::~Throttle() {}
-
-// Given a random 32-bit value, return a float value equally distributed
-// between -1.0 and 1.0.
-static float rand_signed(uint32_t r) {
-    int sign = ((r & 0x1) == 0 ? 1 : -1);
-    return (((float)r * sign) / UINT32_MAX);
-}
 
 // Each time throttle is called, we sleep and return a number of operations to
 // perform next.  To implement this we keep a time calculation in _next_div set
 // initially to the current time + 1/THROTTLE_PER_SEC.  Each call to throttle
 // advances _next_div by 1/THROTTLE_PER_SEC, and if _next_div is in the future,
 // we sleep for the difference between the _next_div and the current_time.  We
-// always return (Thread.options.throttle / THROTTLE_PER_SEC) as the number of
-// operations.
+// we return (Thread.options.throttle / THROTTLE_PER_SEC) as the number of
+// operations, if it does not divide evenly, we'll make sure to not exceed
+// the number of operations requested per second.
 //
 // The only variation is that the amount of individual sleeps is modified by a
 // random amount (which varies more widely as Thread.options.throttle_burst is
@@ -766,11 +1050,13 @@ int Throttle::throttle(uint64_t op_count, uint64_t *op_limit) {
         _next_div = ts_add_ms(now, _ms_per_div);
         _started = true;
     } else {
-        _ops_delta += (op_count - _ops_prev);
+        if (_burst != 0.0)
+            _ops_delta += (op_count - _ops_prev);
+
+        // Sleep until the next division, but potentially with some randomness.
         if (now < _next_div) {
             sleep_ms = ts_ms(_next_div - now);
-            sleep_ms += (_ms_per_div * _burst *
-              rand_signed(workgen_random(_runner._rand_state)));
+            sleep_ms += (_ms_per_div * _burst * _runner.random_signed());
             if (sleep_ms > 0) {
                 DEBUG_CAPTURE(_runner, ", sleep=" << sleep_ms);
                 usleep((useconds_t)ms_to_us(sleep_ms));
@@ -778,7 +1064,12 @@ int Throttle::throttle(uint64_t op_count, uint64_t *op_limit) {
         }
         _next_div = ts_add_ms(_next_div, _ms_per_div);
     }
-    ops = _ops_per_div;
+
+    if (_burst == 0.0)
+        ops = _ops_left_this_second;
+    else
+        ops = _ops_per_div;
+
     if (_ops_delta < (int64_t)ops) {
         ops -= _ops_delta;
         _ops_delta = 0;
@@ -786,15 +1077,29 @@ int Throttle::throttle(uint64_t op_count, uint64_t *op_limit) {
         _ops_delta -= ops;
         ops = 0;
     }
+
+    // Enforce that we haven't exceeded the number of operations this second.
+    // Note that _ops_left_this_second may be fractional.
+    if (ops > _ops_left_this_second)
+        ops = (uint64_t)floorl(_ops_left_this_second);
+    _ops_left_this_second -= ops;
+    ASSERT(_ops_left_this_second >= 0.0);
     *op_limit = ops;
     _ops_prev = ops;
+
+    // Advance the division, and if we pass into a new second, allocate
+    // more operations into the count of operations left this second.
+    _div_pos = (_div_pos + 1) % THROTTLE_PER_SEC;
+    if (_div_pos == 0)
+        _ops_left_this_second += _throttle;
     DEBUG_CAPTURE(_runner, ", return=" << ops << std::endl);
     return (0);
 }
 
-ThreadOptions::ThreadOptions() : name(), throttle(0.0), throttle_burst(1.0),
-    _options() {
+ThreadOptions::ThreadOptions() : name(), session_config(), throttle(0.0), throttle_burst(1.0),
+    synchronized(false), _options() {
     _options.add_string("name", name, "name of the thread");
+    _options.add_string("session_config", session_config, "session config which is passed to open_session");
     _options.add_double("throttle", throttle,
       "Limit to this number of operations per second");
     _options.add_double("throttle_burst", throttle_burst,
@@ -802,8 +1107,9 @@ ThreadOptions::ThreadOptions() : name(), throttle(0.0), throttle_burst(1.0),
       "to having large bursts with lulls (10.0 or larger)");
 }
 ThreadOptions::ThreadOptions(const ThreadOptions &other) :
-    name(other.name), throttle(other.throttle),
-    throttle_burst(other.throttle_burst), _options(other._options) {}
+    name(other.name), session_config(other.session_config), throttle(other.throttle),
+  throttle_burst(other.throttle_burst), synchronized(other.synchronized),
+  _options(other._options) {}
 ThreadOptions::~ThreadOptions() {}
 
 void
@@ -848,45 +1154,52 @@ void Thread::describe(std::ostream &os) const {
 }
 
 Operation::Operation() :
-    _optype(OP_NONE), _table(), _key(), _value(), _config(), _transaction(NULL),
-    _group(NULL), _repeatgroup(0), _flags(0),
-    _keysize(0), _valuesize(0), _keymax(0), _valuemax(0) {
+    _optype(OP_NONE), _internal(NULL), _table(), _key(), _value(), _config(),
+    transaction(NULL), _group(NULL), _repeatgroup(0), _timed(0.0) {
+    init_internal(NULL);
 }
 
 Operation::Operation(OpType optype, Table table, Key key, Value value) :
-    _optype(optype), _table(table), _key(key), _value(value), _config(),
-    _transaction(NULL), _group(NULL), _repeatgroup(0), _flags(0),
-    _keysize(0), _valuesize(0), _keymax(0), _valuemax(0) {
+    _optype(optype), _internal(NULL), _table(table), _key(key), _value(value),
+    _config(), transaction(NULL), _group(NULL), _repeatgroup(0), _timed(0.0) {
+    init_internal(NULL);
     size_check();
 }
 
 Operation::Operation(OpType optype, Table table, Key key) :
-    _optype(optype), _table(table), _key(key), _value(), _config(),
-    _transaction(NULL), _group(NULL), _repeatgroup(0), _flags(0),
-    _keysize(0), _valuesize(0), _keymax(0), _valuemax(0) {
+    _optype(optype), _internal(NULL), _table(table), _key(key), _value(),
+    _config(), transaction(NULL), _group(NULL), _repeatgroup(0), _timed(0.0) {
+    init_internal(NULL);
     size_check();
 }
 
 Operation::Operation(OpType optype, Table table) :
-    _optype(optype), _table(table), _key(), _value(), _config(),
-    _transaction(NULL), _group(NULL), _repeatgroup(0), _flags(0),
-    _keysize(0), _valuesize(0), _keymax(0), _valuemax(0) {
+    _optype(optype), _internal(NULL), _table(table), _key(), _value(),
+    _config(), transaction(NULL), _group(NULL), _repeatgroup(0), _timed(0.0) {
+    init_internal(NULL);
     size_check();
 }
 
 Operation::Operation(const Operation &other) :
-    _optype(other._optype), _table(other._table), _key(other._key),
-    _value(other._value), _config(other._config),
-    _transaction(other._transaction), _group(other._group),
-    _repeatgroup(other._repeatgroup), _flags(other._flags),
-    _keysize(other._keysize), _valuesize(other._valuesize),
-    _keymax(other._keymax), _valuemax(other._valuemax) {
-    // Creation and destruction of _group and _transaction is managed
+    _optype(other._optype), _internal(NULL), _table(other._table),
+    _key(other._key), _value(other._value), _config(other._config),
+    transaction(other.transaction), _group(other._group),
+    _repeatgroup(other._repeatgroup), _timed(other._timed) {
+    // Creation and destruction of _group and transaction is managed
     // by Python.
+    init_internal(other._internal);
+}
+
+Operation::Operation(OpType optype, const char *config) :
+    _optype(optype), _internal(NULL), _table(), _key(), _value(),
+    _config(config), transaction(NULL), _group(NULL), _repeatgroup(0),
+    _timed(0.0) {
+    init_internal(NULL);
 }
 
 Operation::~Operation() {
-    // Creation and destruction of _group, _transaction is managed by Python.
+    // Creation and destruction of _group, transaction is managed by Python.
+    delete _internal;
 }
 
 Operation& Operation::operator=(const Operation &other) {
@@ -894,44 +1207,92 @@ Operation& Operation::operator=(const Operation &other) {
     _table = other._table;
     _key = other._key;
     _value = other._value;
-    _transaction = other._transaction;
+    transaction = other.transaction;
     _group = other._group;
     _repeatgroup = other._repeatgroup;
-    _keysize = other._keysize;
-    _valuesize = other._valuesize;
-    _keymax = other._keymax;
-    _valuemax = other._valuemax;
+    _timed = other._timed;
+    delete _internal;
+    _internal = NULL;
+    init_internal(other._internal);
     return (*this);
+}
+
+void Operation::init_internal(OperationInternal *other) {
+    ASSERT(_internal == NULL);
+
+    switch (_optype) {
+    case OP_CHECKPOINT:
+        if (other == NULL)
+            _internal = new CheckpointOperationInternal();
+        else
+            _internal = new CheckpointOperationInternal(
+              *(CheckpointOperationInternal *)other);
+        break;
+    case OP_INSERT:
+    case OP_REMOVE:
+    case OP_SEARCH:
+    case OP_UPDATE:
+        if (other == NULL)
+            _internal = new TableOperationInternal();
+        else
+            _internal = new TableOperationInternal(
+              *(TableOperationInternal *)other);
+        break;
+    case OP_LOG_FLUSH:
+        _internal = new LogFlushOperationInternal();
+        break;
+    case OP_NONE:
+    case OP_NOOP:
+        if (other == NULL)
+            _internal = new OperationInternal();
+        else
+            _internal = new OperationInternal(*other);
+        break;
+    case OP_SLEEP:
+        if (other == NULL)
+            _internal = new SleepOperationInternal();
+        else
+            _internal = new SleepOperationInternal(
+              *(SleepOperationInternal *)other);
+        break;
+    default:
+        ASSERT(false);
+    }
+}
+
+bool Operation::combinable() const {
+    return (_group != NULL && _repeatgroup == 1 && _timed == 0.0 &&
+      transaction == NULL && _config == "");
 }
 
 void Operation::create_all() {
     size_check();
 
-    _flags = 0;
-    if (!_config.empty()) {
-        if (_config == "reopen")
-            _flags |= WORKGEN_OP_REOPEN;
-        else
-            THROW("operation has illegal config: \"" << _config << "\"");
-    }
+    _internal->_flags = 0;
+    _internal->parse_config(_config);
 }
 
 void Operation::describe(std::ostream &os) const {
     os << "Operation: " << _optype;
-    if (_optype != OP_NONE) {
+    if (is_table_op()) {
         os << ", ";  _table.describe(os);
         os << ", "; _key.describe(os);
         os << ", "; _value.describe(os);
     }
     if (!_config.empty())
-        os << ", '" << _config;
-    if (_transaction != NULL) {
+        os << ", '" << _config << "'";
+    if (transaction != NULL) {
         os << ", [";
-        _transaction->describe(os);
+        transaction->describe(os);
         os << "]";
     }
+    if (_timed != 0.0)
+        os << ", [timed " << _timed << " secs]";
     if (_group != NULL) {
-        os << ", group[" << _repeatgroup << "]: {";
+        os << ", group";
+        if (_repeatgroup != 1)
+            os << "[repeat " << _repeatgroup << "]";
+        os << ": {";
         bool first = true;
         for (std::vector<Operation>::const_iterator i = _group->begin();
              i != _group->end(); i++) {
@@ -945,33 +1306,44 @@ void Operation::describe(std::ostream &os) const {
 }
 
 void Operation::get_static_counts(Stats &stats, int multiplier) {
-    switch (_optype) {
-    case OP_NONE:
-        break;
-    case OP_INSERT:
-        stats.insert.ops += multiplier;
-        break;
-    case OP_REMOVE:
-        stats.remove.ops += multiplier;
-        break;
-    case OP_SEARCH:
-        stats.read.ops += multiplier;
-        break;
-    case OP_UPDATE:
-        stats.update.ops += multiplier;
-        break;
-    default:
-        ASSERT(false);
-    }
+    if (is_table_op())
+        switch (_optype) {
+        case OP_INSERT:
+            stats.insert.ops += multiplier;
+            break;
+        case OP_REMOVE:
+            stats.remove.ops += multiplier;
+            break;
+        case OP_SEARCH:
+            stats.read.ops += multiplier;
+            break;
+        case OP_UPDATE:
+            stats.update.ops += multiplier;
+            break;
+        default:
+            ASSERT(false);
+        }
+    else if (_optype == OP_CHECKPOINT)
+        stats.checkpoint.ops += multiplier;
+
     if (_group != NULL)
         for (std::vector<Operation>::iterator i = _group->begin();
           i != _group->end(); i++)
             i->get_static_counts(stats, multiplier * _repeatgroup);
 }
 
-void Operation::kv_compute_max(bool iskey) {
+bool Operation::is_table_op() const {
+    return (_optype == OP_INSERT || _optype == OP_REMOVE ||
+      _optype == OP_SEARCH || _optype == OP_UPDATE);
+}
+
+void Operation::kv_compute_max(bool iskey, bool has_random) {
     uint64_t max;
     int size;
+    TableOperationInternal *internal;
+
+    ASSERT(is_table_op());
+    internal = (TableOperationInternal *)_internal;
 
     size = iskey ? _key._size : _value._size;
     if (size == 0)
@@ -981,6 +1353,10 @@ void Operation::kv_compute_max(bool iskey) {
         THROW("Key.size too small for table '" << _table._uri << "'");
     if (!iskey && size < 1)
         THROW("Value.size too small for table '" << _table._uri << "'");
+    if (has_random) {
+        if (iskey)
+            THROW("Random keys not allowed");
+    }
 
     if (size > 1)
         max = power64(10, (size - 1)) - 1;
@@ -988,53 +1364,183 @@ void Operation::kv_compute_max(bool iskey) {
         max = 0;
 
     if (iskey) {
-        _keysize = size;
-        _keymax = max;
+        internal->_keysize = size;
+        internal->_keymax = max;
     } else {
-        _valuesize = size;
-        _valuemax = max;
+        internal->_valuesize = size;
+        internal->_valuemax = max;
     }
 }
 
 void Operation::kv_size_buffer(bool iskey, size_t &maxsize) const {
+    TableOperationInternal *internal;
+
+    ASSERT(is_table_op());
+    internal = (TableOperationInternal *)_internal;
+
     if (iskey) {
-        if ((size_t)_keysize > maxsize)
-            maxsize = _keysize;
+        if ((size_t)internal->_keysize > maxsize)
+            maxsize = internal->_keysize;
     } else {
-        if ((size_t)_valuesize > maxsize)
-            maxsize = _valuesize;
+        if ((size_t)internal->_valuesize > maxsize)
+            maxsize = internal->_valuesize;
     }
 }
 
-void Operation::kv_gen(bool iskey, uint64_t n, char *result) const {
-    uint64_t max;
-    int size;
+void Operation::kv_gen(ThreadRunner *runner, bool iskey,
+  uint64_t compressibility, uint64_t n, char *result) const {
+    TableOperationInternal *internal;
+    uint_t max;
+    uint_t size;
 
-    size = iskey ? _keysize : _valuesize;
-    max = iskey ? _keymax : _valuemax;
+    ASSERT(is_table_op());
+    internal = (TableOperationInternal *)_internal;
+
+    size = iskey ? internal->_keysize : internal->_valuesize;
+    max = iskey ? internal->_keymax : internal->_valuemax;
     if (n > max)
         THROW((iskey ? "Key" : "Value") << " (" << n
           << ") too large for size (" << size << ")");
+    /* Setup the buffer, defaulting to zero filled. */
     workgen_u64_to_string_zf(n, result, size);
+
+    /*
+     * Compressibility is a percentage, 100 is all zeroes, it applies to the
+     * proportion of the value that can't be used for the identifier.
+     */
+    if (size > 20 && compressibility < 100) {
+        static const char alphanum[] =
+          "0123456789"
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          "abcdefghijklmnopqrstuvwxyz";
+        /*
+         * The random length is the proportion of the string that should not
+         * be compressible. As an example a compressibility of 25 in a value
+         * of length 100 should be:
+         * 100 - ((100 * 25) / 100) = 75
+         * That means that 75% of the string will be random numbers, and 25
+         * will be easily compressible zero-fill.
+         */
+        uint_t random_len = size - ((size * compressibility) / 100);
+
+        /* Never overwrite the record number identifier */
+        if (random_len > size - 20)
+            random_len = size - 20;
+
+        for (uint64_t i = 0; i < random_len; ++i)
+            /*
+             * TODO: It'd be nice to use workgen_rand here, but this class
+             * is without the context of a runner thread, so it's not easy
+             * to get access to a state.
+             */
+            result[i] = alphanum[runner->random_value() % (sizeof(alphanum) - 1)];
+    }
 }
 
 void Operation::size_check() const {
-    if (_optype != OP_NONE && _key._size == 0 && _table.options.key_size == 0)
-        THROW("operation requires a key size");
-    if (OP_HAS_VALUE(this) && _value._size == 0 &&
-      _table.options.value_size == 0)
-        THROW("operation requires a value size");
+    if (is_table_op()) {
+        if (_key._size == 0 && _table.options.key_size == 0)
+            THROW("operation requires a key size");
+        if (OP_HAS_VALUE(this) && _value._size == 0 &&
+          _table.options.value_size == 0)
+            THROW("operation requires a value size");
+    }
 }
 
-Track::Track(bool latency_tracking) : ops(0), latency_ops(0), latency(0),
-    min_latency(0), max_latency(0), us(NULL), ms(NULL), sec(NULL) {
+void Operation::synchronized_check() const {
+    if (_timed != 0.0)
+        return;
+    if (_optype != Operation::OP_NONE) {
+        if (is_table_op() || _internal->sync_time_us() == 0)
+            THROW("operation cannot be synchronized, needs to be timed()");
+    } else if (_group != NULL) {
+        for (std::vector<Operation>::iterator i = _group->begin();
+             i != _group->end(); i++)
+            i->synchronized_check();
+    }
+}
+
+int CheckpointOperationInternal::run(ThreadRunner *runner, WT_SESSION *session)
+{
+    (void)runner;    /* not used */
+    return (session->checkpoint(session, NULL));
+}
+
+int LogFlushOperationInternal::run(ThreadRunner *runner, WT_SESSION *session)
+{
+    (void)runner;    /* not used */
+    return (session->log_flush(session, NULL));
+}
+
+void SleepOperationInternal::parse_config(const std::string &config)
+{
+    const char *configp;
+    char *endp;
+
+    configp = config.c_str();
+    _sleepvalue = strtod(configp, &endp);
+    if (configp == endp || *endp != '\0' || _sleepvalue < 0.0)
+        THROW("sleep operation requires a configuration string as "
+          "a non-negative float, e.g. '1.5'");
+}
+
+int SleepOperationInternal::run(ThreadRunner *runner, WT_SESSION *session)
+{
+    uint64_t endtime;
+    timespec now;
+    uint64_t now_us;
+
+    (void)runner;    /* not used */
+    (void)session;   /* not used */
+
+    workgen_epoch(&now);
+    now_us = ts_us(now);
+    if (runner->_thread->options.synchronized)
+        endtime = runner->_op_time_us + secs_us(_sleepvalue);
+    else
+        endtime = now_us + secs_us(_sleepvalue);
+
+    // Sleep for up to a second at a time, so we'll break out if
+    // we should stop.
+    while (!runner->_stop && now_us < endtime) {
+        uint64_t sleep_us = endtime - now_us;
+        if (sleep_us >= WT_MILLION) // one second
+            sleep(1);
+        else
+            usleep(sleep_us);
+
+        workgen_epoch(&now);
+        now_us = ts_us(now);
+    }
+    return (0);
+}
+
+uint64_t SleepOperationInternal::sync_time_us() const
+{
+    return (secs_us(_sleepvalue));
+}
+
+void TableOperationInternal::parse_config(const std::string &config)
+{
+    if (!config.empty()) {
+        if (config == "reopen")
+            _flags |= WORKGEN_OP_REOPEN;
+        else
+            THROW("table operation has illegal config: \"" << config << "\"");
+    }
+}
+
+Track::Track(bool latency_tracking) : ops_in_progress(0), ops(0), rollbacks(0),
+    latency_ops(0), latency(0), bucket_ops(0), min_latency(0), max_latency(0),
+    us(NULL), ms(NULL), sec(NULL) {
     track_latency(latency_tracking);
 }
 
-Track::Track(const Track &other) : ops(other.ops),
+Track::Track(const Track &other) : ops_in_progress(other.ops_in_progress),
+    ops(other.ops), rollbacks(other.rollbacks),
     latency_ops(other.latency_ops), latency(other.latency),
-    min_latency(other.min_latency), max_latency(other.max_latency),
-    us(NULL), ms(NULL), sec(NULL) {
+    bucket_ops(other.bucket_ops), min_latency(other.min_latency),
+    max_latency(other.max_latency), us(NULL), ms(NULL), sec(NULL) {
     if (other.us != NULL) {
         us = new uint32_t[LATENCY_US_BUCKETS];
         ms = new uint32_t[LATENCY_MS_BUCKETS];
@@ -1054,6 +1560,7 @@ Track::~Track() {
 }
 
 void Track::add(Track &other, bool reset) {
+    ops_in_progress += other.ops_in_progress;
     ops += other.ops;
     latency_ops += other.latency_ops;
     latency += other.latency;
@@ -1076,6 +1583,7 @@ void Track::add(Track &other, bool reset) {
 }
 
 void Track::assign(const Track &other) {
+    ops_in_progress = other.ops_in_progress;
     ops = other.ops;
     latency_ops = other.latency_ops;
     latency = other.latency;
@@ -1109,10 +1617,17 @@ uint64_t Track::average_latency() const {
         return (latency / latency_ops);
 }
 
+void Track::begin() {
+    ops_in_progress++;
+}
+
 void Track::clear() {
+    ops_in_progress = 0;
     ops = 0;
+    rollbacks = 0;
     latency_ops = 0;
     latency = 0;
+    bucket_ops = 0;
     min_latency = 0;
     max_latency = 0;
     if (us != NULL) {
@@ -1122,13 +1637,15 @@ void Track::clear() {
     }
 }
 
-void Track::incr() {
+void Track::complete() {
+    --ops_in_progress;
     ops++;
 }
 
-void Track::incr_with_latency(uint64_t usecs) {
+void Track::complete_with_latency(uint64_t usecs) {
     ASSERT(us != NULL);
 
+    --ops_in_progress;
     ops++;
     latency_ops++;
     latency += usecs;
@@ -1155,7 +1672,51 @@ void Track::incr_with_latency(uint64_t usecs) {
         sec[LATENCY_SEC_BUCKETS - 1]++;
 }
 
+// Return the latency for which the given percent is lower than it.
+// E.g. for percent == 95, returns the latency for which 95% of latencies
+// are faster (lower), and 5% are slower (higher).
+uint64_t Track::percentile_latency(int percent) const {
+    // Get the total number of operations in the latency buckets.
+    // We can't reliably use latency_ops, because this struct was
+    // added up from Track structures that were being copied while
+    // being updated.
+    uint64_t total = 0;
+    for (int i = 0; i < LATENCY_SEC_BUCKETS; i++)
+        total += sec[i];
+    for (int i = 0; i < LATENCY_MS_BUCKETS; i++)
+        total += ms[i];
+    for (int i = 0; i < LATENCY_US_BUCKETS; i++)
+        total += us[i];
+    if (total == 0)
+        return (0);
+
+    // optimized for percent values over 50, we start counting from above.
+    uint64_t n = 0;
+    uint64_t k = (100 - percent) * total / 100;
+    if (k == 0)
+        return (0);
+    for (int i = LATENCY_SEC_BUCKETS - 1; i >= 0; --i) {
+        n += sec[i];
+        if (n >= k)
+            return (sec_to_us(i));
+    }
+    for (int i = LATENCY_MS_BUCKETS - 1; i >= 0; --i) {
+        n += ms[i];
+        if (n >= k)
+            return (ms_to_us(i));
+    }
+    for (int i = LATENCY_US_BUCKETS - 1; i >= 0; --i) {
+        n += us[i];
+        if (n >= k)
+            return (100 * i);
+    }
+    // We should have accounted for all the buckets.
+    ASSERT(false);
+    return (0);
+}
+
 void Track::subtract(const Track &other) {
+    ops_in_progress -= other.ops_in_progress;
     ops -= other.ops;
     latency_ops -= other.latency_ops;
     latency -= other.latency;
@@ -1169,19 +1730,6 @@ void Track::subtract(const Track &other) {
             ms[i] -= other.ms[i];
         for (int i = 0; i < LATENCY_SEC_BUCKETS; i++)
             sec[i] -= other.sec[i];
-    }
-}
-
-// If there are no entries in this Track, take them from
-// a previous Track. Used to smooth graphs.  We don't worry
-// about latency buckets here.
-void Track::smooth(const Track &other) {
-    if (latency_ops == 0) {
-        ops = other.ops;
-        latency = other.latency;
-        latency_ops = other.latency_ops;
-        min_latency = other.min_latency;
-        max_latency = other.max_latency;
     }
 }
 
@@ -1229,18 +1777,20 @@ void Track::_get_sec(long *result) {
         memset(result, 0, sizeof(long) * LATENCY_SEC_BUCKETS);
 }
 
-Stats::Stats(bool latency) : insert(latency), not_found(latency),
-    read(latency), remove(latency), update(latency), truncate(latency) {
+Stats::Stats(bool latency) : checkpoint(latency), insert(latency),
+    not_found(latency), read(latency), remove(latency), update(latency),
+    truncate(latency) {
 }
 
-Stats::Stats(const Stats &other) : insert(other.insert),
-    not_found(other.not_found), read(other.read), remove(other.remove),
-    update(other.update), truncate(other.truncate) {
+Stats::Stats(const Stats &other) : checkpoint(other.checkpoint),
+    insert(other.insert), not_found(other.not_found), read(other.read),
+    remove(other.remove), update(other.update), truncate(other.truncate) {
 }
 
 Stats::~Stats() {}
 
 void Stats::add(Stats &other, bool reset) {
+    checkpoint.add(other.checkpoint, reset);
     insert.add(other.insert, reset);
     not_found.add(other.not_found, reset);
     read.add(other.read, reset);
@@ -1250,6 +1800,7 @@ void Stats::add(Stats &other, bool reset) {
 }
 
 void Stats::assign(const Stats &other) {
+    checkpoint.assign(other.checkpoint);
     insert.assign(other.insert);
     not_found.assign(other.not_found);
     read.assign(other.read);
@@ -1259,6 +1810,7 @@ void Stats::assign(const Stats &other) {
 }
 
 void Stats::clear() {
+    checkpoint.clear();
     insert.clear();
     not_found.clear();
     read.clear();
@@ -1276,10 +1828,12 @@ void Stats::describe(std::ostream &os) const {
     os << ", updates " << update.ops;
     os << ", truncates " << truncate.ops;
     os << ", removes " << remove.ops;
+    os << ", checkpoints " << checkpoint.ops;
 }
 
 void Stats::final_report(std::ostream &os, timespec &totalsecs) const {
     uint64_t ops = 0;
+    ops += checkpoint.ops;
     ops += read.ops;
     ops += not_found.ops;
     ops += insert.ops;
@@ -1298,6 +1852,7 @@ void Stats::final_report(std::ostream &os, timespec &totalsecs) const {
     FINAL_OUTPUT(os, update.ops, update, ops, totalsecs);
     FINAL_OUTPUT(os, truncate.ops, truncate, ops, totalsecs);
     FINAL_OUTPUT(os, remove.ops, remove, ops, totalsecs);
+    FINAL_OUTPUT(os, checkpoint.ops, checkpoint, ops, totalsecs);
 }
 
 void Stats::report(std::ostream &os) const {
@@ -1308,19 +1863,12 @@ void Stats::report(std::ostream &os) const {
     os << ", " << insert.ops << " inserts, ";
     os << update.ops << " updates, ";
     os << truncate.ops << " truncates, ";
-    os << remove.ops << " removes";
-}
-
-void Stats::smooth(const Stats &other) {
-    insert.smooth(other.insert);
-    not_found.smooth(other.not_found);
-    read.smooth(other.read);
-    remove.smooth(other.remove);
-    update.smooth(other.update);
-    truncate.smooth(other.truncate);
+    os << remove.ops << " removes, ";
+    os << checkpoint.ops << " checkpoints";
 }
 
 void Stats::subtract(const Stats &other) {
+    checkpoint.subtract(other.checkpoint);
     insert.subtract(other.insert);
     not_found.subtract(other.not_found);
     read.subtract(other.read);
@@ -1330,6 +1878,7 @@ void Stats::subtract(const Stats &other) {
 }
 
 void Stats::track_latency(bool latency) {
+    checkpoint.track_latency(latency);
     insert.track_latency(latency);
     not_found.track_latency(latency);
     read.track_latency(latency);
@@ -1338,14 +1887,23 @@ void Stats::track_latency(bool latency) {
     truncate.track_latency(latency);
 }
 
-TableOptions::TableOptions() : key_size(0), value_size(0), _options() {
+TableOptions::TableOptions() : key_size(0), value_size(0),
+    value_compressibility(100), random_value(false), range(0), _options() {
     _options.add_int("key_size", key_size,
       "default size of the key, unless overridden by Key.size");
     _options.add_int("value_size", value_size,
       "default size of the value, unless overridden by Value.size");
+    _options.add_bool("random_value", random_value,
+      "generate random content for the value");
+    _options.add_bool("value_compressibility", value_compressibility,
+      "How compressible the generated value should be");
+    _options.add_int("range", range,
+      "if zero, keys are inserted at the end and reads/updates are in the current range, if non-zero, inserts/reads/updates are at a random key between 0 and the given range");
 }
 TableOptions::TableOptions(const TableOptions &other) :
     key_size(other.key_size), value_size(other.value_size),
+    value_compressibility(other.value_compressibility),
+    random_value(other.random_value), range(other.range),
     _options(other._options) {}
 TableOptions::~TableOptions() {}
 
@@ -1376,8 +1934,9 @@ TableInternal::~TableInternal() {}
 
 WorkloadOptions::WorkloadOptions() : max_latency(0),
     report_file("workload.stat"), report_interval(0), run_time(0),
-    sample_file("sample.json"), sample_interval(0), sample_rate(1),
-    _options() {
+    sample_file("monitor.json"), sample_interval_ms(0), sample_rate(1),
+    warmup(0), oldest_timestamp_lag(0.0), stable_timestamp_lag(0.0),
+    timestamp_advance(0.0), _options() {
     _options.add_int("max_latency", max_latency,
       "prints warning if any latency measured exceeds this number of "
       "milliseconds. Requires sample_interval to be configured.");
@@ -1394,16 +1953,25 @@ WorkloadOptions::WorkloadOptions() : max_latency(0),
       "enabled by the report_interval option. "
       "The file name is relative to the connection's home directory. "
       "When set to the empty string, no JSON is emitted.");
-    _options.add_int("sample_interval", sample_interval,
-      "performance logging every interval seconds, 0 to disable");
+    _options.add_int("sample_interval_ms", sample_interval_ms,
+      "performance logging every interval milliseconds, 0 to disable");
     _options.add_int("sample_rate", sample_rate,
       "how often the latency of operations is measured. 1 for every operation, "
       "2 for every second operation, 3 for every third operation etc.");
+    _options.add_int("warmup", warmup,
+      "how long to run the workload phase before starting measurements");
+    _options.add_double("oldest_timestamp_lag", oldest_timestamp_lag,
+      "how much lag to the oldest timestamp from epoch time");
+    _options.add_double("stable_timestamp_lag", stable_timestamp_lag,
+      "how much lag to the oldest timestamp from epoch time");
+    _options.add_double("timestamp_advance", timestamp_advance,
+      "how many seconds to wait before moving oldest and stable"
+      "timestamp forward");
 }
 
 WorkloadOptions::WorkloadOptions(const WorkloadOptions &other) :
     max_latency(other.max_latency), report_interval(other.report_interval),
-    run_time(other.run_time), sample_interval(other.sample_interval),
+    run_time(other.run_time), sample_interval_ms(other.sample_interval_ms),
     sample_rate(other.sample_rate), _options(other._options) {}
 WorkloadOptions::~WorkloadOptions() {}
 
@@ -1435,13 +2003,12 @@ Workload& Workload::operator=(const Workload &other) {
 
 int Workload::run(WT_CONNECTION *conn) {
     WorkloadRunner runner(this);
-
     return (runner.run(conn));
 }
 
 WorkloadRunner::WorkloadRunner(Workload *workload) :
     _workload(workload), _trunners(workload->_threads.size()),
-    _report_out(&std::cout), _start() {
+    _report_out(&std::cout), _start(), stopping(false) {
     ts_clear(_start);
 }
 WorkloadRunner::~WorkloadRunner() {}
@@ -1452,7 +2019,10 @@ int WorkloadRunner::run(WT_CONNECTION *conn) {
     std::ofstream report_out;
 
     _wt_home = conn->get_home(conn);
-    if (options->sample_interval > 0 && options->sample_rate <= 0)
+
+    if ( (options->oldest_timestamp_lag > 0 || options->stable_timestamp_lag > 0) && options->timestamp_advance < 0 )
+        THROW("Workload.options.timestamp_advance must be positive if either Workload.options.oldest_timestamp_lag or Workload.options.stable_timestamp_lag is set");
+    if (options->sample_interval_ms > 0 && options->sample_rate <= 0)
         THROW("Workload.options.sample_rate must be positive");
     if (!options->report_file.empty()) {
         open_report_file(report_out, options->report_file.c_str(),
@@ -1462,7 +2032,7 @@ int WorkloadRunner::run(WT_CONNECTION *conn) {
     WT_ERR(create_all(conn, _workload->_context));
     WT_ERR(open_all());
     WT_ERR(ThreadRunner::cross_check(_trunners));
-    WT_ERR(run_all());
+    WT_ERR(run_all(conn));
   err:
     //TODO: (void)close_all();
     _report_out = &std::cout;
@@ -1542,23 +2112,25 @@ void WorkloadRunner::final_report(timespec &totalsecs) {
     Stats *stats = &_workload->stats;
 
     stats->clear();
-    stats->track_latency(_workload->options.sample_interval > 0);
+    stats->track_latency(_workload->options.sample_interval_ms > 0);
 
     get_stats(stats);
     stats->final_report(out, totalsecs);
     out << "Run completed: " << totalsecs << " seconds" << std::endl;
 }
 
-int WorkloadRunner::run_all() {
+int WorkloadRunner::run_all(WT_CONNECTION *conn) {
     void *status;
     std::vector<pthread_t> thread_handles;
     Stats counts(false);
     WorkgenException *exception;
     WorkloadOptions *options = &_workload->options;
+    WorkloadRunnerConnection *runnerConnection;
     Monitor monitor(*this);
     std::ofstream monitor_out;
     std::ofstream monitor_json;
     std::ostream &out = *_report_out;
+    pthread_t time_thandle;
     WT_DECL_RET;
 
     for (size_t i = 0; i < _trunners.size(); i++)
@@ -1567,12 +2139,8 @@ int WorkloadRunner::run_all() {
     counts.report(out);
     out << std::endl;
 
-    workgen_epoch(&_start);
-    timespec end = _start + options->run_time;
-    timespec next_report = _start + options->report_interval;
-
     // Start all threads
-    if (options->sample_interval > 0) {
+    if (options->sample_interval_ms > 0) {
         open_report_file(monitor_out, "monitor", "monitor output file");
         monitor._out = &monitor_out;
 
@@ -1606,8 +2174,38 @@ int WorkloadRunner::run_all() {
             return (ret);
         }
         thread_handles.push_back(thandle);
+    }
+
+    // Start Timestamp increment thread
+    if (options->oldest_timestamp_lag > 0 || options->stable_timestamp_lag > 0) {
+
+        runnerConnection = new WorkloadRunnerConnection();
+        runnerConnection->runner = this;
+        runnerConnection->connection = conn;
+
+        if ((ret = pthread_create(&time_thandle, NULL, thread_workload,
+            runnerConnection)) != 0) {
+            std::cerr << "pthread_create failed err=" << ret << std::endl;
+            std::cerr << "Stopping Time threads." << std::endl;
+            (void)pthread_join(time_thandle, &status);
+            delete runnerConnection;
+        }
+    }
+
+    // Treat warmup separately from report interval so that if we have a
+    // warmup period we clear and ignore stats after it ends.
+    if (options->warmup != 0)
+        sleep((unsigned int)options->warmup);
+
+    // Clear stats after any warmup period completes.
+    for (size_t i = 0; i < _trunners.size(); i++) {
+        ThreadRunner *runner = &_trunners[i];
         runner->_stats.clear();
     }
+
+    workgen_epoch(&_start);
+    timespec end = _start + options->run_time;
+    timespec next_report = _start + options->report_interval;
 
     // Let the test run, reporting as needed.
     Stats curstats(false);
@@ -1638,8 +2236,11 @@ int WorkloadRunner::run_all() {
     if (options->run_time != 0)
         for (size_t i = 0; i < _trunners.size(); i++)
             _trunners[i]._stop = true;
-    if (options->sample_interval > 0)
+    if (options->sample_interval_ms > 0)
         monitor._stop = true;
+    if (options->oldest_timestamp_lag > 0 || options->stable_timestamp_lag > 0) {
+        stopping = true;
+    }
 
     // wait for all threads
     exception = NULL;
@@ -1653,7 +2254,15 @@ int WorkloadRunner::run_all() {
         if (exception == NULL && !_trunners[i]._exception._str.empty())
             exception = &_trunners[i]._exception;
     }
-    if (options->sample_interval > 0) {
+
+    // Wait for the time increment thread
+    if (options->oldest_timestamp_lag > 0 || options->stable_timestamp_lag > 0) {
+        WT_TRET(pthread_join(time_thandle, &status));
+        delete runnerConnection;
+    }
+
+    workgen_epoch(&now);
+    if (options->sample_interval_ms > 0) {
         WT_TRET(pthread_join(monitor._handle, &status));
         if (monitor._errno != 0)
             std::cerr << "Monitor thread has errno " << monitor._errno

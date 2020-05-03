@@ -1,41 +1,46 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace optionenvironment {
+
+constexpr Seconds kDefaultConfigExpandTimeout{30};
 
 class Environment;
 class OptionSection;
@@ -90,7 +95,7 @@ public:
      *  true - unknown config options will generate an error during parsing.
      *  false - unknow config options will be ignored during parsing.
      */
-    static stdx::function<bool()> useStrict;
+    static std::function<bool()> useStrict;
 
     OptionsParser() {}
     virtual ~OptionsParser() {}
@@ -110,6 +115,25 @@ public:
                const std::map<std::string, std::string>& env,
                Environment*);
 
+    /** Handles parsing of a YAML or INI formatted string. The
+     *  OptionSection be a description of the allowed options.  This function populates the
+     *  given Environment with the results but does not call validate on the Environment.
+     */
+    Status runConfigFile(const OptionSection&,
+                         const std::string& config,
+                         const std::map<std::string, std::string>& env,
+                         Environment*);
+
+    /**
+     * Flags controlling whether or not __rest and/or __exec directives in a
+     * config file should be expanded via HttpClient/shellExec.
+     */
+    struct ConfigExpand {
+        bool rest = false;
+        bool exec = false;
+        Seconds timeout = kDefaultConfigExpandTimeout;
+    };
+
 private:
     /** Handles parsing of the command line and adds the results to the given Environment */
     Status parseCommandLine(const OptionSection&,
@@ -120,12 +144,21 @@ private:
      * */
     Status parseINIConfigFile(const OptionSection&, const std::string& config, Environment*);
 
+    /** Handles parsing of either YAML or INI config and adds the results to the given Environment
+     */
+    Status parseConfigFile(const OptionSection&,
+                           const std::string& argv,
+                           Environment*,
+                           const ConfigExpand& configExpand);
+
     /** Gets defaults from the OptionSection and adds them to the given Environment */
     Status addDefaultValues(const OptionSection&, Environment*);
 
     /** Reads the given config file into the output string.  This function is virtual for
      *  testing purposes only. */
-    virtual Status readConfigFile(const std::string& filename, std::string*);
+    virtual Status readConfigFile(const std::string& filename,
+                                  std::string*,
+                                  ConfigExpand configExpand);
 };
 
 }  // namespace optionenvironment

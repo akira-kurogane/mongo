@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include <algorithm>
@@ -33,8 +34,8 @@
 #include "mongo/idl/idl_parser.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/commands.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/command_generic_argument.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -63,29 +64,24 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
 
-bool IDLParserErrorContext::checkAndAssertType(const BSONElement& element, BSONType type) const {
+bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& element,
+                                                       BSONType type) const {
     auto elementType = element.type();
 
-    if (elementType != type) {
-        // If the type is wrong, ignore Null and Undefined values
-        if (elementType == jstNULL || elementType == Undefined) {
-            return false;
-        }
-
-        std::string path = getElementPath(element);
-        uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+    // If the type is wrong, ignore Null and Undefined values
+    if (elementType == jstNULL || elementType == Undefined) {
+        return false;
     }
 
-    return true;
+    std::string path = getElementPath(element);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(elementType) << "', expected type '" << typeName(type)
+                            << "'");
 }
 
-bool IDLParserErrorContext::checkAndAssertBinDataType(const BSONElement& element,
-                                                      BinDataType type) const {
+bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& element,
+                                                              BinDataType type) const {
     bool isBinDataType = checkAndAssertType(element, BinData);
     if (!isBinDataType) {
         return false;
@@ -95,10 +91,8 @@ bool IDLParserErrorContext::checkAndAssertBinDataType(const BSONElement& element
         std::string path = getElementPath(element);
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong bindData type '"
-                                << typeName(element.binDataType())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+                                << typeName(element.binDataType()) << "', expected type '"
+                                << typeName(type) << "'");
     }
 
     return true;
@@ -119,9 +113,7 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
         std::string type_str = toCommaDelimitedList(types);
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected types '["
-                                << type_str
+                                << typeName(element.type()) << "', expected types '[" << type_str
                                 << "']");
     }
 
@@ -206,10 +198,8 @@ void IDLParserErrorContext::throwBadArrayFieldNumberSequence(std::uint32_t actua
     std::string path = getElementPath(StringData());
     uasserted(40423,
               str::stream() << "BSON array field '" << path << "' has a non-sequential value '"
-                            << actualValue
-                            << "' for an array field name, expected value '"
-                            << expectedValue
-                            << "'.");
+                            << actualValue << "' for an array field name, expected value '"
+                            << expectedValue << "'.");
 }
 
 void IDLParserErrorContext::throwBadEnumValue(int enumValue) const {
@@ -228,6 +218,12 @@ void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
 
 NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbName,
                                                                  const BSONElement& element) {
+    const bool isUUID = (element.canonicalType() == canonicalizeBSONType(mongo::BinData) &&
+                         element.binDataType() == BinDataType::newUUID);
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Collection name must be provided. UUID is not valid in this "
+                          << "context",
+            !isUUID);
     uassert(ErrorCodes::BadValue,
             str::stream() << "collection name has invalid type " << typeName(element.type()),
             element.canonicalType() == canonicalizeBSONType(mongo::String));
@@ -241,6 +237,17 @@ NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbNa
     return nss;
 }
 
+NamespaceStringOrUUID IDLParserErrorContext::parseNsOrUUID(StringData dbname,
+                                                           const BSONElement& element) {
+    if (element.type() == BinData && element.binDataType() == BinDataType::newUUID) {
+        return {dbname.toString(), uassertStatusOK(UUID::parse(element))};
+    } else {
+        // Ensure collection identifier is not a Command
+        const NamespaceString nss(parseNSCollectionRequired(dbname, element));
+        return nss;
+    }
+}
+
 void IDLParserErrorContext::appendGenericCommandArguments(
     const BSONObj& commandPassthroughFields,
     const std::vector<StringData>& knownFields,
@@ -250,7 +257,7 @@ void IDLParserErrorContext::appendGenericCommandArguments(
 
         StringData name = element.fieldNameStringData();
         // Include a passthrough field as long the IDL class has not defined it.
-        if (Command::isGenericArgument(name) &&
+        if (mongo::isGenericArgument(name) &&
             std::find(knownFields.begin(), knownFields.end(), name) == knownFields.end()) {
             builder->append(element);
         }
@@ -279,7 +286,7 @@ std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::u
     output.reserve(input.size());
 
     std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& vec) {
-        return makeCDR(vec);
+        return ConstDataRange(vec);
     });
 
     return output;

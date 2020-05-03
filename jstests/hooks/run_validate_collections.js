@@ -3,35 +3,79 @@
 'use strict';
 
 (function() {
-    assert.eq(typeof db, 'object', 'Invalid `db` object, is the shell connected to a mongod?');
-    load('jstests/hooks/validate_collections.js');  // For validateCollections
+load('jstests/libs/discover_topology.js');      // For Topology and DiscoverTopology.
+load('jstests/hooks/validate_collections.js');  // For CollectionValidator.
 
-    var serverList = [];
-    serverList.push(db.getMongo());
+assert.eq(typeof db, 'object', 'Invalid `db` object, is the shell connected to a mongod?');
+const topology = DiscoverTopology.findConnectedNodes(db.getMongo());
 
-    var addSecondaryNodes = function() {
-        var cmdLineOpts = db.adminCommand('getCmdLineOpts');
-        assert.commandWorked(cmdLineOpts);
+const hostList = [];
 
-        if (cmdLineOpts.parsed.hasOwnProperty('replication') &&
-            cmdLineOpts.parsed.replication.hasOwnProperty('replSet')) {
-            var rst = new ReplSetTest(db.getMongo().host);
-            // Call getPrimary to populate rst with information about the nodes.
-            var primary = rst.getPrimary();
-            assert(primary, 'calling getPrimary() failed');
-            serverList.push(...rst.getSecondaries());
-        }
-    };
+if (topology.type === Topology.kStandalone) {
+    hostList.push(topology.mongod);
+} else if (topology.type === Topology.kReplicaSet) {
+    hostList.push(...topology.nodes);
+} else if (topology.type === Topology.kShardedCluster) {
+    hostList.push(...topology.configsvr.nodes);
 
-    addSecondaryNodes();
+    for (let shardName of Object.keys(topology.shards)) {
+        const shard = topology.shards[shardName];
 
-    for (var server of serverList) {
-        print('Running validate() on ' + server.host);
-        var dbNames = server.getDBNames();
-        for (var dbName of dbNames) {
-            if (!validateCollections(db.getSiblingDB(dbName), {full: true})) {
-                throw new Error('Collection validation failed');
-            }
+        if (shard.type === Topology.kStandalone) {
+            hostList.push(shard.mongod);
+        } else if (shard.type === Topology.kReplicaSet) {
+            hostList.push(...shard.nodes);
+        } else {
+            throw new Error('Unrecognized topology format: ' + tojson(topology));
         }
     }
+} else {
+    throw new Error('Unrecognized topology format: ' + tojson(topology));
+}
+
+const adminDB = db.getSiblingDB('admin');
+const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
+
+let originalFCV;
+let originalTransactionLifetimeLimitSeconds;
+
+if (requiredFCV) {
+    // Running the setFeatureCompatibilityVersion command may implicitly involve running a
+    // multi-statement transaction. We temporarily raise the transactionLifetimeLimitSeconds to be
+    // 24 hours to avoid spurious failures from it having been set to a lower value.
+    originalTransactionLifetimeLimitSeconds = hostList.map(hostStr => {
+        const conn = new Mongo(hostStr);
+        const res = assert.commandWorked(
+            conn.adminCommand({setParameter: 1, transactionLifetimeLimitSeconds: 24 * 60 * 60}));
+        return {conn, originalValue: res.was};
+    });
+
+    originalFCV = adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'});
+
+    if (originalFCV.targetVersion) {
+        // If a previous FCV upgrade or downgrade was interrupted, then we run the
+        // setFeatureCompatibilityVersion command to complete it before attempting to set the
+        // feature compatibility version to 'requiredFCV'.
+        assert.commandWorked(
+            adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV.targetVersion}));
+        checkFCV(adminDB, originalFCV.targetVersion);
+    }
+
+    // Now that we are certain that an upgrade or downgrade of the FCV is not in progress, ensure
+    // the 'requiredFCV' is set.
+    assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: requiredFCV}));
+}
+
+new CollectionValidator().validateNodes(hostList);
+
+if (originalFCV && originalFCV.version !== requiredFCV) {
+    assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV.version}));
+}
+
+if (originalTransactionLifetimeLimitSeconds) {
+    for (let {conn, originalValue} of originalTransactionLifetimeLimitSeconds) {
+        assert.commandWorked(
+            conn.adminCommand({setParameter: 1, transactionLifetimeLimitSeconds: originalValue}));
+    }
+}
 })();

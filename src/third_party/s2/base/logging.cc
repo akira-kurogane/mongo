@@ -11,34 +11,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
-
 #include "logging.h"
 
 #include <utility>
 
-#include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+namespace s2_env {
 
-using ::mongo::logger::LogstreamBuilder;
+LoggingEnv::~LoggingEnv() = default;
 
-LogMessageBase::LogMessageBase(LogstreamBuilder builder, const char* file, int line) :
-    _lsb(std::move(builder)) {
-    _lsb.setBaseMessage(mongoutils::str::stream() << file << ':' << line << ": ");
-}
+LogMessageSink::~LogMessageSink() = default;
 
-LogMessageBase::LogMessageBase(LogstreamBuilder builder) : _lsb(std::move(builder)) { }
+LogMessage::LogMessage(int verbosity)
+  : _sink(globalLoggingEnv().makeSink(verbosity)) { }
+LogMessage::LogMessage(Severity severity)
+  : _sink(globalLoggingEnv().makeSink(severity)) { }
+LogMessage::LogMessage(Severity severity, const char* file, int line)
+  : _sink(globalLoggingEnv().makeSink(severity, file, line)) { }
 
-LogMessageInfo::LogMessageInfo() : LogMessageBase(mongo::log()) { }
+LogMessage::~LogMessage() = default;
 
-LogMessageWarning::LogMessageWarning(const char* file, int line) :
-        LogMessageBase(mongo::warning(), file, line) { }
-
-LogMessageFatal::LogMessageFatal(const char* file, int line) :
-        LogMessageBase(mongo::severe(), file, line) { }
-
-LogMessageFatal::~LogMessageFatal() {
-    _lsb.~LogstreamBuilder();
-    fassertFailed(40048);
-}
+}  // namespace s2_env

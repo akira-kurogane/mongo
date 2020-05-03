@@ -30,8 +30,8 @@ z.start();
 assert.eq(7, z.returnData());
 
 t = 1;
-z = new ScopedThread(function() {
-    assert(typeof(t) == "undefined", "t not undefined");
+z = new Thread(function() {
+    assert(typeof (t) == "undefined", "t not undefined");
     t = 5;
     return t;
 });

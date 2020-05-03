@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +44,7 @@
 #include "mongo/db/index/haystack_access_method_internal.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -52,8 +53,8 @@ using std::unique_ptr;
 namespace dps = ::mongo::dotted_path_support;
 
 HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState,
-                                           SortedDataInterface* btree)
-    : IndexAccessMethod(btreeState, btree) {
+                                           std::unique_ptr<SortedDataInterface> btree)
+    : AbstractIndexAccessMethod(btreeState, std::move(btree)) {
     const IndexDescriptor* descriptor = btreeState->descriptor();
 
     ExpressionParams::parseHaystackParams(
@@ -63,10 +64,21 @@ HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState,
     uassert(16774, "no non-geo fields specified", _otherFields.size());
 }
 
-void HaystackAccessMethod::doGetKeys(const BSONObj& obj,
-                                     BSONObjSet* keys,
-                                     MultikeyPaths* multikeyPaths) const {
-    ExpressionKeysPrivate::getHaystackKeys(obj, _geoField, _otherFields, _bucketSize, keys);
+void HaystackAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                     const BSONObj& obj,
+                                     GetKeysContext context,
+                                     KeyStringSet* keys,
+                                     KeyStringSet* multikeyMetadataKeys,
+                                     MultikeyPaths* multikeyPaths,
+                                     boost::optional<RecordId> id) const {
+    ExpressionKeysPrivate::getHaystackKeys(obj,
+                                           _geoField,
+                                           _otherFields,
+                                           _bucketSize,
+                                           keys,
+                                           getSortedDataInterface()->getKeyStringVersion(),
+                                           getSortedDataInterface()->getOrdering(),
+                                           id);
 }
 
 void HaystackAccessMethod::searchCommand(OperationContext* opCtx,
@@ -75,11 +87,15 @@ void HaystackAccessMethod::searchCommand(OperationContext* opCtx,
                                          double maxDistance,
                                          const BSONObj& search,
                                          BSONObjBuilder* result,
-                                         unsigned limit) {
+                                         unsigned limit) const {
     Timer t;
 
-    LOG(1) << "SEARCH near:" << redact(nearObj) << " maxDistance:" << maxDistance
-           << " search: " << redact(search);
+    LOGV2_DEBUG(20680,
+                1,
+                "SEARCH near:{nearObj} maxDistance:{maxDistance} search: {search}",
+                "nearObj"_attr = redact(nearObj),
+                "maxDistance"_attr = maxDistance,
+                "search"_attr = redact(search));
     int x, y;
     {
         BSONObjIterator i(nearObj);
@@ -108,7 +124,7 @@ void HaystackAccessMethod::searchCommand(OperationContext* opCtx,
 
             BSONObj key = bb.obj();
 
-            unordered_set<RecordId, RecordId::Hasher> thisPass;
+            stdx::unordered_set<RecordId, RecordId::Hasher> thisPass;
 
 
             auto exec = InternalPlanner::indexScan(opCtx,
@@ -125,7 +141,7 @@ void HaystackAccessMethod::searchCommand(OperationContext* opCtx,
                 if (hopper.limitReached()) {
                     break;
                 }
-                pair<unordered_set<RecordId, RecordId::Hasher>::iterator, bool> p =
+                pair<stdx::unordered_set<RecordId, RecordId::Hasher>::iterator, bool> p =
                     thisPass.insert(loc);
                 // If a new element was inserted (haven't seen the RecordId before), p.second
                 // is true.

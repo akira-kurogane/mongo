@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,9 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/exec/collection_scan.h"
+
+#include <memory>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -38,10 +41,10 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/storage/record_fetcher.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/oplog_hack.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 
 #include "mongo/db/client.h"  // XXX-ERH
 
@@ -49,41 +52,48 @@ namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* CollectionScan::kStageType = "COLLSCAN";
 
-CollectionScan::CollectionScan(OperationContext* opCtx,
+CollectionScan::CollectionScan(ExpressionContext* expCtx,
+                               const Collection* collection,
                                const CollectionScanParams& params,
                                WorkingSet* workingSet,
                                const MatchExpression* filter)
-    : PlanStage(kStageType, opCtx),
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _workingSet(workingSet),
-      _filter(filter),
-      _params(params),
-      _isDead(false),
-      _wsidForFetch(_workingSet->allocate()) {
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
+      _params(params) {
     // Explain reports the direction of the collection scan.
     _specificStats.direction = params.direction;
+    _specificStats.minTs = params.minTs;
+    _specificStats.maxTs = params.maxTs;
+    _specificStats.tailable = params.tailable;
+    if (params.minTs || params.maxTs) {
+        // The 'minTs' and 'maxTs' parameters are used for a special optimization that
+        // applies only to forwards scans of the oplog.
+        invariant(params.direction == CollectionScanParams::FORWARD);
+        invariant(collection->ns().isOplog());
+        invariant(!params.resumeAfterRecordId);
+    }
+    invariant(!_params.shouldTrackLatestOplogTimestamp || collection->ns().isOplog());
+
+    if (params.resumeAfterRecordId) {
+        // The 'resumeAfterRecordId' parameter is used for resumable collection scans, which we
+        // only support in the forward direction.
+        invariant(params.direction == CollectionScanParams::FORWARD);
+    }
+
+    // Set early stop condition.
+    if (params.maxTs) {
+        _endConditionBSON = BSON("$gte"_sd << *(params.maxTs));
+        _endCondition = std::make_unique<GTEMatchExpression>(repl::OpTime::kTimestampFieldName,
+                                                             _endConditionBSON.firstElement());
+    }
 }
 
 PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
-    if (_isDead) {
-        Status status(
-            ErrorCodes::CappedPositionLost,
-            str::stream()
-                << "CollectionScan died due to position in capped collection being deleted. "
-                << "Last seen record id: "
-                << _lastSeenId);
-        *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-        return PlanStage::DEAD;
-    }
-
-    if ((0 != _params.maxScan) && (_specificStats.docsTested >= _params.maxScan)) {
-        _commonStats.isEOF = true;
-    }
-
     if (_commonStats.isEOF) {
         return PlanStage::IS_EOF;
     }
@@ -94,7 +104,7 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
         if (needToMakeCursor) {
             const bool forward = _params.direction == CollectionScanParams::FORWARD;
 
-            if (forward && !_params.tailable && _params.collection->ns().isOplog()) {
+            if (forward && _params.shouldWaitForOplogVisibility) {
                 // Forward, non-tailable scans from the oplog need to wait until all oplog entries
                 // before the read begins to be visible. This isn't needed for reverse scans because
                 // we only hide oplog entries from forward scans, and it isn't necessary for tailing
@@ -102,49 +112,74 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // non-tailable scans are the only case where a meaningful EOF will be seen that
                 // might not include writes that finished before the read started. This also must be
                 // done before we create the cursor as that is when we establish the endpoint for
-                // the cursor.
-                _params.collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(
-                    getOpCtx());
+                // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
+                // storage engine snapshot while waiting. Otherwise, we will end up reading from the
+                // snapshot where the oplog entries are not yet visible even after the wait.
+                invariant(!_params.tailable && collection()->ns().isOplog());
+
+                opCtx()->recoveryUnit()->abandonSnapshot();
+                collection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx());
             }
 
-            _cursor = _params.collection->getCursor(getOpCtx(), forward);
+            _cursor = collection()->getCursor(opCtx(), forward);
 
             if (!_lastSeenId.isNull()) {
                 invariant(_params.tailable);
-                // Seek to where we were last time. If it no longer exists, mark us as dead
-                // since we want to signal an error rather than silently dropping data from the
-                // stream. This is related to the _lastSeenId handling in invalidate. Note that
-                // we want to return the record *after* this one since we have already returned
-                // this one. This is only possible in the tailing case because that is the only
-                // time we'd need to create a cursor after already getting a record out of it.
+                // Seek to where we were last time. If it no longer exists, mark us as dead since we
+                // want to signal an error rather than silently dropping data from the stream.
+                //
+                // Note that we want to return the record *after* this one since we have already
+                // returned this one. This is possible in the tailing case. Notably, tailing is the
+                // only time we'd need to create a cursor after already getting a record out of it
+                // and updating our _lastSeenId.
                 if (!_cursor->seekExact(_lastSeenId)) {
-                    _isDead = true;
                     Status status(ErrorCodes::CappedPositionLost,
                                   str::stream() << "CollectionScan died due to failure to restore "
                                                 << "tailable cursor position. "
-                                                << "Last seen record id: "
-                                                << _lastSeenId);
+                                                << "Last seen record id: " << _lastSeenId);
                     *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-                    return PlanStage::DEAD;
+                    return PlanStage::FAILURE;
+                }
+            }
+
+            if (_params.resumeAfterRecordId) {
+                invariant(!_params.tailable);
+                invariant(_lastSeenId.isNull());
+                // Seek to where we are trying to resume the scan from. Signal a KeyNotFound error
+                // if the record no longer exists.
+                //
+                // Note that we want to return the record *after* this one since we have already
+                // returned this one prior to the resume.
+                auto recordIdToSeek = *_params.resumeAfterRecordId;
+                if (!_cursor->seekExact(recordIdToSeek)) {
+                    Status status(
+                        ErrorCodes::KeyNotFound,
+                        str::stream()
+                            << "Failed to resume collection scan: the recordId from which we are "
+                            << "attempting to resume no longer exists in the collection. "
+                            << "recordId: " << recordIdToSeek);
+                    *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
+                    return PlanStage::FAILURE;
                 }
             }
 
             return PlanStage::NEED_TIME;
         }
 
-        if (_lastSeenId.isNull() && !_params.start.isNull()) {
-            record = _cursor->seekExact(_params.start);
-        } else {
-            // See if the record we're about to access is in memory. If not, pass a fetch
-            // request up.
-            if (auto fetcher = _cursor->fetcherForNext()) {
-                // Pass the RecordFetcher up.
-                WorkingSetMember* member = _workingSet->get(_wsidForFetch);
-                member->setFetcher(fetcher.release());
-                *out = _wsidForFetch;
-                return PlanStage::NEED_YIELD;
+        if (_lastSeenId.isNull() && _params.minTs) {
+            // See if the RecordStore supports the oplogStartHack.
+            StatusWith<RecordId> goal = oploghack::keyForOptime(*_params.minTs);
+            if (goal.isOK()) {
+                boost::optional<RecordId> startLoc =
+                    collection()->getRecordStore()->oplogStartHack(opCtx(), goal.getValue());
+                if (startLoc && !startLoc->isNull()) {
+                    LOGV2_DEBUG(20584, 3, "Using direct oplog seek");
+                    record = _cursor->seekExact(*startLoc);
+                }
             }
+        }
 
+        if (!record) {
             record = _cursor->next();
         }
     } catch (const WriteConflictException&) {
@@ -169,27 +204,50 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     }
 
     _lastSeenId = record->id;
+    if (_params.shouldTrackLatestOplogTimestamp) {
+        auto status = setLatestOplogEntryTimestamp(*record);
+        if (!status.isOK()) {
+            *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
+            return PlanStage::FAILURE;
+        }
+    }
 
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = record->id;
-    member->obj = {getOpCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
+    member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson());
     _workingSet->transitionToRecordIdAndObj(id);
 
     return returnIfMatches(member, id, out);
+}
+
+Status CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
+    auto tsElem = record.data.toBson()[repl::OpTime::kTimestampFieldName];
+    if (tsElem.type() != BSONType::bsonTimestamp) {
+        Status status(ErrorCodes::InternalError,
+                      str::stream() << "CollectionScan was asked to track latest operation time, "
+                                       "but found a result without a valid 'ts' field: "
+                                    << record.data.toBson().toString());
+        return status;
+    }
+    _latestOplogEntryTimestamp = std::max(_latestOplogEntryTimestamp, tsElem.timestamp());
+    return Status::OK();
 }
 
 PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
                                                       WorkingSetID memberID,
                                                       WorkingSetID* out) {
     ++_specificStats.docsTested;
-
     if (Filter::passes(member, _filter)) {
         if (_params.stopApplyingFilterAfterFirstMatch) {
             _filter = nullptr;
         }
         *out = memberID;
         return PlanStage::ADVANCED;
+    } else if (_endCondition && Filter::passes(member, _endCondition.get())) {
+        _workingSet->free(memberID);
+        _commonStats.isEOF = true;
+        return PlanStage::IS_EOF;
     } else {
         _workingSet->free(memberID);
         return PlanStage::NEED_TIME;
@@ -197,43 +255,23 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
 }
 
 bool CollectionScan::isEOF() {
-    return _commonStats.isEOF || _isDead;
+    return _commonStats.isEOF;
 }
 
-void CollectionScan::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& id,
-                                  InvalidationType type) {
-    // We don't care about mutations since we apply any filters to the result when we (possibly)
-    // return it.
-    if (INVALIDATION_DELETION != type) {
-        return;
-    }
-
-    // If we're here, 'id' is being deleted.
-
-    // Deletions can harm the underlying RecordCursor so we must pass them down.
-    if (_cursor) {
-        _cursor->invalidate(opCtx, id);
-    }
-
-    if (_params.tailable && id == _lastSeenId) {
-        // This means that deletes have caught up to the reader. We want to error in this case
-        // so readers don't miss potentially important data.
-        _isDead = true;
-    }
-}
-
-void CollectionScan::doSaveState() {
+void CollectionScan::doSaveStateRequiresCollection() {
     if (_cursor) {
         _cursor->save();
     }
 }
 
-void CollectionScan::doRestoreState() {
+void CollectionScan::doRestoreStateRequiresCollection() {
     if (_cursor) {
-        if (!_cursor->restore()) {
-            _isDead = true;
-        }
+        const bool couldRestore = _cursor->restore();
+        uassert(ErrorCodes::CappedPositionLost,
+                str::stream()
+                    << "CollectionScan died due to position in capped collection being deleted. "
+                    << "Last seen record id: " << _lastSeenId,
+                couldRestore);
     }
 }
 
@@ -244,19 +282,19 @@ void CollectionScan::doDetachFromOperationContext() {
 
 void CollectionScan::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> CollectionScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COLLSCAN);
-    ret->specific = make_unique<CollectionScanStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_COLLSCAN);
+    ret->specific = std::make_unique<CollectionScanStats>(_specificStats);
     return ret;
 }
 

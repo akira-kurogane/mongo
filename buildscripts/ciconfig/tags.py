@@ -1,20 +1,19 @@
 """Module to access and modify tag configuration files used by resmoke."""
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import collections
 import copy
+from functools import cmp_to_key
 import textwrap
-
 import yaml
 
 
 # Setup to preserve order in yaml.dump, see https://stackoverflow.com/a/8661021
 def _represent_dict_order(self, data):
-    return self.represent_mapping("tag:yaml.org,2002:map", data.items())
+    return self.represent_mapping("tag:yaml.org,2002:map", list(data.items()))
+
 
 yaml.add_representer(collections.OrderedDict, _represent_dict_order)
+
 # End setup
 
 
@@ -55,11 +54,11 @@ class TagsConfig(object):
 
     def get_test_kinds(self):
         """List the test kinds."""
-        return self._conf.keys()
+        return list(self._conf.keys())
 
     def get_test_patterns(self, test_kind):
         """List the test patterns under 'test_kind'."""
-        return getdefault(self._conf, test_kind, {}).keys()
+        return list(getdefault(self._conf, test_kind, {}).keys())
 
     def get_tags(self, test_kind, test_pattern):
         """List the tags under 'test_kind' and 'test_pattern'."""
@@ -72,7 +71,7 @@ class TagsConfig(object):
         tags = setdefault(patterns, test_pattern, [])
         if tag not in tags:
             tags.append(tag)
-            tags.sort(cmp=self._cmp_func)
+            tags.sort(key=cmp_to_key(self._cmp_func) if self._cmp_func else None)
             return True
         return False
 
@@ -108,11 +107,9 @@ class TagsConfig(object):
         """
         with open(filename, "w") as fstream:
             if preamble:
-                print(textwrap.fill(preamble,
-                                    width=100,
-                                    initial_indent="# ",
-                                    subsequent_indent="# "),
-                      file=fstream)
+                print(
+                    textwrap.fill(preamble, width=100, initial_indent="# ", subsequent_indent="# "),
+                    file=fstream)
 
             # We use yaml.safe_dump() in order avoid having strings being written to the file as
             # "!!python/unicode ..." and instead have them written as plain 'str' instances.
@@ -120,22 +117,23 @@ class TagsConfig(object):
 
 
 def getdefault(doc, key, default):
-    """Return the value in 'doc' with key 'key' if it is present and not None, returns
-    the specified default value otherwise."""
+    """Return the value in 'doc' with key 'key' if present and not None.
+
+    Return the specified default value otherwise.
+    """
     value = doc.get(key)
     if value is not None:
         return value
-    else:
-        return default
+    return default
 
 
 def setdefault(doc, key, default):
-    """Return the value in 'doc' with key 'key' if it is present and not None, sets the value
-    to default and return it otherwise."""
+    """Return the value in 'doc' with key 'key' if present and not None.
+
+    Otherwise set the value to default and return it.
+    """
     value = doc.setdefault(key, default)
     if value is not None:
         return value
-    else:
-        doc[key] = default
-        return default
-
+    doc[key] = default
+    return default

@@ -28,16 +28,36 @@ execute 'extract artifacts' do
 end
 
 if platform_family? 'debian'
+
+  # SERVER-40491 Debian 8 sources.list need to point to archive url
+  if node['platform_version'] == '8.1'
+    cookbook_file '/etc/apt/sources.list' do
+      source 'sources.list.debian8'
+      owner 'root'
+      group 'root'
+      mode '0644'
+      action :create
+    end
+  end
+
   execute 'apt-get update' do
     command 'apt-get update'
   end
 
+  ENV['DEBIAN_FRONTEND'] = 'noninteractive'
   package 'openssl'
 
   # dpkg returns 1 if dependencies are not satisfied, which they will not be
   # for enterprise builds. We install dependencies in the next block.
   execute 'install mongod' do
     command 'dpkg -i `find . -name "*server*.deb"`'
+    cwd homedir
+    returns [0, 1]
+  end
+
+  # install the tools so we can test install_compass
+  execute 'install mongo tools' do
+    command 'dpkg -i `find . -name "*tools-extra*.deb"`'
     cwd homedir
     returns [0, 1]
   end
@@ -49,6 +69,12 @@ if platform_family? 'debian'
     command 'apt-get update && apt-get -y -f install'
   end
 
+  # the ubuntu 16.04 image does not have python installed by default
+  # and it is required for the install_compass script
+  execute 'install python' do
+    command 'apt-get install -y python'
+  end
+
   execute 'install mongo shell' do
     command 'dpkg -i `find . -name "*shell*.deb"`'
     cwd homedir
@@ -58,6 +84,12 @@ end
 if platform_family? 'rhel'
   execute 'install mongod' do
     command 'yum install -y `find . -name "*server*.rpm"`'
+    cwd homedir
+  end
+
+  # install the tools so we can test install_compass
+  execute 'install mongo tools' do
+    command 'yum install -y `find . -name "*tools-extra*.rpm"`'
     cwd homedir
   end
 
@@ -82,6 +114,16 @@ if platform_family? 'suse'
     done
     exit 1
   EOD
+  end
+
+  %w(
+     SLES12-Pool
+     SLES12-Updates
+  ).each do |repo|
+    execute "add #{repo}" do
+      command "zypper addrepo --check --refresh --name \"#{repo}\" http://smt-ec2.susecloud.net/repo/SUSE/Products/SLE-SERVER/12/x86_64/product?credentials=SMT-http_smt-ec2_susecloud_net 'SMT-http_smt-ec2_susecloud_net:#{repo}'"
+      not_if "zypper lr | grep #{repo}"
+    end
   end
 
   execute 'install mongod' do

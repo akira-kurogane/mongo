@@ -1,26 +1,24 @@
-// wiredtiger_session_cache.h
-
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,7 +37,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
@@ -92,27 +90,92 @@ public:
         return _session;
     }
 
-    WT_CURSOR* getCursor(const std::string& uri, uint64_t id, bool forRecordStore);
+    /**
+     * Gets a cursor on the table id 'id'.
+     *
+     * The config string specifies optional arguments for the cursor. For example, when
+     * the config contains 'read_once=true', this is intended for operations that will be
+     * sequentially scanning large amounts of data. If no cursor is currently available in the
+     * cursor cache, then a new cached cursor will be created with the given config specification.
+     *
+     * This may return a cursor from the cursor cache and these cursors should *always* be released
+     * into the cache by calling releaseCursor().
+     */
+    WT_CURSOR* getCachedCursor(const std::string& uri, uint64_t id, const char* config);
 
+
+    /**
+     * Create a new cursor and ignore the cache.
+     *
+     * The config string specifies optional arguments for the cursor. For example, when
+     * the config contains 'read_once=true', this is intended for operations that will be
+     * sequentially scanning large amounts of data.
+     *
+     * This will never return a cursor from the cursor cache, and these cursors should *never* be
+     * released into the cache by calling releaseCursor(). Use closeCursor() instead.
+     */
+    WT_CURSOR* getNewCursor(const std::string& uri, const char* config);
+
+    /**
+     * Release a cursor into the cursor cache and close old cursors if the number of cursors in the
+     * cache exceeds wiredTigerCursorCacheSize.
+     */
     void releaseCursor(uint64_t id, WT_CURSOR* cursor);
+
+    /**
+     * Close a cursor without releasing it into the cursor cache.
+     */
+    void closeCursor(WT_CURSOR* cursor);
 
     void closeCursorsForQueuedDrops(WiredTigerKVEngine* engine);
 
+    /**
+     * Closes all cached cursors matching the uri.  If the uri is empty,
+     * all cached cursors are closed.
+     */
     void closeAllCursors(const std::string& uri);
 
     int cursorsOut() const {
         return _cursorsOut;
     }
 
+    int cachedCursors() const {
+        return _cursors.size();
+    }
+
+    bool isDropQueuedIdentsAtSessionEndAllowed() const {
+        return _dropQueuedIdentsAtSessionEnd;
+    }
+
+    void dropQueuedIdentsAtSessionEndAllowed(bool dropQueuedIdentsAtSessionEnd) {
+        _dropQueuedIdentsAtSessionEnd = dropQueuedIdentsAtSessionEnd;
+    }
+
     static uint64_t genTableId();
 
     /**
-     * For "metadata:" cursors. Guaranteed never to collide with genTableId() ids.
+     * For special cursors. Guaranteed never to collide with genTableId() ids.
      */
-    static const uint64_t kMetadataTableId = 0;
+    enum TableId {
+        /* For "metadata:" cursors */
+        kMetadataTableId,
+        /* For "metadata:create" cursors */
+        kMetadataCreateTableId,
+        /* The start of non-special table ids for genTableId() */
+        kLastTableId
+    };
+
+    void setIdleExpireTime(Date_t idleExpireTime) {
+        _idleExpireTime = idleExpireTime;
+    }
+
+    Date_t getIdleExpireTime() const {
+        return _idleExpireTime;
+    }
 
 private:
     friend class WiredTigerSessionCache;
+    friend class WiredTigerKVEngine;
 
     // The cursor cache is a list of pairs that contain an ID and cursor
     typedef std::list<WiredTigerCachedCursor> CursorCache;
@@ -133,7 +196,9 @@ private:
     WT_SESSION* _session;            // owned
     CursorCache _cursors;            // owned
     uint64_t _cursorGen;
-    int _cursorsCached, _cursorsOut;
+    int _cursorsOut;
+    bool _dropQueuedIdentsAtSessionEnd = true;
+    Date_t _idleExpireTime;
 };
 
 /**
@@ -143,7 +208,7 @@ private:
 class WiredTigerSessionCache {
 public:
     WiredTigerSessionCache(WiredTigerKVEngine* engine);
-    WiredTigerSessionCache(WT_CONNECTION* conn);
+    WiredTigerSessionCache(WT_CONNECTION* conn, ClockSource* cs);
     ~WiredTigerSessionCache();
 
     /**
@@ -155,11 +220,47 @@ public:
     };
 
     /**
+     * Specifies what data will get flushed to disk in a WiredTigerSessionCache::waitUntilDurable()
+     * call.
+     */
+    enum class Fsync {
+        // Flushes only the journal (oplog) to disk.
+        // If journaling is disabled, checkpoints all of the data.
+        kJournal,
+        // Checkpoints data up to the stable timestamp.
+        // If journaling is disabled, checkpoints all of the data.
+        kCheckpointStableTimestamp,
+        // Checkpoints all of the data.
+        kCheckpointAll,
+    };
+
+    /**
+     * Controls whether or not WiredTigerSessionCache::waitUntilDurable() updates the
+     * JournalListener.
+     */
+    enum class UseJournalListener { kUpdate, kSkip };
+
+    /**
+     * Indicates that WiredTiger should be configured to cache cursors.
+     */
+    static bool isEngineCachingCursors();
+
+    /**
      * Returns a smart pointer to a previously released session for reuse, or creates a new session.
      * This method must only be called while holding the global lock to avoid races with
      * shuttingDown, but otherwise is thread safe.
      */
     std::unique_ptr<WiredTigerSession, WiredTigerSessionDeleter> getSession();
+
+    /**
+     * Get a count of idle sessions in the session cache.
+     */
+    size_t getIdleSessionsCount();
+
+    /**
+     * Closes all cached sessions whose idle expiration time has been reached.
+     */
+    void closeExpiredIdleSessions(int64_t idleTimeMillis);
 
     /**
      * Free all cached sessions and ensures that previously acquired sessions will be freed on
@@ -173,8 +274,8 @@ public:
     void closeCursorsForQueuedDrops();
 
     /**
-     * Closes all cached cursors and ensures that previously opened cursors will be closed on
-     * release.
+     * Closes all cached cursors matching the uri.  If the uri is empty,
+     * all cached cursors are closed.
      */
     void closeAllCursors(const std::string& uri);
 
@@ -185,13 +286,55 @@ public:
      */
     void shuttingDown();
 
-    bool isEphemeral();
     /**
-     * Waits until all commits that happened before this call are durable, either by flushing
-     * the log or forcing a checkpoint if forceCheckpoint is true or the journal is disabled.
+     * True when in the process of shutting down.
+     */
+    bool isShuttingDown();
+
+    bool isEphemeral();
+
+    /**
+     * Waits until all commits that happened before this call are made durable.
+     *
+     * Specifying Fsync::kJournal will flush only the (oplog) journal to disk. Callers are
+     * serialized by a mutex and will return early if it is discovered that another thread started
+     * and completed a flush while they slept.
+     *
+     * Specifying Fsync::kCheckpointStableTimestamp will take a checkpoint up to and including the
+     * stable timestamp.
+     *
+     * Specifying Fsync::kCheckpointAll, or if journaling is disabled with kJournal or
+     * kCheckpointStableTimestamp, causes a checkpoint to be taken of all of the data.
+     *
+     * Taking a checkpoint has the benefit of persisting unjournaled writes.
+     *
+     * 'useListener' controls whether or not the JournalListener is updated with the last durable
+     * value of the timestamp that it tracks. The JournalListener's token is fetched before writing
+     * out to disk and set afterwards to update the repl layer durable timestamp.
+     *
      * Uses a temporary session. Safe to call without any locks, even during shutdown.
      */
-    void waitUntilDurable(bool forceCheckpoint, bool stableCheckpoint);
+    void waitUntilDurable(OperationContext* opCtx, Fsync syncType, UseJournalListener useListener);
+
+    /**
+     * Waits until a prepared unit of work has ended (either been commited or aborted). This
+     * should be used when encountering WT_PREPARE_CONFLICT errors. The caller is required to retry
+     * the conflicting WiredTiger API operation. A return from this function does not guarantee that
+     * the conflicting transaction has ended, only that one prepared unit of work in the process has
+     * signaled that it has ended.
+     * Accepts an OperationContext that will throw an AssertionException when interrupted.
+     *
+     * This method is provided in WiredTigerSessionCache and not RecoveryUnit because all recovery
+     * units share the same session cache, and we want a recovery unit on one thread to signal all
+     * recovery units waiting for prepare conflicts across all other threads.
+     */
+    void waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx, uint64_t lastCount);
+
+    /**
+     * Notifies waiters that the caller's perpared unit of work has ended (either committed or
+     * aborted).
+     */
+    void notifyPreparedUnitOfWorkHasCommittedOrAborted();
 
     WT_CONNECTION* conn() const {
         return _conn;
@@ -214,35 +357,55 @@ public:
         return _engine;
     }
 
+    std::uint64_t getPrepareCommitOrAbortCount() const {
+        return _prepareCommitOrAbortCounter.loadRelaxed();
+    }
+
 private:
-    WiredTigerKVEngine* _engine;  // not owned, might be NULL
-    WT_CONNECTION* _conn;         // not owned
+    WiredTigerKVEngine* _engine;      // not owned, might be NULL
+    WT_CONNECTION* _conn;             // not owned
+    ClockSource* const _clockSource;  // not owned
     WiredTigerSnapshotManager _snapshotManager;
 
     // Used as follows:
     //   The low 31 bits are a count of active calls to releaseSession.
     //   The high bit is a flag that is set if and only if we're shutting down.
-    AtomicUInt32 _shuttingDown;
+    AtomicWord<unsigned> _shuttingDown;
     static const uint32_t kShuttingDownMask = 1 << 31;
 
-    stdx::mutex _cacheLock;
+    Mutex _cacheLock = MONGO_MAKE_LATCH("WiredTigerSessionCache::_cacheLock");
     typedef std::vector<WiredTigerSession*> SessionCache;
     SessionCache _sessions;
 
     // Bumped when all open sessions need to be closed
-    AtomicUInt64 _epoch;  // atomic so we can check it outside of the lock
+    AtomicWord<unsigned long long> _epoch;  // atomic so we can check it outside of the lock
 
     // Bumped when all open cursors need to be closed
-    AtomicUInt64 _cursorEpoch;  // atomic so we can check it outside of the lock
+    AtomicWord<unsigned long long> _cursorEpoch;  // atomic so we can check it outside of the lock
 
     // Counter and critical section mutex for waitUntilDurable
-    AtomicUInt32 _lastSyncTime;
-    stdx::mutex _lastSyncMutex;
+    AtomicWord<unsigned> _lastSyncTime;
+    Mutex _lastSyncMutex = MONGO_MAKE_LATCH("WiredTigerSessionCache::_lastSyncMutex");
 
-    // Protects _journalListener.
-    stdx::mutex _journalListenerMutex;
+    // Mutex and cond var for waiting on prepare commit or abort.
+    Mutex _prepareCommittedOrAbortedMutex =
+        MONGO_MAKE_LATCH("WiredTigerSessionCache::_prepareCommittedOrAbortedMutex");
+    stdx::condition_variable _prepareCommittedOrAbortedCond;
+    AtomicWord<std::uint64_t> _prepareCommitOrAbortCounter{0};
+
+    // Protects getting and setting the _journalListener below.
+    Mutex _journalListenerMutex = MONGO_MAKE_LATCH("WiredTigerSessionCache::_journalListenerMutex");
+
     // Notified when we commit to the journal.
-    JournalListener* _journalListener = &NoOpJournalListener::instance;
+    //
+    // This variable should be accessed under the _journalListenerMutex above and saved in a local
+    // variable before use. That way, we can avoid holding a mutex across calls on the object. It is
+    // only allowed to be set once, in order to ensure the memory to which a copy of the pointer
+    // points is always valid.
+    JournalListener* _journalListener = nullptr;
+
+    WT_SESSION* _waitUntilDurableSession = nullptr;  // owned, and never explicitly closed
+                                                     // (uses connection close to clean up)
 
     /**
      * Returns a session to the cache for later reuse. If closeAll was called between getting this
@@ -257,4 +420,8 @@ private:
 typedef std::unique_ptr<WiredTigerSession,
                         typename WiredTigerSessionCache::WiredTigerSessionDeleter>
     UniqueWiredTigerSession;
-}  // namespace
+
+static constexpr char kWTRepairMsg[] =
+    "Please read the documentation for starting MongoDB with --repair here: "
+    "http://dochub.mongodb.org/core/repair";
+}  // namespace mongo

@@ -1,196 +1,106 @@
 /**
-*    Copyright (C) 2017 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
-#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/debug_util.h"
 
 namespace mongo {
 class CollatorInterface;
 class CollectionCatalogEntry;
-class CollectionInfoCache;
-class HeadManager;
 class IndexAccessMethod;
+class IndexBuildInterceptor;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
 
 class IndexCatalogEntry {
 public:
-    // This class represents the internal vtable for the (potentially polymorphic) implementation of
-    // the `IndexCatalogEntry` class.  This allows us to expose an interface to this object without
-    // requiring a dependency upon the implementation's definition library.
-    class Impl {
-    public:
-        virtual ~Impl() = 0;
-
-        virtual const std::string& ns() const = 0;
-
-        virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
-
-        virtual IndexDescriptor* descriptor() = 0;
-
-        virtual const IndexDescriptor* descriptor() const = 0;
-
-        virtual IndexAccessMethod* accessMethod() = 0;
-
-        virtual const IndexAccessMethod* accessMethod() const = 0;
-
-        virtual const Ordering& ordering() const = 0;
-
-        virtual const MatchExpression* getFilterExpression() const = 0;
-
-        virtual const CollatorInterface* getCollator() const = 0;
-
-        virtual const RecordId& head(OperationContext* opCtx) const = 0;
-
-        virtual void setHead(OperationContext* opCtx, RecordId newHead) = 0;
-
-        virtual void setIsReady(bool newIsReady) = 0;
-
-        virtual HeadManager* headManager() const = 0;
-
-        virtual bool isMultikey() const = 0;
-
-        virtual MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const = 0;
-
-        virtual void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) = 0;
-
-        virtual bool isReady(OperationContext* opCtx) const = 0;
-
-        virtual KVPrefix getPrefix() const = 0;
-
-        virtual boost::optional<SnapshotName> getMinimumVisibleSnapshot() = 0;
-
-        virtual void setMinimumVisibleSnapshot(SnapshotName name) = 0;
-    };
-
-private:
-    static std::unique_ptr<Impl> makeImpl(IndexCatalogEntry* this_,
-                                          OperationContext* opCtx,
-                                          StringData ns,
-                                          CollectionCatalogEntry* collection,
-                                          std::unique_ptr<IndexDescriptor> descriptor,
-                                          CollectionInfoCache* infoCache);
-
-public:
-    using factory_function_type = decltype(makeImpl);
-
-    static void registerFactory(stdx::function<factory_function_type> factory);
-
-    explicit IndexCatalogEntry(
-        OperationContext* opCtx,
-        StringData ns,
-        CollectionCatalogEntry* collection,           // not owned
-        std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-        CollectionInfoCache* infoCache);              // not owned, optional
-
-    // Do not call this function.  It exists for use with test drivers that need to inject
-    // alternative implementations.
-    explicit IndexCatalogEntry(std::unique_ptr<Impl> impl) : _pimpl(std::move(impl)) {}
-
-    inline ~IndexCatalogEntry() = default;
+    IndexCatalogEntry() = default;
+    virtual ~IndexCatalogEntry() = default;
 
     inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
     inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
 
-    inline const std::string& ns() const {
-        return this->_impl().ns();
-    }
+    virtual const NamespaceString& ns() const = 0;
 
-    void init(std::unique_ptr<IndexAccessMethod> accessMethod);
+    virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
 
-    inline IndexDescriptor* descriptor() {
-        return this->_impl().descriptor();
-    }
+    virtual const std::string& getIdent() const = 0;
 
-    inline const IndexDescriptor* descriptor() const {
-        return this->_impl().descriptor();
-    }
+    virtual IndexDescriptor* descriptor() = 0;
 
-    inline IndexAccessMethod* accessMethod() {
-        return this->_impl().accessMethod();
-    }
+    virtual const IndexDescriptor* descriptor() const = 0;
 
-    inline const IndexAccessMethod* accessMethod() const {
-        return this->_impl().accessMethod();
-    }
+    virtual IndexAccessMethod* accessMethod() = 0;
 
-    inline const Ordering& ordering() const {
-        return this->_impl().ordering();
-    }
+    virtual const IndexAccessMethod* accessMethod() const = 0;
 
-    inline const MatchExpression* getFilterExpression() const {
-        return this->_impl().getFilterExpression();
-    }
+    virtual bool isHybridBuilding() const = 0;
 
-    inline const CollatorInterface* getCollator() const {
-        return this->_impl().getCollator();
-    }
+    virtual IndexBuildInterceptor* indexBuildInterceptor() = 0;
+
+    virtual const IndexBuildInterceptor* indexBuildInterceptor() const = 0;
+
+    virtual void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) = 0;
+
+    virtual const Ordering& ordering() const = 0;
+
+    virtual const MatchExpression* getFilterExpression() const = 0;
+
+    virtual const CollatorInterface* getCollator() const = 0;
 
     /// ---------------------
 
-    inline const RecordId& head(OperationContext* const opCtx) const {
-        return this->_impl().head(opCtx);
-    }
+    virtual void setIsReady(const bool newIsReady) = 0;
 
-    inline void setHead(OperationContext* const opCtx, const RecordId newHead) {
-        return this->_impl().setHead(opCtx, newHead);
-    }
-
-    inline void setIsReady(const bool newIsReady) {
-        return this->_impl().setIsReady(newIsReady);
-    }
-
-    inline HeadManager* headManager() const {
-        return this->_impl().headManager();
-    }
+    virtual void setDropped() = 0;
+    virtual bool isDropped() const = 0;
 
     // --
 
     /**
      * Returns true if this index is multikey and false otherwise.
      */
-    inline bool isMultikey() const {
-        return this->_impl().isMultikey();
-    }
+    virtual bool isMultikey() const = 0;
 
     /**
      * Returns the path components that cause this index to be multikey if this index supports
@@ -201,9 +111,7 @@ public:
      * returns a vector with size equal to the number of elements in the index key pattern where
      * each element in the vector is an empty set.
      */
-    inline MultikeyPaths getMultikeyPaths(OperationContext* const opCtx) const {
-        return this->_impl().getMultikeyPaths(opCtx);
-    }
+    virtual MultikeyPaths getMultikeyPaths(OperationContext* const opCtx) const = 0;
 
     /**
      * Sets this index to be multikey. Information regarding which newly detected path components
@@ -214,62 +122,38 @@ public:
      * If this index supports path-level multikey tracking, then 'multikeyPaths' must be a vector
      * with size equal to the number of elements in the index key pattern. Additionally, at least
      * one path component of the indexed fields must cause this index to be multikey.
+     *
+     * If isTrackingMultikeyPathInfo() is set on the OperationContext's MultikeyPathTracker,
+     * then after we confirm that we actually need to set the index as multikey, we will save the
+     * namespace, index name, and multikey paths on the OperationContext rather than set the index
+     * as multikey here.
      */
-    void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) {
-        return this->_impl().setMultikey(opCtx, multikeyPaths);
-    }
+    virtual void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) = 0;
 
     // if this ready is ready for queries
-    bool isReady(OperationContext* const opCtx) const {
-        return this->_impl().isReady(opCtx);
-    }
+    virtual bool isReady(OperationContext* const opCtx) const = 0;
 
-    KVPrefix getPrefix() const {
-        return this->_impl().getPrefix();
-    }
+    /**
+     * Returns true if this index is not ready, and it is not currently in the process of being
+     * built either.
+     */
+    virtual bool isFrozen() const = 0;
+
+    virtual KVPrefix getPrefix() const = 0;
 
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must treat this index as unfinished.
      */
-    boost::optional<SnapshotName> getMinimumVisibleSnapshot() {
-        return this->_impl().getMinimumVisibleSnapshot();
-    }
+    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() = 0;
 
-    void setMinimumVisibleSnapshot(const SnapshotName name) {
-        return this->_impl().setMinimumVisibleSnapshot(name);
-    }
-
-private:
-    // This structure exists to give us a customization point to decide how to force users of this
-    // class to depend upon the corresponding `index_catalog_entry.cpp` Translation Unit (TU).  All
-    // public forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
-    struct TUHook {
-        static void hook() noexcept;
-
-        explicit inline TUHook() noexcept {
-            if (kDebugBuild)
-                this->hook();
-        }
-    };
-
-    inline const Impl& _impl() const {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    inline Impl& _impl() {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    std::unique_ptr<Impl> _pimpl;
+    virtual void setMinimumVisibleSnapshot(const Timestamp name) = 0;
 };
 
 class IndexCatalogEntryContainer {
 public:
-    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator const_iterator;
-    typedef std::vector<std::unique_ptr<IndexCatalogEntry>>::const_iterator iterator;
+    typedef std::vector<std::shared_ptr<IndexCatalogEntry>>::const_iterator const_iterator;
+    typedef std::vector<std::shared_ptr<IndexCatalogEntry>>::const_iterator iterator;
 
     const_iterator begin() const {
         return _entries.begin();
@@ -294,6 +178,11 @@ public:
 
     IndexCatalogEntry* find(const std::string& name);
 
+    /**
+     * Returns a pointer to the IndexCatalogEntry corresponding to 'desc', where the caller assumes
+     * shared ownership of the catalog object. Returns null if the entry does not exist.
+     */
+    std::shared_ptr<IndexCatalogEntry> findShared(const IndexDescriptor* desc) const;
 
     unsigned size() const {
         return _entries.size();
@@ -304,20 +193,21 @@ public:
     /**
      * Removes from _entries and returns the matching entry or NULL if none matches.
      */
-    IndexCatalogEntry* release(const IndexDescriptor* desc);
+    std::shared_ptr<IndexCatalogEntry> release(const IndexDescriptor* desc);
 
     bool remove(const IndexDescriptor* desc) {
-        IndexCatalogEntry* entry = release(desc);
-        delete entry;
-        return entry;
+        return static_cast<bool>(release(desc));
     }
 
-    // pass ownership to EntryContainer
-    void add(IndexCatalogEntry* entry) {
-        _entries.push_back(std::unique_ptr<IndexCatalogEntry>{entry});
+    void add(std::shared_ptr<IndexCatalogEntry>&& entry) {
+        _entries.push_back(std::move(entry));
+    }
+
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> getAllEntries() const {
+        return {_entries.begin(), _entries.end()};
     }
 
 private:
-    std::vector<std::unique_ptr<IndexCatalogEntry>> _entries;
+    std::vector<std::shared_ptr<IndexCatalogEntry>> _entries;
 };
 }  // namespace mongo

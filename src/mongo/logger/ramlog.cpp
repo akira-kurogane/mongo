@@ -1,30 +1,30 @@
-// ramlog.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -34,9 +34,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/util/map_util.h"
-#include "mongo/util/mongoutils/html.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -44,8 +42,8 @@ using std::string;
 
 namespace {
 typedef std::map<string, RamLog*> RM;
-stdx::mutex* _namedLock = NULL;
-RM* _named = NULL;
+stdx::mutex* _namedLock = nullptr;
+RM* _named = nullptr;
 
 }  // namespace
 
@@ -59,7 +57,7 @@ RamLog::~RamLog() {}
 
 void RamLog::write(const std::string& str) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _lastWrite = time(0);
+    _lastWrite = time(nullptr);
     _totalLinesWritten++;
 
     char* p = lines[(h + n) % N];
@@ -133,26 +131,11 @@ string RamLog::clean(const std::vector<const char*>& v, int i, string line) {
     return v[i];
 }
 
-string RamLog::color(const std::string& line) {
-    std::string s = str::after(line, "replSet ");
-    if (str::startsWith(s, "warning") || str::startsWith(s, "error"))
-        return html::red(line);
-    if (str::startsWith(s, "info")) {
-        if (str::endsWith(s, " up\n"))
-            return html::green(line);
-        else if (str::contains(s, " down ") || str::endsWith(s, " down\n"))
-            return html::yellow(line);
-        return line;  // html::blue(line);
-    }
-
-    return line;
-}
-
 /* turn http:... into an anchor */
 string RamLog::linkify(const char* s) {
     const char* p = s;
     const char* h = strstr(p, "http://");
-    if (h == 0)
+    if (h == nullptr)
         return s;
 
     const char* sp = h + 7;
@@ -163,41 +146,6 @@ string RamLog::linkify(const char* s) {
     std::stringstream ss;
     ss << string(s, h - s) << "<a href=\"" << url << "\">" << url << "</a>" << sp;
     return ss.str();
-}
-
-void RamLog::toHTML(std::stringstream& s) {
-    LineIterator iter(this);
-    std::vector<const char*> v;
-    while (iter.more())
-        v.push_back(iter.next());
-
-    s << "<pre>\n";
-    for (int i = 0; i < (int)v.size(); i++) {
-        verify(strlen(v[i]) > 24);
-        int r = repeats(v, i);
-        if (r < 0) {
-            s << color(linkify(html::escape(clean(v, i)).c_str())) << '\n';
-        } else {
-            std::stringstream x;
-            x << string(v[i], 0, 24);
-            int nr = (i - r);
-            int last = i + nr - 1;
-            for (; r < i; r++)
-                x << '.';
-            if (1) {
-                std::stringstream r;
-                if (nr == 1)
-                    r << "repeat last line";
-                else
-                    r << "repeats last " << nr << " lines; ends " << string(v[last] + 4, 0, 15);
-                s << html::a("", r.str(), html::escape(clean(v, i, x.str())));
-            } else
-                s << x.str();
-            s << '\n';
-            i = last;
-        }
-    }
-    s << "</pre>\n";
 }
 
 RamLog::LineIterator::LineIterator(RamLog* ramlog)
@@ -221,7 +169,7 @@ Status RamLogAppender::append(const logger::MessageEventEphemeral& event) {
 RamLog* RamLog::get(const std::string& name) {
     if (!_namedLock) {
         // Guaranteed to happen before multi-threaded operation.
-        _namedLock = new stdx::mutex();
+        _namedLock = new stdx::mutex();  // NOLINT
     }
 
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
@@ -230,19 +178,18 @@ RamLog* RamLog::get(const std::string& name) {
         _named = new RM();
     }
 
-    RamLog* result = mapFindWithDefault(*_named, name, static_cast<RamLog*>(NULL));
-    if (!result) {
-        result = new RamLog(name);
-        (*_named)[name] = result;
-    }
-    return result;
+    auto [iter, isNew] = _named->try_emplace(name);
+    if (isNew)
+        iter->second = new RamLog(name);
+    return iter->second;
 }
 
 RamLog* RamLog::getIfExists(const std::string& name) {
     if (!_named)
-        return NULL;
+        return nullptr;
     stdx::lock_guard<stdx::mutex> lk(*_namedLock);
-    return mapFindWithDefault(*_named, name, static_cast<RamLog*>(NULL));
+    auto iter = _named->find(name);
+    return iter == _named->end() ? nullptr : iter->second;
 }
 
 void RamLog::getNames(std::vector<string>& names) {
@@ -266,10 +213,10 @@ MONGO_INITIALIZER(RamLogCatalog)(InitializerContext*) {
             return Status(ErrorCodes::InternalError,
                           "Inconsistent intiailization of RamLogCatalog.");
         }
-        _namedLock = new stdx::mutex();
+        _namedLock = new stdx::mutex();  // NOLINT
         _named = new RM();
     }
 
     return Status::OK();
 }
-}
+}  // namespace mongo

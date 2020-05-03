@@ -1,33 +1,33 @@
-// processinfo_win32.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -37,36 +37,10 @@
 #include <iostream>
 #include <psapi.h>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
 
-using namespace std;
-using std::unique_ptr;
-
 namespace mongo {
-
-// dynamically link to psapi.dll (in case this version of Windows
-// does not support what we need)
-struct PsApiInit {
-    bool supported;
-    typedef BOOL(WINAPI* pQueryWorkingSetEx)(HANDLE hProcess, PVOID pv, DWORD cb);
-    pQueryWorkingSetEx QueryWSEx;
-
-    PsApiInit() {
-        HINSTANCE psapiLib = LoadLibrary(TEXT("psapi.dll"));
-        if (psapiLib) {
-            QueryWSEx =
-                reinterpret_cast<pQueryWorkingSetEx>(GetProcAddress(psapiLib, "QueryWorkingSetEx"));
-            if (QueryWSEx) {
-                supported = true;
-                return;
-            }
-        }
-        supported = false;
-    }
-};
-
-static PsApiInit* psapiGlobal = NULL;
 
 int _wconvertmtos(SIZE_T s) {
     return (int)(s / (1024 * 1024));
@@ -77,7 +51,7 @@ ProcessInfo::ProcessInfo(ProcessId pid) {}
 ProcessInfo::~ProcessInfo() {}
 
 // get the number of CPUs available to the current process
-boost::optional<unsigned long> ProcessInfo::getNumAvailableCores() {
+boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     DWORD_PTR process_mask, system_mask;
 
     if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
@@ -98,7 +72,9 @@ int ProcessInfo::getVirtualMemorySize() {
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GlobalMemoryStatusEx failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23812,
+                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28621, status);
     }
 
@@ -112,7 +88,9 @@ int ProcessInfo::getResidentSize() {
     BOOL status = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GetProcessMemoryInfo failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23813,
+                    "GetProcessMemoryInfo failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28622, status);
     }
 
@@ -125,7 +103,9 @@ double ProcessInfo::getSystemMemoryPressurePercentage() {
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GlobalMemoryStatusEx failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23814,
+                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28623, status);
     }
 
@@ -181,16 +161,22 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     DWORD verSize = GetFileVersionInfoSizeA(filePath, NULL);
     if (verSize == 0) {
         DWORD gle = GetLastError();
-        warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(
+            23807,
+            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
+            "filePath"_attr = filePath,
+            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
     std::unique_ptr<char[]> verData(new char[verSize]);
     if (GetFileVersionInfoA(filePath, NULL, verSize, verData.get()) == 0) {
         DWORD gle = GetLastError();
-        warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(
+            23808,
+            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
+            "filePath"_attr = filePath,
+            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
@@ -198,13 +184,17 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     VS_FIXEDFILEINFO* verInfo;
     if (VerQueryValueA(verData.get(), "\\", (LPVOID*)&verInfo, &size) == 0) {
         DWORD gle = GetLastError();
-        warning() << "VerQueryValueA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(23809,
+                      "VerQueryValueA on {filePath} failed with {errnoWithDescription_gle}",
+                      "filePath"_attr = filePath,
+                      "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
     if (size != sizeof(VS_FIXEDFILEINFO)) {
-        warning() << "VerQueryValueA on " << filePath << " returned structure with unexpected size";
+        LOGV2_WARNING(23810,
+                      "VerQueryValueA on {filePath} returned structure with unexpected size",
+                      "filePath"_attr = filePath);
         return false;
     }
 
@@ -213,64 +203,9 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     return true;
 }
 
-// If the version of the ntfs.sys driver shows that the KB2731284 hotfix or a later update
-// is installed, zeroing out data files is unnecessary. The file version numbers used below
-// are taken from the Hotfix File Information at http://support.microsoft.com/kb/2731284.
-// In https://support.microsoft.com/en-us/kb/3121255, the LDR branch prefix for SP1 is now
-// .23xxxx since patch numbers have rolled over to the next range.
-// Windows 7 RTM has not received patches for KB3121255.
-bool isKB2731284OrLaterUpdateInstalled() {
-    UINT pathBufferSize = GetSystemDirectoryA(NULL, 0);
-    if (pathBufferSize == 0) {
-        DWORD gle = GetLastError();
-        warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
-        return false;
-    }
-
-    std::unique_ptr<char[]> systemDirectory(new char[pathBufferSize]);
-    UINT systemDirectoryPathLen;
-    systemDirectoryPathLen = GetSystemDirectoryA(systemDirectory.get(), pathBufferSize);
-    if (systemDirectoryPathLen == 0) {
-        DWORD gle = GetLastError();
-        warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
-        return false;
-    }
-
-    if (systemDirectoryPathLen != pathBufferSize - 1) {
-        warning() << "GetSystemDirectoryA returned unexpected path length";
-        return false;
-    }
-
-    string ntfsDotSysPath = systemDirectory.get();
-    if (ntfsDotSysPath.back() != '\\') {
-        ntfsDotSysPath.append("\\");
-    }
-    ntfsDotSysPath.append("drivers\\ntfs.sys");
-    DWORD fileVersionMS;
-    DWORD fileVersionLS;
-    if (getFileVersion(ntfsDotSysPath.c_str(), fileVersionMS, fileVersionLS)) {
-        WORD fileVersionFirstNumber = HIWORD(fileVersionMS);
-        WORD fileVersionSecondNumber = LOWORD(fileVersionMS);
-        WORD fileVersionThirdNumber = HIWORD(fileVersionLS);
-        WORD fileVersionFourthNumber = LOWORD(fileVersionLS);
-
-        if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 &&
-            fileVersionThirdNumber == 7600 && fileVersionFourthNumber >= 21296 &&
-            fileVersionFourthNumber <= 21999) {
-            return true;
-        } else if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 &&
-                   fileVersionThirdNumber == 7601 && fileVersionFourthNumber >= 22083 &&
-                   fileVersionFourthNumber <= 23999) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     BSONObjBuilder bExtra;
-    stringstream verstr;
+    std::stringstream verstr;
     OSVERSIONINFOEX osvi;   // os version
     MEMORYSTATUSEX mse;     // memory stats
     SYSTEM_INFO ntsysinfo;  // system stats
@@ -286,12 +221,18 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     mse.dwLength = sizeof(mse);
     if (GlobalMemoryStatusEx(&mse)) {
         memSize = mse.ullTotalPhys;
+        memLimit = memSize;
     }
 
     // get OS version info
     ZeroMemory(&osvi, sizeof(osvi));
     osvi.dwOSVersionInfoSize = sizeof(osvi);
+#pragma warning(push)
+// GetVersionEx is deprecated
+#pragma warning(disable : 4996)
     if (GetVersionEx((OSVERSIONINFO*)&osvi)) {
+#pragma warning(pop)
+
         verstr << osvi.dwMajorVersion << "." << osvi.dwMinorVersion;
         if (osvi.wServicePackMajor)
             verstr << " SP" << osvi.wServicePackMajor;
@@ -299,6 +240,18 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 
         osName = "Microsoft ";
         switch (osvi.dwMajorVersion) {
+            case 10:
+                if (osvi.wProductType == VER_NT_WORKSTATION)
+                    osName += "Windows 10";
+                else {
+                    // The only way to tell apart Windows Server versions is via build number
+                    if (osvi.dwBuildNumber >= 17763) {
+                        osName += "Windows Server 2019";
+                    } else {
+                        osName += "Windows Server 2016";
+                    }
+                }
+                break;
             case 6:
                 switch (osvi.dwMinorVersion) {
                     case 3:
@@ -318,19 +271,6 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
                             osName += "Windows 7";
                         else
                             osName += "Windows Server 2008 R2";
-
-                        // Windows 6.1 is either Windows 7 or Windows 2008 R2. There is no SP2 for
-                        // either of these two operating systems, but the check will hold if one
-                        // were released. This code assumes that SP2 will include fix for
-                        // http://support.microsoft.com/kb/2731284.
-                        //
-                        if ((osvi.wServicePackMajor >= 0) && (osvi.wServicePackMajor < 2)) {
-                            if (isKB2731284OrLaterUpdateInstalled()) {
-                                fileZeroNeeded = false;
-                            } else {
-                                fileZeroNeeded = true;
-                            }
-                        }
                         break;
                     case 0:
                         if (osvi.wProductType == VER_NT_WORKSTATION)
@@ -344,25 +284,8 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
                         break;
                 }
                 break;
-            case 5:
-                switch (osvi.dwMinorVersion) {
-                    case 2:
-                        osName += "Windows Server 2003";
-                        break;
-                    case 1:
-                        osName += "Windows XP";
-                        break;
-                    case 0:
-                        if (osvi.wProductType == VER_NT_WORKSTATION)
-                            osName += "Windows 2000 Professional";
-                        else
-                            osName += "Windows 2000 Server";
-                        break;
-                    default:
-                        osName += "Windows NT version ";
-                        osName += verstr.str();
-                        break;
-                }
+            default:
+                osName += "Windows";
                 break;
         }
     } else {
@@ -384,9 +307,6 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     osVersion = verstr.str();
     hasNuma = checkNumaEnabled();
     _extraStats = bExtra.obj();
-    if (psapiGlobal == NULL) {
-        psapiGlobal = new PsApiInit();
-    }
 }
 
 bool ProcessInfo::checkNumaEnabled() {
@@ -394,17 +314,11 @@ bool ProcessInfo::checkNumaEnabled() {
 
     DWORD returnLength = 0;
     DWORD numaNodeCount = 0;
-    unique_ptr<SYSTEM_LOGICAL_PROCESSOR_INFORMATION[]> buffer;
-
-    LPFN_GLPI glpi(reinterpret_cast<LPFN_GLPI>(
-        GetProcAddress(GetModuleHandleW(L"kernel32"), "GetLogicalProcessorInformation")));
-    if (glpi == NULL) {
-        return false;
-    }
+    std::unique_ptr<SYSTEM_LOGICAL_PROCESSOR_INFORMATION[]> buffer;
 
     DWORD returnCode = 0;
     do {
-        returnCode = glpi(buffer.get(), &returnLength);
+        returnCode = GetLogicalProcessorInformation(buffer.get(), &returnLength);
 
         if (returnCode == FALSE) {
             if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
@@ -412,8 +326,10 @@ bool ProcessInfo::checkNumaEnabled() {
                     new BYTE[returnLength]));
             } else {
                 DWORD gle = GetLastError();
-                warning() << "GetLogicalProcessorInformation failed with "
-                          << errnoWithDescription(gle);
+                LOGV2_WARNING(
+                    23811,
+                    "GetLogicalProcessorInformation failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
                 return false;
             }
         }
@@ -437,7 +353,7 @@ bool ProcessInfo::checkNumaEnabled() {
 }
 
 bool ProcessInfo::blockCheckSupported() {
-    return psapiGlobal->supported;
+    return true;
 }
 
 bool ProcessInfo::blockInMemory(const void* start) {
@@ -459,16 +375,16 @@ bool ProcessInfo::blockInMemory(const void* start) {
 #endif
     PSAPI_WORKING_SET_EX_INFORMATION wsinfo;
     wsinfo.VirtualAddress = const_cast<void*>(start);
-    BOOL result = psapiGlobal->QueryWSEx(GetCurrentProcess(), &wsinfo, sizeof(wsinfo));
+    BOOL result = QueryWorkingSetEx(GetCurrentProcess(), &wsinfo, sizeof(wsinfo));
     if (result)
         if (wsinfo.VirtualAttributes.Valid)
             return true;
     return false;
 }
 
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>* out) {
+bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
     out->resize(numPages);
-    unique_ptr<PSAPI_WORKING_SET_EX_INFORMATION[]> wsinfo(
+    std::unique_ptr<PSAPI_WORKING_SET_EX_INFORMATION[]> wsinfo(
         new PSAPI_WORKING_SET_EX_INFORMATION[numPages]);
 
     const void* startOfFirstPage = alignToStartOfPage(start);
@@ -477,7 +393,7 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>
             reinterpret_cast<unsigned long long>(startOfFirstPage) + i * getPageSize());
     }
 
-    BOOL result = psapiGlobal->QueryWSEx(
+    BOOL result = QueryWorkingSetEx(
         GetCurrentProcess(), wsinfo.get(), sizeof(PSAPI_WORKING_SET_EX_INFORMATION) * numPages);
 
     if (!result)
@@ -487,4 +403,4 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>
     }
     return true;
 }
-}
+}  // namespace mongo

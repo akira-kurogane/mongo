@@ -1,41 +1,42 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "vm/PosixNSPR.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 namespace mozjs {
@@ -49,7 +50,7 @@ class MozJSImplScope;
  * implementation scope from multiple threads.
  *
  * In terms of implementation, it does most of it's heavy lifting through a
- * stdx::function. The proxy scope owns an implementation scope transitively
+ * unique_function. The proxy scope owns an implementation scope transitively
  * through the thread it owns. They communicate by setting a variable, then
  * signaling each other. That communication has to work, there's no fallback
  * for timing out.
@@ -62,7 +63,8 @@ class MozJSImplScope;
  *
  */
 class MozJSProxyScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSProxyScope);
+    MozJSProxyScope(const MozJSProxyScope&) = delete;
+    MozJSProxyScope& operator=(const MozJSProxyScope&) = delete;
 
     /**
      * The FSM is fairly tight:
@@ -111,13 +113,16 @@ public:
 
     void reset() override;
 
+    /**
+     * Thread safe. Kills the running operation
+     */
+    void kill() override;
+
     bool isKillPending() const override;
 
     void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
-
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 
@@ -165,16 +170,9 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
-
-    OperationContext* getOpContext() const;
-
-    /**
-     * Thread safe. Kills the running operation
-     */
-    void kill();
 
     void interrupt();
 
@@ -182,10 +180,13 @@ private:
     template <typename Closure>
     void run(Closure&& closure);
 
-    void runOnImplThread(stdx::function<void()> f);
+    template <typename Closure>
+    void runWithoutInterruptionExceptAtGlobalShutdown(Closure&& closure);
+
+    void runOnImplThread(unique_function<void()> f);
 
     void shutdownThread();
-    static void implThread(void* proxy);
+    static void implThread(MozJSProxyScope* proxy);
 
     MozJSScriptEngine* const _engine;
     MozJSImplScope* _implScope;
@@ -194,13 +195,15 @@ private:
      * This mutex protects _function, _state and _status as channels for
      * function invocation and exception handling
      */
-    stdx::mutex _mutex;
-    stdx::function<void()> _function;
+    Mutex _mutex = MONGO_MAKE_LATCH("MozJSProxyScope::_mutex");
+    unique_function<void()> _function;
     State _state;
     Status _status;
+    OperationContext* _opCtx = nullptr;
 
-    stdx::condition_variable _condvar;
-    PRThread* _thread;
+    stdx::condition_variable _proxyCondvar;
+    stdx::condition_variable _implCondvar;
+    stdx::thread _thread;
 };
 
 }  // namespace mozjs

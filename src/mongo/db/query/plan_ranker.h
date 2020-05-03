@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,8 +29,8 @@
 
 #pragma once
 
-#include <list>
 #include <memory>
+#include <queue>
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
@@ -37,6 +38,7 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/util/container_size_helper.h"
 
 namespace mongo {
 
@@ -49,13 +51,14 @@ struct PlanRankingDecision;
 class PlanRanker {
 public:
     /**
-     * Returns index in 'candidates' of which plan is best.
-     * Populates 'why' with information relevant to how each plan fared in the ranking process.
-     * Caller owns pointers in 'why'.
-     * 'candidateOrder' holds indices into candidates ordered by score (winner in first element).
+     * Returns a PlanRankingDecision which has the ranking and the information about the ranking
+     * process with status OK if everything worked. 'candidateOrder' within the PlanRankingDecision
+     * holds indices into candidates ordered by score (winner in first element).
+     *
+     * Returns an error if there was an issue with plan ranking (e.g. there was no viable plan).
      */
-    static size_t pickBestPlan(const std::vector<CandidatePlan>& candidates,
-                               PlanRankingDecision* why);
+    static StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
+        const std::vector<CandidatePlan>& candidates);
 
     /**
      * Assign the stats tree a 'goodness' score. The higher the score, the better
@@ -69,15 +72,15 @@ public:
  * Does not own any of its pointers.
  */
 struct CandidatePlan {
-    CandidatePlan(QuerySolution* s, PlanStage* r, WorkingSet* w)
-        : solution(s), root(r), ws(w), failed(false) {}
+    CandidatePlan(std::unique_ptr<QuerySolution> solution, PlanStage* r, WorkingSet* w)
+        : solution(std::move(solution)), root(r), ws(w), failed(false) {}
 
     std::unique_ptr<QuerySolution> solution;
     PlanStage* root;  // Not owned here.
     WorkingSet* ws;   // Not owned here.
 
     // Any results produced during the plan's execution prior to ranking are retained here.
-    std::list<WorkingSetID> results;
+    std::queue<WorkingSetID> results;
 
     bool failed;
 };
@@ -101,7 +104,22 @@ struct PlanRankingDecision {
         }
         decision->scores = scores;
         decision->candidateOrder = candidateOrder;
+        decision->failedCandidates = failedCandidates;
         return decision;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in 'stats' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                stats, [](const auto& stat) { return stat->estimateObjectSizeInBytes(); }, true) +
+            // Add size of each element in 'candidateOrder' vector.
+            container_size_helper::estimateObjectSizeInBytes(candidateOrder) +
+            // Add size of each element in 'failedCandidates' vector.
+            container_size_helper::estimateObjectSizeInBytes(failedCandidates) +
+            // Add size of each element in 'scores' vector.
+            container_size_helper::estimateObjectSizeInBytes(scores) +
+            // Add size of the object.
+            sizeof(*this);
     }
 
     // Stats of all plans sorted in descending order by score.
@@ -118,7 +136,14 @@ struct PlanRankingDecision {
     // with corresponding cores[0] and stats[0]. Runner-up would be
     // candidates[candidateOrder[1]] followed by
     // candidates[candidateOrder[2]], ...
+    //
+    // Contains only non-failing plans.
     std::vector<size_t> candidateOrder;
+
+    // Contains the list of original plans that failed.
+    //
+    // Like 'candidateOrder', the contents of this array are indicies into the 'candidates' array.
+    std::vector<size_t> failedCandidates;
 
     // Whether two plans tied for the win.
     //

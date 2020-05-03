@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,21 +38,22 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 const int kOnErrorNumRetries = 3;
 
-Status _getEffectiveStatus(const StatusWith<Shard::CommandResponse>& swResponse) {
+}  // namespace
+
+Status Shard::CommandResponse::getEffectiveStatus(
+    const StatusWith<Shard::CommandResponse>& swResponse) {
     // Check if the request even reached the shard.
     if (!swResponse.isOK()) {
         return swResponse.getStatus();
     }
+
     auto& response = swResponse.getValue();
 
     // If the request reached the shard, check if the command failed.
@@ -67,13 +69,11 @@ Status _getEffectiveStatus(const StatusWith<Shard::CommandResponse>& swResponse)
     return Status::OK();
 }
 
-}  // namespace
-
 Status Shard::CommandResponse::processBatchWriteResponse(
     StatusWith<Shard::CommandResponse> swResponse, BatchedCommandResponse* batchResponse) {
-    auto status = _getEffectiveStatus(swResponse);
+    auto status = getEffectiveStatus(swResponse);
     if (status.isOK()) {
-        string errmsg;
+        std::string errmsg;
         if (!batchResponse->parseBSON(swResponse.getValue().response, &errmsg)) {
             status = Status(ErrorCodes::FailedToParse,
                             str::stream() << "Failed to parse write response: " << errmsg);
@@ -84,9 +84,7 @@ Status Shard::CommandResponse::processBatchWriteResponse(
 
     if (!status.isOK()) {
         batchResponse->clear();
-        batchResponse->setErrCode(status.code());
-        batchResponse->setErrMessage(status.reason());
-        batchResponse->setOk(false);
+        batchResponse->setStatus(status);
     }
 
     return status;
@@ -95,17 +93,10 @@ Status Shard::CommandResponse::processBatchWriteResponse(
 const Milliseconds Shard::kDefaultConfigCommandTimeout = Seconds{30};
 
 bool Shard::shouldErrorBePropagated(ErrorCodes::Error code) {
-    return std::find(RemoteCommandRetryScheduler::kAllRetriableErrors.begin(),
-                     RemoteCommandRetryScheduler::kAllRetriableErrors.end(),
-                     code) == RemoteCommandRetryScheduler::kAllRetriableErrors.end() &&
-        code != ErrorCodes::ExceededTimeLimit;
+    return !isMongosRetriableError(code) && (code != ErrorCodes::NetworkInterfaceExceededTimeLimit);
 }
 
 Shard::Shard(const ShardId& id) : _id(id) {}
-
-const ShardId Shard::getId() const {
-    return _id;
-}
 
 bool Shard::isConfig() const {
     return _id == "config";
@@ -132,11 +123,15 @@ StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* opCtx,
         }
 
         auto swResponse = _runCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
-        auto status = _getEffectiveStatus(swResponse);
+        auto status = CommandResponse::getEffectiveStatus(swResponse);
         if (isRetriableError(status.code(), retryPolicy)) {
-            LOG(2) << "Command " << redact(cmdObj)
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(status));
+            LOGV2_DEBUG(22719,
+                        2,
+                        "Command {command} failed with retryable error and will be retried. Caused "
+                        "by {error}",
+                        "Command failed with retryable error and will be retried",
+                        "command"_attr = redact(cmdObj),
+                        "error"_attr = redact(status));
             continue;
         }
 
@@ -169,11 +164,15 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
         }
 
         auto swResponse = _runCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
-        auto status = _getEffectiveStatus(swResponse);
+        auto status = CommandResponse::getEffectiveStatus(swResponse);
         if (retry < kOnErrorNumRetries && isRetriableError(status.code(), retryPolicy)) {
-            LOG(2) << "Command " << redact(cmdObj)
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(status));
+            LOGV2_DEBUG(22720,
+                        2,
+                        "Command {command} failed with retryable error and will be retried. Caused "
+                        "by {error}",
+                        "Command failed with retryable error and will be retried",
+                        "command"_attr = redact(cmdObj),
+                        "error"_attr = redact(status));
             continue;
         }
 
@@ -182,12 +181,30 @@ StatusWith<Shard::CommandResponse> Shard::runCommandWithFixedRetryAttempts(
     MONGO_UNREACHABLE;
 }
 
+StatusWith<Shard::QueryResponse> Shard::runExhaustiveCursorCommand(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    const std::string& dbName,
+    const BSONObj& cmdObj,
+    Milliseconds maxTimeMSOverride) {
+    for (int retry = 1; retry <= kOnErrorNumRetries; retry++) {
+        auto result =
+            _runExhaustiveCursorCommand(opCtx, readPref, dbName, maxTimeMSOverride, cmdObj);
+
+        if (retry < kOnErrorNumRetries &&
+            isRetriableError(result.getStatus().code(), RetryPolicy::kIdempotent)) {
+            continue;
+        }
+        return result;
+    }
+    MONGO_UNREACHABLE;
+}
+
 BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
                                                    const Milliseconds maxTimeMS,
                                                    const BatchedCommandRequest& batchRequest,
                                                    RetryPolicy retryPolicy) {
-    const std::string dbname = batchRequest.getNS().db().toString();
-
+    const StringData dbname = batchRequest.getNS().db();
     const BSONObj cmdObj = batchRequest.toBSON();
 
     for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
@@ -198,9 +215,13 @@ BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
         BatchedCommandResponse batchResponse;
         auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
         if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
-            LOG(2) << "Batch write command to " << getId()
-                   << " failed with retriable error and will be retried"
-                   << causedBy(redact(writeStatus));
+            LOGV2_DEBUG(22721,
+                        2,
+                        "Batch write command to shard {shardId} failed with retryable error "
+                        "and will be retried. Caused by {error}",
+                        "Batch write command failed with retryable error and will be retried",
+                        "shardId"_attr = getId(),
+                        "error"_attr = redact(writeStatus));
             continue;
         }
 

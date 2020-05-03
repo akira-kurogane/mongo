@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +33,7 @@
 
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
 
@@ -49,7 +50,7 @@ class BalanceChunkRequest {
 public:
     /**
      * Parses the provided BSON content and if it is correct construct a request object with the
-     * request parameters.
+     * request parameters. If the '_id' field is missing in obj, ignore it.
      */
     static StatusWith<BalanceChunkRequest> parseFromConfigCommand(const BSONObj& obj);
 
@@ -62,7 +63,8 @@ public:
         const ShardId& newShardId,
         int64_t maxChunkSizeBytes,
         const MigrationSecondaryThrottleOptions& secondaryThrottle,
-        bool waitForDelete);
+        bool waitForDelete,
+        bool forceJumbo);
 
     /**
      * Produces a BSON object for the variant of the command, which requests the balancer to pick a
@@ -94,6 +96,10 @@ public:
         return _waitForDelete;
     }
 
+    bool getForceJumbo() const {
+        return _forceJumbo;
+    }
+
 private:
     BalanceChunkRequest(ChunkType chunk, MigrationSecondaryThrottleOptions secondaryThrottle);
 
@@ -113,6 +119,8 @@ private:
     // Whether to block and wait for the range deleter to cleanup the orphaned documents at the end
     // of move.
     bool _waitForDelete;
+
+    bool _forceJumbo;
 };
 
 }  // namespace mongo

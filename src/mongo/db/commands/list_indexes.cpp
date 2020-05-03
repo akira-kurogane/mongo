@@ -1,42 +1,44 @@
 /**
- *    Copyright (C) 2014-2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
@@ -46,8 +48,9 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -55,32 +58,46 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace {
 
 /**
  * Lists the indexes for a given collection.
+ * If 'includeBuildUUIDs' is true, then the index build uuid is also returned alongside the index
+ * spec for in-progress index builds only.
  *
  * Format:
  * {
- *   listIndexes: <collection name>
+ *   listIndexes: <collection name>,
+ *   includeBuildUUIDs: <boolean>,
  * }
  *
  * Return format:
  * {
  *   indexes: [
+ *     <index>,
  *     ...
  *   ]
+ * }
+ *
+ * Where '<index>' is the index spec if either the index is ready or 'includeBuildUUIDs' is false.
+ * If the index is in-progress and 'includeBuildUUIDs' is true then '<index>' has the following
+ * format:
+ * {
+ *   spec: <index spec>,
+ *   buildUUID: <index build uuid>
  * }
  */
 class CmdListIndexes : public BasicCommand {
 public:
-    virtual bool slaveOk() const {
-        return false;
+    CmdListIndexes() : BasicCommand("listIndexes") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
     }
-    virtual bool slaveOverrideOk() const {
-        return true;
+
+    bool maintenanceOk() const override {
+        return false;
     }
     virtual bool adminOnly() const {
         return false;
@@ -89,132 +106,120 @@ public:
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "list indexes for a collection";
+    std::string help() const override {
+        return "list indexes for a collection";
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
 
-        // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
-        // 3.0 systems.
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
-        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
-                                                           ActionType::listIndexes) ||
-            authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(dbname, "system.indexes")),
-                ActionType::find)) {
+        if (!authzSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        // Check for the listIndexes ActionType on the database.
+        const auto nss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+            opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj));
+        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(nss),
+                                                           ActionType::listIndexes)) {
             return Status::OK();
         }
 
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to list indexes on collection: "
-                                    << ns.coll());
+                      str::stream()
+                          << "Not authorized to list indexes on collection: " << nss.ns());
     }
-
-    CmdListIndexes() : BasicCommand("listIndexes") {}
 
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        Lock::DBLock dbSLock(opCtx, dbname, MODE_IS);
-        const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
-        Status parseCursorStatus =
-            CursorRequest::parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize);
-        if (!parseCursorStatus.isOK()) {
-            return appendCommandStatus(result, parseCursorStatus);
-        }
+        uassertStatusOK(
+            CursorRequest::parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize));
 
-        AutoGetCollectionForReadCommand autoColl(opCtx, ns, std::move(dbSLock));
-        if (!autoColl.getDb()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::NamespaceNotFound, "Database " + ns.db() + " doesn't exist"));
-        }
+        auto includeBuildUUIDs = cmdObj["includeBuildUUIDs"].trueValue();
 
-        const Collection* collection = autoColl.getCollection();
-        if (!collection) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::NamespaceNotFound, "Collection " + ns.ns() + " doesn't exist"));
-        }
-
-        const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-        invariant(cce);
-
-        vector<string> indexNames;
-        writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&indexNames, &cce, &opCtx] {
-            indexNames.clear();
-            cce->getAllIndexes(opCtx, &indexNames);
-        });
-
-        auto ws = make_unique<WorkingSet>();
-        auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
-
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            BSONObj indexSpec =
-                writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&cce, &opCtx, &indexNames, i] {
-                    return cce->getIndexSpec(opCtx, indexNames[i]);
-                });
-
-            WorkingSetID id = ws->allocate();
-            WorkingSetMember* member = ws->get(id);
-            member->keyData.clear();
-            member->recordId = RecordId();
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
-            member->transitionToOwnedObj();
-            root->pushBack(id);
-        }
-
-        const NamespaceString cursorNss = NamespaceString::makeListIndexesNSS(dbname, ns.coll());
-        dassert(ns == cursorNss.getTargetNSForListIndexes());
-
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD);
-        if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
-        }
-        auto exec = std::move(statusWithPlanExecutor.getValue());
-
+        NamespaceString nss;
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         BSONArrayBuilder firstBatch;
+        {
+            AutoGetCollectionForReadCommand ctx(opCtx,
+                                                CommandHelpers::parseNsOrUUID(dbname, cmdObj));
+            Collection* collection = ctx.getCollection();
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "ns does not exist: " << ctx.getNss().ns(),
+                    collection);
+            nss = ctx.getNss();
 
-        for (long long objCount = 0; objCount < batchSize; objCount++) {
-            BSONObj next;
-            PlanExecutor::ExecState state = exec->getNext(&next, NULL);
-            if (state == PlanExecutor::IS_EOF) {
-                break;
+            auto expCtx = make_intrusive<ExpressionContext>(
+                opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
+
+            auto indexList = listIndexesInLock(opCtx, collection, nss, includeBuildUUIDs);
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
+
+            for (auto&& indexSpec : indexList) {
+                WorkingSetID id = ws->allocate();
+                WorkingSetMember* member = ws->get(id);
+                member->keyData.clear();
+                member->recordId = RecordId();
+                member->resetDocument(SnapshotId(), indexSpec.getOwned());
+                member->transitionToOwnedObj();
+                root->pushBack(id);
             }
-            invariant(state == PlanExecutor::ADVANCED);
 
-            // If we can't fit this result inside the current batch, then we stash it for later.
-            if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
-                exec->enqueue(next);
-                break;
+            exec = uassertStatusOK(PlanExecutor::make(
+                expCtx, std::move(ws), std::move(root), nullptr, PlanExecutor::NO_YIELD, nss));
+
+            for (long long objCount = 0; objCount < batchSize; objCount++) {
+                Document nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
+                if (state == PlanExecutor::IS_EOF) {
+                    break;
+                }
+                invariant(state == PlanExecutor::ADVANCED);
+
+                BSONObj next = nextDoc.toBson();
+                // If we can't fit this result inside the current batch, then we stash it for later.
+                if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
+                    exec->enqueue(next);
+                    break;
+                }
+
+                firstBatch.append(next);
             }
 
-            firstBatch.append(next);
-        }
+            if (exec->isEOF()) {
+                appendCursorResponseObject(0LL, nss.ns(), firstBatch.arr(), &result);
+                return true;
+            }
 
-        CursorId cursorId = 0LL;
-        if (!exec->isEOF()) {
             exec->saveState();
             exec->detachFromOperationContext();
-            auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
-                opCtx,
-                {std::move(exec),
-                 cursorNss,
-                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                 cmdObj});
-            cursorId = pinnedCursor.getCursor()->cursorid();
-        }
+        }  // Drop collection lock. Global cursor registration must be done without holding any
+           // locks.
 
-        appendCursorResponseObject(cursorId, cursorNss.ns(), firstBatch.arr(), &result);
+        const auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
+            opCtx,
+            {
+                std::move(exec),
+                nss,
+                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                opCtx->getWriteConcern(),
+                repl::ReadConcernArgs::get(opCtx),
+                cmdObj,
+                ClientCursorParams::LockPolicy::kLocksInternally,
+                {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)},
+                false  // needsMerge always 'false' for listIndexes.
+            });
+
+        appendCursorResponseObject(
+            pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);
 
         return true;
     }

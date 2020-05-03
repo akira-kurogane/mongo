@@ -1,40 +1,41 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_unwind.h"
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -159,7 +160,7 @@ DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext
                                            const FieldPath& fieldPath,
                                            bool preserveNullAndEmptyArrays,
                                            const boost::optional<FieldPath>& indexPath)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _unwindPath(fieldPath),
       _preserveNullAndEmptyArrays(preserveNullAndEmptyArrays),
       _indexPath(indexPath),
@@ -170,7 +171,7 @@ REGISTER_DOCUMENT_SOURCE(unwind,
                          DocumentSourceUnwind::createFromBson);
 
 const char* DocumentSourceUnwind::getSourceName() const {
-    return "$unwind";
+    return kStageName.rawData();
 }
 
 intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
@@ -186,9 +187,7 @@ intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
     return source;
 }
 
-DocumentSource::GetNextResult DocumentSourceUnwind::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceUnwind::doGetNext() {
     auto nextOut = _unwinder->getNext();
     while (nextOut.isEOF()) {
         // No more elements in array currently being unwound. This will loop if the input
@@ -204,31 +203,6 @@ DocumentSource::GetNextResult DocumentSourceUnwind::getNext() {
     }
 
     return nextOut;
-}
-
-BSONObjSet DocumentSourceUnwind::getOutputSorts() {
-    BSONObjSet out = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    std::string unwoundPath = getUnwindPath();
-    BSONObjSet inputSort = pSource->getOutputSorts();
-
-    for (auto&& sortObj : inputSort) {
-        // Truncate each sortObj at the unwindPath.
-        BSONObjBuilder outputSort;
-
-        for (BSONElement fieldSort : sortObj) {
-            if (fieldSort.fieldNameStringData() == unwoundPath) {
-                break;
-            }
-            outputSort.append(fieldSort);
-        }
-
-        BSONObj outSortObj = outputSort.obj();
-        if (!outSortObj.isEmpty()) {
-            out.insert(outSortObj);
-        }
-    }
-
-    return out;
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceUnwind::getModifiedPaths() const {
@@ -247,9 +221,9 @@ Value DocumentSourceUnwind::serialize(boost::optional<ExplainOptions::Verbosity>
                                 << (_indexPath ? Value((*_indexPath).fullPath()) : Value()))));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
+DepsTracker::State DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
     deps->fields.insert(_unwindPath.fullPath());
-    return SEE_NEXT;
+    return DepsTracker::State::SEE_NEXT;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
@@ -310,4 +284,4 @@ intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
     string pathString(Expression::removeFieldPrefix(prefixedPathString));
     return DocumentSourceUnwind::create(pExpCtx, pathString, preserveNullAndEmptyArrays, indexPath);
 }
-}
+}  // namespace mongo

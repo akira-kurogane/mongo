@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,20 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/hasher.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/sharding_test_fixture.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -55,7 +57,7 @@ protected:
     std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
         BSONObj queryObj = fromjson(queryStr);
         const NamespaceString nss("test.foo");
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(queryObj);
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         auto statusWithCQ =
@@ -73,7 +75,7 @@ protected:
                                  const char* queryStr,
                                  const IndexBounds& expectedBounds) {
         auto query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
+        ASSERT(query.get() != nullptr);
 
         BSONObj key = fromjson(keyStr);
 
@@ -86,7 +88,10 @@ protected:
             for (size_t i = 0; i < oil.intervals.size(); i++) {
                 if (Interval::INTERVAL_EQUALS !=
                     oil.intervals[i].compare(expectedOil.intervals[i])) {
-                    log() << oil.intervals[i] << " != " << expectedOil.intervals[i];
+                    LOGV2(22676,
+                          "Found mismatching field interval",
+                          "queryFieldInterval"_attr = oil.intervals[i],
+                          "expectedFieldInterval"_attr = expectedOil.intervals[i]);
                 }
                 ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                               oil.intervals[i].compare(expectedOil.intervals[i]));
@@ -97,7 +102,7 @@ protected:
     // Assume shard key is { a: 1 }
     void checkIndexBounds(const char* queryStr, const OrderedIntervalList& expectedOil) {
         auto query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
+        ASSERT(query.get() != nullptr);
 
         BSONObj key = fromjson("{a: 1}");
 
@@ -106,9 +111,10 @@ protected:
         const OrderedIntervalList& oil = indexBounds.fields.front();
 
         if (oil.intervals.size() != expectedOil.intervals.size()) {
-            for (size_t i = 0; i < oil.intervals.size(); i++) {
-                log() << oil.intervals[i];
-            }
+            LOGV2(22677,
+                  "Found mismatching field intervals",
+                  "queryFieldInterval"_attr = oil,
+                  "expectedFieldInterval"_attr = expectedOil);
         }
 
         ASSERT_EQUALS(oil.intervals.size(), expectedOil.intervals.size());
@@ -283,7 +289,7 @@ TEST_F(CMCollapseTreeTest, BasicAllElemMatch) {
 
     const char* queryStr = "{foo: {$all: [ {$elemMatch: {a:1, b:1}} ]}}";
     auto query(canonicalize(queryStr));
-    ASSERT(query.get() != NULL);
+    ASSERT(query.get() != nullptr);
 
     BSONObj key = fromjson("{'foo.a': 1}");
 
@@ -319,8 +325,7 @@ TEST_F(CMCollapseTreeTest, Regex) {
     OrderedIntervalList expected;
     expected.intervals.push_back(Interval(BSON(""
                                                << ""
-                                               << ""
-                                               << BSONObj()),
+                                               << "" << BSONObj()),
                                           true,
                                           false));
     BSONObjBuilder builder;
@@ -362,18 +367,12 @@ TEST_F(CMCollapseTreeTest, TextWithQuery) {
 
 //  { a: 0 } -> hashed a: [hash(0), hash(0)]
 TEST_F(CMCollapseTreeTest, HashedSinglePoint) {
-    const char* queryStr = "{ a: 0 }";
-    auto query(canonicalize(queryStr));
-    ASSERT(query.get() != NULL);
-
-    BSONObj key = fromjson("{a: 'hashed'}");
-
-    IndexBounds indexBounds = ChunkManager::getIndexBoundsForQuery(key, *query.get());
-    ASSERT_EQUALS(indexBounds.size(), 1U);
-    const OrderedIntervalList& oil = indexBounds.fields.front();
-    ASSERT_EQUALS(oil.intervals.size(), 1U);
-    const Interval& interval = oil.intervals.front();
-    ASSERT(interval.isPoint());
+    IndexBounds expectedBounds;
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    const auto hashOfZero = BSONElementHasher::hash64(BSON("" << 0).firstElement(), 0);
+    expectedBounds.fields[0].intervals.push_back(
+        Interval(BSON("" << hashOfZero << "" << hashOfZero), true, true));
+    checkIndexBoundsWithKey("{a: 'hashed'}", "{ a: 0}", expectedBounds);
 }
 
 // { a: { $lt: 2, $gt: 1} } -> hashed a: [Minkey, Maxkey]
@@ -399,6 +398,53 @@ TEST_F(CMCollapseTreeTest, HashedRegex) {
     expectedOil.intervals.push_back(Interval(builder.obj(), true, true));
 
     checkIndexBoundsWithKey("{a: 'hashed'}", "{ a: /abc/ }", expectedBounds);
+}
+
+TEST_F(CMCollapseTreeTest, CompoundHashedShardKeyWithHashedPrefix) {
+    const auto shardKey = "{a: 'hashed', b: 1}";
+    const auto query = "{$or: [{a:{$in:[1]},b:{$in:[1]}}, {a:{$in:[1,5]},b:{$gt:0,$lt:3}}]}";
+
+    IndexBounds expectedBounds;
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    const auto hashOfOne = BSONElementHasher::hash64(BSON("" << 1.0).firstElement(), 0);
+    const auto hashOfFive = BSONElementHasher::hash64(BSON("" << 5.0).firstElement(), 0);
+
+    // a: [[hash(5), hash(5)], [hash(1), hash(1)]]. Note, hash(5) is less than hash(1), hence it
+    // appears before hash(1).
+    expectedBounds.fields[0].intervals.push_back(
+        Interval(BSON("" << hashOfFive << "" << hashOfFive), true, true));
+    expectedBounds.fields[0].intervals.push_back(
+        Interval(BSON("" << hashOfOne << "" << hashOfOne), true, true));
+
+    // b: (0,3)
+    expectedBounds.fields[1].intervals.push_back(Interval(BSON("" << 0 << "" << 3), false, false));
+
+    checkIndexBoundsWithKey(shardKey, query, expectedBounds);
+}
+
+TEST_F(CMCollapseTreeTest, CompoundHashedShardKeyWithRangePrefix) {
+    const auto shardKey = "{a: 1, b: 'hashed', c: 1}";
+    const auto query = "{a:{$gt:0,$lte:3}, b: 4}";
+
+    IndexBounds expectedBounds;
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    expectedBounds.fields.push_back(OrderedIntervalList());
+    const auto hashOfFour = BSONElementHasher::hash64(BSON("" << 4.0).firstElement(), 0);
+
+    // a: (0,3]
+    expectedBounds.fields[0].intervals.push_back(Interval(BSON("" << 0 << "" << 3), false, true));
+    // b: [hash(4), hash(4)]
+    expectedBounds.fields[1].intervals.push_back(
+        Interval(BSON("" << hashOfFour << "" << hashOfFour), true, true));
+    // c: [MinKey, MaxKey]
+    BSONObjBuilder builder;
+    builder.appendMinKey("");
+    builder.appendMaxKey("");
+    expectedBounds.fields[2].intervals.push_back(Interval(builder.obj(), true, true));
+
+    checkIndexBoundsWithKey(shardKey, query, expectedBounds);
 }
 
 /**

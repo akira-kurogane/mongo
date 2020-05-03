@@ -1,32 +1,34 @@
-// updatetests.cpp : unit tests relating to update requests
-//
-
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
+
+/**
+ * unit tests relating to update requests
  */
 
 #include "mongo/platform/basic.h"
@@ -34,10 +36,9 @@
 #include <iostream>
 
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
@@ -46,10 +47,10 @@
 
 namespace UpdateTests {
 
-using std::unique_ptr;
 using std::numeric_limits;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
 
 namespace dps = ::mongo::dotted_path_support;
@@ -71,7 +72,7 @@ protected:
         _client.update(ns, Query(q), o, upsert);
     }
     bool error() {
-        return !_client.getPrevError().getField("err").isNull();
+        return !_client.getLastError().empty();
     }
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
@@ -438,7 +439,8 @@ class MultiInc : public SetBase {
 public:
     string s() {
         stringstream ss;
-        unique_ptr<DBClientCursor> cc = _client.query(ns(), Query().sort(BSON("_id" << 1)));
+        unique_ptr<DBClientCursor> cc =
+            _client.query(NamespaceString(ns()), Query().sort(BSON("_id" << 1)));
         bool first = true;
         while (cc->more()) {
             if (first)
@@ -1663,8 +1665,8 @@ public:
     void run() {
         _client.insert(ns(), fromjson("{'_id':0,x:[{a:1},{a:3}]}"));
         // { $push : { x : { $each : [ {a:2} ], $sort: {a:1}, $slice:-2 } } }
-        BSONObj pushObj = BSON(
-            "$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$slice" << -2.0);
+        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
+                                       << "$slice" << -2.0);
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj expected = fromjson("{'_id':0,x:[{a:2},{a:3}]}");
         BSONObj result = _client.findOne(ns(), Query());
@@ -1678,9 +1680,8 @@ public:
         BSONObj expected = fromjson("{'_id':0,x:[{a:1},{a:3}]}");
         _client.insert(ns(), expected);
         // { $push : { x : { $each : [ {a:2} ], $sort : {a:1}, $sort: {a:1} } } }
-        BSONObj pushObj =
-            BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1) << "$sort"
-                         << BSON("a" << 1));
+        BSONObj pushObj = BSON("$each" << BSON_ARRAY(BSON("a" << 2)) << "$sort" << BSON("a" << 1)
+                                       << "$sort" << BSON("a" << 1));
         _client.update(ns(), Query(), BSON("$push" << BSON("x" << pushObj)));
         BSONObj result = _client.findOne(ns(), Query());
         ASSERT_BSONOBJ_EQ(result, expected);
@@ -1761,9 +1762,7 @@ public:
             ns(), BSON("_id" << 0 << "a" << 1 << "x" << BSONObj() << "x" << BSONObj() << "z" << 5));
         _client.update(ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1)));
         ASSERT_BSONOBJ_EQ(BSON("_id" << 0 << "a" << 1 << "x" << BSON("b" << 1 << "c" << 1) << "x"
-                                     << BSONObj()
-                                     << "z"
-                                     << 5),
+                                     << BSONObj() << "z" << 5),
                           _client.findOne(ns(), BSONObj()));
     }
 };
@@ -1777,9 +1776,7 @@ public:
         _client.update(
             ns(), BSONObj(), BSON("$set" << BSON("x.b" << 1 << "x.c" << 1 << "x.d" << 1)));
         ASSERT_BSONOBJ_EQ(BSON("_id" << 0 << "x" << BSON("b" << 1 << "c" << 1 << "d" << 1) << "x"
-                                     << BSONObj()
-                                     << "x"
-                                     << BSONObj()),
+                                     << BSONObj() << "x" << BSONObj()),
                           _client.findOne(ns(), BSONObj()));
     }
 };
@@ -2001,9 +1998,9 @@ class setswitchint : public Base {
 }  // namespace basic
 
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("update") {}
+    All() : OldStyleSuiteSpecification("update") {}
     void setupTests() {
         add<ModId>();
         add<ModNonmodMix>();
@@ -2121,6 +2118,6 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace UpdateTests

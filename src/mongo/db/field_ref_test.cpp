@@ -1,28 +1,30 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include <string>
@@ -32,14 +34,10 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
+namespace mongo {
 namespace {
-
-using mongo::FieldRef;
-using mongo::StringData;
-using mongoutils::str::stream;
-using std::string;
 
 TEST(Empty, NoFields) {
     FieldRef fieldRef("");
@@ -48,7 +46,7 @@ TEST(Empty, NoFields) {
 }
 
 TEST(Empty, NoFieldNames) {
-    string field = ".";
+    std::string field = ".";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 2U);
     ASSERT_EQUALS(fieldRef.getPart(0), "");
@@ -57,7 +55,7 @@ TEST(Empty, NoFieldNames) {
 }
 
 TEST(Empty, NoFieldNames2) {
-    string field = "..";
+    std::string field = "..";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 3U);
     ASSERT_EQUALS(fieldRef.getPart(0), "");
@@ -67,7 +65,7 @@ TEST(Empty, NoFieldNames2) {
 }
 
 TEST(Empty, EmptyFieldName) {
-    string field = ".b.";
+    std::string field = ".b.";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 3U);
     ASSERT_EQUALS(fieldRef.getPart(0), "");
@@ -76,8 +74,17 @@ TEST(Empty, EmptyFieldName) {
     ASSERT_EQUALS(fieldRef.dottedField(), field);
 }
 
+TEST(Empty, ReinitializeWithEmptyString) {
+    FieldRef fieldRef("a.b.c.d.e");
+    ASSERT_EQUALS(fieldRef.numParts(), 5U);
+
+    fieldRef.parse("");
+    ASSERT_EQUALS(fieldRef.numParts(), 0U);
+    ASSERT_EQUALS(fieldRef.dottedField(), "");
+}
+
 TEST(Normal, SinglePart) {
-    string field = "a";
+    std::string field = "a";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 1U);
     ASSERT_EQUALS(fieldRef.getPart(0), field);
@@ -85,7 +92,7 @@ TEST(Normal, SinglePart) {
 }
 
 TEST(Normal, ParseTwice) {
-    string field = "a";
+    std::string field = "a";
     FieldRef fieldRef;
     for (int i = 0; i < 2; i++) {
         fieldRef.parse(field);
@@ -98,7 +105,7 @@ TEST(Normal, ParseTwice) {
 TEST(Normal, MulitplePartsVariable) {
     const char* parts[] = {"a", "b", "c", "d", "e"};
     size_t size = sizeof(parts) / sizeof(char*);
-    string field(parts[0]);
+    std::string field(parts[0]);
     for (size_t i = 1; i < size; i++) {
         field.append(1, '.');
         field.append(parts[i]);
@@ -113,12 +120,12 @@ TEST(Normal, MulitplePartsVariable) {
 }
 
 TEST(Replacement, SingleField) {
-    string field = "$";
+    std::string field = "$";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 1U);
     ASSERT_EQUALS(fieldRef.getPart(0), "$");
 
-    string newField = "a";
+    std::string newField = "a";
     fieldRef.setPart(0, newField);
     ASSERT_EQUALS(fieldRef.numParts(), 1U);
     ASSERT_EQUALS(fieldRef.getPart(0), newField);
@@ -126,12 +133,12 @@ TEST(Replacement, SingleField) {
 }
 
 TEST(Replacement, InMultipleField) {
-    string field = "a.b.c.$.e";
+    std::string field = "a.b.c.$.e";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 5U);
     ASSERT_EQUALS(fieldRef.getPart(3), "$");
 
-    string newField = "d";
+    std::string newField = "d";
     fieldRef.setPart(3, newField);
     ASSERT_EQUALS(fieldRef.numParts(), 5U);
     ASSERT_EQUALS(fieldRef.getPart(3), newField);
@@ -139,8 +146,8 @@ TEST(Replacement, InMultipleField) {
 }
 
 TEST(Replacement, SameFieldMultipleReplacements) {
-    string prefix = "a.";
-    string field = prefix + "$";
+    std::string prefix = "a.";
+    std::string field = prefix + "$";
     FieldRef fieldRef(field);
     ASSERT_EQUALS(fieldRef.numParts(), 2U);
 
@@ -157,25 +164,39 @@ TEST(Prefix, Normal) {
 
     prefix.parse("a.b");
     ASSERT_TRUE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
 
     prefix.parse("a");
     ASSERT_TRUE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
+
+    prefix.parse("a.b.c");
+    ASSERT_FALSE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
 }
 
 TEST(Prefix, Dotted) {
     FieldRef prefix("a.0"), base("a.0.c");
     ASSERT_TRUE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
+
+    prefix.parse("a.0.c");
+    ASSERT_FALSE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
 }
 
 TEST(Prefix, NoPrefixes) {
     FieldRef prefix("a.b"), base("a.b");
     ASSERT_FALSE(prefix.isPrefixOf(base));
+    ASSERT_TRUE(prefix.isPrefixOfOrEqualTo(base));
 
     base.parse("a");
     ASSERT_FALSE(prefix.isPrefixOf(base));
+    ASSERT_FALSE(prefix.isPrefixOfOrEqualTo(base));
 
     base.parse("b");
     ASSERT_FALSE(prefix.isPrefixOf(base));
+    ASSERT_FALSE(prefix.isPrefixOfOrEqualTo(base));
 }
 
 TEST(Prefix, EmptyBase) {
@@ -790,4 +811,99 @@ TEST(RemoveLastPartLong, AppendThenSetPartThenRemove) {
     ASSERT_EQUALS("a.b.0.d.1.f", path.dottedField());
 }
 
+TEST(RemoveLastPartLong, FieldRefCopyConstructor) {
+    FieldRef original("a.b.c");
+    FieldRef copy = original;
+    ASSERT_EQ(original, copy);
+}
+
+TEST(RemoveLastPartLong, FieldRefCopyAssignment) {
+    FieldRef original("a.b.c");
+    FieldRef other("x.y.z");
+    ASSERT_NE(original, other);
+    other = original;
+    ASSERT_EQ(original, other);
+}
+
+TEST(RemoveLastPartLong, FieldRefFromCopyAssignmentIsValidAfterOriginalIsDeleted) {
+    FieldRef copy("x.y.z");
+    {
+        FieldRef original("a.b.c");
+        ASSERT_NE(original, copy);
+        copy = original;
+    }
+    ASSERT_EQ(copy, FieldRef("a.b.c"));
+}
+
+TEST(RemoveLastPartLong, FieldRefFromCopyAssignmentIsADeepCopy) {
+    FieldRef original("a.b.c");
+    FieldRef other("x.y.z");
+    ASSERT_NE(original, other);
+    other = original;
+    ASSERT_EQ(original, other);
+
+    original.setPart(1u, "foo");
+    original.appendPart("bar");
+    ASSERT_EQ(original, FieldRef("a.foo.c.bar"));
+
+    ASSERT_EQ(other, FieldRef("a.b.c"));
+}
+
+TEST(NumericPathComponents, CanIdentifyNumericPathComponents) {
+    FieldRef path("a.0.b.1.c");
+    ASSERT(!path.isNumericPathComponentStrict(0));
+    ASSERT(path.isNumericPathComponentStrict(1));
+    ASSERT(!path.isNumericPathComponentStrict(2));
+    ASSERT(path.isNumericPathComponentStrict(3));
+    ASSERT(!path.isNumericPathComponentStrict(4));
+}
+
+TEST(NumericPathComponents, CanObtainAllNumericPathComponents) {
+    FieldRef path("a.0.b.1.c.2.d");
+    std::set<FieldIndex> expectedComponents{FieldIndex(1), FieldIndex(3), FieldIndex(5)};
+    auto numericPathComponents = path.getNumericPathComponents();
+    ASSERT(numericPathComponents == expectedComponents);
+}
+
+TEST(NumericPathComponents, FieldsWithLeadingZeroesAreNotConsideredNumeric) {
+    FieldRef path("a.0.b.01.c.2.d");
+    std::set<FieldIndex> expectedComponents{FieldIndex(1), FieldIndex(5)};
+    auto numericPathComponents = path.getNumericPathComponents();
+    ASSERT(numericPathComponents == expectedComponents);
+}
+
+TEST(RemoveFirstPart, EmptyPathDoesNothing) {
+    FieldRef path;
+    path.removeFirstPart();
+    ASSERT_EQ(path.numParts(), 0U);
+}
+
+TEST(RemoveFirstPart, PathWithOneComponentBecomesEmpty) {
+    FieldRef path("first");
+    path.removeFirstPart();
+    ASSERT_EQ(path.numParts(), 0U);
+}
+
+TEST(RemoveFirstPart, PathWithTwoComponentsOnlyHoldsSecond) {
+    FieldRef path("remove.keep");
+    path.removeFirstPart();
+    ASSERT_EQ(path.numParts(), 1U);
+    ASSERT_EQ(path, FieldRef("keep"));
+}
+
+TEST(RemoveFirstPart, RemovingFirstPartFromLongPathMultipleTimes) {
+    FieldRef path("first.second.third.fourth.fifth.sixth.seventh.eigth.ninth.tenth");
+    path.removeFirstPart();
+    ASSERT_EQ(path, FieldRef("second.third.fourth.fifth.sixth.seventh.eigth.ninth.tenth"));
+    path.removeFirstPart();
+    ASSERT_EQ(path, FieldRef("third.fourth.fifth.sixth.seventh.eigth.ninth.tenth"));
+    path.removeFirstPart();
+    ASSERT_EQ(path, FieldRef("fourth.fifth.sixth.seventh.eigth.ninth.tenth"));
+    path.removeFirstPart();
+    ASSERT_EQ(path, FieldRef("fifth.sixth.seventh.eigth.ninth.tenth"));
+    path.removeFirstPart();
+    ASSERT_EQ(path, FieldRef("sixth.seventh.eigth.ninth.tenth"));
+}
+
 }  // namespace
+}  // namespace mongo

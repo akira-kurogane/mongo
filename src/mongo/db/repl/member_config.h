@@ -1,23 +1,24 @@
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,8 +33,12 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/repl/member_config_gen.h"
+#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/repl_set_tag.h"
+#include "mongo/db/repl/split_horizon.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -45,66 +50,85 @@ namespace repl {
 /**
  * Representation of the configuration information about a particular member of a replica set.
  */
-class MemberConfig {
+class MemberConfig : private MemberConfigBase {
 public:
+    // Expose certain member functions used externally.
+    using MemberConfigBase::getId;
+    using MemberConfigBase::setNewlyAdded;
+
+    using MemberConfigBase::kArbiterOnlyFieldName;
+    using MemberConfigBase::kBuildIndexesFieldName;
+    using MemberConfigBase::kHiddenFieldName;
+    using MemberConfigBase::kHorizonsFieldName;
+    using MemberConfigBase::kHostFieldName;
+    using MemberConfigBase::kIdFieldName;
+    using MemberConfigBase::kNewlyAddedFieldName;
+    using MemberConfigBase::kPriorityFieldName;
+    using MemberConfigBase::kSlaveDelaySecsFieldName;
+    using MemberConfigBase::kTagsFieldName;
+    using MemberConfigBase::kVotesFieldName;
+
     typedef std::vector<ReplSetTag>::const_iterator TagIterator;
 
-    static const std::string kIdFieldName;
-    static const std::string kVotesFieldName;
-    static const std::string kPriorityFieldName;
-    static const std::string kHostFieldName;
-    static const std::string kHiddenFieldName;
-    static const std::string kSlaveDelayFieldName;
-    static const std::string kArbiterOnlyFieldName;
-    static const std::string kBuildIndexesFieldName;
-    static const std::string kTagsFieldName;
     static const std::string kInternalVoterTagName;
     static const std::string kInternalElectableTagName;
     static const std::string kInternalAllTagName;
+    static const std::string kConfigAllTagName;
+    static const std::string kConfigVoterTagName;
 
     /**
-     * Default constructor, produces a MemberConfig in an undefined state.
-     * Must successfully call initialze() before calling validate() or the
-     * accessors.
-     */
-    MemberConfig() : _slaveDelay(0) {}
-
-    /**
-     * Initializes this MemberConfig from the contents of "mcfg".
+     * Construct a MemberConfig from the contents of "mcfg".
      *
      * If "mcfg" describes any tags, builds ReplSetTags for this
      * configuration using "tagConfig" as the tag's namespace. This may
      * have the effect of altering "tagConfig" when "mcfg" describes a
      * tag not previously added to "tagConfig".
      */
-    Status initialize(const BSONObj& mcfg, ReplSetTagConfig* tagConfig);
+    MemberConfig(const BSONObj& mcfg, ReplSetTagConfig* tagConfig);
 
     /**
-     * Performs basic consistency checks on the member configuration.
+     * Creates a MemberConfig from a BSON object.  Call "addTagInfo", below, afterwards to
+     * finish initializing.
      */
-    Status validate() const;
-
-    /**
-     * Gets the identifier for this member, unique within a ReplSetConfig.
-     */
-    int getId() const {
-        return _id;
-    }
+    static MemberConfig parseFromBSON(const BSONObj& mcfg);
 
     /**
      * Gets the canonical name of this member, by which other members and clients
      * will contact it.
      */
-    const HostAndPort& getHostAndPort() const {
-        return _host;
+    const HostAndPort& getHostAndPort(StringData horizon = SplitHorizon::kDefaultHorizon) const {
+        return _splitHorizon.getHostAndPort(horizon);
     }
 
     /**
-     * Gets this member's priority.  Higher means more likely to be elected
-     * primary.
+     * Gets the mapping of horizon names to `HostAndPort` for this replica set member.
+     */
+    const auto& getHorizonMappings() const {
+        return _splitHorizon.getForwardMappings();
+    }
+
+    /**
+     * Gets the mapping of host names (not `HostAndPort`) to horizon names for this replica set
+     * member.
+     */
+    const auto& getHorizonReverseHostMappings() const {
+        return _splitHorizon.getReverseHostMappings();
+    }
+
+    /**
+     * Gets the horizon name for which the parameters (captured during the first `isMaster`)
+     * correspond.
+     */
+    StringData determineHorizon(const SplitHorizon::Parameters& params) const {
+        return _splitHorizon.determineHorizon(params);
+    }
+
+    /**
+     * Gets this member's effective priority. Higher means more likely to be elected
+     * primary. If the node is newly added, it has an effective priority of 0.0.
      */
     double getPriority() const {
-        return _priority;
+        return isNewlyAdded() ? 0.0 : MemberConfigBase::getPriority();
     }
 
     /**
@@ -112,18 +136,19 @@ public:
      * remain.  Zero seconds means stay as caught up as possible.
      */
     Seconds getSlaveDelay() const {
-        return _slaveDelay;
+        return Seconds(getSlaveDelaySecs());
     }
 
     /**
-     * Returns true if this member may vote in elections.
+     * Returns true if this member may vote in elections. If the node is newly added, it should be
+     * treated as a non-voting node.
      */
     bool isVoter() const {
-        return _votes != 0;
+        return (getVotes() != 0 && !isNewlyAdded());
     }
 
     /**
-     * Returns the number of votes that this member gets.
+     * Returns the number of votes the member has.
      */
     int getNumVotes() const {
         return isVoter() ? 1 : 0;
@@ -133,21 +158,33 @@ public:
      * Returns true if this member is an arbiter (is not data-bearing).
      */
     bool isArbiter() const {
-        return _arbiterOnly;
+        return getArbiterOnly();
+    }
+
+    /**
+     * Returns true if this member is newly added from reconfig. This indicates that this node
+     * should be treated as non-voting.
+     */
+    bool isNewlyAdded() const {
+        if (getNewlyAdded()) {
+            invariant(getNewlyAdded().get());
+            return true;
+        }
+        return false;
     }
 
     /**
      * Returns true if this member is hidden (not reported by isMaster, not electable).
      */
     bool isHidden() const {
-        return _hidden;
+        return getHidden();
     }
 
     /**
      * Returns true if this member should build secondary indexes.
      */
     bool shouldBuildIndexes() const {
-        return _buildIndexes;
+        return getBuildIndexes();
     }
 
     /**
@@ -158,10 +195,9 @@ public:
     }
 
     /**
-     * Returns true if this MemberConfig has any non-internal tags, using "tagConfig" to
-     * determine the internal property of the tags.
+     * Returns true if this MemberConfig has any non-internal tags.
      */
-    bool hasTags(const ReplSetTagConfig& tagConfig) const;
+    bool hasTags() const;
 
     /**
      * Gets a begin iterator over the tags for this member.
@@ -185,20 +221,27 @@ public:
     }
 
     /**
-     * Returns the member config as a BSONObj, using "tagConfig" to generate the tag subdoc.
+     * Returns the member config as a BSONObj.
      */
-    BSONObj toBSON(const ReplSetTagConfig& tagConfig) const;
+    BSONObj toBSON(bool omitNewlyAddedField = false) const;
+
+    /*
+     * Adds the tag info for this member to the tagConfig; to be used after an IDL parse.
+     */
+    void addTagInfo(ReplSetTagConfig* tagConfig);
 
 private:
-    int _id;
-    HostAndPort _host;
-    double _priority;  // 0 means can never be primary
-    int _votes;        // Can this member vote? Only 0 and 1 are valid.  Default 1.
-    bool _arbiterOnly;
-    Seconds _slaveDelay;
-    bool _hidden;                   // if set, don't advertise to drivers in isMaster.
-    bool _buildIndexes;             // if false, do not create any non-_id indexes
+    /**
+     * Constructor used by IDL; does not set up tags because we cannot pass TagConfig through IDL.
+     */
+    MemberConfig(const BSONObj& mcfg);
+
+    const HostAndPort& _host() const {
+        return getHostAndPort(SplitHorizon::kDefaultHorizon);
+    }
+
     std::vector<ReplSetTag> _tags;  // tagging for data center, rack, etc.
+    SplitHorizon _splitHorizon;
 };
 
 }  // namespace repl

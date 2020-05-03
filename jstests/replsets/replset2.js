@@ -1,7 +1,6 @@
 load("jstests/replsets/rslib.js");
 
 doTest = function(signal) {
-
     // Test replication with write concern.
 
     // Replica set testing API
@@ -28,7 +27,7 @@ doTest = function(signal) {
     // Wait for states to become PRI,SEC,SEC
     waitForAllMembers(master.getDB(testDB));
 
-    var slaves = replTest.liveNodes.slaves;
+    var slaves = replTest._slaves;
     slaves.forEach(function(slave) {
         slave.setSlaveOk();
     });
@@ -47,7 +46,7 @@ doTest = function(signal) {
 
     printjson(master.getDB("admin").runCommand("replSetGetStatus"));
 
-    assert.writeOK(bulk.execute({w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}));
+    assert.commandWorked(bulk.execute({w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}));
 
     print("replset2.js **** TEMP 1a ****");
 
@@ -67,7 +66,7 @@ doTest = function(signal) {
     print("replset2.js **** Try inserting a single record ****");
     master.getDB(testDB).dropDatabase();
     var options = {writeConcern: {w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}};
-    assert.writeOK(master.getDB(testDB).foo.insert({n: 1}, options));
+    assert.commandWorked(master.getDB(testDB).foo.insert({n: 1}, options));
 
     m1 = master.getDB(testDB).foo.findOne({n: 1});
     printjson(m1);
@@ -86,7 +85,7 @@ doTest = function(signal) {
         for (var n = 0; n < 1000; n++) {
             bulk.insert({n: n, data: bigData});
         }
-        assert.writeOK(bulk.execute({w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}));
+        assert.commandWorked(bulk.execute({w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}));
 
         print("replset2.js **** V1 ");
 

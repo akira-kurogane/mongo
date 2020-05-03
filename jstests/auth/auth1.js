@@ -1,5 +1,9 @@
 // test read/write permissions
 // skip this test on 32-bit platforms
+// @tags: [requires_profiling]
+
+// Multiple users cannot be authenticated on one connection within a session.
+TestData.disableImplicitSessions = true;
 
 function setupTest() {
     print("START auth1.js");
@@ -37,8 +41,6 @@ function runTest(m) {
 
     print("make sure we can't run certain commands w/out auth");
     var codeUnauthorized = 13;
-    var rslt = db.runCommand({eval: "function() { return 1; }"});
-    assert.eq(rslt.code, codeUnauthorized, tojson(rslt));
     var rslt = db.runCommand({getLog: "global"});
     assert.eq(rslt.code, codeUnauthorized, tojson(rslt));
 
@@ -60,16 +62,6 @@ function runTest(m) {
     db.setProfilingLevel(0);
     assert.lt(0, db.system.profile.find({user: "eliot@test"}).count(), "AP1");
 
-    var p = {
-        key: {i: true},
-        reduce: function(obj, prev) {
-            prev.count++;
-        },
-        initial: {count: 0}
-    };
-
-    assert.eq(1000, t.group(p).length, "A5");
-
     assert(dbRO.auth("guest", "guest"), "auth failed 2");
 
     assert.eq(1000, tRO.count(), "B1");
@@ -79,41 +71,15 @@ function runTest(m) {
     assert.writeError(tRO.save({}));
 
     assert.eq(1000, tRO.count(), "B6");
-
-    assert.eq(1000, tRO.group(p).length, "C1");
-
-    var p = {
-        key: {i: true},
-        reduce: function(obj, prev) {
-            db.jstests_auth_auth1.save({i: 10000});
-            prev.count++;
-        },
-        initial: {count: 0}
-    };
-
-    assert.throws(function() {
-        return t.group(p);
-    }, [], "write reduce didn't fail");
-    assert.eq(1000, dbRO.jstests_auth_auth1.count(), "C3");
-
     db.getSiblingDB('admin').auth('super', 'super');
 
-    assert.eq(1000,
-              db.eval(function() {
-                  return db["jstests_auth_auth1"].count();
-              }),
-              "D1");
-    db.eval(function() {
-        db["jstests_auth_auth1"].save({i: 1000});
-    });
-    assert.eq(1001,
-              db.eval(function() {
-                  return db["jstests_auth_auth1"].count();
-              }),
-              "D2");
+    assert.eq(1000, t.count(), "D1");
+    t.insert({i: 1000});
+    assert.eq(1001, t.count(), "D2");
 
     print("SUCCESS auth1.js");
 }
 
 var m = setupTest();
 runTest(m);
+MongoRunner.stopMongod(m, null, {user: "root", pwd: "root"});

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +38,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -47,7 +48,7 @@ namespace {
 /**
  * Protocols supported by order of preference.
  */
-const Protocol kPreferredProtos[] = {Protocol::kOpMsg, Protocol::kOpCommandV1, Protocol::kOpQuery};
+const Protocol kPreferredProtos[] = {Protocol::kOpMsg, Protocol::kOpQuery};
 
 struct ProtocolSetAndName {
     StringData name;
@@ -56,14 +57,11 @@ struct ProtocolSetAndName {
 
 constexpr ProtocolSetAndName protocolSetNames[] = {
     // Most common ones go first.
-    {"all"_sd, supports::kAll},                                                     // new mongod.
-    {"opQueryAndOpMsg"_sd, supports::kOpQueryOnly | supports::kOpMsgOnly},          // new mongos.
-    {"opQueryAndOpCommand"_sd, supports::kOpQueryOnly | supports::kOpCommandOnly},  // old mongod.
-    {"opQueryOnly"_sd, supports::kOpQueryOnly},  // old mongos or very old client or mongod.
+    {"all"_sd, supports::kAll},                  // new mongod and mongos or very new client.
+    {"opQueryOnly"_sd, supports::kOpQueryOnly},  // old mongos or mongod or moderately old client.
 
     // Then the rest (these should never happen in production).
     {"none"_sd, supports::kNone},
-    {"opCommandOnly"_sd, supports::kOpCommandOnly},
     {"opMsgOnly"_sd, supports::kOpMsgOnly},
 };
 
@@ -75,8 +73,6 @@ Protocol protocolForMessage(const Message& message) {
             return Protocol::kOpMsg;
         case mongo::dbQuery:
             return Protocol::kOpQuery;
-        case mongo::dbCommand:
-            return Protocol::kOpCommandV1;
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "
@@ -139,38 +135,17 @@ StatusWith<ProtocolSetAndWireVersionInfo> parseProtocolSetFromIsMasterReply(
         return minWireExtractStatus;
     }
 
-    bool isMongos = false;
-
-    std::string msgField;
-    auto msgFieldExtractStatus = bsonExtractStringField(isMasterReply, "msg", &msgField);
-
-    if (msgFieldExtractStatus == ErrorCodes::NoSuchKey) {
-        isMongos = false;
-    } else if (!msgFieldExtractStatus.isOK()) {
-        return msgFieldExtractStatus;
-    } else {
-        isMongos = (msgField == "isdbgrid");
-    }
-
     if (minWireVersion < 0 || maxWireVersion < 0 ||
         minWireVersion >= std::numeric_limits<int>::max() ||
         maxWireVersion >= std::numeric_limits<int>::max()) {
         return Status(ErrorCodes::IncompatibleServerVersion,
                       str::stream() << "Server min and max wire version have invalid values ("
-                                    << minWireVersion
-                                    << ","
-                                    << maxWireVersion
-                                    << ")");
+                                    << minWireVersion << "," << maxWireVersion << ")");
     }
 
     WireVersionInfo version{static_cast<int>(minWireVersion), static_cast<int>(maxWireVersion)};
 
     auto protos = computeProtocolSet(version);
-    if (isMongos) {
-        // Remove support for protocols that mongos doesn't support.
-        protos &= ~supports::kOpCommandOnly;
-    }
-
     return {{protos, version}};
 }
 
@@ -180,14 +155,12 @@ ProtocolSet computeProtocolSet(const WireVersionInfo version) {
         if (version.maxWireVersion >= WireVersion::SUPPORTS_OP_MSG) {
             result |= supports::kOpMsgOnly;
         }
-        if (version.maxWireVersion >= WireVersion::FIND_COMMAND &&
-            version.maxWireVersion <= WireVersion::SUPPORTS_OP_MSG) {
-            // Future versions may remove support for OP_COMMAND.
-            result |= supports::kOpCommandOnly;
-        }
         if (version.minWireVersion <= WireVersion::RELEASE_2_4_AND_BEFORE) {
             result |= supports::kOpQueryOnly;
         }
+        // Note: this means anything using the internal handshake cannot talk to servers between 2.6
+        // and 3.6, since the servers will reply with higher minWireVersions. The shell should still
+        // be able to connect to those versions but will just use OP_QUERY to run commands.
     }
     return result;
 }
@@ -200,27 +173,33 @@ Status validateWireVersion(const WireVersionInfo client, const WireVersionInfo s
     // Server may return bad data.
     if (server.minWireVersion > server.maxWireVersion) {
         return Status(ErrorCodes::IncompatibleServerVersion,
-                      str::stream() << "Server min and max wire version are incorrect ("
-                                    << server.minWireVersion
-                                    << ","
-                                    << server.maxWireVersion
-                                    << ")");
+                      str::stream()
+                          << "Server min and max wire version are incorrect ("
+                          << server.minWireVersion << "," << server.maxWireVersion << ")");
     }
 
     // Determine if the [min, max] tuples overlap.
     // We assert the invariant that min < max above.
     if (!(client.minWireVersion <= server.maxWireVersion &&
           client.maxWireVersion >= server.minWireVersion)) {
+        std::string errmsg = str::stream()
+            << "Server min and max wire version (" << server.minWireVersion << ","
+            << server.maxWireVersion << ") is incompatible with client min wire version ("
+            << client.minWireVersion << "," << client.maxWireVersion << ").";
+        if (client.maxWireVersion < server.minWireVersion) {
+            return Status(ErrorCodes::IncompatibleWithUpgradedServer,
+                          str::stream()
+                              << errmsg
+                              << "You (client) are attempting to connect to a node (server) that "
+                                 "no longer accepts connections with your (client’s) binary "
+                                 "version. Please upgrade the client’s binary version.");
+        }
         return Status(ErrorCodes::IncompatibleServerVersion,
-                      str::stream() << "Server min and max wire version are incompatible ("
-                                    << server.minWireVersion
-                                    << ","
-                                    << server.maxWireVersion
-                                    << ") with client min wire version ("
-                                    << client.minWireVersion
-                                    << ","
-                                    << client.maxWireVersion
-                                    << ")");
+                      str::stream() << errmsg
+                                    << "You (client) are attempting to connect to a node "
+                                       "(server) with a binary version with which "
+                                       "you (client) no longer accept connections. Please "
+                                       "upgrade the server’s binary version.");
     }
 
     return Status::OK();

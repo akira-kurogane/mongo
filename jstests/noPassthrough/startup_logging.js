@@ -4,34 +4,34 @@
 
 (function() {
 
-    'use strict';
+'use strict';
 
-    function makeRegExMatchFn(pattern) {
-        return function(text) {
-            return pattern.test(text);
-        };
-    }
+function makeRegExMatchFn(pattern) {
+    return function(text) {
+        return pattern.test(text);
+    };
+}
 
-    function testStartupLogging(launcher, matchFn, expectedExitCode) {
-        assert(matchFn(rawMongoProgramOutput()));
-    }
+function testStartupLogging(launcher, matchFn, expectedExitCode) {
+    assert(matchFn(rawMongoProgramOutput()));
+}
 
-    function validateWaitingMessage(launcher) {
-        clearRawMongoProgramOutput();
-        var conn = launcher.start({});
-        testStartupLogging(launcher, makeRegExMatchFn(/waiting for connections on port/));
-        launcher.stop(conn, undefined, {});
-    }
+function validateWaitingMessage(launcher) {
+    clearRawMongoProgramOutput();
+    var conn = launcher.start({});
+    launcher.stop(conn, undefined, {});
+    testStartupLogging(
+        launcher,
+        makeRegExMatchFn(
+            /"id":23016,\s*"ctx":"listener","msg":"Waiting for connections","attr":{"port":/));
+}
 
-    print("********************\nTesting startup logging in mongod\n********************");
+print("********************\nTesting startup logging in mongod\n********************");
 
-    validateWaitingMessage({
-        start: function(opts) {
-            var actualOpts = {nojournal: ""};
-            Object.extend(actualOpts, opts);
-            return MongoRunner.runMongod(actualOpts);
-        },
-        stop: MongoRunner.stopMongod
-    });
-
+validateWaitingMessage({
+    start: function(opts) {
+        return MongoRunner.runMongod(opts);
+    },
+    stop: MongoRunner.stopMongod
+});
 }());

@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -34,9 +35,9 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -46,7 +47,11 @@ auto kLogInterval = stdx::chrono::minutes(1);
 
 void DeferredWriter::_logFailure(const Status& status) {
     if (TimePoint::clock::now() - _lastLogged > kLogInterval) {
-        log() << "Unable to write to collection " << _nss.toString() << ": " << status.toString();
+        LOGV2(20516,
+              "Unable to write to collection {nss}: {status}",
+              "Unable to write to collection",
+              "namespace"_attr = _nss.toString(),
+              "error"_attr = status);
         _lastLogged = stdx::chrono::system_clock::now();
     }
 }
@@ -54,8 +59,11 @@ void DeferredWriter::_logFailure(const Status& status) {
 void DeferredWriter::_logDroppedEntry() {
     _droppedEntries += 1;
     if (TimePoint::clock::now() - _lastLoggedDrop > kLogInterval) {
-        log() << "Deferred write buffer for " << _nss.toString() << " is full. " << _droppedEntries
-              << " entries have been dropped.";
+        LOGV2(
+            20517,
+            "Deferred write buffer for {nss} is full. {droppedEntries} entries have been dropped.",
+            "nss"_attr = _nss.toString(),
+            "droppedEntries"_attr = _droppedEntries);
         _lastLoggedDrop = stdx::chrono::system_clock::now();
         _droppedEntries = 0;
     }
@@ -75,7 +83,7 @@ Status DeferredWriter::_makeCollection(OperationContext* opCtx) {
 StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
     OperationContext* opCtx) {
     std::unique_ptr<AutoGetCollection> agc;
-    agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+    agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
 
     while (!agc->getCollection()) {
         // Release the previous AGC's lock before trying to rebuild the collection.
@@ -86,7 +94,7 @@ StatusWith<std::unique_ptr<AutoGetCollection>> DeferredWriter::_getCollection(
             return status;
         }
 
-        agc = stdx::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
+        agc = std::make_unique<AutoGetCollection>(opCtx, _nss, MODE_IX);
     }
 
     return std::move(agc);
@@ -117,7 +125,7 @@ void DeferredWriter::_worker(InsertStatement stmt) {
         return Status::OK();
     });
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     _numBytes -= stmt.doc.objsize();
 
@@ -146,7 +154,7 @@ void DeferredWriter::startup(std::string workerName) {
     options.minThreads = 0;
     options.maxThreads = 1;
     options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
-    _pool = stdx::make_unique<ThreadPool>(options);
+    _pool = std::make_unique<ThreadPool>(options);
     _pool->startup();
 }
 
@@ -165,7 +173,7 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
     // We can't insert documents if we haven't been started up.
     invariant(_pool);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     // Check if we're allowed to insert this object.
     if (_numBytes + obj.objsize() >= _maxNumBytes) {
@@ -177,8 +185,11 @@ bool DeferredWriter::insertDocument(BSONObj obj) {
 
     // Add the object to the buffer.
     _numBytes += obj.objsize();
-    fassertStatusOK(40588,
-                    _pool->schedule([this, obj] { _worker(InsertStatement(obj.getOwned())); }));
+    _pool->schedule([this, obj](auto status) {
+        fassert(40588, status);
+
+        _worker(InsertStatement(obj.getOwned()));
+    });
     return true;
 }
 

@@ -1,42 +1,46 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
+
+#include <algorithm>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/config.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/tcmalloc_parameters_gen.h"
 
 #include <gperftools/malloc_hook.h>
 #include <third_party/murmurhash3/MurmurHash3.h>
@@ -126,6 +130,30 @@
 namespace mongo {
 namespace {
 
+// Simple wrapper for the demangler, particularly its buffer space.
+class Demangler {
+public:
+    Demangler() = default;
+
+    Demangler(const Demangler&) = delete;
+
+    ~Demangler() {
+        free(_buf);
+    }
+
+    char* operator()(const char* sym) {
+        char* dm = abi::__cxa_demangle(sym, _buf, &_bufSize, &_status);
+        if (dm)
+            _buf = dm;
+        return dm;
+    }
+
+private:
+    size_t _bufSize = 0;
+    char* _buf = nullptr;
+    int _status = 0;
+};
+
 //
 // Simple hash table maps Key->Value.
 // All storage is pre-allocated at creation.
@@ -150,7 +178,8 @@ using Hash = uint32_t;
 
 template <class Key, class Value>
 class HashTable {
-    MONGO_DISALLOW_COPYING(HashTable);
+    HashTable(const HashTable&) = delete;
+    HashTable& operator=(const HashTable&) = delete;
 
 private:
     struct Entry {
@@ -280,8 +309,10 @@ private:
     // >1: sample ever sampleIntervalBytes bytes allocated - less accurate but fast and small
     std::atomic_size_t sampleIntervalBytes;  // NOLINT
 
-    stdx::mutex hashtable_mutex;  // guards updates to both object and stack hash tables
-    stdx::mutex stackinfo_mutex;  // guards against races updating the StackInfo bson representation
+    // guards updates to both object and stack hash tables
+    stdx::mutex hashtable_mutex;  // NOLINT
+    // guards against races updating the StackInfo bson representation
+    stdx::mutex stackinfo_mutex;  // NOLINT
 
     // cumulative bytes allocated - determines when samples are taken
     std::atomic_size_t bytesAllocated{0};  // NOLINT
@@ -297,11 +328,11 @@ private:
 
     static const int kMaxStackInfos = 20000;         // max number of unique call sites we handle
     static const int kStackHashTableLoadFactor = 2;  // keep loading <50%
-    static const int kMaxFramesPerStack = 100;       // max depth of stack
+    static const size_t kMaxFramesPerStack = 100;    // max depth of stack
 
     // stack HashTable Key
     struct Stack {
-        int numFrames = 0;
+        size_t numFrames = 0;
         std::array<FrameInfo, kMaxFramesPerStack> frames;
         Stack() {}
 
@@ -332,8 +363,8 @@ private:
     HashTable<Stack, StackInfo> stackHashTable{kMaxStackInfos, kStackHashTableLoadFactor};
 
     // frames to skip at top and bottom of backtrace when reporting stacks
-    int skipStartFrames = 0;
-    int skipEndFrames = 0;
+    size_t skipStartFrames = 0;
+    size_t skipEndFrames = 0;
 
 
     //
@@ -378,7 +409,7 @@ private:
     // disable profiling and then log an error message.
     void disable(const char* msg) {
         sampleIntervalBytes = 0;
-        log() << msg;
+        LOGV2(23157, "{msg}", "msg"_attr = msg);
     }
 
     //
@@ -402,7 +433,7 @@ private:
 
         // Get backtrace.
         Stack tempStack;
-        tempStack.numFrames = backtrace(tempStack.frames.data(), kMaxFramesPerStack);
+        tempStack.numFrames = rawBacktrace(tempStack.frames.data(), kMaxFramesPerStack);
 
         // Compute backtrace hash.
         Hash stackHash = tempStack.hash();
@@ -468,41 +499,49 @@ private:
     //
     // Generate bson representation of stack.
     //
-    void generateStackIfNeeded(Stack& stack, StackInfo& stackInfo) {
+    void generateStackIfNeeded(StackTraceAddressMetadataGenerator& metaGen,
+                               Demangler& demangler,
+                               Stack& stack,
+                               StackInfo& stackInfo) {
         if (!stackInfo.stackObj.isEmpty())
             return;
         BSONArrayBuilder builder;
-        for (int j = skipStartFrames; j < stack.numFrames - skipEndFrames; j++) {
-            Dl_info dli;
-            StringData frameString;
-            char* demangled = nullptr;
-            if (dladdr(stack.frames[j], &dli)) {
-                if (dli.dli_sname) {
-                    int status;
-                    demangled = abi::__cxa_demangle(dli.dli_sname, 0, 0, &status);
-                    if (demangled) {
-                        // strip off function parameters as they are very verbose and not useful
-                        char* p = strchr(demangled, '(');
-                        if (p)
-                            frameString = StringData(demangled, p - demangled);
-                        else
-                            frameString = demangled;
-                    } else {
-                        frameString = dli.dli_sname;
+
+        std::string frameString;
+
+        size_t jb = std::min(stack.numFrames, skipStartFrames);
+        size_t je = stack.numFrames - std::min(stack.numFrames - jb, skipEndFrames);
+        for (size_t j = jb; j != je; ++j) {
+            frameString.clear();
+            void* addr = stack.frames[j];
+            const auto& meta = metaGen.load(addr);
+            if (meta.symbol()) {
+                if (StringData name = meta.symbol().name(); !name.empty()) {
+                    // Upgrade frameString to symbol name.
+                    frameString.assign(name.begin(), name.end());
+                    if (char* dm = demangler(frameString.c_str())) {
+                        // Further upgrade frameString to demangled name.
+                        // We strip function parameters as they are very verbose and not useful.
+                        frameString = dm;
+                        if (auto paren = frameString.find('('); paren != std::string::npos)
+                            frameString.erase(paren);
                     }
                 }
             }
             if (frameString.empty()) {
+                // Fall back to frameString as stringified `void*`.
                 std::ostringstream s;
-                s << stack.frames[j];
+                s << addr;
                 frameString = s.str();
             }
             builder.append(frameString);
-            if (demangled)
-                free(demangled);
         }
         stackInfo.stackObj = builder.obj();
-        log() << "heapProfile stack" << stackInfo.stackNum << ": " << stackInfo.stackObj;
+        LOGV2(23158,
+              "heapProfile stack {stackNum}: {stackObj}",
+              "heapProfile stack",
+              "stackNum"_attr = stackInfo.stackNum,
+              "stackObj"_attr = stackInfo.stackObj);
     }
 
     //
@@ -528,12 +567,19 @@ private:
             const size_t objTableSize = objHashTable.memorySizeBytes();
             const size_t stackTableSize = stackHashTable.memorySizeBytes();
             const double MB = 1024 * 1024;
-            log() << "sampleIntervalBytes " << sampleIntervalBytesParameter << "; "
-                  << "maxActiveMemory " << maxActiveMemory / MB << " MB; "
-                  << "objTableSize " << objTableSize / MB << " MB; "
-                  << "stackTableSize " << stackTableSize / MB << " MB";
+            LOGV2(23159,
+                  "Generating heap profiler serverStatus: sampleIntervalBytes "
+                  "{heapProfilingSampleIntervalBytes}; "
+                  "maxActiveMemory {maxActiveMemoryMB} MB; objTableSize {objTableSize_MB} MB; "
+                  "stackTableSize "
+                  "{stackTableSizeMB} MB",
+                  "Generating heap profiler serverStatus",
+                  "heapProfilingSampleIntervalBytes"_attr = HeapProfilingSampleIntervalBytes,
+                  "maxActiveMemoryMB"_attr = maxActiveMemory / MB,
+                  "objTableSize_MB"_attr = objTableSize / MB,
+                  "stackTableSizeMB"_attr = stackTableSize / MB);
             // print a stack trace to log somap for post-facto symbolization
-            log() << "following stack trace is for heap profiler informational purposes";
+            LOGV2(23160, "Following stack trace is for heap profiler informational purposes");
             printStackTrace();
             logGeneralStats = false;
         }
@@ -556,9 +602,12 @@ private:
         // We use stackinfo_mutex to ensure safety wrt concurrent updates to the StackInfo objects.
         // We can get skew between entries, which is ok.
         std::vector<StackInfo*> stackInfos;
+
+        StackTraceAddressMetadataGenerator metaGen;
+        Demangler demangler;
         stackHashTable.forEach([&](Stack& stack, StackInfo& stackInfo) {
             if (stackInfo.activeBytes) {
-                generateStackIfNeeded(stack, stackInfo);
+                generateStackIfNeeded(metaGen, demangler, stack, stackInfo);
                 stackInfos.push_back(&stackInfo);
             }
         });
@@ -587,14 +636,13 @@ private:
             shortName << "stack" << stackInfo->stackNum;
             BSONObjBuilder stackBuilder(stacksBuilder.subobjStart(shortName.str()));
             stackBuilder.appendNumber("activeBytes", stackInfo->activeBytes);
-            stackBuilder.append("stack", stackInfo->stackObj);
         }
         stacksBuilder.doneFast();
 
         // importantStacks grows monotonically, so it can accumulate unneeded stacks,
         // so we clear it periodically.
         if (++numImportantSamples >= kMaxImportantSamples) {
-            log() << "clearing importantStacks";
+            LOGV2(23161, "Clearing importantStacks");
             importantStacks.clear();
             numImportantSamples = 0;
         }
@@ -614,12 +662,10 @@ private:
 
 public:
     static HeapProfiler* heapProfiler;
-    static bool enabledParameter;
-    static long long sampleIntervalBytesParameter;
 
     HeapProfiler() {
         // Set sample interval from the parameter.
-        sampleIntervalBytes = sampleIntervalBytesParameter;
+        sampleIntervalBytes = HeapProfilingSampleIntervalBytes;
 
         // This is our only allocator dependency - ifdef and change as
         // appropriate for other allocators, using hooks or shims.
@@ -646,7 +692,7 @@ public:
     HeapProfilerServerStatusSection() : ServerStatusSection("heapProfile") {}
 
     bool includeByDefault() const override {
-        return HeapProfiler::enabledParameter;
+        return HeapProfilingEnabled;
     }
 
     BSONObj generateSection(OperationContext* opCtx,
@@ -662,20 +708,10 @@ public:
 //
 
 HeapProfiler* HeapProfiler::heapProfiler;
-bool HeapProfiler::enabledParameter = false;
-long long HeapProfiler::sampleIntervalBytesParameter = 256 * 1024;
-
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> heapProfilingEnabledParameter(
-    ServerParameterSet::getGlobal(), "heapProfilingEnabled", &HeapProfiler::enabledParameter);
-
-ExportedServerParameter<long long, ServerParameterType::kStartupOnly>
-    heapProfilingSampleIntervalBytes(ServerParameterSet::getGlobal(),
-                                     "heapProfilingSampleIntervalBytes",
-                                     &HeapProfiler::sampleIntervalBytesParameter);
 
 MONGO_INITIALIZER_GENERAL(StartHeapProfiling, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
-    if (HeapProfiler::enabledParameter)
+    if (HeapProfilingEnabled)
         HeapProfiler::heapProfiler = new HeapProfiler();
     return Status::OK();
 }

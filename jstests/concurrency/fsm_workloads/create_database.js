@@ -8,18 +8,23 @@
  *
  * Each thread uses its own database, though sometimes threads may try to create databases with
  * names that only differ in case, expecting the appriopriate error code.
+ *
+ * @tags: [creates_background_indexes]
  */
 
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isEphemeralForTest
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
-
     let data = {
         checkCommandResult: function checkCommandResult(mayFailWithDatabaseDifferCase, res) {
             if (mayFailWithDatabaseDifferCase && !res.ok)
-                assertAlways.commandFailedWithCode(res, ErrorCodes.DatabaseDifferCase);
+                assertWorkedOrFailedHandleTxnErrors(
+                    res,
+                    [ErrorCodes.IndexBuildAlreadyInProgress, ErrorCodes.DatabaseDifferCase],
+                    ErrorCodes.DatabaseDifferCase);
             else
-                assertAlways.commandWorked(res);
+                assertWorkedHandleTxnErrors(res, ErrorCodes.IndexBuildAlreadyInProgress);
             return res;
         },
 
@@ -27,7 +32,7 @@ var $config = (function() {
             if (mayFailWithDatabaseDifferCase && res.hasWriteError())
                 assertAlways.writeErrorWithCode(res, ErrorCodes.DatabaseDifferCase);
             else
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
             return res;
         }
     };
@@ -45,7 +50,6 @@ var $config = (function() {
             this.myDB = db.getSiblingDB(this.uniqueDBName);
             this.created = false;
             this.unique = true;
-
         },
 
         useSemiUniqueDBName: function useSemiUniqueDBName(db, collName) {
@@ -131,25 +135,13 @@ var $config = (function() {
         listDatabasesNameOnly: {init: 0.75, listDatabases: 0.10, listDatabasesNameOnly: 0.15},
     };
 
-    // TODO SERVER-27831: Remove this skip function after the deadlock when listing the collections
-    // of the "local" database is fixed.
-    var skip = function skip(cluster) {
-        if (isEphemeralForTest(cluster.getDB("test"))) {
-            return {skip: true, msg: 'does not run with ephemeralForTest storage.'};
-        }
-        return {skip: false};
-    };
-
     return {
         data,
         // We only run a few iterations to reduce the amount of data cumulatively
-        // written to disk by mmapv1. For example, setting 10 threads and 180
-        // iterations (with an expected 6 transitions per create/drop roundtrip)
-        // causes this workload to write at least 32MB (.ns and .0 files) * 10 threads
-        // * 30 iterations worth of data to disk, or about 10GB, which can be slow on
-        // test hosts.
+        // written to disk.
         threadCount: 10,
-        iterations: 180, states, transitions,
-        skip: skip,
+        iterations: 120,
+        states,
+        transitions,
     };
 })();

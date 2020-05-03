@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,12 +32,12 @@
 #include <vector>
 
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
@@ -46,10 +47,9 @@ namespace {
 using std::vector;
 
 //
-// DocumentSourceAddFields delegates much of its responsibilities to the ParsedAddFields, which
-// derives from ParsedAggregationProjection.
-// Most of the functional tests are testing ParsedAddFields directly. These are meant as
-// simpler integration tests.
+// DocumentSourceAddFields delegates much of its responsibilities to the
+// AddFieldsProjectionExecutor. Most of the functional tests are testing
+// AddFieldsProjectionExecutor. directly. These are meant as simpler integration tests.
 //
 
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
@@ -58,7 +58,8 @@ using AddFieldsTest = AggregationContextFixture;
 TEST_F(AddFieldsTest, ShouldKeepUnspecifiedFieldsReplaceExistingFieldsAndAddNewFields) {
     auto addFields =
         DocumentSourceAddFields::create(BSON("e" << 2 << "b" << BSON("c" << 3)), getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"a", 1}, {"b", Document{{"c", 1}}}, {"d", 1}});
+    auto mock = DocumentSourceMock::createForTest(
+        Document{{"a", 1}, {"b", Document{{"c", 1}}}, {"d", 1}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();
@@ -69,6 +70,35 @@ TEST_F(AddFieldsTest, ShouldKeepUnspecifiedFieldsReplaceExistingFieldsAndAddNewF
     ASSERT_TRUE(addFields->getNext().isEOF());
     ASSERT_TRUE(addFields->getNext().isEOF());
     ASSERT_TRUE(addFields->getNext().isEOF());
+}
+
+TEST_F(AddFieldsTest, ShouldSerializeAndParse) {
+    auto addFields = DocumentSourceAddFields::create(BSON("a" << BSON("$const"
+                                                                      << "new")),
+                                                     getExpCtx());
+    ASSERT(addFields->getSourceName() == DocumentSourceAddFields::kStageName);
+    vector<Value> serializedArray;
+    addFields->serializeToArray(serializedArray);
+    auto serializedBson = serializedArray[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedBson, fromjson("{$addFields: {a: {$const: 'new'}}}"));
+    addFields = DocumentSourceAddFields::createFromBson(serializedBson.firstElement(), getExpCtx());
+    ASSERT(addFields != nullptr);
+    ASSERT(addFields->getSourceName() == DocumentSourceAddFields::kStageName);
+}
+
+TEST_F(AddFieldsTest, SetAliasShouldSerializeAndParse) {
+    auto setStage = DocumentSourceAddFields::create(BSON("a" << BSON("$const"
+                                                                     << "new")),
+                                                    getExpCtx(),
+                                                    DocumentSourceAddFields::kAliasNameSet);
+    ASSERT(setStage->getSourceName() == DocumentSourceAddFields::kAliasNameSet);
+    vector<Value> serializedArray;
+    setStage->serializeToArray(serializedArray);
+    auto serializedBson = serializedArray[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(serializedBson, fromjson("{$set: {a: {$const: 'new'}}}"));
+    setStage = DocumentSourceAddFields::createFromBson(serializedBson.firstElement(), getExpCtx());
+    ASSERT(setStage != nullptr);
+    ASSERT(setStage->getSourceName() == DocumentSourceAddFields::kAliasNameSet);
 }
 
 TEST_F(AddFieldsTest, ShouldOptimizeInnerExpressions) {
@@ -93,8 +123,8 @@ TEST_F(AddFieldsTest, ShouldErrorOnNonObjectSpec) {
 
 TEST_F(AddFieldsTest, ShouldBeAbleToProcessMultipleDocuments) {
     auto addFields = DocumentSourceAddFields::create(BSON("a" << 10), getExpCtx());
-    auto mock =
-        DocumentSourceMock::create({Document{{"a", 1}, {"b", 2}}, Document{{"c", 3}, {"d", 4}}});
+    auto mock = DocumentSourceMock::createForTest(
+        {Document{{"a", 1}, {"b", 2}}, Document{{"c", 3}, {"d", 4}}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();
@@ -116,8 +146,8 @@ TEST_F(AddFieldsTest, ShouldAddReferencedFieldsToDependencies) {
     auto addFields = DocumentSourceAddFields::create(
         fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"),
         getExpCtx());
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_EQUALS(DocumentSource::SEE_NEXT, addFields->getDependencies(&dependencies));
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, addFields->getDependencies(&dependencies));
     ASSERT_EQUALS(3U, dependencies.fields.size());
 
     // No implicit _id dependency.
@@ -133,15 +163,17 @@ TEST_F(AddFieldsTest, ShouldAddReferencedFieldsToDependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(1U, dependencies.fields.count("d"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(AddFieldsTest, ShouldPropagatePauses) {
     auto addFields = DocumentSourceAddFields::create(BSON("a" << 10), getExpCtx());
-    auto mock = DocumentSourceMock::create({Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution()});
+    auto mock =
+        DocumentSourceMock::createForTest({Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     addFields->setSource(mock.get());
 
     ASSERT_TRUE(addFields->getNext().isAdvanced());
@@ -158,7 +190,7 @@ TEST_F(AddFieldsTest, AddFieldsWithRemoveSystemVariableDoesNotAddField) {
     auto addFields = DocumentSourceAddFields::create(BSON("fieldToAdd"
                                                           << "$$REMOVE"),
                                                      getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"existingField", 1}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"existingField", 1}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();
@@ -172,7 +204,7 @@ TEST_F(AddFieldsTest, AddFieldsWithRootSystemVariableAddsRootAsSubDoc) {
     auto addFields = DocumentSourceAddFields::create(BSON("b"
                                                           << "$$ROOT"),
                                                      getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"a", 1}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"a", 1}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();
@@ -186,7 +218,7 @@ TEST_F(AddFieldsTest, AddFieldsWithCurrentSystemVariableAddsRootAsSubDoc) {
     auto addFields = DocumentSourceAddFields::create(BSON("b"
                                                           << "$$CURRENT"),
                                                      getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"a", 1}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"a", 1}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();
@@ -213,7 +245,7 @@ BSONObj makeAddFieldsForNestedDocument(size_t depth) {
 TEST_F(AddFieldsTest, CanAddNestedDocumentExactlyAtDepthLimit) {
     auto addFields = DocumentSourceAddFields::create(
         makeAddFieldsForNestedDocument(BSONDepth::getMaxAllowableDepth()), getExpCtx());
-    auto mock = DocumentSourceMock::create(Document{{"_id", 1}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"_id", 1}}, getExpCtx());
     addFields->setSource(mock.get());
 
     auto next = addFields->getNext();

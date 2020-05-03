@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,7 +32,6 @@
 #include <chrono>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/client.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/db_raii.h"
@@ -56,7 +56,7 @@ struct BSONObjCompare {
         return SimpleBSONObjComparator::kInstance.compare(lhs, rhs) < 0;
     }
 };
-}
+}  // namespace
 
 static const NamespaceString kTestNamespace("unittests", "deferred_writer_tests");
 
@@ -69,7 +69,7 @@ static const NamespaceString kTestNamespace("unittests", "deferred_writer_tests"
 class RaiiWrapper {
 public:
     explicit RaiiWrapper(std::unique_ptr<DeferredWriter> writer) : _writer(std::move(writer)) {
-        _writer->startup("DeferredWriter test");
+        _writer->startup("DeferredWriter-test");
     }
 
     RaiiWrapper(RaiiWrapper&& other) : _writer(std::move(other._writer)) {}
@@ -123,7 +123,7 @@ public:
         std::vector<BSONObj> result;
         BSONObj i;
         while (plan->getNext(&i, nullptr) == PlanExecutor::ExecState::ADVANCED) {
-            result.push_back(i);
+            result.push_back(i.getOwned());
         }
 
         return result;
@@ -134,7 +134,7 @@ public:
      */
     RaiiWrapper getWriter(CollectionOptions options = CollectionOptions(),
                           int64_t maxSize = 200'000) {
-        return RaiiWrapper(stdx::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
+        return RaiiWrapper(std::make_unique<DeferredWriter>(kTestNamespace, options, maxSize));
     }
 
     virtual void run(void) = 0;
@@ -370,9 +370,9 @@ private:
     static const int kDocsPerWorker = 100;
 };
 
-class DeferredWriterTests : public Suite {
+class DeferredWriterTests : public OldStyleSuiteSpecification {
 public:
-    DeferredWriterTests() : Suite("deferred_writer_tests") {}
+    DeferredWriterTests() : OldStyleSuiteSpecification("deferred_writer_tests") {}
 
     void setupTests() {
         add<DeferredWriterTestEmpty>();
@@ -382,5 +382,8 @@ public:
         add<DeferredWriterTestCap>();
         add<DeferredWriterTestAsync>();
     }
-} deferredWriterTests;
-}
+};
+
+OldStyleSuiteInitializer<DeferredWriterTests> deferredWriterTests;
+
+}  // namespace deferred_writer_tests

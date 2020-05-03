@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,26 +46,33 @@ size_t getDocumentSize(const BSONObj& o) {
 
 }  // namespace
 
-OplogBufferBlockingQueue::OplogBufferBlockingQueue() : _queue(kOplogBufferSize, &getDocumentSize) {}
+OplogBufferBlockingQueue::OplogBufferBlockingQueue() : OplogBufferBlockingQueue(nullptr) {}
+OplogBufferBlockingQueue::OplogBufferBlockingQueue(Counters* counters)
+    : _counters(counters), _queue(kOplogBufferSize, &getDocumentSize) {}
 
-void OplogBufferBlockingQueue::startup(OperationContext*) {}
+void OplogBufferBlockingQueue::startup(OperationContext*) {
+    // Update server status metric to reflect the current oplog buffer's max size.
+    if (_counters) {
+        _counters->setMaxSize(getMaxSize());
+    }
+}
 
 void OplogBufferBlockingQueue::shutdown(OperationContext* opCtx) {
     clear(opCtx);
 }
 
-void OplogBufferBlockingQueue::pushEvenIfFull(OperationContext*, const Value& value) {
-    _queue.pushEvenIfFull(value);
-}
+void OplogBufferBlockingQueue::push(OperationContext*,
+                                    Batch::const_iterator begin,
+                                    Batch::const_iterator end) {
+    invariant(!_drainMode);
+    _queue.pushAllBlocking(begin, end);
+    _notEmptyCv.notify_one();
 
-void OplogBufferBlockingQueue::push(OperationContext*, const Value& value) {
-    _queue.push(value);
-}
-
-void OplogBufferBlockingQueue::pushAllNonBlocking(OperationContext*,
-                                                  Batch::const_iterator begin,
-                                                  Batch::const_iterator end) {
-    _queue.pushAllNonBlocking(begin, end);
+    if (_counters) {
+        for (auto i = begin; i != end; ++i) {
+            _counters->increment(*i);
+        }
+    }
 }
 
 void OplogBufferBlockingQueue::waitForSpace(OperationContext*, std::size_t size) {
@@ -89,15 +97,27 @@ std::size_t OplogBufferBlockingQueue::getCount() const {
 
 void OplogBufferBlockingQueue::clear(OperationContext*) {
     _queue.clear();
+    if (_counters) {
+        _counters->clear();
+    }
 }
 
 bool OplogBufferBlockingQueue::tryPop(OperationContext*, Value* value) {
-    return _queue.tryPop(*value);
+    if (!_queue.tryPop(*value)) {
+        return false;
+    }
+    if (_counters) {
+        _counters->decrement(*value);
+    }
+    return true;
 }
 
 bool OplogBufferBlockingQueue::waitForData(Seconds waitDuration) {
     Value ignored;
-    return _queue.blockingPeek(ignored, static_cast<int>(durationCount<Seconds>(waitDuration)));
+    stdx::unique_lock<Latch> lk(_notEmptyMutex);
+    _notEmptyCv.wait_for(
+        lk, waitDuration.toSystemDuration(), [&] { return _drainMode || _queue.peek(ignored); });
+    return _queue.peek(ignored);
 }
 
 bool OplogBufferBlockingQueue::peek(OperationContext*, Value* value) {
@@ -107,6 +127,17 @@ bool OplogBufferBlockingQueue::peek(OperationContext*, Value* value) {
 boost::optional<OplogBuffer::Value> OplogBufferBlockingQueue::lastObjectPushed(
     OperationContext*) const {
     return _queue.lastObjectPushed();
+}
+
+void OplogBufferBlockingQueue::enterDrainMode() {
+    stdx::lock_guard<Latch> lk(_notEmptyMutex);
+    _drainMode = true;
+    _notEmptyCv.notify_one();
+}
+
+void OplogBufferBlockingQueue::exitDrainMode() {
+    stdx::lock_guard<Latch> lk(_notEmptyMutex);
+    _drainMode = false;
 }
 
 }  // namespace repl

@@ -1,28 +1,30 @@
-/*    Copyright 2015 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,18 +36,16 @@
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_type.h"
 #include "mongo/platform/endian.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 class ConstDataRangeCursor : public ConstDataRange {
 public:
-    ConstDataRangeCursor(const char* begin, const char* end, std::ptrdiff_t debug_offset = 0)
-        : ConstDataRange(begin, end, debug_offset) {}
-
+    using ConstDataRange::ConstDataRange;
     ConstDataRangeCursor(ConstDataRange cdr) : ConstDataRange(cdr) {}
 
-    Status advance(size_t advance) {
+    Status advanceNoThrow(size_t advance) noexcept try {
         if (advance > length()) {
             return makeAdvanceStatus(advance);
         }
@@ -54,10 +54,16 @@ public:
         _debug_offset += advance;
 
         return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+
+    void advance(size_t advance) {
+        uassertStatusOK(advanceNoThrow(advance));
     }
 
     template <typename T>
-    Status skip() {
+    Status skipNoThrow() noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load<T>(nullptr, _begin, _end - _begin, &advanced, _debug_offset);
@@ -71,7 +77,12 @@ public:
     }
 
     template <typename T>
-    Status readAndAdvance(T* t) {
+    void skip() {
+        uassertStatusOK(skipNoThrow<T>());
+    }
+
+    template <typename T>
+    Status readAndAdvanceNoThrow(T* t) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load(t, _begin, _end - _begin, &advanced, _debug_offset);
@@ -85,15 +96,25 @@ public:
     }
 
     template <typename T>
-    StatusWith<T> readAndAdvance() {
+    void readAndAdvance(T* t) {
+        return uassertStatusOK(readAndAdvanceNoThrow(t));
+    }
+
+    template <typename T>
+    StatusWith<T> readAndAdvanceNoThrow() noexcept {
         T out(DataType::defaultConstruct<T>());
-        Status x = readAndAdvance(&out);
+        Status x = readAndAdvanceNoThrow(&out);
 
         if (x.isOK()) {
             return StatusWith<T>(std::move(out));
         } else {
             return StatusWith<T>(std::move(x));
         }
+    }
+
+    template <typename T>
+    T readAndAdvance() {
+        return uassertStatusOK(readAndAdvanceNoThrow<T>());
     }
 
 private:
@@ -102,16 +123,14 @@ private:
 
 class DataRangeCursor : public DataRange {
 public:
-    DataRangeCursor(char* begin, char* end, std::ptrdiff_t debug_offset = 0)
-        : DataRange(begin, end, debug_offset) {}
-
+    using DataRange::DataRange;
     DataRangeCursor(DataRange range) : DataRange(range) {}
 
     operator ConstDataRangeCursor() const {
         return ConstDataRangeCursor(ConstDataRange(_begin, _end, _debug_offset));
     }
 
-    Status advance(size_t advance) {
+    Status advanceNoThrow(size_t advance) noexcept {
         if (advance > length()) {
             return makeAdvanceStatus(advance);
         }
@@ -122,8 +141,12 @@ public:
         return Status::OK();
     }
 
+    void advance(size_t advance) {
+        uassertStatusOK(advanceNoThrow(advance));
+    }
+
     template <typename T>
-    Status skip() {
+    Status skipNoThrow() noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load<T>(nullptr, _begin, _end - _begin, &advanced, _debug_offset);
@@ -137,7 +160,12 @@ public:
     }
 
     template <typename T>
-    Status readAndAdvance(T* t) {
+    void skip() {
+        uassertStatusOK(skipNoThrow<T>());
+    }
+
+    template <typename T>
+    Status readAndAdvanceNoThrow(T* t) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::load(t, _begin, _end - _begin, &advanced, _debug_offset);
@@ -151,9 +179,14 @@ public:
     }
 
     template <typename T>
-    StatusWith<T> readAndAdvance() {
+    void readAndAdvance(T* t) {
+        uassertStatusOK(readAndAdvanceNoThrow(t));
+    }
+
+    template <typename T>
+    StatusWith<T> readAndAdvanceNoThrow() noexcept {
         T out(DataType::defaultConstruct<T>());
-        Status x = readAndAdvance(&out);
+        Status x = readAndAdvanceNoThrow(&out);
 
         if (x.isOK()) {
             return StatusWith<T>(std::move(out));
@@ -163,7 +196,12 @@ public:
     }
 
     template <typename T>
-    Status writeAndAdvance(const T& value) {
+    T readAndAdvance() {
+        return uassertStatusOK(readAndAdvanceNoThrow<T>());
+    }
+
+    template <typename T>
+    Status writeAndAdvanceNoThrow(const T& value) noexcept {
         size_t advanced = 0;
 
         Status x = DataType::store(
@@ -175,6 +213,11 @@ public:
         }
 
         return x;
+    }
+
+    template <typename T>
+    void writeAndAdvance(const T& value) {
+        uassertStatusOK(writeAndAdvanceNoThrow(value));
     }
 
 private:

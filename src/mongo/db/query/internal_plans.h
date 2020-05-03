@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 
@@ -40,7 +42,6 @@ class IndexDescriptor;
 class OperationContext;
 class PlanStage;
 class WorkingSet;
-struct DeleteStageParams;
 struct UpdateStageParams;
 
 /**
@@ -72,8 +73,7 @@ public:
         StringData ns,
         Collection* collection,
         PlanExecutor::YieldPolicy yieldPolicy,
-        const Direction direction = FORWARD,
-        const RecordId startLoc = RecordId());
+        const Direction direction = FORWARD);
 
     /**
      * Returns a FETCH => DELETE plan.
@@ -81,10 +81,9 @@ public:
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithCollectionScan(
         OperationContext* opCtx,
         Collection* collection,
-        const DeleteStageParams& params,
+        std::unique_ptr<DeleteStageParams> params,
         PlanExecutor::YieldPolicy yieldPolicy,
-        Direction direction = FORWARD,
-        const RecordId& startLoc = RecordId());
+        Direction direction = FORWARD);
 
     /**
      * Returns an index scan.  Caller owns returned pointer.
@@ -106,7 +105,7 @@ public:
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithIndexScan(
         OperationContext* opCtx,
         Collection* collection,
-        const DeleteStageParams& params,
+        std::unique_ptr<DeleteStageParams> params,
         const IndexDescriptor* descriptor,
         const BSONObj& startKey,
         const BSONObj& endKey,
@@ -131,26 +130,27 @@ private:
      *
      * Used as a helper for collectionScan() and deleteWithCollectionScan().
      */
-    static std::unique_ptr<PlanStage> _collectionScan(OperationContext* opCtx,
-                                                      WorkingSet* ws,
-                                                      const Collection* collection,
-                                                      Direction direction,
-                                                      const RecordId& startLoc);
+    static std::unique_ptr<PlanStage> _collectionScan(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WorkingSet* ws,
+        const Collection* collection,
+        Direction direction);
 
     /**
      * Returns a plan stage that is either an index scan or an index scan with a fetch stage.
      *
      * Used as a helper for indexScan() and deleteWithIndexScan().
      */
-    static std::unique_ptr<PlanStage> _indexScan(OperationContext* opCtx,
-                                                 WorkingSet* ws,
-                                                 const Collection* collection,
-                                                 const IndexDescriptor* descriptor,
-                                                 const BSONObj& startKey,
-                                                 const BSONObj& endKey,
-                                                 BoundInclusion boundInclusion,
-                                                 Direction direction = FORWARD,
-                                                 int options = IXSCAN_DEFAULT);
+    static std::unique_ptr<PlanStage> _indexScan(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WorkingSet* ws,
+        const Collection* collection,
+        const IndexDescriptor* descriptor,
+        const BSONObj& startKey,
+        const BSONObj& endKey,
+        BoundInclusion boundInclusion,
+        Direction direction = FORWARD,
+        int options = IXSCAN_DEFAULT);
 };
 
 }  // namespace mongo

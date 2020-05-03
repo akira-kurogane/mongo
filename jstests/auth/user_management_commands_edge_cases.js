@@ -1,6 +1,7 @@
 /**
  * This tests that all the different commands for user manipulation all properly handle invalid and
  * atypical inputs.
+ * @tags: [requires_sharding]
  */
 
 function runTest(conn) {
@@ -87,9 +88,8 @@ function runTest(conn) {
         });
 
         // Try to update user that doesn't exist
-        assert.throws(function() {
-            db.updateUser('fakeUser', {roles: ['read']});
-        });
+        assert.commandFailedWithCode(db.runCommand({updateUser: 'fakeUser', roles: ['read']}),
+                                     ErrorCodes.UserNotFound);
 
         // Try to update user with invalid password
         assert.throws(function() {
@@ -257,7 +257,6 @@ function runTest(conn) {
         assert.throws(function() {
             db.getUser(['user1']);
         });
-
     })();
 
     (function testDropUser() {
@@ -277,7 +276,6 @@ function runTest(conn) {
 
 jsTest.log('Test standalone');
 var conn = MongoRunner.runMongod({auth: ''});
-conn.getDB('admin').runCommand({setParameter: 1, newCollectionsUsePowerOf2Sizes: false});
 runTest(conn);
 MongoRunner.stopMongod(conn);
 

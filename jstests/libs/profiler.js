@@ -1,5 +1,40 @@
 // Provides convenience methods for confirming system.profile content.
 
+// Given a command, build its expected shape in the system profiler.
+function buildCommandProfile(command, sharded) {
+    let commandProfile = {};
+
+    if (command.mapReduce) {
+        // MapReduce is rewritten to an aggregate pipeline.
+        commandProfile["command.aggregate"] = command.mapReduce;
+    } else if (command.update) {
+        // Updates are batched, but only allow using buildCommandProfile() for an update batch that
+        // contains a single update, since the profiler generates separate entries for each update
+        // in the batch.
+        assert(command.updates.length == 1);
+        for (let key in command.updates[0]) {
+            commandProfile["command." + key] = command.updates[0][key];
+        }
+        // Though 'upsert' and 'multi' are optional fields, they are written with the default value
+        // in the profiler.
+        commandProfile["command.upsert"] = commandProfile["command.upsert"] || false;
+        commandProfile["command.multi"] = commandProfile["command.multi"] || false;
+    } else if (command.delete) {
+        // Deletes are batched, but only allow using buildCommandProfile() for a delete batch that
+        // contains a single delete, since the profiler generates separate entries for each delete
+        // in the batch.
+        assert(command.deletes.length == 1);
+        for (let key in command.deletes[0]) {
+            commandProfile["command." + key] = command.deletes[0][key];
+        }
+    } else {
+        for (let key in command) {
+            commandProfile["command." + key] = command[key];
+        }
+    }
+    return commandProfile;
+}
+
 // Retrieve latest system.profile entry.
 function getLatestProfilerEntry(profileDB, filter) {
     if (filter === null) {
@@ -18,8 +53,6 @@ function getProfilerProtocolStringForCommand(conn) {
     const protocols = conn.getClientRPCProtocols();
     if ("all" === protocols || /Msg/.test(protocols))
         return "op_msg";
-    if (/Command/.test(protocols))
-        return "op_command";
     if (/Query/.test(protocols))
         return "op_query";
     doassert(`Unknown prototocol string ${protocols}`);

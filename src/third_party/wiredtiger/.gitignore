@@ -78,10 +78,15 @@ _wiredtiger.pyd
 
 # Binaries
 **/bench/wtperf/wtperf
+**/csuite/test_incr_backup
+**/csuite/test_wt4699_json
+**/csuite/test_wt4803_history_store_abort
+**/csuite/test_wt4891_meta_ckptlist_get_alloc
 **/examples/c/ex_access
 **/examples/c/ex_all
 **/examples/c/ex_async
 **/examples/c/ex_backup
+**/examples/c/ex_backup_block
 **/examples/c/ex_call_center
 **/examples/c/ex_config_parse
 **/examples/c/ex_cursor
@@ -102,8 +107,13 @@ _wiredtiger.pyd
 **/examples/c/ex_thread
 **/test/bloom/t
 **/test/checkpoint/t
+**/test/csuite/test_random_abort
+**/test/csuite/test_random_directio
 **/test/csuite/test_rwlock
+**/test/csuite/test_schema_abort
 **/test/csuite/test_scope
+**/test/csuite/test_timestamp_abort
+**/test/csuite/test_truncated_log
 **/test/csuite/test_wt1965_col_efficiency
 **/test/csuite/test_wt2246_col_append
 **/test/csuite/test_wt2323_join_visibility
@@ -122,6 +132,11 @@ _wiredtiger.pyd
 **/test/csuite/test_wt3184_dup_index_collator
 **/test/csuite/test_wt3338_partial_update
 **/test/csuite/test_wt3363_checkpoint_op_races
+**/test/csuite/test_wt3874_pad_byte_collator
+**/test/csuite/test_wt4105_large_doc_small_upd
+**/test/csuite/test_wt4117_checksum
+**/test/csuite/test_wt4156_metadata_salvage
+**/test/csuite/test_wt4333_handle_locks
 **/test/cursor_order/cursor_order
 **/test/fops/t
 **/test/format/s_dumpcmp
@@ -133,9 +148,6 @@ _wiredtiger.pyd
 **/test/packing/intpack-test3
 **/test/packing/packing-test
 **/test/readonly/t
-**/test/recovery/random-abort
-**/test/recovery/timestamp-abort
-**/test/recovery/truncated-log
 **/test/salvage/t
 **/test/syscall/test_wt2336_base
 **/test/thread/t

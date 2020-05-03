@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/plan_enumerator.h"
 
@@ -34,24 +35,22 @@
 
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/indexability.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
 
 namespace {
 
 using namespace mongo;
-using std::unique_ptr;
 using std::endl;
 using std::set;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 std::string getPathPrefix(std::string path) {
-    if (mongoutils::str::contains(path, '.')) {
-        return mongoutils::str::before(path, '.');
-    } else {
-        return path;
-    }
+    if (auto dot = path.find('.'); dot != path.npos)
+        path.resize(dot);
+    return path;
 }
 
 /**
@@ -167,7 +166,7 @@ void getPossibleFirstAssignments(const IndexEntry& thisIndex,
  * will be assigned to the index.
  */
 bool canAssignPredToIndex(const RelevantTag* rt,
-                          const std::set<size_t>& multikeyComponents,
+                          const MultikeyComponents& multikeyComponents,
                           StringMap<MatchExpression*>* used) {
     invariant(used);
     const FieldRef path(rt->path);
@@ -223,27 +222,30 @@ bool canAssignPredToIndex(const RelevantTag* rt,
  */
 void tagForSort(MatchExpression* tree) {
     if (!Indexability::nodeCanUseIndexOnOwnField(tree)) {
-        size_t myTagValue = IndexTag::kNoIndex;
+        const IndexTag* myIndexTag = nullptr;
         for (size_t i = 0; i < tree->numChildren(); ++i) {
             MatchExpression* child = tree->getChild(i);
             tagForSort(child);
             if (child->getTag() &&
                 child->getTag()->getType() == MatchExpression::TagData::Type::IndexTag) {
-                IndexTag* childTag = static_cast<IndexTag*>(child->getTag());
-                myTagValue = std::min(myTagValue, childTag->index);
+                auto childTag = static_cast<const IndexTag*>(child->getTag());
+                if (!myIndexTag || myIndexTag->index > childTag->index) {
+                    myIndexTag = childTag;
+                }
             } else if (child->getTag() &&
                        child->getTag()->getType() ==
                            MatchExpression::TagData::Type::OrPushdownTag) {
                 OrPushdownTag* childTag = static_cast<OrPushdownTag*>(child->getTag());
                 if (childTag->getIndexTag()) {
-                    const IndexTag* indexTag =
-                        static_cast<const IndexTag*>(childTag->getIndexTag());
-                    myTagValue = std::min(myTagValue, indexTag->index);
+                    auto indexTag = static_cast<const IndexTag*>(childTag->getIndexTag());
+                    if (!myIndexTag || myIndexTag->index > indexTag->index) {
+                        myIndexTag = indexTag;
+                    }
                 }
             }
         }
-        if (myTagValue != IndexTag::kNoIndex) {
-            tree->setTag(new IndexTag(myTagValue));
+        if (myIndexTag) {
+            tree->setTag(new IndexTag(*myIndexTag));
         }
     }
 }
@@ -261,7 +263,7 @@ PlanEnumerator::PlanEnumerator(const PlanEnumeratorParams& params)
       _intersectLimit(params.maxIntersectPerAnd) {}
 
 PlanEnumerator::~PlanEnumerator() {
-    typedef unordered_map<MemoID, NodeAssignment*> MemoMap;
+    typedef stdx::unordered_map<MemoID, NodeAssignment*> MemoMap;
     for (MemoMap::iterator it = _memo.begin(); it != _memo.end(); ++it) {
         delete it->second;
     }
@@ -278,18 +280,18 @@ Status PlanEnumerator::init() {
 }
 
 std::string PlanEnumerator::dumpMemo() {
-    mongoutils::str::stream ss;
+    str::stream ss;
 
     // Note that this needs to be kept in sync with allocateAssignment which assigns memo IDs.
-    for (size_t i = 1; i < _memo.size(); ++i) {
+    for (size_t i = 1; i <= _memo.size(); ++i) {
         ss << "[Node #" << i << "]: " << _memo[i]->toString() << "\n";
     }
     return ss;
 }
 
 string PlanEnumerator::NodeAssignment::toString() const {
-    if (NULL != andAssignment) {
-        mongoutils::str::stream ss;
+    if (nullptr != andAssignment) {
+        str::stream ss;
         ss << "AND enumstate counter " << andAssignment->counter;
         for (size_t i = 0; i < andAssignment->choices.size(); ++i) {
             ss << "\n\tchoice " << i << ":\n";
@@ -304,13 +306,18 @@ string PlanEnumerator::NodeAssignment::toString() const {
                 ss << "\t\tidx[" << oie.index << "]\n";
 
                 for (size_t k = 0; k < oie.preds.size(); ++k) {
-                    ss << "\t\t\tpos " << oie.positions[k] << " pred " << oie.preds[k]->toString();
+                    ss << "\t\t\tpos " << oie.positions[k] << " pred "
+                       << oie.preds[k]->debugString();
+                }
+
+                for (auto&& pushdown : oie.orPushdowns) {
+                    ss << "\t\torPushdownPred: " << pushdown.first->debugString();
                 }
             }
         }
         return ss;
-    } else if (NULL != arrayAssignment) {
-        mongoutils::str::stream ss;
+    } else if (nullptr != arrayAssignment) {
+        str::stream ss;
         ss << "ARRAY SUBNODES enumstate " << arrayAssignment->counter << "/ ONE OF: [ ";
         for (size_t i = 0; i < arrayAssignment->subnodes.size(); ++i) {
             ss << arrayAssignment->subnodes[i] << " ";
@@ -318,8 +325,8 @@ string PlanEnumerator::NodeAssignment::toString() const {
         ss << "]";
         return ss;
     } else {
-        verify(NULL != orAssignment);
-        mongoutils::str::stream ss;
+        verify(nullptr != orAssignment);
+        str::stream ss;
         ss << "ALL OF: [ ";
         for (size_t i = 0; i < orAssignment->subnodes.size(); ++i) {
             ss << orAssignment->subnodes[i] << " ";
@@ -330,31 +337,32 @@ string PlanEnumerator::NodeAssignment::toString() const {
 }
 
 PlanEnumerator::MemoID PlanEnumerator::memoIDForNode(MatchExpression* node) {
-    unordered_map<MatchExpression*, MemoID>::iterator it = _nodeToId.find(node);
+    stdx::unordered_map<MatchExpression*, MemoID>::iterator it = _nodeToId.find(node);
 
     if (_nodeToId.end() == it) {
-        error() << "Trying to look up memo entry for node, none found.";
-        invariant(0);
+        LOGV2_ERROR(20945, "Trying to look up memo entry for node, none found.");
+        MONGO_UNREACHABLE;
     }
 
     return it->second;
 }
 
-bool PlanEnumerator::getNext(MatchExpression** tree) {
+unique_ptr<MatchExpression> PlanEnumerator::getNext() {
     if (_done) {
-        return false;
+        return nullptr;
     }
 
     // Tag with our first solution.
     tagMemo(memoIDForNode(_root));
 
-    *tree = _root->shallowClone().release();
-    tagForSort(*tree);
+    unique_ptr<MatchExpression> tree(_root->shallowClone());
+    tagForSort(tree.get());
 
     _root->resetTag();
-    LOG(5) << "Enumerator: memo just before moving:" << endl << dumpMemo();
+    LOGV2_DEBUG(
+        20943, 5, "Enumerator: memo just before moving:\n{dumpMemo}", "dumpMemo"_attr = dumpMemo());
     _done = nextMemo(memoIDForNode(_root));
-    return true;
+    return tree;
 }
 
 //
@@ -389,8 +397,24 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
 
             // Extend the path through the indexed ORs of each outside predicate.
             auto childContextCopy = childContext;
-            for (auto& pred : childContextCopy.outsidePreds) {
-                pred.second.push_back(i);
+            for (auto it = childContextCopy.outsidePreds.begin();
+                 it != childContextCopy.outsidePreds.end();) {
+                // If the route has already traversed through an $elemMatch object, then we cannot
+                // push down through this OR. Here we remove such routes from our context object.
+                //
+                // For example, suppose we have index {a: 1, "b.c": 1} and the following query:
+                //
+                //   {a: 1, b: {$elemMatch: {$or: [{c: 2}, {c: 3}]}}}
+                //
+                // It is not correct to push the 'a' predicate down such that it is a sibling of
+                // either of the predicates on 'c', since this would change the predicate's meaning
+                // from a==1 to "b.a"==1.
+                if (it->second.traversedThroughElemMatchObj) {
+                    childContextCopy.outsidePreds.erase(it++);
+                } else {
+                    it->second.route.push_back(i);
+                    ++it;
+                }
             }
 
             if (!prepMemo(node->getChild(i), childContextCopy)) {
@@ -416,6 +440,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
 
         if (MatchExpression::ELEM_MATCH_OBJECT == node->matchType()) {
             childContext.elemMatchExpr = node;
+            markTraversedThroughElemMatchObj(&childContext);
         }
 
         // For an OR to be indexed, all its children must be indexed.
@@ -455,23 +480,22 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
         // (e.g. an OR which contains a TEXT child).
         vector<MemoID> mandatorySubnodes;
 
-        // A list of predicates contained in the subtree rooted at 'node'
-        // obtained by traversing deeply through $and and $elemMatch children.
-        vector<MatchExpression*> indexedPreds;
+        // A list of predicates contained in the subtree rooted at 'node' obtained by traversing
+        // deeply through $and and $elemMatch children.
+        std::vector<MatchExpression*> indexedPreds;
 
-        // Partition the childen into the children that aren't predicates which may or may
-        // not be indexed ('subnodes'), children that aren't predicates which must use the
-        // index ('mandatorySubnodes'). and children that are predicates ('indexedPreds').
+        // Partition the childen into the children that aren't predicates which may or may not be
+        // indexed ('subnodes'), children that aren't predicates which must use the index
+        // ('mandatorySubnodes'). and children that are predicates ('indexedPreds').
         //
-        // We have to get the subnodes with mandatory assignments rather than adding the
-        // mandatory preds to 'indexedPreds'. Adding the mandatory preds directly to
-        // 'indexedPreds' would lead to problems such as pulling a predicate beneath an OR
-        // into a set joined by an AND.
+        // We have to get the subnodes with mandatory assignments rather than adding the mandatory
+        // preds to 'indexedPreds'. Adding the mandatory preds directly to 'indexedPreds' would lead
+        // to problems such as pulling a predicate beneath an OR into a set joined by an AND.
         getIndexedPreds(node, childContext, &indexedPreds);
         // Pass in the indexed predicates as outside predicates when prepping the subnodes.
         auto childContextCopy = childContext;
         for (auto pred : indexedPreds) {
-            childContextCopy.outsidePreds[pred] = std::deque<size_t>();
+            childContextCopy.outsidePreds[pred] = OutsidePredRoute{};
         }
         if (!prepSubNodes(node, childContextCopy, &subnodes, &mandatorySubnodes)) {
             return false;
@@ -483,7 +507,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
 
         // There can only be one mandatory predicate (at most one $text, at most one
         // $geoNear, can't combine $text/$geoNear).
-        MatchExpression* mandatoryPred = NULL;
+        MatchExpression* mandatoryPred = nullptr;
 
         // There could be multiple indices which we could use to satisfy the mandatory
         // predicate. Keep the set of such indices. Currently only one text index is
@@ -505,7 +529,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
                 // This should include only TEXT and GEO_NEAR preds.
 
                 // We expect either 0 or 1 mandatory predicates.
-                invariant(NULL == mandatoryPred);
+                invariant(nullptr == mandatoryPred);
 
                 // Mandatory predicates are TEXT or GEO_NEAR.
                 invariant(MatchExpression::TEXT == child->matchType() ||
@@ -554,7 +578,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
             return true;
         }
 
-        if (NULL != mandatoryPred) {
+        if (nullptr != mandatoryPred) {
             // We must have at least one index which can be used to answer 'mandatoryPred'.
             invariant(!mandatoryIndices.empty());
             return enumerateMandatoryIndex(
@@ -573,6 +597,32 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
 
     // Don't know what the node is at this point.
     return false;
+}
+
+void PlanEnumerator::assignToNonMultikeyMandatoryIndex(
+    const IndexEntry& index,
+    const std::vector<MatchExpression*>& predsOverLeadingField,
+    const IndexToPredMap& idxToNotFirst,
+    OneIndexAssignment* indexAssign) {
+    // Text indexes are typically multikey because there is an index key for each token in the
+    // source text. However, the leading and trailing non-text fields of the index cannot be
+    // multikey. As a result, we should use non-multikey predicate assignment rules for such
+    // indexes.
+    invariant(!index.multikey || index.type == IndexType::INDEX_TEXT);
+
+    // Since the index is not multikey, all predicates over the leading field can be assigned.
+    indexAssign->preds = predsOverLeadingField;
+
+    // Since everything in assign.preds prefixes the index, they all go at position '0' in the
+    // index, the first position.
+    indexAssign->positions.resize(indexAssign->preds.size(), 0);
+
+    // And now we begin compound analysis. Find everything that could use assign.index but isn't a
+    // pred over the first field of that index.
+    auto compIt = idxToNotFirst.find(indexAssign->index);
+    if (compIt != idxToNotFirst.end()) {
+        compound(compIt->second, index, indexAssign);
+    }
 }
 
 bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
@@ -609,14 +659,19 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
 
         const vector<MatchExpression*>& predsOverLeadingField = it->second;
 
-        if (thisIndex.multikey && !thisIndex.multikeyPaths.empty()) {
+        // Text indexes should be treated like non-multikey indexes, since the non-text fields are
+        // prohibited from containing arrays.
+        if (thisIndex.type == IndexType::INDEX_TEXT) {
+            assignToNonMultikeyMandatoryIndex(
+                thisIndex, predsOverLeadingField, idxToNotFirst, &indexAssign);
+        } else if (thisIndex.multikey && !thisIndex.multikeyPaths.empty()) {
             // 2dsphere indexes are the only special index type that should ever have path-level
             // multikey information.
             invariant(INDEX_2DSPHERE == thisIndex.type);
 
-            if (predsOverLeadingField.end() != std::find(predsOverLeadingField.begin(),
-                                                         predsOverLeadingField.end(),
-                                                         mandatoryPred)) {
+            if (predsOverLeadingField.end() !=
+                std::find(
+                    predsOverLeadingField.begin(), predsOverLeadingField.end(), mandatoryPred)) {
                 // The mandatory predicate is on the leading field of 'thisIndex'. We assign it to
                 // 'thisIndex' and skip assigning any other predicates on the leading field to
                 // 'thisIndex' because no additional predicate on the leading field will generate a
@@ -629,14 +684,14 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                     // Assign any predicates on the non-leading index fields to 'indexAssign' that
                     // don't violate the intersecting or compounding rules for multikey indexes.
                     // We do not currently try to assign outside predicates to mandatory indexes.
-                    const unordered_map<MatchExpression*, std::deque<size_t>> outsidePreds{};
+                    const stdx::unordered_map<MatchExpression*, OutsidePredRoute> outsidePreds{};
                     assignMultikeySafePredicates(compIt->second, outsidePreds, &indexAssign);
                 }
             } else {
                 // Assign any predicates on the leading index field to 'indexAssign' that don't
                 // violate the intersecting rules for multikey indexes.
                 // We do not currently try to assign outside predicates to mandatory indexes.
-                const unordered_map<MatchExpression*, std::deque<size_t>> outsidePreds{};
+                const stdx::unordered_map<MatchExpression*, OutsidePredRoute> outsidePreds{};
                 assignMultikeySafePredicates(predsOverLeadingField, outsidePreds, &indexAssign);
 
                 // Assign the mandatory predicate to 'thisIndex'. Due to how keys are generated for
@@ -668,9 +723,9 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
             }
         } else if (thisIndex.multikey) {
             // Special handling for multikey mandatory indices.
-            if (predsOverLeadingField.end() != std::find(predsOverLeadingField.begin(),
-                                                         predsOverLeadingField.end(),
-                                                         mandatoryPred)) {
+            if (predsOverLeadingField.end() !=
+                std::find(
+                    predsOverLeadingField.begin(), predsOverLeadingField.end(), mandatoryPred)) {
                 // The mandatory predicate is over the first field of the index. Assign
                 // it now.
                 indexAssign.preds.push_back(mandatoryPred);
@@ -721,22 +776,9 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                 }
             }
         } else {
-            // For non-multikey, we don't have to do anything too special.
-            // Just assign all "first" predicates and try to compound like usual.
-            indexAssign.preds = it->second;
-
-            // Since everything in assign.preds prefixes the index, they all go
-            // at position '0' in the index, the first position.
-            indexAssign.positions.resize(indexAssign.preds.size(), 0);
-
-            // And now we begin compound analysis.
-
-            // Find everything that could use assign.index but isn't a pred over
-            // the first field of that index.
-            IndexToPredMap::const_iterator compIt = idxToNotFirst.find(indexAssign.index);
-            if (compIt != idxToNotFirst.end()) {
-                compound(compIt->second, thisIndex, &indexAssign);
-            }
+            // The index is not multikey.
+            assignToNonMultikeyMandatoryIndex(
+                thisIndex, predsOverLeadingField, idxToNotFirst, &indexAssign);
         }
 
         // The mandatory predicate must be assigned.
@@ -753,18 +795,18 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
 }
 
 void PlanEnumerator::assignPredicate(
-    const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
+    const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
     MatchExpression* pred,
     size_t position,
     OneIndexAssignment* indexAssignment) {
     if (outsidePreds.find(pred) != outsidePreds.end()) {
         OrPushdownTag::Destination dest;
-        dest.route = outsidePreds.at(pred);
+        dest.route = outsidePreds.at(pred).route;
 
         // This method should only be called if we can combine bounds.
         const bool canCombineBounds = true;
         dest.tagData =
-            stdx::make_unique<IndexTag>(indexAssignment->index, position, canCombineBounds);
+            std::make_unique<IndexTag>(indexAssignment->index, position, canCombineBounds);
         indexAssignment->orPushdowns.emplace_back(pred, std::move(dest));
     } else {
         indexAssignment->preds.push_back(pred);
@@ -772,11 +814,30 @@ void PlanEnumerator::assignPredicate(
     }
 }
 
+void PlanEnumerator::markTraversedThroughElemMatchObj(PrepMemoContext* context) {
+    invariant(context);
+    for (auto&& pred : context->outsidePreds) {
+        auto relevantTag = static_cast<RelevantTag*>(pred.first->getTag());
+        // Only indexed predicates should ever be considered as outside predicates eligible for
+        // pushdown.
+        invariant(relevantTag);
+
+        // Check whether the current $elemMatch through which we are traversing is the same as the
+        // outside predicate's $elemMatch context. If so, then that outside predicate hasn't
+        // actually traversed through an $elemMatch (it has simply been promoted by
+        // getIndexedPreds() into the set of AND-related indexed predicates). If not, then the OR
+        // pushdown route descends through an $elemMatch object node, and must be marked as such.
+        if (relevantTag->elemMatchExpr != context->elemMatchExpr) {
+            pred.second.traversedThroughElemMatchObj = true;
+        }
+    }
+}
+
 void PlanEnumerator::enumerateOneIndex(
     IndexToPredMap idxToFirst,
     IndexToPredMap idxToNotFirst,
     const vector<MemoID>& subnodes,
-    const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
+    const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
     AndAssignment* andAssignment) {
     // Each choice in the 'andAssignment' will consist of a single subnode to index (an OR or array
     // operator) or a OneIndexAssignment. When creating a OneIndexAssignment, we ensure that at
@@ -966,21 +1027,17 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
          ++firstIt) {
         const IndexEntry& oneIndex = (*_indices)[firstIt->first];
 
-        // 'oneAssign' is used to assign indices and subnodes or to
-        // make assignments for the first index when it's multikey.
-        // It is NOT used in the inner loop that considers pairs of
-        // indices.
-        OneIndexAssignment oneAssign;
-        oneAssign.index = firstIt->first;
-        oneAssign.preds = firstIt->second;
-        // Since everything in assign.preds prefixes the index, they all go
-        // at position '0' in the index, the first position.
-        oneAssign.positions.resize(oneAssign.preds.size(), 0);
-
         // We create a scan per predicate so if we have >1 predicate we'll already
         // have at least 2 scans (one predicate per scan as the planner can't
         // intersect bounds when the index is multikey), so we stop here.
-        if (oneIndex.multikey && oneAssign.preds.size() > 1) {
+        if (oneIndex.multikey && firstIt->second.size() > 1) {
+            OneIndexAssignment oneAssign;
+            oneAssign.index = firstIt->first;
+            oneAssign.preds = firstIt->second;
+            // Since everything in assign.preds prefixes the index, they all go at position '0' in
+            // the index, the first position.
+            oneAssign.positions.resize(oneAssign.preds.size(), 0);
+
             oneAssign.canCombineBounds = false;
             // One could imagine an enormous auto-generated $all query with too many clauses to
             // have an ixscan per clause.
@@ -998,6 +1055,13 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
 
         // Output (subnode, firstAssign) pairs.
         for (size_t i = 0; i < subnodes.size(); ++i) {
+            OneIndexAssignment oneAssign;
+            oneAssign.index = firstIt->first;
+            oneAssign.preds = firstIt->second;
+            // Since everything in assign.preds prefixes the index, they all go at position '0' in
+            // the index, the first position.
+            oneAssign.positions.resize(oneAssign.preds.size(), 0);
+
             AndEnumerableState indexAndSubnode;
             indexAndSubnode.assignments.push_back(std::move(oneAssign));
             indexAndSubnode.subnodesToIndex.push_back(subnodes[i]);
@@ -1171,27 +1235,11 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
             andAssignment->choices.push_back(std::move(state));
         }
     }
-
-    // TODO: Do we just want one subnode at a time?  We can use far more than 2 indices at once
-    // doing this very easily.  If we want to restrict the # of indices the children use, when
-    // we memoize the subtree above we can restrict it to 1 index at a time.  This can get
-    // tricky if we want both an intersection and a 1-index memo entry, since our state change
-    // is simple and we don't traverse the memo in any targeted way.  Should also verify that
-    // having a one-to-many mapping of MatchExpression to MemoID doesn't break anything.  This
-    // approach errors on the side of "too much indexing."
-    for (size_t i = 0; i < subnodes.size(); ++i) {
-        for (size_t j = i + 1; j < subnodes.size(); ++j) {
-            AndEnumerableState state;
-            state.subnodesToIndex.push_back(subnodes[i]);
-            state.subnodesToIndex.push_back(subnodes[j]);
-            andAssignment->choices.push_back(std::move(state));
-        }
-    }
 }
 
 void PlanEnumerator::getIndexedPreds(MatchExpression* node,
                                      PrepMemoContext context,
-                                     vector<MatchExpression*>* indexedPreds) {
+                                     std::vector<MatchExpression*>* indexedPreds) {
     if (Indexability::nodeCanUseIndexOnOwnField(node)) {
         RelevantTag* rt = static_cast<RelevantTag*>(node->getTag());
         if (context.elemMatchExpr) {
@@ -1249,6 +1297,7 @@ bool PlanEnumerator::prepSubNodes(MatchExpression* node,
             PrepMemoContext childContext;
             childContext.elemMatchExpr = child;
             childContext.outsidePreds = context.outsidePreds;
+            markTraversedThroughElemMatchObj(&childContext);
             prepSubNodes(child, childContext, subnodesOut, mandatorySubnodes);
         } else if (MatchExpression::AND == child->matchType()) {
             prepSubNodes(child, context, subnodesOut, mandatorySubnodes);
@@ -1271,24 +1320,24 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
     //
     // As we iterate over the available indexed predicates, we keep track
     // of the used prefixes both inside and outside of an $elemMatch context.
-    unordered_map<MatchExpression*, set<string>> used;
+    stdx::unordered_map<MatchExpression*, set<string>> used;
 
     // Initialize 'used' with the starting predicates in 'assigned'. Begin by
     // initializing the top-level scope with the prefix of the full path.
     for (size_t i = 0; i < assigned.size(); i++) {
         const MatchExpression* assignedPred = assigned[i];
-        invariant(NULL != assignedPred->getTag());
+        invariant(nullptr != assignedPred->getTag());
         RelevantTag* usedRt = static_cast<RelevantTag*>(assignedPred->getTag());
         set<string> usedPrefixes;
         usedPrefixes.insert(getPathPrefix(usedRt->path));
-        used[NULL] = usedPrefixes;
+        used[nullptr] = usedPrefixes;
 
         // If 'assigned' is a predicate inside an $elemMatch, we have to
         // add the prefix not only to the top-level context, but also to the
         // the $elemMatch context. For example, if 'assigned' is {a: {$elemMatch: {b: 1}}},
         // then we will have already added "a" to the set for NULL. We now
         // also need to add "b" to the set for the $elemMatch.
-        if (NULL != usedRt->elemMatchExpr) {
+        if (nullptr != usedRt->elemMatchExpr) {
             set<string> elemMatchUsed;
             // Whereas getPathPrefix(usedRt->path) is the prefix of the full path,
             // usedRt->pathPrefix contains the prefix of the portion of the
@@ -1306,8 +1355,8 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
 
         if (used.end() == used.find(rt->elemMatchExpr)) {
             // This is a new $elemMatch that we haven't seen before.
-            invariant(used.end() != used.find(NULL));
-            set<string>& topLevelUsed = used.find(NULL)->second;
+            invariant(used.end() != used.find(nullptr));
+            set<string>& topLevelUsed = used.find(nullptr)->second;
 
             // If the top-level path prefix of the $elemMatch hasn't been
             // used yet, couldCompound[i] is safe to compound.
@@ -1339,7 +1388,7 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
 
 void PlanEnumerator::assignMultikeySafePredicates(
     const std::vector<MatchExpression*>& couldAssign,
-    const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
+    const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
     OneIndexAssignment* indexAssignment) {
     invariant(indexAssignment);
     invariant(indexAssignment->preds.size() == indexAssignment->positions.size());
@@ -1520,19 +1569,19 @@ void PlanEnumerator::compound(const vector<MatchExpression*>& tryCompound,
 //
 
 void PlanEnumerator::tagMemo(size_t id) {
-    LOG(5) << "Tagging memoID " << id;
+    LOGV2_DEBUG(20944, 5, "Tagging memoID {id}", "id"_attr = id);
     NodeAssignment* assign = _memo[id];
-    verify(NULL != assign);
+    verify(nullptr != assign);
 
-    if (NULL != assign->orAssignment) {
+    if (nullptr != assign->orAssignment) {
         OrAssignment* oa = assign->orAssignment.get();
         for (size_t i = 0; i < oa->subnodes.size(); ++i) {
             tagMemo(oa->subnodes[i]);
         }
-    } else if (NULL != assign->arrayAssignment) {
+    } else if (nullptr != assign->arrayAssignment) {
         ArrayAssignment* aa = assign->arrayAssignment.get();
         tagMemo(aa->subnodes[aa->counter]);
-    } else if (NULL != assign->andAssignment) {
+    } else if (nullptr != assign->andAssignment) {
         AndAssignment* aa = assign->andAssignment.get();
         verify(aa->counter < aa->choices.size());
 
@@ -1574,9 +1623,9 @@ void PlanEnumerator::tagMemo(size_t id) {
 
 bool PlanEnumerator::nextMemo(size_t id) {
     NodeAssignment* assign = _memo[id];
-    verify(NULL != assign);
+    verify(nullptr != assign);
 
-    if (NULL != assign->orAssignment) {
+    if (nullptr != assign->orAssignment) {
         OrAssignment* oa = assign->orAssignment.get();
 
         // Limit the number of OR enumerations
@@ -1596,7 +1645,7 @@ bool PlanEnumerator::nextMemo(size_t id) {
         }
         // If we're here, the last subnode had a carry, therefore the OR has a carry.
         return true;
-    } else if (NULL != assign->arrayAssignment) {
+    } else if (nullptr != assign->arrayAssignment) {
         ArrayAssignment* aa = assign->arrayAssignment.get();
         // moving to next on current subnode is OK
         if (!nextMemo(aa->subnodes[aa->counter])) {
@@ -1609,7 +1658,7 @@ bool PlanEnumerator::nextMemo(size_t id) {
         }
         aa->counter = 0;
         return true;
-    } else if (NULL != assign->andAssignment) {
+    } else if (nullptr != assign->andAssignment) {
         AndAssignment* aa = assign->andAssignment.get();
 
         // One of our subnodes might have to move on to its next enumeration state.

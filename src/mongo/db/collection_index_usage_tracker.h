@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/platform/atomic_word.h"
@@ -44,12 +44,21 @@ class ClockSource;
  * considered "used" when it appears as part of a winning plan for an operation that uses the
  * query system.
  *
+ * It also tracks non-usage of indexes. I.e. it collects information about collection scans that
+ * occur on a collection.
+ *
  * Indexes must be registered and deregistered on creation/destruction.
  */
 class CollectionIndexUsageTracker {
-    MONGO_DISALLOW_COPYING(CollectionIndexUsageTracker);
+    CollectionIndexUsageTracker(const CollectionIndexUsageTracker&) = delete;
+    CollectionIndexUsageTracker& operator=(const CollectionIndexUsageTracker&) = delete;
 
 public:
+    struct CollectionScanStats {
+        unsigned long long collectionScans{0};
+        unsigned long long collectionScansNonTailable{0};
+    };
+
     struct IndexUsageStats {
         IndexUsageStats() = default;
         explicit IndexUsageStats(Date_t now, const BSONObj& key)
@@ -68,7 +77,7 @@ public:
         }
 
         // Number of operations that have used this index.
-        AtomicInt64 accesses;
+        AtomicWord<long long> accesses;
 
         // Date/Time that we started tracking index usage.
         Date_t trackerStartTime;
@@ -110,6 +119,15 @@ public:
      */
     StringMap<CollectionIndexUsageTracker::IndexUsageStats> getUsageStats() const;
 
+    /**
+     * Get the current state of the usage of collection scans. This struct will only include
+     * information about the collection scans that have occured at the time of calling.
+     */
+    CollectionScanStats getCollectionScanStats() const;
+
+    void recordCollectionScans(unsigned long long collectionScans);
+    void recordCollectionScansNonTailable(unsigned long long collectionScansNonTailable);
+
 private:
     // Map from index name to usage statistics.
     StringMap<CollectionIndexUsageTracker::IndexUsageStats> _indexUsageMap;
@@ -117,8 +135,10 @@ private:
     // Clock source. Used when the 'trackerStartTime' time for an IndexUsageStats object needs to
     // be set.
     ClockSource* _clockSource;
+
+    AtomicWord<unsigned long long> _collectionScans{0};
+    AtomicWord<unsigned long long> _collectionScansNonTailable{0};
 };
 
 typedef StringMap<CollectionIndexUsageTracker::IndexUsageStats> CollectionIndexUsageMap;
-
 }  // namespace mongo

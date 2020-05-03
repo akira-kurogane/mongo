@@ -20,7 +20,7 @@ doTest = function() {
     // save some records
     var len = 100;
     for (var i = 0; i < len; ++i) {
-        assert.writeOK(mColl.save({a: i}));
+        assert.commandWorked(mColl.save({a: i}));
     }
 
     print("******* replSetMaintenance called on secondary ************* ");
@@ -31,7 +31,7 @@ doTest = function() {
     assert.eq(false, ismaster.secondary);
 
     print("******* writing to primary ************* ");
-    assert.writeOK(mColl.save({_id: -1}));
+    assert.commandWorked(mColl.save({_id: -1}));
     printjson(sDB.currentOp());
     assert.neq(null, mColl.findOne());
 
@@ -41,6 +41,10 @@ doTest = function() {
 
     print("******* fsyncUnlock'n secondary ************* ");
     sDB.fsyncUnlock();
+
+    print("******* unset replSetMaintenance on secondary ************* ");
+    assert.commandWorked(sDB.adminCommand({replSetMaintenance: 0}));
+    replTest.stopSet();
 };
 
 doTest();

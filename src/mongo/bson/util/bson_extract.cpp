@@ -1,34 +1,36 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/bson/util/bson_extract.h"
 
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -50,8 +52,7 @@ Status bsonExtractFieldImpl(const BSONObj& object,
         return kDefaultCase;
     }
     return Status(ErrorCodes::NoSuchKey,
-                  mongoutils::str::stream() << "Missing expected field \"" << fieldName.toString()
-                                            << "\"");
+                  str::stream() << "Missing expected field \"" << fieldName.toString() << "\"");
 }
 
 Status bsonExtractTypedFieldImpl(const BSONObj& object,
@@ -64,11 +65,9 @@ Status bsonExtractTypedFieldImpl(const BSONObj& object,
         return status;
     if (type != outElement->type()) {
         return Status(ErrorCodes::TypeMismatch,
-                      mongoutils::str::stream() << "\"" << fieldName
-                                                << "\" had the wrong type. Expected "
-                                                << typeName(type)
-                                                << ", found "
-                                                << typeName(outElement->type()));
+                      str::stream()
+                          << "\"" << fieldName << "\" had the wrong type. Expected "
+                          << typeName(type) << ", found " << typeName(outElement->type()));
     }
     return status;
 }
@@ -83,18 +82,17 @@ Status bsonExtractIntegerFieldImpl(const BSONObj& object,
         return status;
     if (!element.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
-                      mongoutils::str::stream() << "Expected field \"" << fieldName
-                                                << "\" to have numeric type, but found "
-                                                << typeName(element.type()));
+                      str::stream()
+                          << "Expected field \"" << fieldName
+                          << "\" to have numeric type, but found " << typeName(element.type()));
     }
     long long result = element.safeNumberLong();
     if (result != element.numberDouble()) {
-        return Status(
-            ErrorCodes::BadValue,
-            mongoutils::str::stream() << "Expected field \"" << fieldName
-                                      << "\" to have a value "
-                                         "exactly representable as a 64-bit integer, but found "
-                                      << element);
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Expected field \"" << fieldName
+                                    << "\" to have a value "
+                                       "exactly representable as a 64-bit integer, but found "
+                                    << element);
     }
     *out = result;
     return status;
@@ -110,9 +108,9 @@ Status bsonExtractDoubleFieldImpl(const BSONObj& object,
         return status;
     if (!element.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
-                      mongoutils::str::stream() << "Expected field \"" << fieldName
-                                                << "\" to have numeric type, but found "
-                                                << typeName(element.type()));
+                      str::stream()
+                          << "Expected field \"" << fieldName
+                          << "\" to have numeric type, but found " << typeName(element.type()));
     }
     *out = element.numberDouble();
     return status;
@@ -155,10 +153,8 @@ Status bsonExtractBooleanFieldWithDefault(const BSONObj& object,
 
     if (!element.isNumber() && !element.isBoolean()) {
         return Status(ErrorCodes::TypeMismatch,
-                      mongoutils::str::stream() << "Expected boolean or number type for field \""
-                                                << fieldName
-                                                << "\", found "
-                                                << typeName(element.type()));
+                      str::stream() << "Expected boolean or number type for field \"" << fieldName
+                                    << "\", found " << typeName(element.type()));
     }
     *out = element.trueValue();
     return status;
@@ -253,7 +249,7 @@ Status bsonExtractIntegerFieldWithDefault(const BSONObj& object,
 Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
                                             StringData fieldName,
                                             long long defaultValue,
-                                            stdx::function<bool(long long)> pred,
+                                            std::function<bool(long long)> pred,
                                             const std::string& predDescription,
                                             long long* out) {
     Status status = bsonExtractIntegerFieldWithDefault(object, fieldName, defaultValue, out);
@@ -261,11 +257,9 @@ Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
         return status;
     }
     if (!pred(*out)) {
-        return Status(
-            ErrorCodes::BadValue,
-            mongoutils::str::stream() << "Invalid value in field \"" << fieldName << "\": " << *out
-                                      << ": "
-                                      << predDescription);
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid value in field \"" << fieldName << "\": " << *out
+                                    << ": " << predDescription);
     }
     return status;
 }
@@ -273,7 +267,7 @@ Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
 Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
                                             StringData fieldName,
                                             long long defaultValue,
-                                            stdx::function<bool(long long)> pred,
+                                            std::function<bool(long long)> pred,
                                             long long* out) {
     return bsonExtractIntegerFieldWithDefaultIf(
         object, fieldName, defaultValue, pred, "constraint failed", out);

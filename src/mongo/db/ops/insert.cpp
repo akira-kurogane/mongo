@@ -1,25 +1,24 @@
-// insert.cpp
-
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,16 +33,15 @@
 #include <vector>
 
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/views/durable_view_catalog.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::string;
-
-using namespace mongoutils;
 
 namespace {
 /**
@@ -61,9 +59,9 @@ Status validateDepth(const BSONObj& obj) {
                 // We're exactly at the limit, so descending to the next level would exceed
                 // the maximum depth.
                 return {ErrorCodes::Overflow,
-                        str::stream() << "cannot insert document because it exceeds "
-                                      << BSONDepth::getMaxDepthForUserStorage()
-                                      << " levels of nesting"};
+                        str::stream()
+                            << "cannot insert document because it exceeds "
+                            << BSONDepth::getMaxDepthForUserStorage() << " levels of nesting"};
             }
             frames.emplace_back(elem.embeddedObject());
         }
@@ -81,10 +79,8 @@ StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj&
     if (doc.objsize() > BSONObjMaxUserSize)
         return StatusWith<BSONObj>(ErrorCodes::BadValue,
                                    str::stream() << "object to insert too large"
-                                                 << ". size in bytes: "
-                                                 << doc.objsize()
-                                                 << ", max size: "
-                                                 << BSONObjMaxUserSize);
+                                                 << ". size in bytes: " << doc.objsize()
+                                                 << ", max size: " << BSONObjMaxUserSize);
 
     auto depthStatus = validateDepth(doc);
     if (!depthStatus.isOK()) {
@@ -158,7 +154,7 @@ StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj&
         if (e.type()) {
             b.append(e);
         } else {
-            b.appendOID("_id", NULL, true);
+            b.appendOID("_id", nullptr, true);
         }
     }
 
@@ -207,23 +203,12 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
     if (!NamespaceString::validCollectionName(coll))
         return Status(ErrorCodes::InvalidNamespace, "invalid collection name");
 
-    if (db.size() + 1 /* dot */ + coll.size() > NamespaceString::MaxNsCollectionLen)
-        return Status(ErrorCodes::InvalidNamespace,
-                      str::stream() << "fully qualified namespace " << db << '.' << coll
-                                    << " is too long "
-                                    << "(max is "
-                                    << NamespaceString::MaxNsCollectionLen
-                                    << " bytes)");
-
-    // check spceial areas
+    // check special areas
 
     if (db == "system")
         return Status(ErrorCodes::InvalidNamespace, "cannot use 'system' database");
 
-
     if (coll.startsWith("system.")) {
-        if (coll == "system.indexes")
-            return Status::OK();
         if (coll == "system.js")
             return Status::OK();
         if (coll == "system.profile")
@@ -235,8 +220,6 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
         if (db == "admin") {
             if (coll == "system.version")
                 return Status::OK();
-            if (coll == "system.sessions")
-                return Status::OK();
             if (coll == "system.roles")
                 return Status::OK();
             if (coll == "system.new_users")
@@ -244,6 +227,12 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
             if (coll == "system.backup_users")
                 return Status::OK();
             if (coll == "system.keys")
+                return Status::OK();
+        }
+        if (db == "config") {
+            if (coll == "system.sessions")
+                return Status::OK();
+            if (coll == "system.indexBuilds")
                 return Status::OK();
         }
         if (db == "local") {
@@ -259,6 +248,16 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
     // some special rules
 
     if (coll.find(".system.") != string::npos) {
+        // Writes are permitted to the persisted chunk metadata collections. These collections are
+        // named based on the name of the sharded collection, e.g.
+        // 'config.cache.chunks.dbname.collname'. Since there is a sharded collection
+        // 'config.system.sessions', there will be a corresponding persisted chunk metadata
+        // collection 'config.cache.chunks.config.system.sessions'. We wish to allow writes to this
+        // collection.
+        if (coll.find(".system.sessions") != string::npos) {
+            return Status::OK();
+        }
+
         // this matches old (2.4 and older) behavior, but I'm not sure its a good idea
         return Status(ErrorCodes::BadValue,
                       str::stream() << "cannot write to '" << db << "." << coll << "'");
@@ -266,4 +265,4 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
 
     return Status::OK();
 }
-}
+}  // namespace mongo

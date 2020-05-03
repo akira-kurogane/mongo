@@ -1,6 +1,7 @@
 /**
  * Test that the replica set connections to the secondaries will have the right auth credentials
  * even when these connections are shared within the same connection pool.
+ * @tags: [requires_replication]
  */
 
 var NUM_NODES = 3;
@@ -33,11 +34,11 @@ var barDB1 = replConn1.getDB('bar');
 fooDB0.auth('foo', 'foopwd');
 barDB1.auth('bar', 'barpwd');
 
-assert.writeOK(fooDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
+assert.commandWorked(fooDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
 assert.writeError(barDB0.user.insert({x: 1}, {writeConcern: {w: NUM_NODES}}));
 
 assert.writeError(fooDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
-assert.writeOK(barDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
+assert.commandWorked(barDB1.user.insert({x: 2}, {writeConcern: {w: NUM_NODES}}));
 
 // Make sure replica set connection in the shell is ready.
 _awaitRSHostViaRSMonitor(rsTest.getPrimary().name, {ok: true, ismaster: true}, rsTest.name);
@@ -63,5 +64,9 @@ for (var x = 0; x < 20; x++) {
     explain = barDB1.user.find().readPref('secondary').explain('executionStats');
     assert.eq(1, explain.executionStats.nReturned);
 }
+
+admin.logout();
+fooDB0.logout();
+barDB1.logout();
 
 rsTest.stopSet();

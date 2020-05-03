@@ -1,37 +1,40 @@
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -51,7 +54,7 @@ namespace mongo {
 BSONObj fromjson(const std::string& str);
 
 /** @param len will be size of JSON object in text chars. */
-BSONObj fromjson(const char* str, int* len = NULL);
+BSONObj fromjson(const char* str, int* len = nullptr);
 
 /**
  * Tests whether the JSON string is an Array.
@@ -76,7 +79,9 @@ bool isArray(StringData str);
  * @param format The JSON format (TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONArray& arr,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
 
 /**
  * Convert a BSONObj to a JSON string.
@@ -85,7 +90,9 @@ std::string tojson(const BSONArray& arr, JsonStringFormat format = Strict, bool 
  * @param format The JSON format (JS, TenGen, Strict).
  * @param pretty Enables pretty output.
  */
-std::string tojson(const BSONObj& obj, JsonStringFormat format = Strict, bool pretty = false);
+std::string tojson(const BSONObj& obj,
+                   JsonStringFormat format = ExtendedCanonicalV2_0_0,
+                   bool pretty = false);
 
 /**
  * Parser class.  A BSONObj is constructed incrementally by passing a
@@ -182,6 +189,12 @@ private:
     Status binaryObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * UUIDOBJECT :
+     *     { FIELD("$uuid") : <string representation of UUID, in hexadecimal per RFC 4122> }
+     */
+    Status uuidObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * DATEOBJECT :
      *     { FIELD("$date") : <64 bit signed integer for milliseconds since epoch> }
      */
@@ -206,6 +219,16 @@ private:
     Status regexObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     *     NOTE: the rules for the body of the regex are different here,
+     *     since it is quoted instead of surrounded by slashes.
+     * REGEXOBJECT :
+     *     { FIELD("$regularExpression") : {
+     *         FIELD("pattern") : <string representing body of regex>,
+     *         FIELD("options") : <string representing regex options> } }
+     */
+    Status regexObjectCanonical(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * REFOBJECT :
      *     { FIELD("$ref") : <string representing collection name>,
      *          FIELD("$id") : <24 character hex std::string> }
@@ -221,10 +244,22 @@ private:
     Status undefinedObject(StringData fieldName, BSONObjBuilder&);
 
     /*
+     * NUMBERINTOBJECT :
+     *     { FIELD("$numberInt") : "<number>" }
+     */
+    Status numberIntObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
      * NUMBERLONGOBJECT :
      *     { FIELD("$numberLong") : "<number>" }
      */
     Status numberLongObject(StringData fieldName, BSONObjBuilder&);
+
+    /*
+     * NUMBERDOUBLEOBJECT :
+     *     { FIELD("$numberDouble") : "<number>" }
+     */
+    Status numberDoubleObject(StringData fieldName, BSONObjBuilder&);
 
     /*
      * NUMBERDECIMALOBJECT :
@@ -409,7 +444,7 @@ private:
      * string, but there is no guarantee that it will not contain other
      * null characters.
      */
-    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = NULL);
+    Status chars(std::string* result, const char* terminalSet, const char* allowedSet = nullptr);
 
     /**
      * Converts the two byte Unicode code point to its UTF8 character
@@ -471,6 +506,12 @@ private:
      * additional context information
      */
     Status parseError(StringData msg);
+
+    /**
+     * @returns a valid Date_t or FailedToParse status.
+     * Updates _input to past the end of the parsed date.
+     */
+    StatusWith<Date_t> parseDate();
 
 public:
     inline int offset() {

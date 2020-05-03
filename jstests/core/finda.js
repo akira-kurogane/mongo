@@ -1,3 +1,7 @@
+// @tags: [
+//   requires_getmore,
+// ]
+
 // Tests where the QueryOptimizerCursor enters takeover mode during a query rather than a get more.
 
 t = db.jstests_finda;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -37,15 +37,14 @@ def timestamp_str(t):
     return '%x' % t
 
 class test_timestamp01(wttest.WiredTigerTestCase, suite_subprocess):
-    def test_timestamp_range(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
+    session_config = 'isolation=snapshot'
 
+    def test_timestamp_range(self):
         # Cannot set a timestamp on a non-running transaction
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.timestamp_transaction(
                 'commit_timestamp=' + timestamp_str(1 << 5000)),
-                '/must be running/')
+                '/only permitted in a running/')
 
         # Zero is not permitted
         self.session.begin_transaction()
@@ -61,10 +60,38 @@ class test_timestamp01(wttest.WiredTigerTestCase, suite_subprocess):
                 'commit_timestamp=' + timestamp_str(1 << 5000)),
                 '/too long/')
 
-        # One is okay, as is 2**64 - 1
+        # Anything other than lower case hexadecimal characters is not permitted
+        self.session.begin_transaction()
+        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
+            lambda: self.session.commit_transaction(
+                'commit_timestamp=' + timestamp_str(-1)),
+                '/Failed to parse commit timestamp/')
+
+        self.session.begin_transaction()
+        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
+            lambda: self.session.commit_transaction(
+                'commit_timestamp=' + 'a/78f'),
+                '/Failed to parse commit timestamp/')
+
+        self.session.begin_transaction()
+        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
+            lambda: self.session.commit_transaction(
+                'commit_timestamp=' + 'a`78f'),
+                '/Failed to parse commit timestamp/')
+
+        self.session.begin_transaction()
+        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
+            lambda: self.session.commit_transaction(
+                'commit_timestamp=' + 'a{78f'),
+                '/Failed to parse commit timestamp/')
+
+        # One is okay, as is upper case hex and 2**64 - 1
         self.session.begin_transaction()
         self.session.commit_transaction(
             'commit_timestamp=' + timestamp_str(1))
+        self.session.begin_transaction()
+        self.session.commit_transaction(
+            'commit_timestamp=0A78F')
         self.session.begin_transaction()
         self.session.commit_transaction(
             'commit_timestamp=' + timestamp_str(1 << 64 - 1))

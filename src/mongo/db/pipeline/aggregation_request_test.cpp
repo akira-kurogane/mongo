@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,10 +35,10 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/unittest/unittest.h"
@@ -59,7 +60,8 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
         "{pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: true, fromMongos: true, "
         "needsMerge: true, bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: "
         "{batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, readConcern: {level: 'linearizable'}, "
-        "$queryOptions: {$readPreference: 'nearest'}, comment: 'agg_comment'}}");
+        "$queryOptions: {$readPreference: 'nearest'}, exchange: {policy: "
+        "'roundrobin', consumers:NumberInt(2)}, isMapReduceCommand: true}");
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
     ASSERT_FALSE(request.getExplain());
     ASSERT_TRUE(request.shouldAllowDiskUse());
@@ -68,7 +70,6 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     ASSERT_TRUE(request.shouldBypassDocumentValidation());
     ASSERT_EQ(request.getBatchSize(), 10);
     ASSERT_BSONOBJ_EQ(request.getHint(), BSON("a" << 1));
-    ASSERT_EQ(request.getComment(), "agg_comment");
     ASSERT_BSONOBJ_EQ(request.getCollation(),
                       BSON("locale"
                            << "en_US"));
@@ -79,16 +80,8 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     ASSERT_BSONOBJ_EQ(request.getUnwrappedReadPref(),
                       BSON("$readPreference"
                            << "nearest"));
-}
-
-TEST(AggregationRequestTest, ShouldParseNeedsMerge34) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromRouter: true}");
-    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
-    ASSERT_TRUE(request.needsMerge());
-    ASSERT_TRUE(request.isFromMongos());
-    ASSERT_TRUE(request.isFrom34Mongos());
+    ASSERT_TRUE(request.getExchangeSpec().is_initialized());
+    ASSERT_TRUE(request.getIsMapReduceCommand());
 }
 
 TEST(AggregationRequestTest, ShouldParseExplicitExplainTrue) {
@@ -126,6 +119,19 @@ TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArgAn
     ASSERT_EQ(request.getBatchSize(), 10);
 }
 
+TEST(AggregationRequestTest, ShouldParseExplainFlagWithReadConcern) {
+    NamespaceString nss("a.collection");
+    // Non-local readConcern should not be allowed with the explain flag, but this is checked
+    // elsewhere to avoid having to parse the readConcern in AggregationRequest.
+    const BSONObj inputBson =
+        fromjson("{pipeline: [], explain: true, readConcern: {level: 'majority'}}");
+    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
+    ASSERT_TRUE(request.getExplain());
+    ASSERT_BSONOBJ_EQ(request.getReadConcern(),
+                      BSON("level"
+                           << "majority"));
+}
+
 //
 // Serialization
 //
@@ -151,10 +157,10 @@ TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefau
     request.setBypassDocumentValidation(false);
     request.setCollation(BSONObj());
     request.setHint(BSONObj());
-    request.setComment("");
     request.setMaxTimeMS(0u);
     request.setUnwrappedReadPref(BSONObj());
     request.setReadConcern(BSONObj());
+    request.setIsMapReduceCommand(false);
 
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
@@ -174,8 +180,6 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     request.setMaxTimeMS(10u);
     const auto hintObj = BSON("a" << 1);
     request.setHint(hintObj);
-    const auto comment = std::string("agg_comment");
-    request.setComment(comment);
     const auto collationObj = BSON("locale"
                                    << "en_US");
     request.setCollation(collationObj);
@@ -185,6 +189,10 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     const auto readConcernObj = BSON("level"
                                      << "linearizable");
     request.setReadConcern(readConcernObj);
+    request.setIsMapReduceCommand(true);
+    const auto letParamsObj = BSON("foo"
+                                   << "bar");
+    request.letParameters = letParamsObj;
 
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
@@ -197,10 +205,11 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
                  {AggregationRequest::kCursorName,
                   Value(Document({{AggregationRequest::kBatchSizeName, 10}}))},
                  {AggregationRequest::kHintName, hintObj},
-                 {AggregationRequest::kCommentName, comment},
                  {repl::ReadConcernArgs::kReadConcernFieldName, readConcernObj},
                  {QueryRequest::kUnwrappedReadPrefField, readPrefObj},
-                 {QueryRequest::cmdOptionMaxTimeMS, 10}};
+                 {QueryRequest::cmdOptionMaxTimeMS, 10},
+                 {AggregationRequest::kIsMapReduceCommand, true},
+                 {AggregationRequest::kLet, letParamsObj}};
     ASSERT_DOCUMENT_EQ(request.serializeToCommandObj(), expectedSerialization);
 }
 
@@ -305,14 +314,6 @@ TEST(AggregationRequestTest, ShouldRejectHintAsArray) {
         AggregationRequest::parseFromBSON(NamespaceString("a.collection"), inputBson).getStatus());
 }
 
-TEST(AggregationRequestTest, ShouldRejectNonStringComment) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, comment: 1}");
-    ASSERT_NOT_OK(
-        AggregationRequest::parseFromBSON(NamespaceString("a.collection"), inputBson).getStatus());
-}
-
 TEST(AggregationRequestTest, ShouldRejectExplainIfNumber) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
@@ -377,6 +378,13 @@ TEST(AggregationRequestTest, ShouldRejectNonBoolAllowDiskUse) {
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
+TEST(AggregationRequestTest, ShouldRejectNonBoolIsMapReduceCommand) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, isMapReduceCommand: 1}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
 TEST(AggregationRequestTest, ShouldRejectNoCursorNoExplain) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson = fromjson("{pipeline: [{$match: {a: 'abc'}}]}");
@@ -397,13 +405,6 @@ TEST(AggregationRequestTest, ShouldRejectExplainFalseWithSeparateExplainArg) {
     ASSERT_NOT_OK(
         AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
             .getStatus());
-}
-
-TEST(AggregationRequestTest, ShouldRejectExplainWithReadConcernMajority) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [], explain: true, readConcern: {level: 'majority'}}");
-    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithReadConcernMajority) {
@@ -427,6 +428,13 @@ TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConce
     ASSERT_NOT_OK(
         AggregationRequest::parseFromBSON(nss, inputBson, ExplainOptions::Verbosity::kExecStats)
             .getStatus());
+}
+
+TEST(AggregationRequestTest, CannotParseNeedsMerge34) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromRouter: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
 TEST(AggregationRequestTest, ParseNSShouldReturnAggregateOneNSIfAggregateFieldIsOne) {
@@ -477,6 +485,24 @@ TEST(AggregationRequestTest, ParseFromBSONOverloadsShouldProduceIdenticalRequest
     ASSERT_DOCUMENT_EQ(aggReqDBName.serializeToCommandObj(), aggReqNSS.serializeToCommandObj());
 }
 
+TEST(AggregationRequestTest, ShouldRejectExchangeNotObject) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], exchage: '42'}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectExchangeInvalidSpec) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], exchage: {}}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectInvalidWriteConcern) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, writeConcern: 'invalid'}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
 //
 // Ignore fields parsed elsewhere.
 //
@@ -485,13 +511,6 @@ TEST(AggregationRequestTest, ShouldIgnoreQueryOptions) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
         fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, $queryOptions: {}}");
-    ASSERT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
-}
-
-TEST(AggregationRequestTest, ShouldIgnoreWriteConcernOption) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, writeConcern: 'invalid'}");
     ASSERT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 

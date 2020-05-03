@@ -1,14 +1,15 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import sys
 
 from gen_helper import getCopyrightNotice, openNamespaces, closeNamespaces, \
     include
 
+
 def generate(unicode_proplist_file, target):
     """Generates a C++ source file that contains a diacritic checking function.
 
-    The diacritic checking function contains a switch statement with cases for 
+    The diacritic checking function contains a switch statement with cases for
     every diacritic in the Unicode Character Database.
     """
     out = open(target, "w")
@@ -20,17 +21,17 @@ def generate(unicode_proplist_file, target):
 
     diacritics = set()
 
-    proplist_file = open(unicode_proplist_file, 'rU')
+    proplist_file = open(unicode_proplist_file, 'r')
 
     for line in proplist_file:
         # Filter out blank lines and lines that start with #
         data = line[:line.find('#')]
-        if(data == ""):
+        if (data == ""):
             continue
 
         # Parse the data on the line
         values = data.split("; ")
-        assert(len(values) == 2)
+        assert (len(values) == 2)
 
         uproperty = values[1].strip()
         if uproperty in "Diacritic":
@@ -38,10 +39,10 @@ def generate(unicode_proplist_file, target):
                 codepoint_range = values[0].split('..')
 
                 start = int(codepoint_range[0], 16)
-                end   = int(codepoint_range[1], 16) + 1
+                end = int(codepoint_range[1], 16) + 1
 
                 for i in range(start, end):
-                    if i not in diacritics: 
+                    if i not in diacritics:
                         diacritics.add(i)
             else:
                 if int(values[0], 16) not in diacritics:
@@ -58,6 +59,7 @@ def generate(unicode_proplist_file, target):
     default: return false;\n    }\n}")
 
     out.write(closeNamespaces())
+
 
 if __name__ == "__main__":
     generate(sys.argv[1], sys.argv[2])

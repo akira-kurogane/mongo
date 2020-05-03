@@ -1,7 +1,7 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection]
+// @tags: [assumes_unsharded_collection, requires_non_retryable_writes]
 
 t = db.server1470;
 t.drop();
@@ -12,7 +12,7 @@ q = {
 };
 t.update(q, {$set: {x: 1}}, true, true);
 ref = t.findOne().pic;
-assert.eq("object", typeof(ref));
+assert.eq("object", typeof (ref));
 assert.eq(q.pic["$ref"], ref["$ref"]);
 assert.eq(q.pic["$id"], ref["$id"]);
 

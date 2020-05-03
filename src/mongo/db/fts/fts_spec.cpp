@@ -1,31 +1,31 @@
-// fts_spec.cpp
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -37,8 +37,7 @@
 #include "mongo/db/fts/fts_tokenizer.h"
 #include "mongo/db/fts/fts_util.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -46,7 +45,6 @@ namespace fts {
 
 using std::map;
 using std::string;
-using namespace mongoutils;
 namespace dps = ::mongo::dotted_path_support;
 
 const double DEFAULT_WEIGHT = 1;
@@ -61,15 +59,14 @@ const std::string moduleDefaultLanguage("english");
 bool validateOverride(const string& override) {
     // The override field can't be empty, can't be prefixed with a dollar sign, and
     // can't contain a dot.
-    return !override.empty()&& override[0] != '$' && override.find('.') == std::string::npos;
+    return !override.empty() && override[0] != '$' && override.find('.') == std::string::npos;
 }
-}
+}  // namespace
 
 FTSSpec::FTSSpec(const BSONObj& indexInfo) {
-    // indexInfo is a text index spec.  Text index specs pass through fixSpec() before
-    // being saved to the system.indexes collection.  fixSpec() enforces a schema, such that
-    // required fields must exist and be of the correct type (e.g. weights,
-    // textIndexVersion).
+    // indexInfo is a text index spec.  Text index specs pass through fixSpec() before being
+    // persisted.  fixSpec() enforces a schema, such that required fields must exist and be of the
+    // correct type (e.g. weights, textIndexVersion).
     massert(16739, "found invalid spec for text index", indexInfo["weights"].isABSONObj());
     BSONElement textIndexVersionElt = indexInfo["textIndexVersion"];
     massert(17367,
@@ -93,28 +90,24 @@ FTSSpec::FTSSpec(const BSONObj& indexInfo) {
             msgasserted(17364,
                         str::stream() << "attempt to use unsupported textIndexVersion "
                                       << textIndexVersionElt.numberInt()
-                                      << "; versions supported: "
-                                      << TEXT_INDEX_VERSION_3
-                                      << ", "
-                                      << TEXT_INDEX_VERSION_2
-                                      << ", "
-                                      << TEXT_INDEX_VERSION_1);
+                                      << "; versions supported: " << TEXT_INDEX_VERSION_3 << ", "
+                                      << TEXT_INDEX_VERSION_2 << ", " << TEXT_INDEX_VERSION_1);
     }
 
     // Initialize _defaultLanguage.  Note that the FTSLanguage constructor requires
     // textIndexVersion, since language parsing is version-specific.
     auto indexLanguage = indexInfo["default_language"].String();
-    auto swl = FTSLanguage::make(indexLanguage, _textIndexVersion);
-
-    // This can fail if the user originally created the text index under an instance of
-    // MongoDB that supports different languages then the current instance
-    // TODO: consder propagating the index ns to here to improve the error message
-    uassert(28682,
-            str::stream() << "Unrecognized language " << indexLanguage
-                          << " found for text index. Verify mongod was started with the"
-                             " correct options.",
-            swl.getStatus().isOK());
-    _defaultLanguage = swl.getValue();
+    try {
+        _defaultLanguage = &FTSLanguage::make(indexLanguage, _textIndexVersion);
+    } catch (const DBException&) {
+        // This can fail if the user originally created the text index under an instance of
+        // MongoDB that supports different languages then the current instance
+        // TODO: consder propagating the index ns to here to improve the error message
+        uasserted(28682,
+                  str::stream() << "Unrecognized language " << indexLanguage
+                                << " found for text index. Verify mongod was started with the"
+                                   " correct options.");
+    }
 
     _languageOverrideField = indexInfo["language_override"].valuestrsafe();
 
@@ -148,7 +141,7 @@ FTSSpec::FTSSpec(const BSONObj& indexInfo) {
 
         while (i.more()) {
             BSONElement e = i.next();
-            if (str::equals(e.fieldName(), "_fts") || str::equals(e.fieldName(), "_ftsx")) {
+            if ((e.fieldNameStringData() == "_fts") || (e.fieldNameStringData() == "_ftsx")) {
                 passedFTS = true;
                 continue;
             }
@@ -170,9 +163,11 @@ const FTSLanguage* FTSSpec::_getLanguageToUseV2(const BSONObj& userDoc,
     uassert(17261,
             "found language override field in document with non-string type",
             e.type() == mongo::String);
-    StatusWithFTSLanguage swl = FTSLanguage::make(e.String(), getTextIndexVersion());
-    uassert(17262, "language override unsupported: " + e.String(), swl.getStatus().isOK());
-    return swl.getValue();
+    try {
+        return &FTSLanguage::make(e.String(), getTextIndexVersion());
+    } catch (DBException&) {
+        uasserted(17262, "language override unsupported: " + e.String());
+    }
 }
 
 void FTSSpec::scoreDocument(const BSONObj& obj, TermFrequencyMap* term_freqs) const {
@@ -275,7 +270,7 @@ Status verifyFieldNameNotReserved(StringData s) {
 
     return Status::OK();
 }
-}
+}  // namespace
 
 StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
     if (spec["textIndexVersion"].numberInt() == TEXT_INDEX_VERSION_1) {
@@ -294,13 +289,13 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
             BSONObjIterator i(spec["key"].Obj());
             while (i.more()) {
                 BSONElement e = i.next();
-                if (str::equals(e.fieldName(), "_fts")) {
+                if (e.fieldNameStringData() == "_fts") {
                     if (INDEX_NAME != e.valuestrsafe()) {
                         return {ErrorCodes::CannotCreateIndex, "expecting _fts:\"text\""};
                     }
                     addedFtsStuff = true;
                     b.append(e);
-                } else if (str::equals(e.fieldName(), "_ftsx")) {
+                } else if (e.fieldNameStringData() == "_ftsx") {
                     if (e.numberInt() != 1) {
                         return {ErrorCodes::CannotCreateIndex, "expecting _ftsx:1"};
                     }
@@ -347,13 +342,13 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
             }
 
             // text fields
-            bool alreadyFixed = str::equals(e.fieldName(), "_fts");
+            bool alreadyFixed = (e.fieldNameStringData() == "_fts");
             if (alreadyFixed) {
                 if (!i.more()) {
                     return {ErrorCodes::CannotCreateIndex, "expected _ftsx after _fts"};
                 }
                 e = i.next();
-                if (!str::equals(e.fieldName(), "_ftsx")) {
+                if (e.fieldNameStringData() != "_ftsx") {
                     return {ErrorCodes::CannotCreateIndex, "expected _ftsx after _fts"};
                 }
                 e = i.next();
@@ -409,9 +404,7 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
             if (i->second <= 0 || i->second >= MAX_WORD_WEIGHT) {
                 return {ErrorCodes::CannotCreateIndex,
                         str::stream() << "text index weight must be in the exclusive interval (0,"
-                                      << MAX_WORD_WEIGHT
-                                      << ") but found: "
-                                      << i->second};
+                                      << MAX_WORD_WEIGHT << ") but found: " << i->second};
             }
 
             // Verify weight refers to a valid field.
@@ -448,7 +441,9 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
         return {ErrorCodes::CannotCreateIndex, "default_language needs a string type"};
     }
 
-    if (!FTSLanguage::make(default_language, TEXT_INDEX_VERSION_3).getStatus().isOK()) {
+    try {
+        FTSLanguage::make(default_language, TEXT_INDEX_VERSION_3);
+    } catch (DBException&) {
         return {ErrorCodes::CannotCreateIndex, "default_language is not valid"};
     }
 
@@ -469,20 +464,21 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
     BSONObjIterator i(spec);
     while (i.more()) {
         BSONElement e = i.next();
-        if (str::equals(e.fieldName(), "key")) {
+        StringData fieldName = e.fieldNameStringData();
+        if (fieldName == "key") {
             b.append("key", keyPattern);
-        } else if (str::equals(e.fieldName(), "weights")) {
+        } else if (fieldName == "weights") {
             b.append("weights", weights);
             weights = BSONObj();
-        } else if (str::equals(e.fieldName(), "default_language")) {
+        } else if (fieldName == "default_language") {
             b.append("default_language", default_language);
             default_language = "";
-        } else if (str::equals(e.fieldName(), "language_override")) {
+        } else if (fieldName == "language_override") {
             b.append("language_override", language_override);
             language_override = "";
-        } else if (str::equals(e.fieldName(), "v")) {
+        } else if (fieldName == "v") {
             version = e.numberInt();
-        } else if (str::equals(e.fieldName(), "textIndexVersion")) {
+        } else if (fieldName == "textIndexVersion") {
             if (!e.isNumber()) {
                 return {ErrorCodes::CannotCreateIndex,
                         "text index option 'textIndexVersion' must be a number"};
@@ -515,5 +511,5 @@ StatusWith<BSONObj> FTSSpec::fixSpec(const BSONObj& spec) {
 
     return b.obj();
 }
-}
-}
+}  // namespace fts
+}  // namespace mongo

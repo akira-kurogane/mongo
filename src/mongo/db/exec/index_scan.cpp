@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,22 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/index_scan.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/query/index_bounds_builder.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace {
 
@@ -59,72 +59,79 @@ namespace mongo {
 // static
 const char* IndexScan::kStageType = "IXSCAN";
 
-IndexScan::IndexScan(OperationContext* opCtx,
-                     const IndexScanParams& params,
+IndexScan::IndexScan(ExpressionContext* expCtx,
+                     IndexScanParams params,
                      WorkingSet* workingSet,
                      const MatchExpression* filter)
-    : PlanStage(kStageType, opCtx),
+    : RequiresIndexStage(kStageType, expCtx, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
-      _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
-      _keyPattern(params.descriptor->keyPattern().getOwned()),
-      _scanState(INITIALIZING),
-      _filter(filter),
-      _shouldDedup(true),
+      _keyPattern(params.keyPattern.getOwned()),
+      _bounds(std::move(params.bounds)),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
+      _direction(params.direction),
       _forward(params.direction == 1),
-      _params(params),
+      _shouldDedup(params.shouldDedup),
+      _addKeyMetadata(params.addKeyMetadata),
       _startKeyInclusive(IndexBounds::isStartIncludedInBound(params.bounds.boundInclusion)),
       _endKeyInclusive(IndexBounds::isEndIncludedInBound(params.bounds.boundInclusion)) {
-    // We can't always access the descriptor in the call to getStats() so we pull
-    // any info we need for stats reporting out here.
+    _specificStats.indexName = params.name;
     _specificStats.keyPattern = _keyPattern;
-    if (BSONElement collationElement = _params.descriptor->getInfoElement("collation")) {
-        invariant(collationElement.isABSONObj());
-        _specificStats.collation = collationElement.Obj().getOwned();
-    }
-    _specificStats.indexName = _params.descriptor->indexName();
-    _specificStats.isMultiKey = _params.descriptor->isMultikey(getOpCtx());
-    _specificStats.multiKeyPaths = _params.descriptor->getMultikeyPaths(getOpCtx());
-    _specificStats.isUnique = _params.descriptor->unique();
-    _specificStats.isSparse = _params.descriptor->isSparse();
-    _specificStats.isPartial = _params.descriptor->isPartial();
-    _specificStats.indexVersion = static_cast<int>(_params.descriptor->version());
+    _specificStats.isMultiKey = params.isMultiKey;
+    _specificStats.multiKeyPaths = params.multikeyPaths;
+    _specificStats.isUnique = params.indexDescriptor->unique();
+    _specificStats.isSparse = params.indexDescriptor->isSparse();
+    _specificStats.isPartial = params.indexDescriptor->isPartial();
+    _specificStats.indexVersion = static_cast<int>(params.indexDescriptor->version());
+    _specificStats.collation = params.indexDescriptor->infoObj()
+                                   .getObjectField(IndexDescriptor::kCollationFieldName)
+                                   .getOwned();
 }
 
 boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
-    if (_params.doNotDedup) {
-        _shouldDedup = false;
-    } else {
-        // TODO it is incorrect to rely on this not changing. SERVER-17678
-        _shouldDedup = _params.descriptor->isMultikey(getOpCtx());
-    }
-
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
-    _indexCursor = _iam->newCursor(getOpCtx(), _forward);
+    _indexCursor = indexAccessMethod()->newCursor(opCtx(), _forward);
 
     // We always seek once to establish the cursor position.
     ++_specificStats.seeks;
 
-    if (_params.bounds.isSimpleRange) {
+    if (_bounds.isSimpleRange) {
         // Start at one key, end at another.
-        _startKey = _params.bounds.startKey;
-        _endKey = _params.bounds.endKey;
+        _startKey = _bounds.startKey;
+        _endKey = _bounds.endKey;
         _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
-        return _indexCursor->seek(_startKey, _startKeyInclusive);
+
+        KeyString::Value keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            _startKey,
+            indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+            indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+            _forward,
+            _startKeyInclusive);
+        return _indexCursor->seek(keyStringForSeek);
     } else {
         // For single intervals, we can use an optimized scan which checks against the position
         // of an end cursor.  For all other index scans, we fall back on using
         // IndexBoundsChecker to determine when we've finished the scan.
         if (IndexBoundsBuilder::isSingleInterval(
-                _params.bounds, &_startKey, &_startKeyInclusive, &_endKey, &_endKeyInclusive)) {
+                _bounds, &_startKey, &_startKeyInclusive, &_endKey, &_endKeyInclusive)) {
             _indexCursor->setEndPosition(_endKey, _endKeyInclusive);
-            return _indexCursor->seek(_startKey, _startKeyInclusive);
+
+            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                _startKey,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                _forward,
+                _startKeyInclusive);
+            return _indexCursor->seek(keyStringForSeek);
         } else {
-            _checker.reset(new IndexBoundsChecker(&_params.bounds, _keyPattern, _params.direction));
+            _checker.reset(new IndexBoundsChecker(&_bounds, _keyPattern, _direction));
 
             if (!_checker->getStartSeekPoint(&_seekPoint))
                 return boost::none;
-
-            return _indexCursor->seek(_seekPoint);
+            return _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                _seekPoint,
+                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                _forward));
         }
     }
 }
@@ -142,7 +149,11 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
                 break;
             case NEED_SEEK:
                 ++_specificStats.seeks;
-                kv = _indexCursor->seek(_seekPoint);
+                kv = _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                    _seekPoint,
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    _forward));
                 break;
             case HIT_END:
                 return PlanStage::IS_EOF;
@@ -156,7 +167,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         // In debug mode, check that the cursor isn't lying to us.
         if (kDebugBuild && !_startKey.isEmpty()) {
             int cmp = kv->key.woCompare(_startKey,
-                                        Ordering::make(_params.descriptor->keyPattern()),
+                                        Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
             if (cmp == 0)
                 dassert(_startKeyInclusive);
@@ -165,7 +176,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
 
         if (kDebugBuild && !_endKey.isEmpty()) {
             int cmp = kv->key.woCompare(_endKey,
-                                        Ordering::make(_params.descriptor->keyPattern()),
+                                        Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
             if (cmp == 0)
                 dassert(_endKeyInclusive);
@@ -173,9 +184,6 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         }
 
         ++_specificStats.keysExamined;
-        if (_params.maxScan && _specificStats.keysExamined >= _params.maxScan) {
-            kv = boost::none;
-        }
     }
 
     if (kv && _checker) {
@@ -211,10 +219,8 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         }
     }
 
-    if (_filter) {
-        if (!Filter::passes(kv->key, _keyPattern, _filter)) {
-            return PlanStage::NEED_TIME;
-        }
+    if (!Filter::passes(kv->key, _keyPattern, _filter)) {
+        return PlanStage::NEED_TIME;
     }
 
     if (!kv->key.isOwned())
@@ -224,13 +230,12 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = kv->loc;
-    member->keyData.push_back(IndexKeyDatum(_keyPattern, kv->key, _iam));
+    member->keyData.push_back(IndexKeyDatum(
+        _keyPattern, kv->key, workingSetIndexId(), opCtx()->recoveryUnit()->getSnapshotId()));
     _workingSet->transitionToRecordIdAndIdx(id);
 
-    if (_params.addKeyMetadata) {
-        BSONObjBuilder bob;
-        bob.appendKeys(_keyPattern, kv->key);
-        member->addComputed(new IndexKeyComputedData(bob.obj()));
+    if (_addKeyMetadata) {
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_keyPattern, kv->key));
     }
 
     *out = id;
@@ -241,7 +246,7 @@ bool IndexScan::isEOF() {
     return _commonStats.isEOF;
 }
 
-void IndexScan::doSaveState() {
+void IndexScan::doSaveStateRequiresIndex() {
     if (!_indexCursor)
         return;
 
@@ -253,7 +258,7 @@ void IndexScan::doSaveState() {
     _indexCursor->save();
 }
 
-void IndexScan::doRestoreState() {
+void IndexScan::doRestoreStateRequiresIndex() {
     if (_indexCursor)
         _indexCursor->restore();
 }
@@ -265,23 +270,7 @@ void IndexScan::doDetachFromOperationContext() {
 
 void IndexScan::doReattachToOperationContext() {
     if (_indexCursor)
-        _indexCursor->reattachToOperationContext(getOpCtx());
-}
-
-void IndexScan::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
-    // The only state we're responsible for holding is what RecordIds to drop.  If a document
-    // mutates the underlying index cursor will deal with it.
-    if (INVALIDATION_MUTATION == type) {
-        return;
-    }
-
-    // If we see this RecordId again, it may not be the same document it was before, so we want
-    // to return it if we see it again.
-    unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
-    if (it != _returned.end()) {
-        ++_specificStats.seenInvalidated;
-        _returned.erase(it);
-    }
+        _indexCursor->reattachToOperationContext(opCtx());
 }
 
 std::unique_ptr<PlanStageStats> IndexScan::getStats() {
@@ -289,7 +278,7 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
     // catalog information here.
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
@@ -299,14 +288,14 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
     if (_specificStats.indexType.empty()) {
         _specificStats.indexType = "BtreeCursor";  // TODO amName;
 
-        _specificStats.indexBounds = _params.bounds.toBSON();
+        _specificStats.indexBounds = _bounds.toBSON();
 
-        _specificStats.direction = _params.direction;
+        _specificStats.direction = _direction;
     }
 
     std::unique_ptr<PlanStageStats> ret =
-        stdx::make_unique<PlanStageStats>(_commonStats, STAGE_IXSCAN);
-    ret->specific = stdx::make_unique<IndexScanStats>(_specificStats);
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_IXSCAN);
+    ret->specific = std::make_unique<IndexScanStats>(_specificStats);
     return ret;
 }
 

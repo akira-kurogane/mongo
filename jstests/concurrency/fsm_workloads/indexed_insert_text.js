@@ -6,7 +6,6 @@
  * Inserts some documents into a collection with a text index.
  */
 var $config = (function() {
-
     var states = {
         init: function init(db, collName) {
             // noop
@@ -18,7 +17,7 @@ var $config = (function() {
             var snippet = this.getRandomTextSnippet();
             doc[this.indexedField] = snippet;
             var res = db[collName].insert(doc);
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted, tojson(res));
             // TODO: what else can we assert? should that go in a read test?
 
@@ -126,5 +125,4 @@ var $config = (function() {
         },
         setup: setup
     };
-
 })();

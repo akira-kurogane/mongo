@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -79,7 +80,7 @@ public:
     vector<ChunkType> setUpChunkLoaderWithFiveChunks();
 
     const KeyPattern kKeyPattern = KeyPattern(BSON(kPattern << 1));
-    const stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>
+    const std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>
         kDoNothingCallbackFn = [](
             OperationContext * opCtx,
             StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {};
@@ -97,16 +98,16 @@ void ShardServerCatalogCacheLoaderTest::setUp() {
 
     // Create mock remote and real shard loader, retaining a pointer to the mock remote loader so
     // that unit tests can manipulate it to return certain responses.
-    std::unique_ptr<CatalogCacheLoaderMock> mockLoader =
-        stdx::make_unique<CatalogCacheLoaderMock>();
+    std::unique_ptr<CatalogCacheLoaderMock> mockLoader = std::make_unique<CatalogCacheLoaderMock>();
     _remoteLoaderMock = mockLoader.get();
-    _shardLoader = stdx::make_unique<ShardServerCatalogCacheLoader>(std::move(mockLoader));
+    _shardLoader = std::make_unique<ShardServerCatalogCacheLoader>(std::move(mockLoader));
 
     // Set the shard loader to primary mode, and set it for testing.
     _shardLoader->initializeReplicaSetRole(true);
 }
 
 void ShardServerCatalogCacheLoaderTest::tearDown() {
+    _shardLoader->shutDown();
     _shardLoader.reset();
     ShardServerTestFixture::tearDown();
 }
@@ -125,7 +126,7 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeFiveChunks(
         collVersion.incMajor();
 
         ChunkType chunk;
-        chunk.setNS(kNss.ns());
+        chunk.setNS(kNss);
         chunk.setMin(mins[i]);
         chunk.setMax(maxs[i]);
         chunk.setShard(kShardId);
@@ -148,7 +149,7 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeThreeUpdatedChunksDiff(
     // dependent on a race between persistence and retrieving data because it combines enqueued and
     // persisted results without applying modifications.
     ChunkType oldChunk;
-    oldChunk.setNS(kNss.ns());
+    oldChunk.setNS(kNss);
     oldChunk.setMin(BSON("a" << 200));
     oldChunk.setMax(BSON("a" << MAXKEY));
     oldChunk.setShard(kShardId);
@@ -164,7 +165,7 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeThreeUpdatedChunksDiff(
         collVersion.incMinor();
 
         ChunkType chunk;
-        chunk.setNS(kNss.ns());
+        chunk.setNS(kNss);
         chunk.setMin(mins[i]);
         chunk.setMax(maxs[i]);
         chunk.setShard(kShardId);

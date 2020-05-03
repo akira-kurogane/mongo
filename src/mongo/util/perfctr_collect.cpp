@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -34,9 +35,9 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -82,7 +83,7 @@ std::string errnoWithPdhDescription(PDH_STATUS status) {
         return str::stream() << "Format message failed with " << gle << " for status " << status;
     }
 
-    ScopeGuard errorTextGuard = MakeGuard([errorText]() { LocalFree(errorText); });
+    auto errorTextGuard = makeGuard([errorText] { LocalFree(errorText); });
     std::string utf8ErrorText = toUtf8String(errorText);
 
     auto size = utf8ErrorText.find_first_of("\r\n");
@@ -243,7 +244,7 @@ StatusWith<PerfCounterCollector::CounterInfo> PerfCounterCollector::addCounter(S
         return {ErrorCodes::WindowsPdhError, formatFunctionCallError("PdhGetCounterInfoW", status)};
     }
 
-    auto buf = stdx::make_unique<char[]>(bufferSize);
+    auto buf = std::make_unique<char[]>(bufferSize);
     auto counterInfo = reinterpret_cast<PPDH_COUNTER_INFO>(buf.get());
 
     status = PdhGetCounterInfoW(counter, false, &bufferSize, counterInfo);
@@ -295,12 +296,10 @@ StatusWith<std::vector<PerfCounterCollector::CounterInfo>> PerfCounterCollector:
     if (status != PDH_MORE_DATA) {
         return {ErrorCodes::WindowsPdhError,
                 str::stream() << formatFunctionCallError("PdhExpandCounterPathW", status)
-                              << " for counter '"
-                              << path
-                              << "'"};
+                              << " for counter '" << path << "'"};
     }
 
-    auto buf = stdx::make_unique<wchar_t[]>(pathListLength);
+    auto buf = std::make_unique<wchar_t[]>(pathListLength);
 
     status = PdhExpandCounterPathW(pathWide.c_str(), buf.get(), &pathListLength);
 

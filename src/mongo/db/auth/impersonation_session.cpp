@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,7 +40,7 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/rpc/metadata/audit_metadata.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 
@@ -47,28 +48,24 @@ namespace mongo {
 
 ImpersonationSessionGuard::ImpersonationSessionGuard(OperationContext* opCtx) : _opCtx(opCtx) {
     auto authSession = AuthorizationSession::get(_opCtx->getClient());
-
-    const auto& impersonatedUsersAndRoles =
-        rpc::AuditMetadata::get(opCtx).getImpersonatedUsersAndRoles();
-
-    if (impersonatedUsersAndRoles != boost::none) {
+    const auto impersonatedUsersAndRoles = rpc::getImpersonatedUserMetadata(opCtx);
+    if (impersonatedUsersAndRoles) {
         uassert(ErrorCodes::Unauthorized,
                 "Unauthorized use of impersonation metadata.",
                 authSession->isAuthorizedForPrivilege(
                     Privilege(ResourcePattern::forClusterResource(), ActionType::impersonate)));
-
         fassert(ErrorCodes::InternalError, !authSession->isImpersonating());
-
-        authSession->setImpersonatedUserData(std::get<0>(*impersonatedUsersAndRoles),
-                                             std::get<1>(*impersonatedUsersAndRoles));
+        authSession->setImpersonatedUserData(impersonatedUsersAndRoles->getUsers(),
+                                             impersonatedUsersAndRoles->getRoles());
         _active = true;
+        return;
     }
 }
 
 ImpersonationSessionGuard::~ImpersonationSessionGuard() {
-    DESTRUCTOR_GUARD(if (_active) {
+    if (_active) {
         AuthorizationSession::get(_opCtx->getClient())->clearImpersonatedUserData();
-    })
+    }
 }
 
 }  // namespace mongo

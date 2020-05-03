@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,12 +39,14 @@ namespace mongo {
 namespace rpc {
 
 using repl::OpTime;
+using repl::OpTimeAndWallTime;
 
 const char kOplogQueryMetadataFieldName[] = "$oplogQueryData";
 
 namespace {
 
 const char kLastOpCommittedFieldName[] = "lastOpCommitted";
+const char kLastCommittedWallFieldName[] = "lastCommittedWall";
 const char kLastOpAppliedFieldName[] = "lastOpApplied";
 const char kPrimaryIndexFieldName[] = "primaryIndex";
 const char kSyncSourceIndexFieldName[] = "syncSourceIndex";
@@ -53,7 +56,7 @@ const char kRBIDFieldName[] = "rbid";
 
 const int OplogQueryMetadata::kNoPrimary;
 
-OplogQueryMetadata::OplogQueryMetadata(OpTime lastOpCommitted,
+OplogQueryMetadata::OplogQueryMetadata(OpTimeAndWallTime lastOpCommitted,
                                        OpTime lastOpApplied,
                                        int rbid,
                                        int currentPrimaryIndex,
@@ -88,10 +91,19 @@ StatusWith<OplogQueryMetadata> OplogQueryMetadata::readFromMetadata(const BSONOb
     if (!status.isOK())
         return status;
 
-    repl::OpTime lastOpCommitted;
-    status = bsonExtractOpTimeField(oqMetadataObj, kLastOpCommittedFieldName, &lastOpCommitted);
+    repl::OpTimeAndWallTime lastOpCommitted;
+    status =
+        bsonExtractOpTimeField(oqMetadataObj, kLastOpCommittedFieldName, &(lastOpCommitted.opTime));
     if (!status.isOK())
         return status;
+
+    BSONElement wallClockTimeElement;
+    status = bsonExtractTypedField(
+        oqMetadataObj, kLastCommittedWallFieldName, BSONType::Date, &wallClockTimeElement);
+    if (!status.isOK()) {
+        return status;
+    }
+    lastOpCommitted.wallTime = wallClockTimeElement.Date();
 
     repl::OpTime lastOpApplied;
     status = bsonExtractOpTimeField(oqMetadataObj, kLastOpAppliedFieldName, &lastOpApplied);
@@ -103,7 +115,8 @@ StatusWith<OplogQueryMetadata> OplogQueryMetadata::readFromMetadata(const BSONOb
 
 Status OplogQueryMetadata::writeToMetadata(BSONObjBuilder* builder) const {
     BSONObjBuilder oqMetadataBuilder(builder->subobjStart(kOplogQueryMetadataFieldName));
-    _lastOpCommitted.append(&oqMetadataBuilder, kLastOpCommittedFieldName);
+    _lastOpCommitted.opTime.append(&oqMetadataBuilder, kLastOpCommittedFieldName);
+    oqMetadataBuilder.appendDate(kLastCommittedWallFieldName, _lastOpCommitted.wallTime);
     _lastOpApplied.append(&oqMetadataBuilder, kLastOpAppliedFieldName);
     oqMetadataBuilder.append(kRBIDFieldName, _rbid);
     oqMetadataBuilder.append(kPrimaryIndexFieldName, _currentPrimaryIndex);

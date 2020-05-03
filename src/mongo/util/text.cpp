@@ -1,30 +1,30 @@
-// text.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -43,45 +43,43 @@
 
 #include "mongo/platform/basic.h"
 #include "mongo/util/allocator.h"
-#include "mongo/util/mongoutils/str.h"
-
-using namespace std;
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 // --- StringSplitter ----
 
 /** get next split string fragment */
-string StringSplitter::next() {
+std::string StringSplitter::next() {
     const char* foo = strstr(_big, _splitter);
     if (foo) {
-        string s(_big, foo - _big);
+        std::string s(_big, foo - _big);
         _big = foo + strlen(_splitter);
         while (*_big && strstr(_big, _splitter) == _big)
             _big++;
         return s;
     }
 
-    string s = _big;
+    std::string s = _big;
     _big += strlen(_big);
     return s;
 }
 
 
-void StringSplitter::split(vector<string>& l) {
+void StringSplitter::split(std::vector<std::string>& l) {
     while (more()) {
         l.push_back(next());
     }
 }
 
-vector<string> StringSplitter::split() {
-    vector<string> l;
+std::vector<std::string> StringSplitter::split() {
+    std::vector<std::string> l;
     split(l);
     return l;
 }
 
-string StringSplitter::join(const vector<string>& l, const string& split) {
-    stringstream ss;
+std::string StringSplitter::join(const std::vector<std::string>& l, const std::string& split) {
+    std::stringstream ss;
     for (unsigned i = 0; i < l.size(); i++) {
         if (i > 0)
             ss << split;
@@ -90,7 +88,8 @@ string StringSplitter::join(const vector<string>& l, const string& split) {
     return ss.str();
 }
 
-vector<string> StringSplitter::split(const string& big, const string& splitter) {
+std::vector<std::string> StringSplitter::split(const std::string& big,
+                                               const std::string& splitter) {
     StringSplitter ss(big.c_str(), splitter.c_str());
     return ss.split();
 }
@@ -118,14 +117,9 @@ inline int leadingOnes(unsigned char c) {
     return _leadingOnes[c & 0x7f];
 }
 
-bool isValidUTF8(const std::string& s) {
-    return isValidUTF8(s.c_str());
-}
-
-bool isValidUTF8(const char* s) {
+bool isValidUTF8(StringData s) {
     int left = 0;  // how many bytes are left in the current codepoint
-    while (*s) {
-        const unsigned char c = (unsigned char)*(s++);
+    for (unsigned char c : s) {
         const int ones = leadingOnes(c);
         if (left) {
             if (ones != 1)
@@ -160,7 +154,7 @@ std::string toUtf8String(const std::wstring& wide) {
 
     // Calculate necessary buffer size
     int len = ::WideCharToMultiByte(
-        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), NULL, 0, NULL, NULL);
+        CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
 
     // Perform actual conversion
     if (len > 0) {
@@ -171,16 +165,39 @@ std::string toUtf8String(const std::wstring& wide) {
                                     static_cast<int>(wide.size()),
                                     &buffer[0],
                                     static_cast<int>(buffer.size()),
-                                    NULL,
-                                    NULL);
+                                    nullptr,
+                                    nullptr);
         if (len > 0) {
             verify(len == static_cast<int>(buffer.size()));
             return std::string(&buffer[0], buffer.size());
         }
     }
 
-    msgasserted(16091, mongoutils::str::stream() << "can't wstring to utf8: " << ::GetLastError());
+    msgasserted(16091, str::stream() << "can't wstring to utf8: " << ::GetLastError());
     return "";
+}
+
+std::wstring toWideStringFromStringData(StringData utf8String) {
+    int bufferSize = MultiByteToWideChar(CP_UTF8,               // Code page
+                                         0,                     // Flags
+                                         utf8String.rawData(),  // Input string
+                                         utf8String.size(),     // Count, -1 for NUL-terminated
+                                         nullptr,               // No output buffer
+                                         0  // Zero means "compute required size"
+    );
+    if (bufferSize == 0) {
+        return std::wstring();
+    }
+    std::unique_ptr<wchar_t[]> tempBuffer(new wchar_t[bufferSize]);
+    tempBuffer[0] = L'0';
+    MultiByteToWideChar(CP_UTF8,               // Code page
+                        0,                     // Flags
+                        utf8String.rawData(),  // Input string
+                        utf8String.size(),     // Count, -1 for NUL-terminated
+                        tempBuffer.get(),      // UTF-16 output buffer
+                        bufferSize             // Buffer size in wide characters
+    );
+    return std::wstring(tempBuffer.get(), bufferSize);
 }
 
 std::wstring toWideString(const char* utf8String) {
@@ -188,9 +205,9 @@ std::wstring toWideString(const char* utf8String) {
                                          0,           // Flags
                                          utf8String,  // Input string
                                          -1,          // Count, -1 for NUL-terminated
-                                         NULL,        // No output buffer
+                                         nullptr,     // No output buffer
                                          0            // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return std::wstring();
     }
@@ -202,7 +219,7 @@ std::wstring toWideString(const char* utf8String) {
                         -1,                // Count, -1 for NUL-terminated
                         tempBuffer.get(),  // UTF-16 output buffer
                         bufferSize         // Buffer size in wide characters
-                        );
+    );
     return std::wstring(tempBuffer.get());
 }
 
@@ -218,9 +235,9 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                          0,               // Flags
                                          utf8String,      // Input string
                                          utf8StringSize,  // Input string length
-                                         NULL,            // No output buffer
+                                         nullptr,         // No output buffer
                                          0                // Zero means "compute required size"
-                                         );
+    );
     if (bufferSize == 0) {
         return true;
     }
@@ -231,7 +248,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                         utf8StringSize,     // Input string length
                         utf16String.get(),  // UTF-16 output buffer
                         bufferSize          // Buffer size in wide characters
-                        );
+    );
     const wchar_t* utf16Pointer = utf16String.get();
     size_t numberOfCharactersToWrite = bufferSize;
     HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -246,7 +263,7 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
                                      utf16Pointer,
                                      numberOfCharactersThisPass,
                                      &numberOfCharactersWritten,
-                                     NULL);
+                                     nullptr);
         if (0 == success) {
             DWORD dosError = GetLastError();
             static bool errorMessageShown = false;
@@ -271,10 +288,10 @@ bool writeUtf8ToWindowsConsole(const char* utf8String, unsigned int utf8StringSi
 }
 
 WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envpW[])
-    : _argv(NULL), _envp(NULL) {
+    : _argv(nullptr), _envp(nullptr) {
     // Construct UTF-8 copy of arguments
-    vector<string> utf8args;
-    vector<size_t> utf8argLength;
+    std::vector<std::string> utf8args;
+    std::vector<size_t> utf8argLength;
     size_t blockSize = argc * sizeof(char*);
     size_t blockPtr = blockSize;
     for (int i = 0; i < argc; ++i) {
@@ -296,8 +313,8 @@ WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envp
     while (*envpWptr++) {
         ++envCount;
     }
-    vector<string> utf8envs;
-    vector<size_t> utf8envLength;
+    std::vector<std::string> utf8envs;
+    std::vector<size_t> utf8envLength;
     blockSize = (envCount + 1) * sizeof(char*);
     blockPtr = blockSize;
     for (size_t i = 0; i < envCount; ++i) {
@@ -313,7 +330,7 @@ WindowsCommandLine::WindowsCommandLine(int argc, wchar_t* argvW[], wchar_t* envp
         strcpy_s(_envp[i], utf8envLength[i], utf8envs[i].c_str());
         blockPtr += utf8envLength[i];
     }
-    _envp[i] = NULL;
+    _envp[i] = nullptr;
 }
 
 WindowsCommandLine::~WindowsCommandLine() {
@@ -358,8 +375,8 @@ std::string constructUtf8WindowsCommandLine(const std::vector<std::string>& argv
         return "";
 
     std::ostringstream commandLine;
-    std::vector<std::string>::const_iterator iter = argv.begin();
-    std::vector<std::string>::const_iterator end = argv.end();
+    auto iter = argv.begin();
+    const auto end = argv.end();
     quoteForWindowsCommandLine(*iter, commandLine);
     ++iter;
     for (; iter != end; ++iter) {
@@ -368,4 +385,4 @@ std::string constructUtf8WindowsCommandLine(const std::vector<std::string>& argv
     }
     return commandLine.str();
 }
-}
+}  // namespace mongo

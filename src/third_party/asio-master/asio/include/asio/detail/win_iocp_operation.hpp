@@ -2,7 +2,7 @@
 // detail/win_iocp_operation.hpp
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-// Copyright (c) 2003-2017 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2003-2018 Christopher M. Kohlhoff (chris at kohlhoff dot com)
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -51,6 +51,10 @@ public:
     func_(0, this, asio::error_code(), 0);
   }
 
+  ULONG_PTR& completionKey() {
+      return completionKey_;
+  }
+
 protected:
   typedef void (*func_type)(
       void*, win_iocp_operation*,
@@ -58,7 +62,8 @@ protected:
 
   win_iocp_operation(func_type func)
     : next_(0),
-      func_(func)
+      func_(func),
+      completionKey_(0)
   {
     reset();
   }
@@ -76,6 +81,7 @@ protected:
     OffsetHigh = 0;
     hEvent = 0;
     ready_ = 0;
+    completionKey_ = 0;
   }
 
 private:
@@ -84,6 +90,7 @@ private:
   win_iocp_operation* next_;
   func_type func_;
   long ready_;
+  ULONG_PTR completionKey_;
 };
 
 } // namespace detail

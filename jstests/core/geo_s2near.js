@@ -1,8 +1,7 @@
-// Cannot implicitly shard accessed collections because of use of $near query instead of geoNear
-// command.
-// @tags: [assumes_unsharded_collection]
+// @tags: [requires_getmore]
 
-// Test 2dsphere near search, called via find and geoNear.
+// Test 2dsphere near search, called via find and $geoNear.
+(function() {
 t = db.geo_s2near;
 t.drop();
 
@@ -13,9 +12,13 @@ goldenPoint = {
 };
 t.insert({geo: goldenPoint});
 t.ensureIndex({geo: "2dsphere"});
-resNear = db.runCommand(
-    {geoNear: t.getName(), near: [30, 40], num: 1, spherical: true, includeLocs: true});
-assert.eq(resNear.results[0].loc, goldenPoint);
+resNear =
+    t.aggregate([
+         {$geoNear: {near: [30, 40], distanceField: "d", spherical: true, includeLocs: "loc"}},
+         {$limit: 1}
+     ]).toArray();
+assert.eq(resNear.length, 1, tojson(resNear));
+assert.eq(resNear[0].loc, goldenPoint);
 
 // FYI:
 // One degree of long @ 0 is 111km or so.
@@ -52,26 +55,34 @@ assert.throws(function() {
     return t.find({"geo": {"$near": {"$geometry": somepoly}}}).count();
 });
 assert.throws(function() {
-    return db.runCommand({geoNear: t.getName(), near: someline, spherical: true}).results.length;
+    return t.aggregate({$geoNear: {near: someline, distanceField: "dis", spherical: true}});
 });
 assert.throws(function() {
-    return db.runCommand({geoNear: t.getName(), near: somepoly, spherical: true}).results.length;
+    return t.aggregate({$geoNear: {near: somepoly, distanceField: "dis", spherical: true}});
 });
 
 // Do some basic near searches.
 res = t.find({"geo": {"$near": {"$geometry": origin, $maxDistance: 2000}}}).limit(10);
-resNear = db.runCommand(
-    {geoNear: t.getName(), near: [0, 0], num: 10, maxDistance: Math.PI, spherical: true});
-assert.eq(res.itcount(), resNear.results.length, 10);
+resNear = t.aggregate([
+    {$geoNear: {near: [0, 0], distanceField: "dis", maxDistance: Math.PI, spherical: true}},
+    {$limit: 10},
+]);
+assert.eq(res.itcount(), resNear.itcount(), "10");
 
 res = t.find({"geo": {"$near": {"$geometry": origin}}}).limit(10);
-resNear = db.runCommand({geoNear: t.getName(), near: [0, 0], num: 10, spherical: true});
-assert.eq(res.itcount(), resNear.results.length, 10);
+resNear = t.aggregate([
+    {$geoNear: {near: [0, 0], distanceField: "dis", spherical: true}},
+    {$limit: 10},
+]);
+assert.eq(res.itcount(), resNear.itcount(), "10");
 
 // Find all the points!
 res = t.find({"geo": {"$near": {"$geometry": origin}}}).limit(10000);
-resNear = db.runCommand({geoNear: t.getName(), near: [0, 0], num: 10000, spherical: true});
-assert.eq(resNear.results.length, res.itcount(), (2 * points) * (2 * points));
+resNear = t.aggregate([
+    {$geoNear: {near: [0, 0], distanceField: "dis", spherical: true}},
+    {$limit: 10000},
+]);
+assert.eq(res.itcount(), resNear.itcount(), ((2 * points) * (2 * points)).toString());
 
 // longitude goes -180 to 180
 // latitude goes -90 to 90
@@ -82,8 +93,11 @@ t.insert({geo: {"type": "Point", "coordinates": [180, -90]}});
 t.insert({geo: {"type": "Point", "coordinates": [180, 90]}});
 t.insert({geo: {"type": "Point", "coordinates": [-180, 90]}});
 res = t.find({"geo": {"$near": {"$geometry": origin}}}).limit(10000);
-resNear = db.runCommand({geoNear: t.getName(), near: [0, 0], num: 10000, spherical: true});
-assert.eq(res.itcount(), resNear.results.length, (2 * points) * (2 * points) + 4);
+resNear = t.aggregate([
+    {$geoNear: {near: [0, 0], distanceField: "dis", spherical: true}},
+    {$limit: 10000},
+]);
+assert.eq(res.itcount(), resNear.itcount(), ((2 * points) * (2 * points) + 4).toString());
 
 function testRadAndDegreesOK(distance) {
     // Distance for old style points is radians.
@@ -93,19 +107,29 @@ function testRadAndDegreesOK(distance) {
     // And we should get the same # of results no matter what.
     assert.eq(resRadians.itcount(), resMeters.itcount());
 
-    // Also, geoNear should behave the same way.
-    resGNMeters =
-        db.runCommand({geoNear: t.getName(), near: origin, maxDistance: distance, spherical: true});
-    resGNRadians = db.runCommand({
-        geoNear: t.getName(),
-        near: [0, 0],
-        maxDistance: (distance / (6378.1 * 1000)),
-        spherical: true
-    });
-    assert.eq(resGNRadians.results.length, resGNMeters.results.length);
+    // Also, $geoNear should behave the same way.
+    resGNMeters = t.aggregate({
+                       $geoNear: {
+                           near: origin,
+                           distanceField: "dis",
+                           maxDistance: distance,
+                           spherical: true,
+                       }
+                   }).toArray();
+    resGNRadians = t.aggregate({
+                        $geoNear: {
+                            near: [0, 0],
+                            distanceField: "dis",
+                            maxDistance: (distance / (6378.1 * 1000)),
+                            spherical: true,
+                        }
+                    }).toArray();
+    const errmsg = `$geoNear using meter distances returned ${tojson(resGNMeters)}, but ` +
+        `$geoNear using radian distances returned ${tojson(resGNRadians)}`;
+    assert.eq(resGNRadians.length, resGNMeters.length, errmsg);
     for (var i = 0; i < resGNRadians.length; ++i) {
         // Radius of earth * radians = distance in meters.
-        assert.close(resGNRadians.results[i].dis * 6378.1 * 1000, resGNMeters.results[i].dis);
+        assert.close(resGNRadians[i].dis * 6378.1 * 1000, resGNMeters[i].dis);
     }
 }
 
@@ -115,5 +139,16 @@ testRadAndDegreesOK(50);
 testRadAndDegreesOK(10000);
 
 // SERVER-13666 legacy coordinates must be in bounds for spherical near queries.
-assert.commandFailed(
-    db.runCommand({geoNear: t.getName(), near: [1210.466, 31.2051], spherical: true, num: 10}));
+assert.commandFailedWithCode(db.runCommand({
+    aggregate: t.getName(),
+    cursor: {},
+    pipeline: [{
+        $geoNear: {
+            near: [1210.466, 31.2051],
+            distanceField: "dis",
+            spherical: true,
+        }
+    }]
+}),
+                             17444);
+}());

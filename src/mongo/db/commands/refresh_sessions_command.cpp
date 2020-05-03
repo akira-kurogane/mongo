@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,38 +29,41 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/sessions_commands_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_cache.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/refresh_sessions_gen.h"
 
 namespace mongo {
+namespace {
 
 class RefreshSessionsCommand final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(RefreshSessionsCommand);
-
 public:
     RefreshSessionsCommand() : BasicCommand("refreshSessions") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
+
     bool adminOnly() const override {
         return false;
     }
+
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "renew a set of logical sessions";
+
+    std::string help() const override {
+        return "renew a set of logical sessions";
     }
+
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
+                                 const BSONObj& cmdObj) const override {
         // It is always ok to run this command, as long as you are authenticated
         // as some user, if auth is enabled.
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
@@ -72,20 +76,24 @@ public:
         }
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
-        IDLParserErrorContext ctx("RefreshSessionsCmdFromClient");
-        auto cmd = RefreshSessionsCmdFromClient::parse(ctx, cmdObj);
-        auto res =
-            LogicalSessionCache::get(opCtx->getServiceContext())->refreshSessions(opCtx, cmd);
-        if (!res.isOK()) {
-            return appendCommandStatus(result, res);
+    bool run(OperationContext* opCtx,
+             const std::string& db,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        auto refreshSessionsRequest = RefreshSessionsCmdFromClient::parse(
+            IDLParserErrorContext("RefreshSessionsCmdFromClient"), cmdObj);
+
+        const auto lsCache = LogicalSessionCache::get(opCtx);
+
+        for (const auto& lsid :
+             makeLogicalSessionIds(refreshSessionsRequest.getSessions(), opCtx)) {
+            uassertStatusOK(lsCache->vivify(opCtx, lsid));
         }
 
         return true;
     }
+
 } refreshSessionsCommand;
 
+}  // namespace
 }  // namespace mongo

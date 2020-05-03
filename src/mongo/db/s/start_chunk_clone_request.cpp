@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,12 +34,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 
 namespace mongo {
 namespace {
 
 const char kRecvChunkStart[] = "_recvChunkStart";
 const char kFromShardConnectionString[] = "from";
+// Note: The UUID parsing code relies on this field being named 'uuid'.
+const char kMigrationId[] = "uuid";
+const char kLsid[] = "lsid";
+const char kTxnNumber[] = "txnNumber";
 const char kFromShardId[] = "fromShardName";
 const char kToShardId[] = "toShardName";
 const char kChunkMinKey[] = "min";
@@ -146,12 +152,22 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         }
     }
 
+    if (obj.getField("uuid")) {
+        request._migrationId = UUID::parse(obj);
+        request._lsid = LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"),
+                                                obj[kLsid].Obj());
+        request._txnNumber = obj.getField(kTxnNumber).Long();
+    }
+
     return request;
 }
 
 void StartChunkCloneRequest::appendAsCommand(
     BSONObjBuilder* builder,
     const NamespaceString& nss,
+    const UUID& migrationId,
+    const LogicalSessionId& lsid,
+    TxnNumber txnNumber,
     const MigrationSessionId& sessionId,
     const ConnectionString& fromShardConnectionString,
     const ShardId& fromShardId,
@@ -159,12 +175,20 @@ void StartChunkCloneRequest::appendAsCommand(
     const BSONObj& chunkMinKey,
     const BSONObj& chunkMaxKey,
     const BSONObj& shardKeyPattern,
-    const MigrationSecondaryThrottleOptions& secondaryThrottle) {
+    const MigrationSecondaryThrottleOptions& secondaryThrottle,
+    bool resumableRangeDeleterDisabled) {
     invariant(builder->asTempObj().isEmpty());
     invariant(nss.isValid());
     invariant(fromShardConnectionString.isValid());
 
     builder->append(kRecvChunkStart, nss.ns());
+
+    if (!resumableRangeDeleterDisabled) {
+        migrationId.appendToBuilder(builder, kMigrationId);
+        builder->append(kLsid, lsid.toBSON());
+        builder->append(kTxnNumber, txnNumber);
+    }
+
     sessionId.append(builder);
     builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());

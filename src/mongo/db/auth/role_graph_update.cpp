@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -38,7 +40,7 @@
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/update/update_driver.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -88,12 +90,9 @@ Status checkIdMatchesRoleName(const BSONElement& idElement, const RoleName& role
     if (firstDot == std::string::npos || idField.substr(0, firstDot) != roleName.getDB() ||
         idField.substr(firstDot + 1) != roleName.getRole()) {
         return Status(ErrorCodes::FailedToParse,
-                      mongoutils::str::stream()
-                          << "Role document _id fields must be encoded as the string "
-                             "dbname.rolename.  Found "
-                          << idField
-                          << " for "
-                          << roleName.getFullName());
+                      str::stream() << "Role document _id fields must be encoded as the string "
+                                       "dbname.rolename.  Found "
+                                    << idField << " for " << roleName.getFullName());
     }
     return Status::OK();
 }
@@ -195,6 +194,7 @@ Status handleOplogInsert(RoleGraph* roleGraph, const BSONObj& insertedObj) {
  */
 Status handleOplogUpdate(OperationContext* opCtx,
                          RoleGraph* roleGraph,
+                         const NamespaceString& nss,
                          const BSONObj& updatePattern,
                          const BSONObj& queryPattern) {
     RoleName roleToUpdate;
@@ -202,18 +202,16 @@ Status handleOplogUpdate(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    UpdateDriver::Options updateOptions;
-    updateOptions.modOptions.fromOplogApplication = true;
-    UpdateDriver driver(updateOptions);
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, nullptr, nss));
+    UpdateDriver driver(std::move(expCtx));
+    driver.setFromOplogApplication(true);
 
     // Oplog updates do not have array filters.
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    status = driver.parse(updatePattern, arrayFilters);
-    if (!status.isOK())
-        return status;
+    driver.parse(updatePattern, arrayFilters);
 
     mutablebson::Document roleDocument;
-    status = AuthorizationManager::getBSONForRole(roleGraph, roleToUpdate, roleDocument.root());
+    status = RoleGraph::getBSONForRole(roleGraph, roleToUpdate, roleDocument.root());
     if (status == ErrorCodes::RoleNotFound) {
         // The query pattern will only contain _id, no other immutable fields are present
         const FieldRef idFieldRef("_id");
@@ -225,13 +223,11 @@ Status handleOplogUpdate(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    // The original document can be empty because it is only needed for validation of immutable
-    // paths.
-    const BSONObj emptyOriginal;
     const bool validateForStorage = false;
     const FieldRefSet emptyImmutablePaths;
+    bool isInsert = false;
     status = driver.update(
-        StringData(), emptyOriginal, &roleDocument, validateForStorage, emptyImmutablePaths);
+        StringData(), &roleDocument, validateForStorage, emptyImmutablePaths, isInsert);
     if (!status.isOK())
         return status;
 
@@ -299,17 +295,52 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         }
         return Status::OK();
     }
+
+    if (cmdName == "commitTransaction" || cmdName == "abortTransaction") {
+        return Status::OK();
+    }
+
     if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return Status::OK();
     }
-    if ((cmdName == "collMod" || cmdName == "emptycapped") &&
+    if ((cmdName == "collMod" || cmdName == "emptycapped" || cmdName == "createIndexes") &&
         cmdObj.firstElement().str() != rolesCollectionNamespace.coll()) {
         // We don't care about these if they're not on the roles collection.
         return Status::OK();
     }
+    if (cmdName == "createIndexes" &&
+        cmdObj.firstElement().str() == rolesCollectionNamespace.coll()) {
+        UnorderedFieldsBSONObjComparator instance;
+        if (instance.evaluate(
+                cmdObj ==
+                (BSON("createIndexes"
+                      << "system.roles"
+                      << "v" << 2 << "name"
+                      << "role_1_db_1"
+                      << "key" << BSON("role" << 1 << "db" << 1) << "unique" << true)))) {
+            return Status::OK();
+        }
+    }
+    if (cmdName == "startIndexBuild" || cmdName == "abortIndexBuild" ||
+        cmdName == "commitIndexBuild") {
+        if (cmdObj.firstElement().str() != rolesCollectionNamespace.coll()) {
+            return Status::OK();
+        }
+        for (auto indexSpecElem : cmdObj["indexes"].Array()) {
+            UnorderedFieldsBSONObjComparator instance;
+            auto indexSpec = indexSpecElem.Obj();
+            if (instance.evaluate(
+                    indexSpec ==
+                    (BSON("v" << 2 << "name"
+                              << "role_1_db_1"
+                              << "key" << BSON("role" << 1 << "db" << 1) << "unique" << true)))) {
+                return Status::OK();
+            }
+        }
+    }
 
-    if ((cmdName == "collMod") && (cmdObj.nFields() == 1)) {
-        // We also don't care about empty modifications even if they are on roles collection
+    if (cmdName == "collMod" && cmdObj.nFields() == 1) {
+        // We don't care about empty modifications, even if they are on roles collection.
         return Status::OK();
     }
 
@@ -336,8 +367,7 @@ Status RoleGraph::handleLogOp(OperationContext* opCtx,
         return Status::OK();
     if (op[0] == '\0' || op[1] != '\0') {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "Unrecognized \"op\" field value \"" << op
-                                                << '"');
+                      str::stream() << "Unrecognized \"op\" field value \"" << op << '"');
     }
 
     if (ns.db() != AuthorizationManager::rolesCollectionNamespace.db())
@@ -362,7 +392,7 @@ Status RoleGraph::handleLogOp(OperationContext* opCtx,
                 return Status(ErrorCodes::InternalError,
                               "Missing query pattern in update oplog entry.");
             }
-            return handleOplogUpdate(opCtx, this, o, *o2);
+            return handleOplogUpdate(opCtx, this, ns, o, *o2);
         case 'd':
             return handleOplogDelete(this, o);
         case 'n':
@@ -372,8 +402,7 @@ Status RoleGraph::handleLogOp(OperationContext* opCtx,
                           "Namespace admin.system.roles is not a valid target for commands");
         default:
             return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() << "Unrecognized \"op\" field value \"" << op
-                                                    << '"');
+                          str::stream() << "Unrecognized \"op\" field value \"" << op << '"');
     }
 }
 

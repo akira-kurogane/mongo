@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,7 +32,6 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
@@ -39,16 +39,7 @@ using std::string;
 
 namespace dps = ::mongo::dotted_path_support;
 
-WorkingSet::MemberHolder::MemberHolder() : member(NULL) {}
-WorkingSet::MemberHolder::~MemberHolder() {}
-
 WorkingSet::WorkingSet() : _freeList(INVALID_ID) {}
-
-WorkingSet::~WorkingSet() {
-    for (size_t i = 0; i < _data.size(); i++) {
-        delete _data[i].member;
-    }
-}
 
 WorkingSetID WorkingSet::allocate() {
     if (_freeList == INVALID_ID) {
@@ -58,7 +49,6 @@ WorkingSetID WorkingSet::allocate() {
         WorkingSetID id = _data.size();
         _data.resize(_data.size() + 1);
         _data.back().nextFreeOrSelf = id;
-        _data.back().member = new WorkingSetMember();
         return id;
     }
 
@@ -75,49 +65,27 @@ void WorkingSet::free(WorkingSetID i) {
     verify(holder.nextFreeOrSelf == i);  // ID currently in use.
 
     // Free resources and push this WSM to the head of the freelist.
-    holder.member->clear();
+    holder.member.clear();
     holder.nextFreeOrSelf = _freeList;
     _freeList = i;
 }
 
-void WorkingSet::flagForReview(WorkingSetID i) {
-    WorkingSetMember* member = get(i);
-    verify(WorkingSetMember::OWNED_OBJ == member->_state);
-    _flagged.insert(i);
-}
-
-const unordered_set<WorkingSetID>& WorkingSet::getFlagged() const {
-    return _flagged;
-}
-
-bool WorkingSet::isFlagged(WorkingSetID id) const {
-    invariant(id < _data.size());
-    return _flagged.end() != _flagged.find(id);
-}
-
 void WorkingSet::clear() {
-    for (size_t i = 0; i < _data.size(); i++) {
-        delete _data[i].member;
-    }
     _data.clear();
 
     // Since working set is now empty, the free list pointer should
     // point to nothing.
     _freeList = INVALID_ID;
-
-    _flagged.clear();
-    _yieldSensitiveIds.clear();
 }
 
 void WorkingSet::transitionToRecordIdAndIdx(WorkingSetID id) {
     WorkingSetMember* member = get(id);
     member->_state = WorkingSetMember::RID_AND_IDX;
-    _yieldSensitiveIds.push_back(id);
 }
 
 void WorkingSet::transitionToRecordIdAndObj(WorkingSetID id) {
     WorkingSetMember* member = get(id);
-    member->_state = WorkingSetMember::RID_AND_OBJ;
+    member->transitionToRecordIdAndObj();
 }
 
 void WorkingSet::transitionToOwnedObj(WorkingSetID id) {
@@ -125,28 +93,35 @@ void WorkingSet::transitionToOwnedObj(WorkingSetID id) {
     member->transitionToOwnedObj();
 }
 
-std::vector<WorkingSetID> WorkingSet::getAndClearYieldSensitiveIds() {
-    std::vector<WorkingSetID> out;
-    // Clear '_yieldSensitiveIds' by swapping it into the set to be returned.
-    _yieldSensitiveIds.swap(out);
-    return out;
+WorkingSetMember WorkingSet::extract(WorkingSetID wsid) {
+    invariant(wsid < _data.size());
+    WorkingSetMember ret = std::move(_data[wsid].member);
+    free(wsid);
+    return ret;
+}
+
+WorkingSetID WorkingSet::emplace(WorkingSetMember&& wsm) {
+    auto wsid = allocate();
+    *get(wsid) = std::move(wsm);
+    return wsid;
 }
 
 //
 // WorkingSetMember
 //
 
-WorkingSetMember::WorkingSetMember() {}
-
-WorkingSetMember::~WorkingSetMember() {}
-
 void WorkingSetMember::clear() {
-    for (size_t i = 0; i < WSM_COMPUTED_NUM_TYPES; i++) {
-        _computed[i].reset();
-    }
-
+    _metadata = DocumentMetadataFields{};
     keyData.clear();
-    obj.reset();
+    if (doc.value().hasExclusivelyOwnedStorage()) {
+        // Reset the document to point to an empty BSON, which will preserve its underlying
+        // DocumentStorage for future users of this WSM.
+        resetDocument(SnapshotId(), BSONObj());
+    } else {
+        // If the Document doesn't exclusively own its storage, don't do anything. Attempting to
+        // assign it a value (even an empty one) would result in an allocation, which we don't want
+        // here, since this function is very much on the hot path.
+    }
     _state = WorkingSetMember::INVALID;
 }
 
@@ -155,10 +130,13 @@ WorkingSetMember::MemberState WorkingSetMember::getState() const {
 }
 
 void WorkingSetMember::transitionToOwnedObj() {
-    invariant(obj.value().isOwned());
+    invariant(doc.value().isOwned());
     _state = OWNED_OBJ;
 }
 
+void WorkingSetMember::transitionToRecordIdAndObj() {
+    _state = WorkingSetMember::RID_AND_OBJ;
+}
 
 bool WorkingSetMember::hasRecordId() const {
     return _state == RID_AND_IDX || _state == RID_AND_OBJ;
@@ -169,67 +147,33 @@ bool WorkingSetMember::hasObj() const {
 }
 
 bool WorkingSetMember::hasOwnedObj() const {
-    return _state == OWNED_OBJ || (_state == RID_AND_OBJ && obj.value().isOwned());
+    return _state == OWNED_OBJ || _state == RID_AND_OBJ;
 }
 
 void WorkingSetMember::makeObjOwnedIfNeeded() {
-    if (supportsDocLocking() && _state == RID_AND_OBJ && !obj.value().isOwned()) {
-        obj.setValue(obj.value().getOwned());
+    if (_state == RID_AND_OBJ && !doc.value().isOwned()) {
+        doc.value() = doc.value().getOwned();
     }
-}
-
-bool WorkingSetMember::hasComputed(const WorkingSetComputedDataType type) const {
-    return _computed[type].get();
-}
-
-const WorkingSetComputedData* WorkingSetMember::getComputed(
-    const WorkingSetComputedDataType type) const {
-    verify(_computed[type]);
-    return _computed[type].get();
-}
-
-void WorkingSetMember::addComputed(WorkingSetComputedData* data) {
-    verify(!hasComputed(data->type()));
-    _computed[data->type()].reset(data);
-}
-
-void WorkingSetMember::setFetcher(RecordFetcher* fetcher) {
-    _fetcher.reset(fetcher);
-}
-
-RecordFetcher* WorkingSetMember::releaseFetcher() {
-    return _fetcher.release();
-}
-
-bool WorkingSetMember::hasFetcher() const {
-    return NULL != _fetcher.get();
 }
 
 bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) const {
     // If our state is such that we have an object, use it.
     if (hasObj()) {
-        *out = dps::extractElementAtPath(obj.value(), field);
+        // The document must not be modified. Otherwise toBson() call would create a temporary BSON
+        // that would get destroyed at the end of this function. *out would then point to dangling
+        // memory.
+        invariant(!doc.value().isModified());
+        *out = dps::extractElementAtPath(doc.value().toBson(), field);
         return true;
     }
 
     // Our state should be such that we have index data/are covered.
-    for (size_t i = 0; i < keyData.size(); ++i) {
-        BSONObjIterator keyPatternIt(keyData[i].indexKeyPattern);
-        BSONObjIterator keyDataIt(keyData[i].keyData);
-
-        while (keyPatternIt.more()) {
-            BSONElement keyPatternElt = keyPatternIt.next();
-            verify(keyDataIt.more());
-            BSONElement keyDataElt = keyDataIt.next();
-
-            if (field == keyPatternElt.fieldName()) {
-                *out = keyDataElt;
-                return true;
-            }
-        }
+    if (auto outOpt = IndexKeyDatum::getFieldDotted(keyData, field)) {
+        *out = outOpt.get();
+        return true;
+    } else {
+        return false;
     }
-
-    return false;
 }
 
 size_t WorkingSetMember::getMemUsage() const {
@@ -239,10 +183,8 @@ size_t WorkingSetMember::getMemUsage() const {
         memUsage += sizeof(RecordId);
     }
 
-    // XXX: Unowned objects count towards current size.
-    //      See SERVER-12579
     if (hasObj()) {
-        memUsage += obj.value().objsize();
+        memUsage += doc.value().getApproximateSize();
     }
 
     for (size_t i = 0; i < keyData.size(); ++i) {
@@ -251,6 +193,100 @@ size_t WorkingSetMember::getMemUsage() const {
     }
 
     return memUsage;
+}
+
+void WorkingSetMember::resetDocument(SnapshotId snapshot, const BSONObj& obj) {
+    doc.setSnapshotId(snapshot);
+    MutableDocument md(std::move(doc.value()));
+    md.reset(obj, false);
+    doc.value() = md.freeze();
+}
+
+void WorkingSetMember::serialize(BufBuilder& buf) const {
+    // It is not legal to serialize a Document which has metadata attached to it. Any metadata must
+    // reside directly in the WorkingSetMember.
+    invariant(!doc.value().metadata());
+
+    buf.appendChar(static_cast<char>(_state));
+
+    if (hasObj()) {
+        doc.value().serializeForSorter(buf);
+        buf.appendNum(static_cast<unsigned long long>(doc.snapshotId().toNumber()));
+    }
+
+    if (_state == RID_AND_IDX) {
+        // First append the number of index keys, and then encode them in series.
+        buf.appendNum(static_cast<char>(keyData.size()));
+        for (auto&& indexKeyDatum : keyData) {
+            indexKeyDatum.indexKeyPattern.serializeForSorter(buf);
+            indexKeyDatum.keyData.serializeForSorter(buf);
+            buf.appendNum(indexKeyDatum.indexId);
+            buf.appendNum(static_cast<unsigned long long>(indexKeyDatum.snapshotId.toNumber()));
+        }
+    }
+
+    if (hasRecordId()) {
+        buf.appendNum(recordId.repr());
+    }
+
+    _metadata.serializeForSorter(buf);
+}
+
+WorkingSetMember WorkingSetMember::deserialize(BufReader& buf) {
+    WorkingSetMember wsm;
+
+    // First decode the state, which instructs us on how to interpret the rest of the buffer.
+    wsm._state = static_cast<MemberState>(buf.read<char>());
+
+    if (wsm.hasObj()) {
+        wsm.doc.setValue(
+            Document::deserializeForSorter(buf, Document::SorterDeserializeSettings{}));
+        auto snapshotIdRepr = buf.read<LittleEndian<uint64_t>>();
+        auto snapshotId = snapshotIdRepr ? SnapshotId{snapshotIdRepr} : SnapshotId{};
+        wsm.doc.setSnapshotId(snapshotId);
+    }
+
+    if (wsm.getState() == WorkingSetMember::RID_AND_IDX) {
+        auto numKeys = buf.read<char>();
+        wsm.keyData.reserve(numKeys);
+        for (auto i = 0; i < numKeys; ++i) {
+            auto indexKeyPattern =
+                BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings{}).getOwned();
+            auto indexKey =
+                BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings{}).getOwned();
+            auto indexId = buf.read<LittleEndian<unsigned int>>();
+            auto snapshotIdRepr = buf.read<LittleEndian<uint64_t>>();
+            auto snapshotId = snapshotIdRepr ? SnapshotId{snapshotIdRepr} : SnapshotId{};
+            wsm.keyData.push_back(IndexKeyDatum{
+                std::move(indexKeyPattern), std::move(indexKey), indexId, snapshotId});
+        }
+    }
+
+    if (wsm.hasRecordId()) {
+        wsm.recordId = RecordId{buf.read<LittleEndian<int64_t>>()};
+    }
+
+    DocumentMetadataFields::deserializeForSorter(buf, &wsm._metadata);
+
+    return wsm;
+}
+
+SortableWorkingSetMember SortableWorkingSetMember::getOwned() const {
+    auto ret = *this;
+    ret._holder->makeObjOwnedIfNeeded();
+    return ret;
+}
+
+WorkingSetRegisteredIndexId WorkingSet::registerIndexAccessMethod(
+    const IndexAccessMethod* indexAccess) {
+    for (WorkingSetRegisteredIndexId i = 0; i < _registeredIndexes.size(); ++i) {
+        if (_registeredIndexes[i] == indexAccess) {
+            return i;
+        }
+    }
+
+    _registeredIndexes.push_back(indexAccess);
+    return _registeredIndexes.size() - 1;
 }
 
 }  // namespace mongo

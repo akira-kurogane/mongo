@@ -1,3 +1,9 @@
+// @tags: [
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 // Test db.loadServerScripts()
 

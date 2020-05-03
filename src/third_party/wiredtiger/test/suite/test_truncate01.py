@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -32,7 +32,7 @@
 
 import wiredtiger, wttest
 from helper import confirm_empty
-from wtdataset import SimpleDataSet, ComplexDataSet
+from wtdataset import SimpleDataSet, ComplexDataSet, simple_key
 from wtscenario import make_scenarios
 
 # Test truncation arguments.
@@ -159,8 +159,8 @@ class test_truncate_cursor_end(wttest.WiredTigerTestCase):
         c2 = self.session.open_cursor(uri, None)
         c2.set_key(ds.key(2000))
         self.session.truncate(None, c1, c2, None)
-        self.assertEquals(c1.close(), 0)
-        self.assertEquals(c2.close(), 0)
+        self.assertEqual(c1.close(), 0)
+        self.assertEqual(c2.close(), 0)
         self.session.drop(uri)
 
         if self.type == "table:":
@@ -171,9 +171,42 @@ class test_truncate_cursor_end(wttest.WiredTigerTestCase):
             c2 = self.session.open_cursor(uri, None)
             c2.set_key(ds.key(2000))
             self.session.truncate(None, c1, c2, None)
-            self.assertEquals(c1.close(), 0)
-            self.assertEquals(c2.close(), 0)
+            self.assertEqual(c1.close(), 0)
+            self.assertEqual(c2.close(), 0)
             self.session.drop(uri)
+
+# Test truncation of empty objects.
+class test_truncate_empty(wttest.WiredTigerTestCase):
+    name = 'test_truncate_empty'
+
+    types = [
+        ('file', dict(type='file:')),
+        ('table', dict(type='table:'))
+    ]
+    keyfmt = [
+        ('integer', dict(keyfmt='i')),
+        ('recno', dict(keyfmt='r')),
+        ('string', dict(keyfmt='S')),
+    ]
+    scenarios = make_scenarios(types, keyfmt)
+
+    # Test truncation of empty objects using a cursor
+    def test_truncate_empty_cursor(self):
+        uri = self.type + self.name
+        self.session.create(uri,
+            ',key_format=' + self.keyfmt + ',value_format=S')
+        c1 = self.session.open_cursor(uri, None)
+        c1.set_key(simple_key(c1, 1000))
+        c2 = self.session.open_cursor(uri, None)
+        c2.set_key(simple_key(c2, 2000))
+        self.assertEqual(self.session.truncate(None, c1, c2, None), 0)
+
+    # Test truncation of empty objects using a URI
+    def test_truncate_empty_uri(self):
+        uri = self.type + self.name
+        self.session.create(uri,
+            ',key_format=' + self.keyfmt + ',value_format=S')
+        self.assertEqual(self.session.truncate(uri, None, None, None), 0)
 
 # Test session.truncate.
 class test_truncate_cursor(wttest.WiredTigerTestCase):
@@ -239,7 +272,7 @@ class test_truncate_cursor(wttest.WiredTigerTestCase):
         cursor = self.session.open_cursor(uri, None)
         for i in range(begin, end + 1):
             expected[ds.key(i)] = [0]
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             cursor.set_key(k)
             if v == [0] and \
               cursor.key_format == 'r' and cursor.value_format == '8t':

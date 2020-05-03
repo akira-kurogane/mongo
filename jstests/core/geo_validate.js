@@ -48,7 +48,7 @@ assert.throws(function() {
 //
 //
 // Make sure we can do a $within search with a zero-radius circular region
-assert.writeOK(coll.insert({geo: [0, 0]}));
+assert.commandWorked(coll.insert({geo: [0, 0]}));
 assert.neq(null, coll.findOne({geo: {$within: {$center: [[0, 0], 0]}}}));
 assert.neq(null, coll.findOne({geo: {$within: {$centerSphere: [[0, 0], 0]}}}));
 assert.neq(null, coll.findOne({geo: {$within: {$center: [[0, 0], Infinity]}}}));
@@ -75,17 +75,6 @@ assert.throws(function() {
 assert.throws(function() {
     coll.findOne({geo: {$geoNear: [0, 0], $maxDistance: -Infinity}});
 });
-
-//
-//
-// Make sure we can't do a near search with a negative limit
-assert.commandFailed(
-    db.runCommand({geoNear: coll.getName(), near: [0, 0], spherical: true, num: -1}));
-assert.commandFailed(
-    db.runCommand({geoNear: coll.getName(), near: [0, 0], spherical: true, num: -Infinity}));
-// NaN is interpreted as limit 0
-assert.commandWorked(
-    db.runCommand({geoNear: coll.getName(), near: [0, 0], spherical: true, num: NaN}));
 
 //
 // SERVER-17241 Polygon has no loop

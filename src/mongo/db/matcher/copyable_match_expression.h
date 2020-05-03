@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -51,48 +52,33 @@ public:
      * encounter an error.
      */
     CopyableMatchExpression(BSONObj matchAST,
-                            const CollatorInterface* collator,
-                            const boost::intrusive_ptr<ExpressionContext>& expCtx = nullptr,
+                            const boost::intrusive_ptr<ExpressionContext>& expCtx,
                             std::unique_ptr<const ExtensionsCallback> extensionsCallback =
-                                stdx::make_unique<ExtensionsCallbackNoop>(),
+                                std::make_unique<ExtensionsCallbackNoop>(),
                             MatchExpressionParser::AllowedFeatureSet allowedFeatures =
-                                MatchExpressionParser::kDefaultSpecialFeatures)
+                                MatchExpressionParser::kDefaultSpecialFeatures,
+                            bool optimizeExpression = false)
         : _matchAST(matchAST), _extensionsCallback(std::move(extensionsCallback)) {
-        StatusWithMatchExpression parseResult = MatchExpressionParser::parse(
-            _matchAST, collator, expCtx, *_extensionsCallback, allowedFeatures);
+        StatusWithMatchExpression parseResult =
+            MatchExpressionParser::parse(_matchAST, expCtx, *_extensionsCallback, allowedFeatures);
         uassertStatusOK(parseResult.getStatus());
-        _matchExpr = std::move(parseResult.getValue());
+        _matchExpr = optimizeExpression
+            ? MatchExpression::optimize(std::move(parseResult.getValue()))
+            : std::move(parseResult.getValue());
     }
 
     /**
-     * Semantically, this behaves as if the client called setCollator() on the underlying
-     * MatchExpression (which is impossible, because it's const).
-     *
-     * Behind the scenes, it actually makes a new MatchExpression with the new collator. That way,
-     * if there other CopyableMatchExpression objects referencing this MatchExpression, they don't
-     * see the change in collator.
+     * Sets the collator on the underlying MatchExpression and all clones(!).
      */
-    void setCollator(const CollatorInterface* collator,
-                     const boost::intrusive_ptr<ExpressionContext>& expCtx = nullptr) {
-        // We can allow all features because any features that were allowed in the original
-        // MatchExpression construction should be allowed now.
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures =
-            MatchExpressionParser::kAllowAllSpecialFeatures;
-        if (!expCtx) {
-            allowedFeatures = allowedFeatures & ~MatchExpressionParser::AllowedFeatures::kExpr;
-        }
-
-        StatusWithMatchExpression parseResult = MatchExpressionParser::parse(
-            _matchAST, collator, expCtx, *_extensionsCallback, allowedFeatures);
-        invariantOK(parseResult.getStatus());
-        _matchExpr = std::move(parseResult.getValue());
+    void setCollator(const CollatorInterface* collator) {
+        _matchExpr->setCollator(collator);
     }
 
     /**
      * Overload * so that CopyableMatchExpression can be dereferenced as if it were a pointer to the
      * underlying MatchExpression.
      */
-    const MatchExpression& operator*() {
+    const MatchExpression& operator*() const {
         return *_matchExpr;
     }
 
@@ -100,14 +86,18 @@ public:
      * Overload -> so that CopyableMatchExpression can be dereferenced as if it were a pointer to
      * the underlying MatchExpression.
      */
-    const MatchExpression* operator->() {
+    const MatchExpression* operator->() const {
         return &(*_matchExpr);
+    }
+
+    auto inputBSON() const {
+        return _matchAST;
     }
 
 private:
     BSONObj _matchAST;
     std::shared_ptr<const ExtensionsCallback> _extensionsCallback;
-    std::shared_ptr<const MatchExpression> _matchExpr;
+    std::shared_ptr<MatchExpression> _matchExpr;
 };
 
 }  // namespace mongo

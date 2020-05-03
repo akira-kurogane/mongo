@@ -7,19 +7,19 @@
  * thread does an insert on each iteration. The first insert done by each
  * thread is marked with an extra field. At the end, we assert that the first
  * doc inserted by each thread is no longer in the collection.
+ * @tags: [uses_ttl]
  */
 var $config = (function() {
-
     var states = {
         init: function init(db, collName) {
             var res = db[collName].insert({indexed_insert_ttl: new ISODate(), first: true});
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertWhenOwnColl.eq(1, res.nInserted, tojson(res));
         },
 
         insert: function insert(db, collName) {
             var res = db[collName].insert({indexed_insert_ttl: new ISODate()});
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertWhenOwnColl.eq(1, res.nInserted, tojson(res));
         }
     };
@@ -40,7 +40,8 @@ var $config = (function() {
         // right after the TTL thread has started to sleep, which requires us to wait at least ~60
         // seconds for it to wake up and delete the expired documents. We wait at least another
         // minute just to avoid race-prone tests on overloaded test hosts.
-        var timeoutMS = 2 * Math.max(defaultTTLSecs, this.ttlSeconds) * 1000;
+        var timeoutMS =
+            (TestData.inEvergreen ? 10 : 2) * Math.max(defaultTTLSecs, this.ttlSeconds) * 1000;
 
         assertWhenOwnColl.soon(function checkTTLCount() {
             // All initial documents should be removed by the end of the workload.

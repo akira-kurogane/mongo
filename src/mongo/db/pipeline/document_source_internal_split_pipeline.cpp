@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -47,7 +48,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSplitPipeline::create
 
     auto specObj = elem.embeddedObject();
 
-    HostTypeRequirement mergeType = HostTypeRequirement::kAnyShard;
+    HostTypeRequirement mergeType = HostTypeRequirement::kNone;
 
     for (auto&& elt : specObj) {
         if (elt.fieldNameStringData() == "mergeType"_sd) {
@@ -57,31 +58,30 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSplitPipeline::create
 
             auto mergeTypeString = elt.valueStringData();
 
-            if ("anyShard"_sd == mergeTypeString) {
+            if ("localOnly"_sd == mergeTypeString) {
+                mergeType = HostTypeRequirement::kLocalOnly;
+            } else if ("anyShard"_sd == mergeTypeString) {
                 mergeType = HostTypeRequirement::kAnyShard;
             } else if ("primaryShard"_sd == mergeTypeString) {
                 mergeType = HostTypeRequirement::kPrimaryShard;
             } else if ("mongos"_sd == mergeTypeString) {
-                mergeType = HostTypeRequirement::kAnyShardOrMongoS;
+                mergeType = HostTypeRequirement::kMongoS;
             } else {
                 uasserted(ErrorCodes::BadValue,
                           str::stream() << "unrecognized field while parsing mergeType: '"
-                                        << elt.fieldNameStringData()
-                                        << "'");
+                                        << elt.fieldNameStringData() << "'");
             }
         } else {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "unrecognized field while parsing $_internalSplitPipeline: '"
-                                    << elt.fieldNameStringData()
-                                    << "'");
+                                    << elt.fieldNameStringData() << "'");
         }
     }
 
     return new DocumentSourceInternalSplitPipeline(expCtx, mergeType);
 }
 
-DocumentSource::GetNextResult DocumentSourceInternalSplitPipeline::getNext() {
-    pExpCtx->checkForInterrupt();
+DocumentSource::GetNextResult DocumentSourceInternalSplitPipeline::doGetNext() {
     return pSource->getNext();
 }
 
@@ -90,20 +90,31 @@ Value DocumentSourceInternalSplitPipeline::serialize(
     std::string mergeTypeString;
 
     switch (_mergeType) {
-        case HostTypeRequirement::kAnyShardOrMongoS:
-            mergeTypeString = "mongos";
+        case HostTypeRequirement::kAnyShard:
+            mergeTypeString = "anyShard";
             break;
 
         case HostTypeRequirement::kPrimaryShard:
             mergeTypeString = "primaryShard";
             break;
 
+        case HostTypeRequirement::kLocalOnly:
+            mergeTypeString = "localOnly";
+            break;
+
+        case HostTypeRequirement::kMongoS:
+            mergeTypeString = "mongos";
+            break;
+
+        case HostTypeRequirement::kNone:
         default:
-            mergeTypeString = "anyShard";
             break;
     }
 
-    return Value(Document{{getSourceName(), Value{Document{{"mergeType", mergeTypeString}}}}});
+    return Value(
+        Document{{getSourceName(),
+                  Value{Document{{"mergeType",
+                                  mergeTypeString.empty() ? Value() : Value(mergeTypeString)}}}}});
 }
 
-}  // namesace mongo
+}  // namespace mongo

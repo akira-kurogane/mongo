@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -35,39 +35,36 @@ static const char *home;
 int
 main(int argc, char *argv[])
 {
-	WT_CONNECTION *conn;
-	WT_SESSION *session;
-	int i, j, k;
+    WT_CONNECTION *conn;
+    WT_SESSION *session;
+    int i, j, k;
 
-	home = example_setup(argc, argv);
+    home = example_setup(argc, argv);
 
-	/* Open a connection to the database, creating it if necessary. */
-	error_check(wiredtiger_open(home, NULL, "create", &conn));
+    /* Open a connection to the database, creating it if necessary. */
+    error_check(wiredtiger_open(home, NULL, "create", &conn));
 
-	/* Open a session for the current thread's work. */
-	error_check(conn->open_session(conn, NULL, NULL, &session));
+    /* Open a session for the current thread's work. */
+    error_check(conn->open_session(conn, NULL, NULL, &session));
 
-	{
-	/*! [packing] */
-	size_t size;
-	char buf[50];
+    {
+        /*! [packing] */
+        size_t size;
+        char buf[50];
 
-	error_check(
-	    wiredtiger_struct_size(session, &size, "iii", 42, 1000, -9));
-	if (size > sizeof(buf)) {
-		/* Allocate a bigger buffer. */
-	}
+        error_check(wiredtiger_struct_size(session, &size, "iii", 42, 1000, -9));
+        if (size > sizeof(buf)) {
+            /* Allocate a bigger buffer. */
+        }
 
-	error_check(
-	    wiredtiger_struct_pack(session, buf, size, "iii", 42, 1000, -9));
+        error_check(wiredtiger_struct_pack(session, buf, size, "iii", 42, 1000, -9));
 
-	error_check(
-	    wiredtiger_struct_unpack(session, buf, size, "iii", &i, &j, &k));
-	/*! [packing] */
-	}
+        error_check(wiredtiger_struct_unpack(session, buf, size, "iii", &i, &j, &k));
+        /*! [packing] */
+    }
 
-	/* Note: closing the connection implicitly closes open session(s). */
-	error_check(conn->close(conn, NULL));
+    /* Note: closing the connection implicitly closes open session(s). */
+    error_check(conn->close(conn, NULL));
 
-	return (EXIT_SUCCESS);
+    return (EXIT_SUCCESS);
 }

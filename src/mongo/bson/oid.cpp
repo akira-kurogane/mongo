@@ -1,30 +1,30 @@
-// @file oid.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,6 +33,7 @@
 
 #include <boost/functional/hash.hpp>
 #include <limits>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -43,7 +44,7 @@
 namespace mongo {
 
 namespace {
-std::unique_ptr<AtomicUInt32> counter;
+std::unique_ptr<AtomicWord<int64_t>> counter;
 
 const std::size_t kTimestampOffset = 0;
 const std::size_t kInstanceUniqueOffset = kTimestampOffset + OID::kTimestampSize;
@@ -53,9 +54,9 @@ OID::InstanceUnique _instanceUnique;
 
 MONGO_INITIALIZER_GENERAL(OIDGeneration, MONGO_NO_PREREQUISITES, ("default"))
 (InitializerContext* context) {
-    std::unique_ptr<SecureRandom> entropy(SecureRandom::create());
-    counter.reset(new AtomicUInt32(uint32_t(entropy->nextInt64())));
-    _instanceUnique = OID::InstanceUnique::generate(*entropy);
+    SecureRandom entropy;
+    counter = std::make_unique<AtomicWord<int64_t>>(entropy.nextInt64());
+    _instanceUnique = OID::InstanceUnique::generate(entropy);
     return Status::OK();
 }
 
@@ -71,9 +72,8 @@ OID::Increment OID::Increment::next() {
 }
 
 OID::InstanceUnique OID::InstanceUnique::generate(SecureRandom& entropy) {
-    int64_t rand = entropy.nextInt64();
     OID::InstanceUnique u;
-    std::memcpy(u.bytes, &rand, kInstanceUniqueSize);
+    entropy.fill(u.bytes, kInstanceUniqueSize);
     return u;
 }
 
@@ -118,8 +118,8 @@ size_t OID::Hasher::operator()(const OID& oid) const {
 }
 
 void OID::regenMachineId() {
-    std::unique_ptr<SecureRandom> entropy(SecureRandom::create());
-    _instanceUnique = InstanceUnique::generate(*entropy);
+    SecureRandom entropy;
+    _instanceUnique = InstanceUnique::generate(entropy);
 }
 
 unsigned OID::getMachineId() {
@@ -134,7 +134,7 @@ void OID::justForked() {
 
 void OID::init() {
     // each set* method handles endianness
-    setTimestamp(time(0));
+    setTimestamp(time(nullptr));
     setInstanceUnique(_instanceUnique);
     setIncrement(Increment::next());
 }
@@ -151,7 +151,7 @@ void OID::init(const std::string& s) {
     verify(s.size() == 24);
     const char* p = s.c_str();
     for (std::size_t i = 0; i < kOIDSize; i++) {
-        _data[i] = fromHex(p);
+        _data[i] = uassertStatusOK(fromHex(p));
         p += 2;
     }
 }

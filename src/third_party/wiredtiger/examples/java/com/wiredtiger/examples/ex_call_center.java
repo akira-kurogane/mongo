@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -238,7 +238,7 @@ public class ex_call_center {
 	 * SELECT * FROM Calls WHERE cust_id=? ORDER BY call_date DESC LIMIT 3
 	 *
 	 * Use the call_cust_date index to find the matching calls.  Since it is
-	 * is in increasing order by date for a given customer, we want to start
+	 * in increasing order by date for a given customer, we want to start
 	 * with the last record for the customer and work backwards.
 	 *
 	 * Specify a subset of columns to be returned.  (Note that if these were

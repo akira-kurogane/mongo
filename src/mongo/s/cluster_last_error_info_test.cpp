@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +37,9 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/cluster_last_error_info.h"
-#include "mongo/s/sharding_test_fixture.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -84,14 +84,13 @@ TEST_F(ClusterGetLastErrorTest,
     // Make the reply contain ShardingMetadata.
     repl::OpTime opTime{Timestamp{10, 10}, 10};
     onCommandWithMetadata([&](const RemoteCommandRequest& request) {
-        BSONObjBuilder metadataBob;
-        rpc::ShardingMetadata(opTime, OID() /* ignored OID field */)
-            .writeToMetadata(&metadataBob)
-            .transitional_ignore();
-        return RemoteCommandResponse(BSON("ok" << 1), metadataBob.obj(), Milliseconds(1));
+        auto bob = BSONObjBuilder(BSON("ok" << 1));
+        uassertStatusOK(
+            rpc::ShardingMetadata(opTime, OID() /* ignored OID field */).writeToMetadata(&bob));
+        return RemoteCommandResponse(bob.obj(), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the last error info was updated with the contacted host and returned opTime.
 
@@ -129,14 +128,13 @@ TEST_F(ClusterGetLastErrorTest, ClusterLastErrorInfoNotUpdatedIfNotInitialized) 
     // Make the reply contain ShardingMetadata.
     repl::OpTime opTime{Timestamp{10, 10}, 10};
     onCommandWithMetadata([&](const RemoteCommandRequest& request) {
-        BSONObjBuilder metadataBob;
-        rpc::ShardingMetadata(opTime, OID() /* ignored OID field */)
-            .writeToMetadata(&metadataBob)
-            .transitional_ignore();
-        return RemoteCommandResponse(BSON("ok" << 1), metadataBob.obj(), Milliseconds(1));
+        auto bob = BSONObjBuilder(BSON("ok" << 1));
+        uassertStatusOK(
+            rpc::ShardingMetadata(opTime, OID() /* ignored OID field */).writeToMetadata(&bob));
+        return RemoteCommandResponse(bob.obj(), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the clusterGLE on the Client has still not been initialized.
     ASSERT(!ClusterLastErrorInfo::get(client));
@@ -174,10 +172,10 @@ TEST_F(ClusterGetLastErrorTest, ClusterLastErrorInfoNotUpdatedIfReplyDoesntHaveS
     // Do not return ShardingMetadata in the reply.
     repl::OpTime opTime{Timestamp{10, 10}, 10};
     onCommandWithMetadata([&](const RemoteCommandRequest& request) {
-        return RemoteCommandResponse(BSON("ok" << 1), BSONObj(), Milliseconds(1));
+        return RemoteCommandResponse(BSON("ok" << 1), Milliseconds(1));
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     // Ensure the last error info was not updated.
 

@@ -1,11 +1,7 @@
-// Cannot implicitly shard accessed collections because of use of $near query instead of geoNear
-// command.
-// @tags: [assumes_unsharded_collection]
-
 // Tests geo near with 2 points diametrically opposite to each other
 // on the equator
 // First reported in SERVER-11830 as a regression in 2.5
-
+(function() {
 var t = db.geos2nearequatoropposite;
 
 t.drop();
@@ -20,22 +16,37 @@ var dist = 40075000 / 2 + 1;
 
 var nearSphereCount =
     t.find({
-         loc: {
-             $nearSphere: {$geometry: {type: 'Point', coordinates: [180, 0]}, $maxDistance: dist}
-         }
+         loc: {$nearSphere: {$geometry: {type: 'Point', coordinates: [180, 0]}, $maxDistance: dist}}
      }).itcount();
 var nearCount =
     t.find({
          loc: {$near: {$geometry: {type: 'Point', coordinates: [180, 0]}, $maxDistance: dist}}
      }).itcount();
-var geoNearResult = db.runCommand(
-    {geoNear: t.getName(), near: {type: 'Point', coordinates: [180, 0]}, spherical: true});
-
-print('nearSphere count = ' + nearSphereCount);
-print('near count = ' + nearCount);
-print('geoNearResults = ' + tojson(geoNearResult));
+var geoNearResult = t.aggregate([
+                         {
+                             $geoNear: {
+                                 near: {type: 'Point', coordinates: [180, 0]},
+                                 spherical: true,
+                                 distanceField: "dist",
+                             }
+                         },
+                         {
+                             $group: {
+                                 _id: null,
+                                 nResults: {$sum: 1},
+                                 maxDistance: {$max: "$distanceField"},
+                             }
+                         }
+                     ]).toArray();
 
 assert.eq(2, nearSphereCount, 'unexpected document count for nearSphere');
 assert.eq(2, nearCount, 'unexpected document count for near');
-assert.eq(2, geoNearResult.results.length, 'unexpected document count in geoNear results');
-assert.gt(dist, geoNearResult.stats.maxDistance, 'unexpected maximum distance in geoNear results');
+assert.eq(1, geoNearResult.length, `unexpected $geoNear result: ${tojson(geoNearResult)}`);
+
+const geoNearStats = geoNearResult[0];
+assert.eq(
+    2, geoNearStats.nResults, `unexpected document count for $geoNear: ${tojson(geoNearStats)}`);
+assert.gt(dist,
+          geoNearStats.maxDistance,
+          `unexpected maximum distance in $geoNear results: ${tojson(geoNearStats)}`);
+}());

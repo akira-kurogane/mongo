@@ -1,41 +1,47 @@
 /**
-*    Copyright (C) 2010 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <set>
+#include <vector>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/client/shard.h"
+#include "mongo/s/request_types/move_chunk_request.h"
+#include "mongo/s/shard_id.h"
 
 namespace mongo {
+
 
 struct ZoneRange {
     ZoneRange(const BSONObj& a_min, const BSONObj& a_max, const std::string& _zone);
@@ -48,18 +54,27 @@ struct ZoneRange {
 };
 
 struct MigrateInfo {
-    MigrateInfo(const ShardId& a_to, const ChunkType& a_chunk);
+    enum MigrationReason { drain, zoneViolation, chunksImbalance };
+
+    MigrateInfo(const ShardId& a_to,
+                const ChunkType& a_chunk,
+                MoveChunkRequest::ForceJumbo a_forceJumbo,
+                MigrationReason a_reason);
 
     std::string getName() const;
 
+    BSONObj getMigrationTypeQuery() const;
+
     std::string toString() const;
 
-    std::string ns;
+    NamespaceString nss;
     ShardId to;
     ShardId from;
     BSONObj minKey;
     BSONObj maxKey;
     ChunkVersion version;
+    MoveChunkRequest::ForceJumbo forceJumbo;
+    MigrationReason reason;
 };
 
 typedef std::vector<ClusterStatistics::ShardStatistics> ShardStatisticsVector;
@@ -71,7 +86,8 @@ typedef std::map<ShardId, std::vector<ChunkType>> ShardToChunksMap;
  * query utilization statististics and to decide what to balance.
  */
 class DistributionStatus {
-    MONGO_DISALLOW_COPYING(DistributionStatus);
+    DistributionStatus(const DistributionStatus&) = delete;
+    DistributionStatus& operator=(const DistributionStatus&) = delete;
 
 public:
     DistributionStatus(NamespaceString nss, ShardToChunksMap shardToChunksMap);
@@ -177,12 +193,14 @@ public:
      * any of the shards have chunks, which are sufficiently higher than this number, suggests
      * moving chunks to shards, which are under this number.
      *
-     * The shouldAggressivelyBalance parameter causes the threshold for chunk could disparity
-     * between shards to be lowered.
+     * The usedShards parameter is in/out and it contains the set of shards, which have already been
+     * used for migrations. Used so we don't return multiple conflicting migrations for the same
+     * shard.
      */
     static std::vector<MigrateInfo> balance(const ShardStatisticsVector& shardStats,
                                             const DistributionStatus& distribution,
-                                            bool shouldAggressivelyBalance);
+                                            std::set<ShardId>* usedShards,
+                                            bool forceJumbo);
 
     /**
      * Using the specified distribution information, returns a suggested better location for the
@@ -227,9 +245,9 @@ private:
                                    const DistributionStatus& distribution,
                                    const std::string& tag,
                                    size_t idealNumberOfChunksPerShardForTag,
-                                   size_t imbalanceThreshold,
                                    std::vector<MigrateInfo>* migrations,
-                                   std::set<ShardId>* usedShards);
+                                   std::set<ShardId>* usedShards,
+                                   MoveChunkRequest::ForceJumbo forceJumbo);
 };
 
 }  // namespace mongo

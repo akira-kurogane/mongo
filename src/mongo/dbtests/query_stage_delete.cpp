@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -31,6 +32,8 @@
  */
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -44,13 +47,11 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 namespace QueryStageDelete {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 static const NamespaceString nss("unittests.QueryStageDelete");
 
@@ -61,7 +62,7 @@ static const NamespaceString nss("unittests.QueryStageDelete");
 class QueryStageDeleteBase {
 public:
     QueryStageDeleteBase() : _client(&_opCtx) {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
         for (size_t i = 0; i < numObj(); ++i) {
             BSONObjBuilder bob;
@@ -72,7 +73,7 @@ public:
     }
 
     virtual ~QueryStageDeleteBase() {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
     }
 
@@ -86,11 +87,11 @@ public:
         WorkingSet ws;
 
         CollectionScanParams params;
-        params.collection = collection;
         params.direction = direction;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(
+            new CollectionScan(_expCtx.get(), collection, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -103,7 +104,7 @@ public:
     }
 
     unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(query);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
@@ -118,21 +119,22 @@ protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
 
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
+
 private:
     DBDirectClient _client;
 };
 
-//
-// Test invalidation for the delete stage.  Use the delete stage to delete some objects
-// retrieved by a collscan, then invalidate the upcoming object, then expect the delete stage to
-// skip over it and successfully delete the rest.
-//
-class QueryStageDeleteInvalidateUpcomingObject : public QueryStageDeleteBase {
+// Use the delete stage to delete some objects retrieved by a collscan, then separately delete the
+// upcoming object. We expect the delete stage to skip over it and successfully continue.
+class QueryStageDeleteUpcomingObjectWasDeleted : public QueryStageDeleteBase {
 public:
     void run() {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
         Collection* coll = ctx.getCollection();
+        ASSERT(coll);
 
         // Get the RecordIds that would be returned by an in-order scan.
         vector<RecordId> recordIds;
@@ -140,20 +142,20 @@ public:
 
         // Configure the scan.
         CollectionScanParams collScanParams;
-        collScanParams.collection = coll;
         collScanParams.direction = CollectionScanParams::FORWARD;
         collScanParams.tailable = false;
 
         // Configure the delete stage.
-        DeleteStageParams deleteStageParams;
-        deleteStageParams.isMulti = true;
+        auto deleteStageParams = std::make_unique<DeleteStageParams>();
+        deleteStageParams->isMulti = true;
 
         WorkingSet ws;
-        DeleteStage deleteStage(&_opCtx,
-                                deleteStageParams,
-                                &ws,
-                                coll,
-                                new CollectionScan(&_opCtx, collScanParams, &ws, NULL));
+        DeleteStage deleteStage(
+            _expCtx.get(),
+            std::move(deleteStageParams),
+            &ws,
+            coll,
+            new CollectionScan(_expCtx.get(), coll, collScanParams, &ws, nullptr));
 
         const DeleteStats* stats = static_cast<const DeleteStats*>(deleteStage.getSpecificStats());
 
@@ -166,16 +168,11 @@ public:
         }
 
         // Remove recordIds[targetDocIndex];
-        deleteStage.saveState();
-        {
-            WriteUnitOfWork wunit(&_opCtx);
-            deleteStage.invalidate(&_opCtx, recordIds[targetDocIndex], INVALIDATION_DELETION);
-            wunit.commit();
-        }
+        static_cast<PlanStage*>(&deleteStage)->saveState();
         BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[targetDocIndex]).value();
         ASSERT(!targetDoc.isEmpty());
         remove(targetDoc);
-        deleteStage.restoreState();
+        static_cast<PlanStage*>(&deleteStage)->restoreState();
 
         // Remove the rest.
         while (!deleteStage.isEOF()) {
@@ -196,11 +193,12 @@ class QueryStageDeleteReturnOldDoc : public QueryStageDeleteBase {
 public:
     void run() {
         // Various variables we'll need.
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         Collection* coll = ctx.getCollection();
+        ASSERT(coll);
         const int targetDocIndex = 0;
         const BSONObj query = BSON("foo" << BSON("$gte" << targetDocIndex));
-        const auto ws = make_unique<WorkingSet>();
+        const auto ws = std::make_unique<WorkingSet>();
         const unique_ptr<CanonicalQuery> cq(canonicalize(query));
 
         // Get the RecordIds that would be returned by an in-order scan.
@@ -209,22 +207,22 @@ public:
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
-        auto qds = make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto qds = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
         WorkingSetID id = ws->allocate();
         WorkingSetMember* member = ws->get(id);
         member->recordId = recordIds[targetDocIndex];
         const BSONObj oldDoc = BSON("_id" << targetDocIndex << "foo" << targetDocIndex);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), oldDoc);
+        member->doc = {SnapshotId(), Document{oldDoc}};
         ws->transitionToRecordIdAndObj(id);
         qds->pushBack(id);
 
         // Configure the delete.
-        DeleteStageParams deleteParams;
-        deleteParams.returnDeleted = true;
-        deleteParams.canonicalQuery = cq.get();
+        auto deleteParams = std::make_unique<DeleteStageParams>();
+        deleteParams->returnDeleted = true;
+        deleteParams->canonicalQuery = cq.get();
 
-        const auto deleteStage =
-            make_unique<DeleteStage>(&_opCtx, deleteParams, ws.get(), coll, qds.release());
+        const auto deleteStage = std::make_unique<DeleteStage>(
+            _expCtx.get(), std::move(deleteParams), ws.get(), coll, qds.release());
 
         const DeleteStats* stats = static_cast<const DeleteStats*>(deleteStage->getSpecificStats());
 
@@ -242,10 +240,10 @@ public:
         ASSERT_TRUE(resultMember->hasOwnedObj());
         ASSERT_FALSE(resultMember->hasRecordId());
         ASSERT_EQUALS(resultMember->getState(), WorkingSetMember::OWNED_OBJ);
-        ASSERT_TRUE(resultMember->obj.value().isOwned());
+        ASSERT_TRUE(resultMember->doc.value().isOwned());
 
         // Should be the old value.
-        ASSERT_BSONOBJ_EQ(resultMember->obj.value(), oldDoc);
+        ASSERT_BSONOBJ_EQ(resultMember->doc.value().toBson(), oldDoc);
 
         // Should have done the delete.
         ASSERT_EQUALS(stats->docsDeleted, 1U);
@@ -255,68 +253,17 @@ public:
     }
 };
 
-/**
- * Test that a delete stage which has not been asked to return the deleted document will skip a
- * WorkingSetMember that has been returned from the child in the OWNED_OBJ state. A WorkingSetMember
- * in the OWNED_OBJ state implies there was a conflict during execution, so this WorkingSetMember
- * should be skipped.
- */
-class QueryStageDeleteSkipOwnedObjects : public QueryStageDeleteBase {
+class All : public OldStyleSuiteSpecification {
 public:
-    void run() {
-        // Various variables we'll need.
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
-        Collection* coll = ctx.getCollection();
-        const BSONObj query = BSONObj();
-        const auto ws = make_unique<WorkingSet>();
-        const unique_ptr<CanonicalQuery> cq(canonicalize(query));
-
-        // Configure a QueuedDataStage to pass an OWNED_OBJ to the delete stage.
-        auto qds = make_unique<QueuedDataStage>(&_opCtx, ws.get());
-        {
-            WorkingSetID id = ws->allocate();
-            WorkingSetMember* member = ws->get(id);
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), fromjson("{x: 1}"));
-            member->transitionToOwnedObj();
-            qds->pushBack(id);
-        }
-
-        // Configure the delete.
-        DeleteStageParams deleteParams;
-        deleteParams.isMulti = false;
-        deleteParams.canonicalQuery = cq.get();
-
-        const auto deleteStage =
-            make_unique<DeleteStage>(&_opCtx, deleteParams, ws.get(), coll, qds.release());
-        const DeleteStats* stats = static_cast<const DeleteStats*>(deleteStage->getSpecificStats());
-
-        // Call work, passing the set up member to the delete stage.
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        PlanStage::StageState state = deleteStage->work(&id);
-
-        // Should return NEED_TIME, not deleting anything.
-        ASSERT_EQUALS(PlanStage::NEED_TIME, state);
-        ASSERT_EQUALS(stats->docsDeleted, 0U);
-
-        id = WorkingSet::INVALID_ID;
-        state = deleteStage->work(&id);
-        ASSERT_EQUALS(PlanStage::IS_EOF, state);
-    }
-};
-
-
-class All : public Suite {
-public:
-    All() : Suite("query_stage_delete") {}
+    All() : OldStyleSuiteSpecification("query_stage_delete") {}
 
     void setupTests() {
         // Stage-specific tests below.
-        add<QueryStageDeleteInvalidateUpcomingObject>();
+        add<QueryStageDeleteUpcomingObjectWasDeleted>();
         add<QueryStageDeleteReturnOldDoc>();
-        add<QueryStageDeleteSkipOwnedObjects>();
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
 }  // namespace QueryStageDelete

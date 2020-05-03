@@ -2,7 +2,7 @@
 // detail/win_iocp_socket_service.hpp
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
-// Copyright (c) 2003-2017 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2003-2018 Christopher M. Kohlhoff (chris at kohlhoff dot com)
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -562,10 +562,10 @@ public:
 
   // Connect the socket to the specified endpoint.
   asio::error_code connect(implementation_type& impl,
-      const endpoint_type& peer_endpoint, asio::error_code& ec)
+      const endpoint_type& peer_endpoint, int timeout_ms, asio::error_code& ec)
   {
     socket_ops::sync_connect(impl.socket_,
-        peer_endpoint.data(), peer_endpoint.size(), ec);
+        peer_endpoint.data(), peer_endpoint.size(), timeout_ms, ec);
     return ec;
   }
 

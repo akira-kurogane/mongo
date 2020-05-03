@@ -1,41 +1,35 @@
-// Basic tests for a form of stack recursion that's been shown to cause C++
-// side stack overflows in the past. See SERVER-19614.
+// Basic tests for a form of stack recursion that's been shown to cause C++ side stack overflows in
+// the past. See SERVER-19614.
+//
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_commands,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
 (function() {
-    "use strict";
+"use strict";
 
-    db.recursion.drop();
+db.recursion.drop();
 
-    // Make sure the shell doesn't blow up
-    function shellRecursion() {
-        shellRecursion.apply();
-    }
-    assert.throws(shellRecursion);
+// Make sure the shell doesn't blow up.
+function shellRecursion() {
+    shellRecursion.apply();
+}
+assert.throws(shellRecursion);
 
-    // Make sure db.eval doesn't blow up
-    function dbEvalRecursion() {
-        db.eval(function() {
-            function recursion() {
+// Make sure server side stack overflow doesn't blow up.
+function mapReduceRecursion() {
+    db.recursion.mapReduce(
+        function() {
+            (function recursion() {
                 recursion.apply();
-            }
-            recursion();
-        });
-    }
-    assert.commandFailedWithCode(assert.throws(dbEvalRecursion), ErrorCodes.JSInterpreterFailure);
+            })();
+        },
+        function() {},
+        {out: {merge: 'out_coll'}});
+}
 
-    // Make sure mapReduce doesn't blow up
-    function mapReduceRecursion() {
-        db.recursion.mapReduce(
-            function() {
-                (function recursion() {
-                    recursion.apply();
-                })();
-            },
-            function() {},
-            {out: 'inline'});
-    }
-
-    db.recursion.insert({});
-    assert.commandFailedWithCode(assert.throws(mapReduceRecursion),
-                                 ErrorCodes.JSInterpreterFailure);
+assert.commandWorked(db.recursion.insert({}));
+assert.commandFailedWithCode(assert.throws(mapReduceRecursion), ErrorCodes.JSInterpreterFailure);
 }());

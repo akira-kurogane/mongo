@@ -11,15 +11,10 @@
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
-
     function makeQuery(options) {
         var query = {};
         if (!options.multi) {
             query._id = Random.randInt(options.numDocs);
-        }
-
-        if (options.isolated) {
-            query.$isolated = 1;
         }
 
         return query;
@@ -48,8 +43,7 @@ var $config = (function() {
             var updateDoc = makeRandomUpdateDoc();
 
             // apply this update
-            var query =
-                makeQuery({multi: this.multi, isolated: this.isolated, numDocs: this.numDocs});
+            var query = makeQuery({multi: this.multi, numDocs: this.numDocs});
             var res = db[collName].update(query, updateDoc, {multi: this.multi});
             this.assertResult(res, db, collName, query);
         }
@@ -69,7 +63,7 @@ var $config = (function() {
 
         for (var i = 0; i < this.numDocs; ++i) {
             var res = db[collName].insert({_id: i});
-            assertWhenOwnColl.writeOK(res);
+            assertWhenOwnColl.commandWorked(res);
             assertWhenOwnColl.eq(1, res.nInserted);
         }
     }
@@ -105,9 +99,7 @@ var $config = (function() {
                 }
             },
             multi: false,
-            isolated: false,
         },
         setup: setup
     };
-
 })();

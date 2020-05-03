@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2010-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -85,47 +86,17 @@ public:
 
     /**
      * Helper to run an explain of a find operation on the shards. Fills 'out' with the result of
-     * the of the explain command on success. On failure, returns a non-OK status and does not
-     * modify 'out'.
+     * the of the explain command on success. On failure, throws and does not modify 'out'.
      *
      * Used both if mongos receives an explain command and if it receives an OP_QUERY find with the
      * $explain modifier.
      */
-    static Status explainFind(OperationContext* opCtx,
-                              const BSONObj& findCommand,
-                              const QueryRequest& qr,
-                              ExplainOptions::Verbosity verbosity,
-                              const ReadPreferenceSetting& readPref,
-                              BSONObjBuilder* out);
-
-    struct CommandResult {
-        CommandResult() = default;
-        CommandResult(ShardId shardId, ConnectionString target, BSONObj result)
-            : shardTargetId(std::move(shardId)),
-              target(std::move(target)),
-              result(std::move(result)) {}
-        ShardId shardTargetId;
-        ConnectionString target;
-        BSONObj result;
-    };
-
-    /**
-     * Executes a command against a particular database, and targets the command based on a
-     * collection in that database, according to 'targetingQuery' and 'targetingCollation'. If
-     * 'targetingCollation' is empty, the collection default collation is used for targeting.
-     *
-     * This version should be used by internal commands when possible.
-     *
-     * TODO: Replace these methods and all other methods of command dispatch with a more general
-     * command op framework.
-     */
-    static void commandOp(OperationContext* opCtx,
-                          const std::string& db,
-                          const BSONObj& command,
-                          const std::string& versionedNS,
-                          const BSONObj& targetingQuery,
-                          const BSONObj& targetingCollation,
-                          std::vector<CommandResult>* results);
+    static void explainFind(OperationContext* opCtx,
+                            const BSONObj& findCommand,
+                            const QueryRequest& qr,
+                            ExplainOptions::Verbosity verbosity,
+                            const ReadPreferenceSetting& readPref,
+                            BSONObjBuilder* out);
 };
 
 }  // namespace mongo

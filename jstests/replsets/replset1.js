@@ -2,8 +2,8 @@ var ssl_options1;
 var ssl_options2;
 var ssl_name;
 load("jstests/replsets/rslib.js");
+load('jstests/replsets/libs/election_metrics.js');
 var doTest = function(signal) {
-
     // Test basic replica set functionality.
     // -- Replication
     // -- Failover
@@ -29,17 +29,14 @@ var doTest = function(signal) {
     // elected master.
     var master = replTest.getPrimary();
 
-    var isPV1 = (replTest.getReplSetConfigFromNode().protocolVersion == 1);
-    if (isPV1) {
-        // Ensure the primary logs an n-op to the oplog upon transitioning to primary.
-        assert.gt(master.getDB("local").oplog.rs.count({op: 'n', o: {msg: 'new primary'}}), 0);
-    }
-    // Calling getPrimary also makes available the liveNodes structure,
-    // which looks like this:
-    // liveNodes = {master: masterNode,
-    //              slaves: [slave1, slave2]
-    //             }
-    printjson(replTest.liveNodes);
+    // Check that both the 'called' and 'successful' fields of the 'electionTimeout' election reason
+    // counter have been incremented in serverStatus.
+    const primaryStatus = assert.commandWorked(master.adminCommand({serverStatus: 1}));
+    verifyServerStatusElectionReasonCounterValue(
+        primaryStatus.electionMetrics, "electionTimeout", 1);
+
+    // Ensure the primary logs an n-op to the oplog upon transitioning to primary.
+    assert.gt(master.getDB("local").oplog.rs.count({op: 'n', o: {msg: 'new primary'}}), 0);
 
     // Here's how you save something to master
     master.getDB("foo").foo.save({a: 1000});
@@ -104,7 +101,7 @@ var doTest = function(signal) {
     replTest.awaitSecondaryNodes();
     replTest.awaitReplication();
 
-    var slaves = replTest.liveNodes.slaves;
+    var slaves = replTest._slaves;
     assert(slaves.length == 2, "Expected 2 slaves but length was " + slaves.length);
     slaves.forEach(function(slave) {
         slave.setSlaveOk();
@@ -115,8 +112,7 @@ var doTest = function(signal) {
 
     // last error
     master = replTest.getPrimary();
-    slaves = replTest.liveNodes.slaves;
-    printjson(replTest.liveNodes);
+    slaves = replTest._slaves;
 
     var db = master.getDB("foo");
     var t = db.foo;
@@ -128,25 +124,8 @@ var doTest = function(signal) {
 
     t.save({a: 1000});
     t.ensureIndex({a: 1});
+    replTest.waitForAllIndexBuildsToFinish('foo', 'foo');
 
-    var result = db.runCommand({getLastError: 1, w: 3, wtimeout: 30000});
-    printjson(result);
-    var lastOp = result.lastOp;
-    var lastOplogOp = master.getDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
-    if (replTest.getReplSetConfigFromNode().protocolVersion != 1) {
-        assert.eq(lastOplogOp['ts'], lastOp);
-    } else {
-        assert.eq(lastOplogOp['ts'], lastOp['ts']);
-        assert.eq(lastOplogOp['t'], lastOp['t']);
-    }
-
-    ts.forEach(function(z) {
-        assert.eq(2, z.getIndexKeys().length, "A " + z.getMongo());
-    });
-
-    t.reIndex();
-
-    db.getLastError(3, 30000);
     ts.forEach(function(z) {
         assert.eq(2, z.getIndexKeys().length, "A " + z.getMongo());
     });

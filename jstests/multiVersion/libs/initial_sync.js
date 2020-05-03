@@ -12,7 +12,6 @@ load("./jstests/replsets/rslib.js");
  */
 var multversionInitialSyncTest = function(
     name, replSetVersion, newNodeVersion, configSettings, fcv) {
-
     var nodes = {n1: {binVersion: replSetVersion}, n2: {binVersion: replSetVersion}};
 
     jsTestLog("Starting up a two-node '" + replSetVersion + "' version replica set.");
@@ -30,6 +29,7 @@ var multversionInitialSyncTest = function(
     if (fcv) {
         jsTestLog("Setting FCV to '" + fcv + "' on the primary.");
         assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: fcv}));
+        rst.awaitReplication();
     }
 
     // Insert some data and wait for replication.

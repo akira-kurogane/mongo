@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,35 +29,32 @@
 
 #include "mongo/db/exec/and_sorted.h"
 
-#include "mongo/db/exec/and_common-inl.h"
+#include <memory>
+
+#include "mongo/db/exec/and_common.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::numeric_limits;
+using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* AndSortedStage::kStageType = "AND_SORTED";
 
-AndSortedStage::AndSortedStage(OperationContext* opCtx,
-                               WorkingSet* ws,
-                               const Collection* collection)
-    : PlanStage(kStageType, opCtx),
-      _collection(collection),
+AndSortedStage::AndSortedStage(ExpressionContext* expCtx, WorkingSet* ws)
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _targetNode(numeric_limits<size_t>::max()),
       _targetId(WorkingSet::INVALID_ID),
       _isEOF(false) {}
 
 
-void AndSortedStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void AndSortedStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 }
 
 bool AndSortedStage::isEOF() {
@@ -96,14 +94,10 @@ PlanStage::StageState AndSortedStage::getTargetRecordId(WorkingSetID* out) {
     if (PlanStage::ADVANCED == state) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
-
-        verify(member->hasRecordId());
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an WSM
+        // with no record id.
+        invariant(member->hasRecordId());
 
         // We have a value from one child to AND with.
         _targetNode = 0;
@@ -128,7 +122,7 @@ PlanStage::StageState AndSortedStage::getTargetRecordId(WorkingSetID* out) {
         // failed, in which case 'id' is valid.  If ID is invalid, we
         // create our own error message.
         if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "sorted AND stage failed to read in results from first child";
             Status status(ErrorCodes::InternalError, ss);
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
@@ -158,14 +152,10 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
     if (PlanStage::ADVANCED == state) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
-
-        verify(member->hasRecordId());
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an WSM
+        // with no record id.
+        invariant(member->hasRecordId());
 
         if (member->recordId == _targetRecordId) {
             // The front element has hit _targetRecordId.  Don't move it forward anymore/work on
@@ -218,17 +208,11 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
         _isEOF = true;
         _ws->free(_targetId);
         return state;
-    } else if (PlanStage::FAILURE == state || PlanStage::DEAD == state) {
+    } else if (PlanStage::FAILURE == state) {
+        // The stage which produces a failure is responsible for allocating a working set member
+        // with error details.
+        invariant(WorkingSet::INVALID_ID != id);
         *out = id;
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case 'id' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
-            ss << "sorted AND stage failed to read in results from child " << workingChildNumber;
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-        }
         _isEOF = true;
         _ws->free(_targetId);
         return state;
@@ -241,39 +225,12 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
     }
 }
 
-
-void AndSortedStage::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& dl,
-                                  InvalidationType type) {
-    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
-    if (isEOF()) {
-        return;
-    }
-
-    if (dl == _targetRecordId) {
-        // We're in the middle of moving children forward until they hit _targetRecordId, which is
-        // no
-        // longer a valid target.  If it's a deletion we can't AND it with anything, if it's a
-        // mutation the predicates implied by the AND may no longer be true.  So no matter what,
-        // fetch it, flag for review, and find another _targetRecordId.
-        ++_specificStats.flagged;
-
-        // The RecordId could still be a valid result so flag it and save it for later.
-        WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, _ws->get(_targetId), _collection);
-        _ws->flagForReview(_targetId);
-
-        _targetId = WorkingSet::INVALID_ID;
-        _targetNode = numeric_limits<size_t>::max();
-        _targetRecordId = RecordId();
-        _workingTowardRep = std::queue<size_t>();
-    }
-}
-
 unique_ptr<PlanStageStats> AndSortedStage::getStats() {
     _commonStats.isEOF = isEOF();
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_AND_SORTED);
-    ret->specific = make_unique<AndSortedStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_AND_SORTED);
+    ret->specific = std::make_unique<AndSortedStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

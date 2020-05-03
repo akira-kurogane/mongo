@@ -2,94 +2,102 @@
 // Basic tests of cleanupOrphaned. Validates that non allowed uses of the cleanupOrphaned
 // command fail.
 //
+// requires_persistence because it restarts a shard.
+// @tags: [requires_persistence]
 
 (function() {
-    "use strict";
+"use strict";
 
-    /*****************************************************************************
-     * Unsharded mongod.
-     ****************************************************************************/
+// This test restarts a shard.
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-    // cleanupOrphaned fails against unsharded mongod.
-    var mongod = MongoRunner.runMongod();
-    assert.commandFailed(mongod.getDB('admin').runCommand({cleanupOrphaned: 'foo.bar'}));
+/*****************************************************************************
+ * Unsharded mongod.
+ ****************************************************************************/
 
-    /*****************************************************************************
-     * Bad invocations of cleanupOrphaned command.
-     ****************************************************************************/
+// cleanupOrphaned fails against unsharded mongod.
+var mongod = MongoRunner.runMongod();
+assert.commandFailed(mongod.getDB('admin').runCommand({cleanupOrphaned: 'foo.bar'}));
+MongoRunner.stopMongod(mongod);
 
-    var st = new ShardingTest({other: {rs: true, rsOptions: {nodes: 2}}});
+/*****************************************************************************
+ * Bad invocations of cleanupOrphaned command.
+ ****************************************************************************/
 
-    var mongos = st.s0;
-    var mongosAdmin = mongos.getDB('admin');
-    var dbName = 'foo';
-    var collectionName = 'bar';
-    var ns = dbName + '.' + collectionName;
-    var coll = mongos.getCollection(ns);
+var st = new ShardingTest({
+    other: {rs: true, rsOptions: {nodes: 2, setParameter: {"disableResumableRangeDeleter": true}}}
+});
 
-    // cleanupOrphaned fails against mongos ('no such command'): it must be run
-    // on mongod.
-    assert.commandFailed(mongosAdmin.runCommand({cleanupOrphaned: ns}));
+var mongos = st.s0;
+var mongosAdmin = mongos.getDB('admin');
+var dbName = 'foo';
+var collectionName = 'bar';
+var ns = dbName + '.' + collectionName;
+var coll = mongos.getCollection(ns);
 
-    // cleanupOrphaned must be run on admin DB.
-    var shardFooDB = st.shard0.getDB(dbName);
-    assert.commandFailed(shardFooDB.runCommand({cleanupOrphaned: ns}));
+// cleanupOrphaned fails against mongos ('no such command'): it must be run
+// on mongod.
+assert.commandFailed(mongosAdmin.runCommand({cleanupOrphaned: ns}));
 
-    // Must be run on primary.
-    var secondaryAdmin = st.rs0.getSecondary().getDB('admin');
-    var response = secondaryAdmin.runCommand({cleanupOrphaned: ns});
-    print('cleanupOrphaned on secondary:');
-    printjson(response);
-    assert.commandFailed(response);
+// cleanupOrphaned must be run on admin DB.
+var shardFooDB = st.shard0.getDB(dbName);
+assert.commandFailed(shardFooDB.runCommand({cleanupOrphaned: ns}));
 
-    var shardAdmin = st.shard0.getDB('admin');
-    var badNS = ' \\/."*<>:|?';
-    assert.commandFailed(shardAdmin.runCommand({cleanupOrphaned: badNS}));
+// Must be run on primary.
+var secondaryAdmin = st.rs0.getSecondary().getDB('admin');
+var response = secondaryAdmin.runCommand({cleanupOrphaned: ns});
+print('cleanupOrphaned on secondary:');
+printjson(response);
+assert.commandFailed(response);
 
-    // cleanupOrphaned works on sharded collection.
-    assert.commandWorked(mongosAdmin.runCommand({enableSharding: coll.getDB().getName()}));
+var shardAdmin = st.shard0.getDB('admin');
+var badNS = ' \\/."*<>:|?';
+assert.commandFailed(shardAdmin.runCommand({cleanupOrphaned: badNS}));
 
-    st.ensurePrimaryShard(coll.getDB().getName(), st.shard0.shardName);
+// cleanupOrphaned works on sharded collection.
+assert.commandWorked(mongosAdmin.runCommand({enableSharding: coll.getDB().getName()}));
 
-    assert.commandWorked(mongosAdmin.runCommand({shardCollection: ns, key: {_id: 1}}));
+st.ensurePrimaryShard(coll.getDB().getName(), st.shard0.shardName);
 
-    assert.commandWorked(shardAdmin.runCommand({cleanupOrphaned: ns}));
+assert.commandWorked(mongosAdmin.runCommand({shardCollection: ns, key: {_id: 1}}));
 
-    /*****************************************************************************
-     * Empty shard.
-     ****************************************************************************/
+assert.commandWorked(shardAdmin.runCommand({cleanupOrphaned: ns}));
 
-    // Ping shard[1] so it will be aware that it is sharded. Otherwise cleanupOrphaned
-    // may fail.
-    assert.commandWorked(mongosAdmin.runCommand({
-        moveChunk: coll.getFullName(),
-        find: {_id: 1},
-        to: st.shard1.shardName,
-        _waitForDelete: true
-    }));
+/*****************************************************************************
+ * Empty shard.
+ ****************************************************************************/
 
-    assert.commandWorked(mongosAdmin.runCommand({
-        moveChunk: coll.getFullName(),
-        find: {_id: 1},
-        to: st.shard0.shardName,
-        _waitForDelete: true
-    }));
+// Ping shard[1] so it will be aware that it is sharded. Otherwise cleanupOrphaned
+// may fail.
+assert.commandWorked(mongosAdmin.runCommand({
+    moveChunk: coll.getFullName(),
+    find: {_id: 1},
+    to: st.shard1.shardName,
+    _waitForDelete: true
+}));
 
-    // Collection's home is shard0, there are no chunks assigned to shard1.
-    st.shard1.getCollection(ns).insert({});
-    assert.eq(null, st.shard1.getDB(dbName).getLastError());
-    assert.eq(1, st.shard1.getCollection(ns).count());
-    response = st.shard1.getDB('admin').runCommand({cleanupOrphaned: ns});
-    assert.commandWorked(response);
-    assert.eq({_id: {$maxKey: 1}}, response.stoppedAtKey);
-    assert.eq(0,
-              st.shard1.getCollection(ns).count(),
-              "cleanupOrphaned didn't delete orphan on empty shard.");
+assert.commandWorked(mongosAdmin.runCommand({
+    moveChunk: coll.getFullName(),
+    find: {_id: 1},
+    to: st.shard0.shardName,
+    _waitForDelete: true
+}));
 
-    /*****************************************************************************
-     * Bad startingFromKeys.
-     ****************************************************************************/
+// Collection's home is shard0, there are no chunks assigned to shard1.
+st.shard1.getCollection(ns).insert({});
+assert.eq(null, st.shard1.getDB(dbName).getLastError());
+assert.eq(1, st.shard1.getCollection(ns).count());
+response = st.shard1.getDB('admin').runCommand({cleanupOrphaned: ns});
+assert.commandWorked(response);
+assert.eq({_id: {$maxKey: 1}}, response.stoppedAtKey);
+assert.eq(
+    0, st.shard1.getCollection(ns).count(), "cleanupOrphaned didn't delete orphan on empty shard.");
 
+/*****************************************************************************
+ * Bad startingFromKeys.
+ ****************************************************************************/
+
+function testBadStartingFromKeys(shardAdmin) {
     // startingFromKey of MaxKey.
     response = shardAdmin.runCommand({cleanupOrphaned: ns, startingFromKey: {_id: MaxKey}});
     assert.commandWorked(response);
@@ -115,7 +123,18 @@
     // startingFromKey matches number of fields in shard key but not field names.
     assert.commandFailed(shardAdmin.runCommand(
         {cleanupOrphaned: coll2.getFullName(), startingFromKey: {a: 'someValue', c: 1}}));
+}
 
-    st.stop();
+// Test when disableResumableRangeDeleter=true.
+testBadStartingFromKeys(shardAdmin);
 
+// Restart the shard with disableResumableRangeDeleter=false and test bad startingFromKey's. Note
+// that the 'startingFromKey' parameter is validated when disableResumableRangeDeleter=false and the
+// FCV is 4.4, but is not otherwise used (cleanupOrphaned waits for there to be no orphans in the
+// entire key space).
+st.rs0.stopSet(null /* signal */, true /* forRestart */);
+st.rs0.startSet({restart: true, setParameter: {disableResumableRangeDeleter: false}});
+testBadStartingFromKeys(st.rs0.getPrimary().getDB("admin"));
+
+st.stop();
 })();

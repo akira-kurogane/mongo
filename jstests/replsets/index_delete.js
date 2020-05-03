@@ -2,7 +2,7 @@
  * This test builds an index and then drops the index once the secondary has started building it.
  * After the drop, we assert that the secondary no longer has the index.
  * We then create two indexes and assert that dropping all indexes with '*' replicates properly.
- *
+ * @tags: [multiversion_incompatible]
  */
 
 function indexBuildInProgress(checkDB) {
@@ -18,8 +18,13 @@ function indexBuildInProgress(checkDB) {
     return indexOps.length > 0;
 }
 
-// Set up replica set
-var replTest = new ReplSetTest({nodes: [{}, {}, {arbiter: true}]});
+// Set up replica set.
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
+var replTest = new ReplSetTest({
+    nodes: [{}, {}, {arbiter: true}],
+    nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}
+});
 var nodes = replTest.nodeList();
 
 // We need an arbiter to ensure that the primary doesn't step down when we restart the secondary.
@@ -43,7 +48,7 @@ var bulk = masterDB[collName].initializeUnorderedBulkOp();
 for (var i = 0; i < size; ++i) {
     bulk.insert({i: i, j: i, k: i});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 jsTest.log("Creating index");
 masterDB[collName].ensureIndex({i: 1});
@@ -105,7 +110,6 @@ master.getCollection('local.oplog.rs').find().forEach(function(entry) {
         assert(entry.o2.name);
         assert(entry.o2.key);
         assert.eq(entry.o2.v, 2);
-        assert.eq(entry.o2.ns, dbName + "." + collName);
         assert.eq(entry.ns, dbName + ".$cmd");
     }
 });
@@ -121,3 +125,5 @@ assert.soon(function() {
     return 1 == secondDB[collName].getIndexes().length;
 }, "Indexes not dropped on secondary");
 assert.eq(1, secondDB[collName].getIndexes().length);
+
+replTest.stopSet();

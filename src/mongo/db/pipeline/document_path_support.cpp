@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -34,10 +35,10 @@
 
 #include "mongo/base/parse_number.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace document_path_support {
@@ -48,8 +49,7 @@ namespace {
  * If 'value' is an array, invokes 'callback' once on each element of 'value'. Otherwise, if 'value'
  * is not missing, invokes 'callback' on 'value' itself.
  */
-void invokeCallbackOnTrailingValue(const Value& value,
-                                   stdx::function<void(const Value&)> callback) {
+void invokeCallbackOnTrailingValue(const Value& value, std::function<void(const Value&)> callback) {
     if (value.isArray()) {
         for (auto&& finalValue : value.getArray()) {
             if (!finalValue.missing()) {
@@ -64,7 +64,7 @@ void invokeCallbackOnTrailingValue(const Value& value,
 void visitAllValuesAtPathHelper(Document doc,
                                 const FieldPath& path,
                                 size_t fieldPathIndex,
-                                stdx::function<void(const Value&)> callback) {
+                                std::function<void(const Value&)> callback) {
     invariant(path.getPathLength() > 0 && fieldPathIndex < path.getPathLength());
 
     // The first field in the path must be treated as a field name, even if it is numeric as in
@@ -80,7 +80,7 @@ void visitAllValuesAtPathHelper(Document doc,
     // positional specifications, if applicable. For example, it will consume "0" and "1" from the
     // path "a.0.1.b" if the value at "a" is an array with arrays inside it.
     while (fieldPathIndex < path.getPathLength() && nextValue.isArray()) {
-        if (auto index = parseUnsignedBase10Integer(path.getFieldName(fieldPathIndex))) {
+        if (auto index = str::parseUnsignedBase10Integer(path.getFieldName(fieldPathIndex))) {
             nextValue = nextValue[*index];
             ++fieldPathIndex;
         } else {
@@ -115,7 +115,7 @@ void visitAllValuesAtPathHelper(Document doc,
 
 void visitAllValuesAtPath(const Document& doc,
                           const FieldPath& path,
-                          stdx::function<void(const Value&)> callback) {
+                          std::function<void(const Value&)> callback) {
     visitAllValuesAtPathHelper(doc, path, 0, callback);
 }
 

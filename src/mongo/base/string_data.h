@@ -1,30 +1,30 @@
-// string_data.h
-
-/*    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -35,6 +35,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#include <fmt/format.h>
 
 #include "mongo/stdx/type_traits.h"
 #define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
@@ -57,6 +59,7 @@ namespace mongo {
  *    rawData() terminates with a null.
  */
 class StringData {
+    /** Tag used to bypass the invariant of the {c,len} constructor. */
     struct TrustedInitTag {};
     constexpr StringData(const char* c, size_t len, TrustedInitTag) : _data(c), _size(len) {}
 
@@ -86,20 +89,23 @@ public:
 
     /**
      * Constructs a StringData with an explicit length. 'c' must
-     * either be NULL (in which case len must be zero), or be a
+     * either be nullptr (in which case len must be zero), or be a
      * pointer into a character array. The StringData will refer to
      * the first 'len' characters starting at 'c'. The range of
-     * characters c to c+len must be valid.
+     * characters in the half-open interval `[c, c + len)` must be valid.
      */
     StringData(const char* c, size_t len) : StringData(c, len, TrustedInitTag()) {
         invariant(_data || (_size == 0));
     }
 
-    /**
-     * Constructs a StringData from a user defined literal.  This allows
-     * for constexpr creation of StringData's that are known at compile time.
-     */
-    constexpr friend StringData operator"" _sd(const char* c, std::size_t len);
+    /** Helper for the `literals::operator""_sd` function below. Conceptually non-public. */
+    static constexpr StringData _literalHelper(const char* c, std::size_t len) {
+        return StringData(c, len, TrustedInitTag{});
+    }
+
+    explicit operator std::string() const {
+        return toString();
+    }
 
     /**
      * Constructs a StringData with begin and end iterators. begin points to the beginning of the
@@ -140,7 +146,7 @@ public:
     //
 
     size_t find(char c, size_t fromPos = 0) const;
-    size_t find(StringData needle) const;
+    size_t find(StringData needle, size_t fromPos = 0) const;
     size_t rfind(char c, size_t fromPos = std::string::npos) const;
 
     /**
@@ -162,11 +168,11 @@ public:
      * null-terminated, so if using this without checking size(), you are likely doing
      * something wrong.
      */
-    constexpr const char* rawData() const {
+    constexpr const char* rawData() const noexcept {
         return _data;
     }
 
-    constexpr size_t size() const {
+    constexpr size_t size() const noexcept {
         return _size;
     }
     constexpr bool empty() const {
@@ -220,10 +226,6 @@ inline bool operator>=(StringData lhs, StringData rhs) {
 
 std::ostream& operator<<(std::ostream& stream, StringData value);
 
-constexpr StringData operator"" _sd(const char* c, std::size_t len) {
-    return StringData(c, len, StringData::TrustedInitTag{});
-}
-
 inline int StringData::compare(StringData other) const {
     // It is illegal to pass nullptr to memcmp. It is an invariant of
     // StringData that if _data is nullptr, _size is zero. If asked to
@@ -273,12 +275,12 @@ inline size_t StringData::find(char c, size_t fromPos) const {
         return std::string::npos;
 
     const void* x = memchr(_data + fromPos, c, _size - fromPos);
-    if (x == 0)
+    if (x == nullptr)
         return std::string::npos;
     return static_cast<size_t>(static_cast<const char*>(x) - _data);
 }
 
-inline size_t StringData::find(StringData needle) const {
+inline size_t StringData::find(StringData needle, size_t fromPos) const {
     size_t mx = size();
     size_t needleSize = needle.size();
 
@@ -287,9 +289,12 @@ inline size_t StringData::find(StringData needle) const {
     else if (needleSize > mx)
         return std::string::npos;
 
+    if (fromPos > size())
+        return std::string::npos;
+
     mx -= needleSize;
 
-    for (size_t i = 0; i <= mx; i++) {
+    for (size_t i = fromPos; i <= mx; i++) {
         if (memcmp(_data + i, needle._data, needleSize) == 0)
             return i;
     }
@@ -344,5 +349,20 @@ inline std::string operator+(StringData lhs, std::string rhs) {
         rhs.insert(0, lhs.rawData(), lhs.size());
     return rhs;
 }
+
+constexpr fmt::string_view to_string_view(StringData s) noexcept {
+    return fmt::string_view(s.rawData(), s.size());
+}
+
+inline namespace literals {
+
+/**
+ * Makes a constexpr StringData from a user defined literal (e.g. "hello"_sd).
+ * This allows for constexpr creation of `StringData` that are known at compile time.
+ */
+constexpr StringData operator"" _sd(const char* c, std::size_t len) {
+    return StringData::_literalHelper(c, len);
+}
+}  // namespace literals
 
 }  // namespace mongo

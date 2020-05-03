@@ -1,5 +1,16 @@
-// Test that the plan summary string appears in db.currentOp() for
-// count operations. SERVER-14064.
+// Test that the plan summary string appears in db.currentOp() for count operations. SERVER-14064.
+//
+// @tags: [
+//   # This test attempts to perform a find command and find it using the currentOp command. The
+//   # former operation may be routed to a secondary in the replica set, whereas the latter must be
+//   # routed to the primary.
+//   assumes_read_preference_unchanged,
+//   does_not_support_stepdowns,
+//   # Uses $where operator
+//   requires_scripting,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 var t = db.jstests_count_plan_summary;
 t.drop();

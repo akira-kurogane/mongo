@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,14 +32,13 @@
 #include <boost/optional.hpp>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/plan_cache.h"
-#include "mongo/platform/unordered_map.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -47,7 +47,8 @@ namespace mongo {
  */
 class AllowedIndicesFilter {
 private:
-    MONGO_DISALLOW_COPYING(AllowedIndicesFilter);
+    AllowedIndicesFilter(const AllowedIndicesFilter&) = delete;
+    AllowedIndicesFilter& operator=(const AllowedIndicesFilter&) = delete;
 
 public:
     AllowedIndicesFilter(const BSONObjSet& indexKeyPatterns,
@@ -62,7 +63,7 @@ public:
      */
     bool allows(const IndexEntry& entry) const {
         return indexKeyPatterns.find(entry.keyPattern) != indexKeyPatterns.end() ||
-            indexNames.find(entry.name) != indexNames.end();
+            indexNames.find(entry.identifier.catalogName) != indexNames.end();
     }
 
     // These are the index key patterns and names that
@@ -106,7 +107,8 @@ public:
  */
 class QuerySettings {
 private:
-    MONGO_DISALLOW_COPYING(QuerySettings);
+    QuerySettings(const QuerySettings&) = delete;
+    QuerySettings& operator=(const QuerySettings&) = delete;
 
 public:
     QuerySettings() = default;
@@ -115,7 +117,8 @@ public:
      * Returns AllowedIndicesFilter for the query if it is set in the query settings, or
      * boost::none if it isn't.
      */
-    boost::optional<AllowedIndicesFilter> getAllowedIndicesFilter(const PlanCacheKey& query) const;
+    boost::optional<AllowedIndicesFilter> getAllowedIndicesFilter(
+        const CanonicalQuery::QueryShapeString& query) const;
 
     /**
      * Returns copies of all overrides for the collection.
@@ -127,14 +130,13 @@ public:
      * If existing entry is found for the same key, replaces it.
      */
     void setAllowedIndices(const CanonicalQuery& canonicalQuery,
-                           const PlanCacheKey& key,
                            const BSONObjSet& indexKeyPatterns,
                            const stdx::unordered_set<std::string>& indexNames);
 
     /**
      * Removes single entry from query settings. No effect if query shape is not found.
      */
-    void removeAllowedIndices(const PlanCacheKey& canonicalQuery);
+    void removeAllowedIndices(const CanonicalQuery::QueryShapeString& canonicalQuery);
 
     /**
      * Clears all allowed indices from query settings.
@@ -143,13 +145,14 @@ public:
 
 private:
     // Allowed index entries owned here.
-    using AllowedIndexEntryMap = unordered_map<PlanCacheKey, AllowedIndexEntry>;
+    using AllowedIndexEntryMap =
+        stdx::unordered_map<CanonicalQuery::QueryShapeString, AllowedIndexEntry>;
     AllowedIndexEntryMap _allowedIndexEntryMap;
 
     /**
      * Protects data in query settings.
      */
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("QuerySettings::_mutex");
 };
 
 }  // namespace mongo

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import os, re, sys, textwrap
-from dist import compare_srcfile
+from dist import compare_srcfile, format_srcfile
 import log_data
 
 # Temporary file.
@@ -18,6 +18,9 @@ field_types = {
           'WT_ERR(__logrec_make_hex_str(session, &escaped, &arg));']),
     'recno' : ('uint64_t', 'r', '%" PRIu64 "', 'arg', [ '' ]),
     'uint32' : ('uint32_t', 'I', '%" PRIu32 "', 'arg', [ '' ]),
+    # The fileid may have the high bit set. Print in both decimal and hex.
+    'uint32_id' : ('uint32_t', 'I',
+        '%" PRIu32 " 0x%" PRIx32 "', 'arg, arg', [ '' ]),
     'uint64' : ('uint64_t', 'Q', '%" PRIu64 "', 'arg', [ '' ]),
 }
 
@@ -98,10 +101,11 @@ def printf_line(f, optype, i, ishex):
         name += '-hex'
         ifend = nl_indent + '}'
         nl_indent += '\t'
-        ifbegin = 'if (LF_ISSET(WT_TXN_PRINTLOG_HEX)) {' + nl_indent
+        ifbegin = \
+            'if (FLD_ISSET(args->flags, WT_TXN_PRINTLOG_HEX)) {' + nl_indent
         if postcomma == '':
             precomma = ',\\n'
-    body = '%s%s(__wt_fprintf(session, WT_STDOUT(session),' % (
+    body = '%s%s(__wt_fprintf(session, args->fs,' % (
         printf_setup(f, ishex, nl_indent),
         'WT_ERR' if has_escape(optype.fields) else 'WT_RET') + \
         '%s    "%s        \\"%s\\": %s%s",%s));' % (
@@ -277,13 +281,13 @@ __wt_logop_%(name)s_unpack(
     tfile.write('''
 int
 __wt_logop_%(name)s_print(WT_SESSION_IMPL *session,
-    const uint8_t **pp, const uint8_t *end, uint32_t flags)
+    const uint8_t **pp, const uint8_t *end, WT_TXN_PRINTLOG_ARGS *args)
 {%(arg_ret)s%(arg_decls)s
 
-\t%(arg_unused)s%(arg_init)sWT_RET(__wt_logop_%(name)s_unpack(
+\t%(arg_init)sWT_RET(__wt_logop_%(name)s_unpack(
 \t    session, pp, end%(arg_addrs)s));
 
-\tWT_RET(__wt_fprintf(session, WT_STDOUT(session),
+\tWT_RET(__wt_fprintf(session, args->fs,
 \t    " \\"optype\\": \\"%(name)s\\",\\n"));
 %(print_args)s
 %(arg_fini)s
@@ -295,8 +299,6 @@ __wt_logop_%(name)s_print(WT_SESSION_IMPL *session,
         (clocaltype(f), '' if clocaltype(f)[-1] == '*' else ' ', f[1])
         for f in optype.fields)) + escape_decl(optype.fields)
         if optype.fields else ''),
-    'arg_unused' : ('' if has_escape(optype.fields)
-        else 'WT_UNUSED(flags);\n\t'),
     'arg_init' : ('escaped = NULL;\n\t' if has_escape(optype.fields) else ''),
     'arg_fini' : ('\nerr:\t__wt_free(session, escaped);\n\treturn (ret);'
     if has_escape(optype.fields) else '\treturn (0);'),
@@ -310,7 +312,7 @@ __wt_logop_%(name)s_print(WT_SESSION_IMPL *session,
 tfile.write('''
 int
 __wt_txn_op_printlog(WT_SESSION_IMPL *session,
-    const uint8_t **pp, const uint8_t *end, uint32_t flags)
+    const uint8_t **pp, const uint8_t *end, WT_TXN_PRINTLOG_ARGS *args)
 {
 \tuint32_t optype, opsize;
 
@@ -323,7 +325,7 @@ __wt_txn_op_printlog(WT_SESSION_IMPL *session,
 for optype in log_data.optypes:
     tfile.write('''
 \tcase %(macro)s:
-\t\tWT_RET(%(print_func)s(session, pp, end, flags));
+\t\tWT_RET(%(print_func)s(session, pp, end, args));
 \t\tbreak;
 ''' % {
     'macro' : optype.macro_name(),
@@ -331,7 +333,7 @@ for optype in log_data.optypes:
 })
 
 tfile.write('''
-\tWT_ILLEGAL_VALUE(session);
+\tdefault:\n\t\treturn (__wt_illegal_value(session, optype));
 \t}
 
 \treturn (0);
@@ -339,4 +341,5 @@ tfile.write('''
 ''')
 
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, f)

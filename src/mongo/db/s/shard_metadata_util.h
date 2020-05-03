@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,6 +44,7 @@ class CollectionMetadata;
 class NamespaceString;
 class OperationContext;
 class ShardCollectionType;
+class ShardDatabaseType;
 template <typename T>
 class StatusWith;
 
@@ -96,20 +98,6 @@ struct RefreshState {
 QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion);
 
 /**
- * Writes a persisted signal to indicate that the chunks collection is being updated. It is
- * essential to call this before updating the chunks collection for 'nss' so that secondaries do not
- * use incomplete metadata.
- *
- * It is safe to call this multiple times: it's an idempotent action.
- *
- * Don't forget to call refreshPersistedSignalFinish after the chunks update is finished!
- *
- * Note: if there is no document present in the collections collection for 'nss', nothing is
- * updated.
- */
-Status setPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss);
-
-/**
  * Writes a persisted signal to indicate that it is once again safe to read from the chunks
  * collection for 'nss' and updates the collection's collection version to 'refreshedVersion'. It is
  * essential to call this after updating the chunks collection so that secondaries know they can
@@ -139,18 +127,43 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
                                                           const NamespaceString& nss);
 
 /**
+ * Reads the shard server's databases collection entry identified by 'dbName'.
+ */
+StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, StringData dbName);
+
+/**
  * Updates the collections collection entry matching 'query' with 'update' using local write
  * concern.
  *
  * Uses the $set operator on the update so that updates can be applied without resetting everything.
+ * 'inc' can be used to specify fields and their increments: it will be assigned to the $inc
+ * operator.
  *
- * If 'upsert' is true, expects neither 'refreshing' or 'lastRefreshedCollectionVersion' to be
- * present in the update: these refreshing fields should only be added to an existing document.
+ * If 'upsert' is true, expects 'lastRefreshedCollectionVersion' to be absent in the update:
+ * these refreshing fields should only be added to an existing document.
+ * Similarly, 'inc' should not specify 'upsert' true.
  */
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
+                                   const BSONObj& inc,
                                    const bool upsert);
+
+/**
+ * Updates the databases collection entry matching 'query' with 'update' using local write
+ * concern.
+ *
+ * Uses the $set operator on the update so that updates can be applied without resetting everything.
+ * 'inc' can be used to specify fields and their increments: it will be assigned to the $inc
+ * operator.
+ *
+ * 'inc' should not specify 'upsert' true.
+ */
+Status updateShardDatabasesEntry(OperationContext* opCtx,
+                                 const BSONObj& query,
+                                 const BSONObj& update,
+                                 const BSONObj& inc,
+                                 const bool upsert);
 
 /**
  * Reads the shard server's chunks collection corresponding to 'nss' for chunks matching 'query',
@@ -196,6 +209,17 @@ Status updateShardChunks(OperationContext* opCtx,
  * retries, rather than returning with a useful error message.
  */
 Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Drops locally persisted chunk metadata associated with 'nss': only drops the chunks collection.
+ */
+void dropChunks(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Deletes locally persisted database metadata associated with 'dbName': removes the databases
+ * collection entry.
+ */
+Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName);
 
 }  // namespace shardmetadatautil
 }  // namespace mongo

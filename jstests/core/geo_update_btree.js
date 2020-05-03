@@ -1,4 +1,11 @@
 // Tests whether the geospatial search is stable under btree updates
+//
+// @tags: [
+//   assumes_write_concern_unchanged,
+//   requires_non_retryable_writes,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 var coll = db.getCollection("jstests_geo_update_btree");
 coll.drop();
@@ -14,14 +21,15 @@ if (testingReplication) {
 Random.setRandomSeed();
 
 var parallelInsert = startParallelShell(
-    "Random.setRandomSeed();" + "for ( var i = 0; i < 1000; i++ ) {" +
+    "Random.setRandomSeed();" +
+    "for ( var i = 0; i < 1000; i++ ) {" +
     "    var doc = { loc: [ Random.rand() * 180, Random.rand() * 180 ], v: '' };" +
-    "    db.jstests_geo_update_btree.insert(doc);" + "}");
+    "    db.jstests_geo_update_btree.insert(doc);" +
+    "}");
 
 for (i = 0; i < 1000; i++) {
     coll.update({
-        loc:
-            {$within: {$center: [[Random.rand() * 180, Random.rand() * 180], Random.rand() * 50]}}
+        loc: {$within: {$center: [[Random.rand() * 180, Random.rand() * 180], Random.rand() * 50]}}
     },
                 {$set: {v: big}},
                 false,

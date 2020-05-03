@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,8 +39,8 @@ namespace {
 
 using mongo::WireVersion;
 using namespace mongo::rpc;
-using mongo::unittest::assertGet;
 using mongo::BSONObj;
+using mongo::unittest::assertGet;
 
 // Checks if negotiation of the first to protocol sets results in the 'proto'
 const auto assert_negotiated = [](ProtocolSet fst, ProtocolSet snd, Protocol proto) {
@@ -51,7 +52,6 @@ const auto assert_negotiated = [](ProtocolSet fst, ProtocolSet snd, Protocol pro
 TEST(Protocol, SuccessfulNegotiation) {
     assert_negotiated(supports::kAll, supports::kAll, Protocol::kOpMsg);
     assert_negotiated(supports::kAll, supports::kOpMsgOnly, Protocol::kOpMsg);
-    assert_negotiated(supports::kAll, supports::kOpCommandOnly, Protocol::kOpCommandV1);
     assert_negotiated(supports::kAll, supports::kOpQueryOnly, Protocol::kOpQuery);
 }
 
@@ -63,13 +63,23 @@ const auto assert_not_negotiated = [](ProtocolSet fst, ProtocolSet snd) {
 };
 
 TEST(Protocol, FailedNegotiation) {
-    assert_not_negotiated(supports::kOpQueryOnly, supports::kOpCommandOnly);
+    assert_not_negotiated(supports::kOpQueryOnly, supports::kOpMsgOnly);
     assert_not_negotiated(supports::kAll, supports::kNone);
     assert_not_negotiated(supports::kOpQueryOnly, supports::kNone);
-    assert_not_negotiated(supports::kOpCommandOnly, supports::kNone);
+    assert_not_negotiated(supports::kOpMsgOnly, supports::kNone);
 }
 
 TEST(Protocol, parseProtocolSetFromIsMasterReply) {
+    {
+        // MongoDB 4.0
+        auto mongod40 =
+            BSON("maxWireVersion" << static_cast<int>(WireVersion::REPLICA_SET_TRANSACTIONS)
+                                  << "minWireVersion"
+                                  << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE));
+
+        ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod40)).protocolSet,
+                  supports::kAll);
+    }
     {
         // MongoDB 3.6
         auto mongod36 =
@@ -88,15 +98,14 @@ TEST(Protocol, parseProtocolSetFromIsMasterReply) {
                                   << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE));
 
         ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod32)).protocolSet,
-                  supports::kOpQueryOnly | supports::kOpCommandOnly);
+                  supports::kOpQueryOnly);  // This used to also include OP_COMMAND.
     }
     {
         // MongoDB 3.2 (mongos)
         auto mongos32 =
             BSON("maxWireVersion" << static_cast<int>(WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN)
                                   << "minWireVersion"
-                                  << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE)
-                                  << "msg"
+                                  << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE) << "msg"
                                   << "isdbgrid");
 
         ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongos32)).protocolSet,
@@ -104,8 +113,8 @@ TEST(Protocol, parseProtocolSetFromIsMasterReply) {
     }
     {
         // MongoDB 3.0 (mongod)
-        auto mongod30 = BSON(
-            "maxWireVersion" << static_cast<int>(WireVersion::RELEASE_2_7_7) << "minWireVersion"
+        auto mongod30 = BSON("maxWireVersion"
+                             << static_cast<int>(WireVersion::RELEASE_2_7_7) << "minWireVersion"
                              << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE));
         ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod30)).protocolSet,
                   supports::kOpQueryOnly);
@@ -127,56 +136,165 @@ TEST(Protocol, parseProtocolSetFromIsMasterReply) {
     } while (0);
 
 TEST(Protocol, validateWireVersion) {
-    // Base Test
-    VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+    /*
+     * Test communication with a MongoD latest binary server with downgraded FCV.
+     */
 
-    // Allowed during upgrade
-    // MongoD 3.4 client -> MongoD 3.4 server
+    // MongoD 'latest' client -> MongoD 'latest' server
     VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
 
-    // MongoD 3.4 client -> MongoD 3.2 server
+    // MongoD 'latest' client -> MongoD downgraded 'last-stable' server
     VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::FIND_COMMAND);
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 2,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
 
-    // MongoD 3.2 client -> MongoD 3.4 server
+    // MongoD 'latest' client -> MongoD upgraded 'last-stable' server
     VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
 
-    // MongoS 3.4 client -> MongoD 3.4 server
+    // MongoD downgraded 'last-stable' client -> MongoD 'latest' server
     VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+                          WireVersion::LATEST_WIRE_VERSION - 2,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
 
-    // MongoS 3.2 client -> MongoD 3.4 server
+    // MongoD upgraded 'last-stable' client -> MongoD 'latest' server
     VALIDATE_WIRE_VERSION(ASSERT_OK,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::FIND_COMMAND,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
 
-    // Disallowed
-    // MongoS 3.4 -> MongoDB 3.2 server
+    // MongoS 'latest' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoS 'last-stable' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
+    /*
+     * Test communication with a MongoD latest binary server with upgraded FCV.
+     */
+
+    // MongoD 'latest' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoD 'latest' client -> MongoD downgraded 'last-stable' server
     VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN,
-                          WireVersion::RELEASE_2_4_AND_BEFORE,
-                          WireVersion::FIND_COMMAND);
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 2,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
+
+    // MongoD 'latest' client -> MongoD upgraded 'last-stable' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
+
+    // MongoD downgraded 'last-stable' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION - 2,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoD upgraded 'last-stable' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoS 'latest' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoS 'last-stable' client -> MongoD 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    /*
+     * Test communication between MongoD latest binary servers where one has upgraded FCV and the
+     * other downgraded FCV.
+     */
+
+    // MongoD upgraded 'latest' client -> MongoD downgraded 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    // MongoD downgraded 'latest' client -> MongoD upgraded 'latest' server
+    VALIDATE_WIRE_VERSION(ASSERT_OK,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION);
+
+    /*
+     * Test that it is disallowed for MongoS to communicate with a lower binary server, regardless
+     * of FCV.
+     */
+
+    // MongoS 'latest' -> MongoD downgraded 'last-stable' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 2,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
+
+    // MongoS 'latest' -> MongoD upgraded 'last-stable' server
+    VALIDATE_WIRE_VERSION(ASSERT_NOT_OK,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION,
+                          WireVersion::LATEST_WIRE_VERSION - 1,
+                          WireVersion::LATEST_WIRE_VERSION - 1);
+}
+
+// A mongos is unable to communicate with a fully upgraded cluster with a higher wire version.
+TEST(Protocol, validateWireVersionFailsForUpgradedServerNode) {
+    // Server is fully upgraded to the latest wire version.
+    auto msg = BSON("minWireVersion" << static_cast<int>(WireVersion::LATEST_WIRE_VERSION)
+                                     << "maxWireVersion"
+                                     << static_cast<int>(WireVersion::LATEST_WIRE_VERSION));
+    auto swReply = parseProtocolSetFromIsMasterReply(msg);
+    ASSERT_OK(swReply.getStatus());
+
+    // The client (this mongos server) only has the previous wire version.
+    ASSERT_EQUALS(mongo::ErrorCodes::IncompatibleWithUpgradedServer,
+                  validateWireVersion(
+                      {WireVersion::LATEST_WIRE_VERSION - 1, WireVersion::LATEST_WIRE_VERSION - 1},
+                      swReply.getValue().version)
+                      .code());
 }
 
 }  // namespace

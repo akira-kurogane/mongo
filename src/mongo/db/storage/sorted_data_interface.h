@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,6 +35,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string.h"
 
 #pragma once
 
@@ -45,24 +47,15 @@ class SortedDataBuilderInterface;
 struct ValidateResults;
 
 /**
- * This interface is a work in progress.  Notes below:
- *
- * This interface began as the SortedDataInterface, a way to hide the fact that there were two
- * on-disk formats for the btree.  With the introduction of other storage engines, this
- * interface was generalized to provide access to sorted data.  Specifically:
- *
- * 1. Many other storage engines provide different Btree(-ish) implementations.  This interface
- * could allow those interfaces to avoid storing btree buckets in an already sorted structure.
- *
- * TODO: See if there is actually a performance gain.
- *
- * 2. The existing btree implementation is written to assume that if it modifies a record it is
- * modifying the underlying record.  This interface is an attempt to work around that.
- *
- * TODO: See if this actually works.
+ * This is the uniform interface for storing indexes and supporting point queries as well as range
+ * queries. The actual implementation is up to the storage engine. All the storage engines must
+ * support an index key size up to the maximum document size.
  */
 class SortedDataInterface {
 public:
+    SortedDataInterface(KeyString::Version keyStringVersion, Ordering ordering)
+        : _keyStringVersion(keyStringVersion), _ordering(ordering) {}
+
     virtual ~SortedDataInterface() {}
 
     //
@@ -85,7 +78,8 @@ public:
                                                        bool dupsAllowed) = 0;
 
     /**
-     * Insert an entry into the index with the specified key and RecordId.
+     * Insert an entry into the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the insert takes place
      * @param dupsAllowed true if duplicate keys are allowed, and false
@@ -93,37 +87,33 @@ public:
      *
      * @return Status::OK() if the insert succeeded,
      *
-     *         ErrorCodes::DuplicateKey if 'key' already exists in 'this' index
+     *         ErrorCodes::DuplicateKey if 'keyString' already exists in 'this' index
      *         at a RecordId other than 'loc' and duplicates were not allowed
      */
     virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& loc,
+                          const KeyString::Value& keyString,
                           bool dupsAllowed) = 0;
 
     /**
-     * Remove the entry from the index with the specified key and RecordId.
+     * Remove the entry from the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
      *
      * @param opCtx the transaction under which the remove takes place
      * @param dupsAllowed true if duplicate keys are allowed, and false
      *        otherwise
      */
     virtual void unindex(OperationContext* opCtx,
-                         const BSONObj& key,
-                         const RecordId& loc,
+                         const KeyString::Value& keyString,
                          bool dupsAllowed) = 0;
 
     /**
-     * Return ErrorCodes::DuplicateKey if 'key' already exists in 'this'
-     * index at a RecordId other than 'loc', and Status::OK() otherwise.
+     * Return ErrorCodes::DuplicateKey if there is more than one occurence of 'KeyString' in this
+     * index, and Status::OK() otherwise. This call is only allowed on a unique index, and will
+     * invariant otherwise.
      *
      * @param opCtx the transaction under which this operation takes place
-     *
-     * TODO: Hide this by exposing an update method?
      */
-    virtual Status dupKeyCheck(OperationContext* opCtx,
-                               const BSONObj& key,
-                               const RecordId& loc) = 0;
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) = 0;
 
     /**
      * Attempt to reduce the storage space used by this index via compaction. Only called if the
@@ -164,19 +154,6 @@ public:
     virtual bool isEmpty(OperationContext* opCtx) = 0;
 
     /**
-     * Attempt to bring the entirety of 'this' index into memory.
-     *
-     * If the underlying storage engine does not support the operation,
-     * returns ErrorCodes::CommandNotSupported
-     *
-     * @return Status::OK()
-     */
-    virtual Status touch(OperationContext* opCtx) const {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "this storage engine does not support touch");
-    }
-
-    /**
      * Return the number of entries in 'this' index.
      *
      * The default implementation should be overridden with a more
@@ -184,8 +161,22 @@ public:
      */
     virtual long long numEntries(OperationContext* opCtx) const {
         long long x = -1;
-        fullValidate(opCtx, &x, NULL);
+        fullValidate(opCtx, &x, nullptr);
         return x;
+    }
+
+    /*
+     * Return the KeyString version for 'this' index.
+     */
+    KeyString::Version getKeyStringVersion() const {
+        return _keyStringVersion;
+    }
+
+    /*
+     * Return the ordering for 'this' index.
+     */
+    Ordering getOrdering() const {
+        return _ordering;
     }
 
     /**
@@ -261,44 +252,50 @@ public:
          * If not positioned, returns boost::none.
          */
         virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> nextKeyString() = 0;
 
         //
         // Seeking
         //
 
         /**
-         * Seeks to the provided key and returns current position.
-         *
-         * TODO consider removing once IndexSeekPoint has been cleaned up a bit. In particular,
-         * need a way to specify use whole keyPrefix and nothing else and to support the
-         * combination of empty and exclusive. Should also make it easier to construct for the
-         * common cases.
+         * Seeks to the provided keyString and returns the KeyStringEntry.
+         * The provided keyString has discriminator information encoded.
          */
-        virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
-                                                    bool inclusive,
-                                                    RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> seekForKeyString(
+            const KeyString::Value& keyString) = 0;
 
         /**
-         * Seeks to the position described by seekPoint and returns the current position.
-         *
-         * NOTE: most implementations should just pass seekPoint to
-         * IndexEntryComparison::makeQueryObject().
+         * Seeks to the provided keyString and returns the IndexKeyEntry.
+         * The provided keyString has discriminator information encoded.
          */
-        virtual boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
+        virtual boost::optional<IndexKeyEntry> seek(const KeyString::Value& keyString,
                                                     RequestedInfo parts = kKeyAndLoc) = 0;
 
         /**
          * Seeks to a key with a hint to the implementation that you only want exact matches. If
          * an exact match can't be found, boost::none will be returned and the resulting
          * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
          */
-        virtual boost::optional<IndexKeyEntry> seekExact(const BSONObj& key,
-                                                         RequestedInfo parts = kKeyAndLoc) {
-            auto kv = seek(key, true, kKeyAndLoc);
-            if (kv && kv->key.woCompare(key, BSONObj(), /*considerFieldNames*/ false) == 0)
-                return kv;
-            return {};
-        }
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyString) = 0;
+
+        /**
+         * Seeks to a key with a hint to the implementation that you only want exact matches. If
+         * an exact match can't be found, boost::none will be returned and the resulting
+         * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
+         *
+         * Unlike the previous method, this one will return IndexKeyEntry if an exact match is
+         * found.
+         */
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyString,
+                                                         RequestedInfo parts = kKeyAndLoc) = 0;
 
         //
         // Saving and restoring state
@@ -363,29 +360,15 @@ public:
     virtual std::unique_ptr<Cursor> newCursor(OperationContext* opCtx,
                                               bool isForward = true) const = 0;
 
-    /**
-     * Constructs a cursor over an index that returns entries in a randomized order, and allows
-     * storage engines to provide a more efficient way to randomly sample a collection than
-     * MongoDB's default sampling methods, which are used when this method returns {}. Note if it is
-     * possible to implement RecordStore::getRandomCursor(), that method is preferred, as it will
-     * return the entire document, whereas this method will only return the index key and the
-     * RecordId, requiring an extra lookup.
-     *
-     * This method may be implemented using a pseudo-random walk over B-trees or a similar approach.
-     * Different cursors should return entries in a different order. Random cursors may return the
-     * same entry more than once and, as a result, may return more entries than exist in the index.
-     * Implementations should avoid obvious biases toward older, newer, larger smaller or other
-     * specific classes of entries.
-     */
-    virtual std::unique_ptr<Cursor> newRandomCursor(OperationContext* opCtx) const {
-        return {};
-    }
-
     //
     // Index creation
     //
 
     virtual Status initAsEmpty(OperationContext* opCtx) = 0;
+
+protected:
+    const KeyString::Version _keyStringVersion;
+    const Ordering _ordering;
 };
 
 /**
@@ -396,12 +379,12 @@ public:
     virtual ~SortedDataBuilderInterface() {}
 
     /**
-     * Adds 'key' to intermediate storage.
+     * Adds 'keyString' to intermediate storage.
      *
-     * 'key' must be > or >= the last key passed to this function (depends on _dupsAllowed).  If
-     * this is violated an error Status (ErrorCodes::InternalError) will be returned.
+     * 'keyString' must be > or >= the last key passed to this function (depends on _dupsAllowed).
+     * If this is violated an error Status (ErrorCodes::InternalError) will be returned.
      */
-    virtual Status addKey(const BSONObj& key, const RecordId& loc) = 0;
+    virtual Status addKey(const KeyString::Value& keyString) = 0;
 
     /**
      * Do any necessary work to finish building the tree.

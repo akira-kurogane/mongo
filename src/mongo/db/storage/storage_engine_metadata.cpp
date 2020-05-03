@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -40,13 +41,21 @@
 #include <ostream>
 #include <vector>
 
+#ifdef __linux__  // Only needed by flushDirectory for Linux
+#include <boost/filesystem/path.hpp>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include "mongo/base/data_type_validated.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/mmap_v1/paths.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -56,14 +65,7 @@ namespace {
 
 const std::string kMetadataBasename = "storage.bson";
 
-/**
- * Returns true if local.ns is found in 'directory' or 'directory'/local/.
- */
-bool containsMMapV1LocalNsFile(const std::string& directory) {
-    boost::filesystem::path directoryPath(directory);
-    return boost::filesystem::exists(directoryPath / "local.ns") ||
-        boost::filesystem::exists((directoryPath / "local") / "local.ns");
-}
+}  // namespace
 
 bool fsyncFile(boost::filesystem::path path) {
     invariant(path.has_filename());
@@ -76,8 +78,6 @@ bool fsyncFile(boost::filesystem::path path) {
     return true;
 }
 
-}  // namespace
-
 // static
 std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std::string& dbpath) {
     std::unique_ptr<StorageEngineMetadata> metadata;
@@ -85,8 +85,10 @@ std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std:
         metadata.reset(new StorageEngineMetadata(dbpath));
         Status status = metadata->read();
         if (!status.isOK()) {
-            error() << "Unable to read the storage engine metadata file: " << status;
-            fassertFailed(28661);
+            LOGV2_ERROR(22288,
+                        "Unable to read the storage engine metadata file: {status}",
+                        "status"_attr = status);
+            fassertFailedNoTrace(28661);
         }
     }
     return metadata;
@@ -99,11 +101,6 @@ boost::optional<std::string> StorageEngineMetadata::getStorageEngineForPath(
         return {metadata->getStorageEngine()};
     }
 
-    // Fallback to checking for MMAPv1-specific files to handle upgrades from before the
-    // storage.bson metadata file was introduced in 3.0.
-    if (containsMMapV1LocalNsFile(dbpath)) {
-        return {std::string("mmapv1")};
-    }
     return {};
 }
 
@@ -147,13 +144,13 @@ Status StorageEngineMetadata::read() {
     boost::uintmax_t fileSize = boost::filesystem::file_size(metadataPath);
     if (fileSize == 0) {
         return Status(ErrorCodes::InvalidPath,
-                      str::stream() << "Metadata file " << metadataPath.string()
-                                    << " cannot be empty.");
+                      str::stream()
+                          << "Metadata file " << metadataPath.string() << " cannot be empty.");
     }
     if (fileSize == static_cast<boost::uintmax_t>(-1)) {
         return Status(ErrorCodes::InvalidPath,
-                      str::stream() << "Unable to determine size of metadata file "
-                                    << metadataPath.string());
+                      str::stream()
+                          << "Unable to determine size of metadata file " << metadataPath.string());
     }
 
     std::vector<char> buffer(fileSize);
@@ -161,34 +158,30 @@ Status StorageEngineMetadata::read() {
         std::ifstream ifs(metadataPath.c_str(), std::ios_base::in | std::ios_base::binary);
         if (!ifs) {
             return Status(ErrorCodes::FileNotOpen,
-                          str::stream() << "Failed to read metadata from "
-                                        << metadataPath.string());
+                          str::stream()
+                              << "Failed to read metadata from " << metadataPath.string());
         }
 
         // Read BSON from file
         ifs.read(&buffer[0], buffer.size());
         if (!ifs) {
             return Status(ErrorCodes::FileStreamFailed,
-                          str::stream() << "Unable to read BSON data from "
-                                        << metadataPath.string());
+                          str::stream()
+                              << "Unable to read BSON data from " << metadataPath.string());
         }
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::FileStreamFailed,
                       str::stream() << "Unexpected error reading BSON data from "
-                                    << metadataPath.string()
-                                    << ": "
-                                    << ex.what());
+                                    << metadataPath.string() << ": " << ex.what());
     }
 
-    BSONObj obj;
-    try {
-        obj = BSONObj(&buffer[0]);
-    } catch (DBException& ex) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Failed to convert data in " << metadataPath.string()
-                                    << " to BSON: "
-                                    << ex.what());
+    ConstDataRange cdr(&buffer[0], buffer.size());
+    auto swObj = cdr.readNoThrow<Validated<BSONObj>>();
+    if (!swObj.isOK()) {
+        return swObj.getStatus();
     }
+
+    BSONObj obj = swObj.getValue();
 
     // Validate 'storage.engine' field.
     BSONElement storageEngineElement = dps::extractElementAtPath(obj, "storage.engine");
@@ -221,6 +214,58 @@ Status StorageEngineMetadata::read() {
     return Status::OK();
 }
 
+void flushMyDirectory(const boost::filesystem::path& file) {
+#ifdef __linux__  // this isn't needed elsewhere
+    static bool _warnedAboutFilesystem = false;
+    // if called without a fully qualified path it asserts; that makes mongoperf fail.
+    // so make a warning. need a better solution longer term.
+    // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(),);
+    if (!file.has_branch_path()) {
+        LOGV2(22283,
+              "warning flushMyDirectory couldn't find parent dir for file: {file_string}",
+              "file_string"_attr = file.string());
+        return;
+    }
+
+
+    boost::filesystem::path dir = file.branch_path();  // parent_path in new boosts
+
+    LOGV2_DEBUG(22284, 1, "flushing directory {dir_string}", "dir_string"_attr = dir.string());
+
+    int fd = ::open(dir.string().c_str(), O_RDONLY);  // DO NOT THROW OR ASSERT BEFORE CLOSING
+    massert(13650,
+            str::stream() << "Couldn't open directory '" << dir.string()
+                          << "' for flushing: " << errnoWithDescription(),
+            fd >= 0);
+    if (fsync(fd) != 0) {
+        int e = errno;
+        if (e == EINVAL) {  // indicates filesystem does not support synchronization
+            if (!_warnedAboutFilesystem) {
+                LOGV2_OPTIONS(
+                    22285,
+                    {logv2::LogTag::kStartupWarnings},
+                    "\tWARNING: This file system is not supported. For further information see:");
+                LOGV2_OPTIONS(22286,
+                              {logv2::LogTag::kStartupWarnings},
+                              "\t\t\thttp://dochub.mongodb.org/core/unsupported-filesystems");
+                LOGV2_OPTIONS(22287,
+                              {logv2::LogTag::kStartupWarnings},
+                              "\t\tPlease notify MongoDB, Inc. if an unlisted filesystem generated "
+                              "this warning.");
+                _warnedAboutFilesystem = true;
+            }
+        } else {
+            close(fd);
+            massert(13651,
+                    str::stream() << "Couldn't fsync directory '" << dir.string()
+                                  << "': " << errnoWithDescription(e),
+                    false);
+        }
+    }
+    close(fd);
+#endif
+}
+
 Status StorageEngineMetadata::write() const {
     if (_storageEngine.empty()) {
         return Status(ErrorCodes::BadValue,
@@ -232,9 +277,9 @@ Status StorageEngineMetadata::write() const {
     {
         std::ofstream ofs(metadataTempPath.c_str(), std::ios_base::out | std::ios_base::binary);
         if (!ofs) {
-            return Status(
-                ErrorCodes::FileNotOpen,
-                str::stream() << "Failed to write metadata to " << metadataTempPath.string() << ": "
+            return Status(ErrorCodes::FileNotOpen,
+                          str::stream()
+                              << "Failed to write metadata to " << metadataTempPath.string() << ": "
                               << errnoWithDescription());
         }
 
@@ -243,10 +288,9 @@ Status StorageEngineMetadata::write() const {
         ofs.write(obj.objdata(), obj.objsize());
         if (!ofs) {
             return Status(ErrorCodes::OperationFailed,
-                          str::stream() << "Failed to write BSON data to "
-                                        << metadataTempPath.string()
-                                        << ": "
-                                        << errnoWithDescription());
+                          str::stream()
+                              << "Failed to write BSON data to " << metadataTempPath.string()
+                              << ": " << errnoWithDescription());
         }
     }
 
@@ -262,15 +306,12 @@ Status StorageEngineMetadata::write() const {
                           str::stream() << "Failed to fsync new `storage.bson` file.");
         }
         boost::filesystem::rename(metadataTempPath, metadataPath);
-        flushMyDirectory(metadataPath.parent_path());
+        flushMyDirectory(metadataPath);
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::FileRenameFailed,
                       str::stream() << "Unexpected error while renaming temporary metadata file "
-                                    << metadataTempPath.string()
-                                    << " to "
-                                    << metadataPath.string()
-                                    << ": "
-                                    << ex.what());
+                                    << metadataTempPath.string() << " to " << metadataPath.string()
+                                    << ": " << ex.what());
     }
 
     return Status::OK();
@@ -286,21 +327,16 @@ Status StorageEngineMetadata::validateStorageEngineOption<bool>(
                 ErrorCodes::InvalidOptions,
                 str::stream()
                     << "Requested option conflicts with the current storage engine option for "
-                    << fieldName
-                    << "; you requested "
-                    << (expectedValue ? "true" : "false")
+                    << fieldName << "; you requested " << (expectedValue ? "true" : "false")
                     << " but the current server storage is implicitly set to "
-                    << (*defaultValue ? "true" : "false")
-                    << " and cannot be changed");
+                    << (*defaultValue ? "true" : "false") << " and cannot be changed");
         }
         return Status::OK();
     }
     if (!element.isBoolean()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Expected boolean field " << fieldName << " but got "
-                                    << typeName(element.type())
-                                    << " instead: "
-                                    << element);
+                                    << typeName(element.type()) << " instead: " << element);
     }
     if (element.boolean() == expectedValue) {
         return Status::OK();
@@ -308,12 +344,9 @@ Status StorageEngineMetadata::validateStorageEngineOption<bool>(
     return Status(
         ErrorCodes::InvalidOptions,
         str::stream() << "Requested option conflicts with current storage engine option for "
-                      << fieldName
-                      << "; you requested "
-                      << (expectedValue ? "true" : "false")
+                      << fieldName << "; you requested " << (expectedValue ? "true" : "false")
                       << " but the current server storage is already set to "
-                      << (element.boolean() ? "true" : "false")
-                      << " and cannot be changed");
+                      << (element.boolean() ? "true" : "false") << " and cannot be changed");
 }
 
 }  // namespace mongo

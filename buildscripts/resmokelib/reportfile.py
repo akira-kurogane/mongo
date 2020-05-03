@@ -1,8 +1,4 @@
-"""
-Manages interactions with the report.json file.
-"""
-
-from __future__ import absolute_import
+"""Manage interactions with the report.json file."""
 
 import json
 
@@ -11,10 +7,7 @@ from .testing import report as _report
 
 
 def write(suites):
-    """
-    Writes the combined report of all executions if --reportFile was
-    specified on the command line.
-    """
+    """Write the combined report of all executions if --reportFile was specified."""
 
     if config.REPORT_FILE is None:
         return
@@ -23,6 +16,6 @@ def write(suites):
     for suite in suites:
         reports.extend(suite.get_reports())
 
-    combined_report_dict = _report.TestReport.combine(*reports).as_dict(convert_failures=True)
+    combined_report_dict = _report.TestReport.combine(*reports).as_dict()
     with open(config.REPORT_FILE, "w") as fp:
         json.dump(combined_report_dict, fp)

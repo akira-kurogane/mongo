@@ -1,111 +1,146 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_writer.h"
 
 namespace mongo {
-
-class DocumentSourceOut final : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
+/**
+ * Implementation for the $out aggregation stage.
+ */
+class DocumentSourceOut final : public DocumentSourceWriter<BSONObj> {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
-        const AggregationRequest& request, const BSONElement& spec);
-
-    // virtuals from DocumentSource
-    ~DocumentSourceOut() final;
-    GetNextResult getNext() final;
-    const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
-
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
-        constraints.isAllowedInsideFacetStage = false;
-        constraints.requiredPosition = PositionRequirement::kLast;
-        return constraints;
-    }
-
-    // Virtuals for SplittableDocumentSource
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return NULL;
-    }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
-    }
-
-    const NamespaceString& getOutputNs() const {
-        return _outputNs;
-    }
+    static constexpr StringData kStageName = "$out"_sd;
 
     /**
-      Create a document source for output and pass-through.
+     * A "lite parsed" $out stage is similar to other stages involving foreign collections except in
+     * some cases the foreign collection is allowed to be sharded.
+     */
+    class LiteParsed final : public LiteParsedDocumentSourceForeignCollection {
+    public:
+        using LiteParsedDocumentSourceForeignCollection::LiteParsedDocumentSourceForeignCollection;
 
-      This can be put anywhere in a pipeline and will store content as
-      well as pass it on.
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec);
 
-      @param pBsonElement the raw BSON specification for the source
-      @param pExpCtx the expression context for the pipeline
-      @returns the newly created document source
-    */
+        bool allowShardedForeignCollection(NamespaceString nss) const final {
+            return _foreignNss != nss;
+        }
+
+        bool allowedToPassthroughFromMongos() const final {
+            return false;
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+            ActionSet actions{ActionType::insert, ActionType::remove};
+            if (bypassDocumentValidation) {
+                actions.addAction(ActionType::bypassDocumentValidation);
+            }
+
+            return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), actions)};
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+            return {
+                {level == repl::ReadConcernLevel::kLinearizableReadConcern,
+                 {ErrorCodes::InvalidOptions,
+                  "{} cannot be used with a 'linearizable' read concern level"_format(kStageName)}},
+                Status::OK()};
+        }
+    };
+
+    ~DocumentSourceOut() override;
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final override {
+        return {StreamType::kStreaming,
+                PositionRequirement::kLast,
+                HostTypeRequirement::kPrimaryShard,
+                DiskUseRequirement::kWritesPersistentData,
+                FacetRequirement::kNotAllowed,
+                TransactionRequirement::kNotAllowed,
+                LookupRequirement::kNotAllowed,
+                UnionRequirement::kNotAllowed};
+    }
+
+    Value serialize(
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final override;
+
+    /**
+     * Creates a new $out stage from the given arguments.
+     */
+    static boost::intrusive_ptr<DocumentSource> create(
+        NamespaceString outputNs, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Parses a $out stage from the user-supplied BSON.
+     */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    const char* getSourceName() const final override {
+        return kStageName.rawData();
+    }
+
 private:
-    DocumentSourceOut(const NamespaceString& outputNs,
-                      const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    DocumentSourceOut(NamespaceString outputNs,
+                      const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx) {}
 
-    /**
-     * Sets '_tempNs' to a unique temporary namespace, makes sure the output collection isn't
-     * sharded or capped, and saves the collection options and indexes of the target collection.
-     * Then creates the temporary collection we will insert into by copying the collection options
-     * and indexes from the target collection.
-     *
-     * Sets '_initialized' to true upon completion.
-     */
-    void initialize();
+    static NamespaceString parseNsFromElem(const BSONElement& spec, const StringData& defaultDB);
 
-    /**
-     * Inserts all of 'toInsert' into the temporary collection.
-     */
-    void spill(const std::vector<BSONObj>& toInsert);
+    void initialize() override;
 
-    bool _initialized = false;
-    bool _done = false;
+    void finalize() override;
+
+    void spill(BatchedObjects&& batch) override {
+        DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
+
+        auto targetEpoch = boost::none;
+        uassertStatusOK(pExpCtx->mongoProcessInterface->insert(
+            pExpCtx, _tempNs, std::move(batch), _writeConcern, targetEpoch));
+    }
+
+    std::pair<BSONObj, int> makeBatchObject(Document&& doc) const override {
+        auto obj = doc.toBson();
+        return {obj, obj.objsize()};
+    }
+
+    void waitWhileFailPointEnabled() override;
 
     // Holds on to the original collection options and index specs so we can check they didn't
     // change during computation.
     BSONObj _originalOutOptions;
     std::list<BSONObj> _originalIndexes;
 
-    NamespaceString _tempNs;          // output goes here as it is being processed.
-    const NamespaceString _outputNs;  // output will go here after all data is processed.
+    // The temporary namespace for the $out writes.
+    NamespaceString _tempNs;
 };
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 // SERVER-6591: Localhost authentication exception doesn't work right on sharded cluster
-//
+// @tags: [requires_os_access]
 // This test is to ensure that localhost authentication works correctly against a replica set
 // whether they are hosted with "localhost" or a hostname.
 
@@ -43,11 +43,8 @@ var assertCannotRunCommands = function(mongo, isPrimary) {
             {out: "other"});
     });
 
-    // DB operations
-    var authorizeErrorCode = 13;
-    assert.commandFailedWithCode(
-        mongo.getDB("test").copyDatabase("admin", "admin2"), authorizeErrorCode, "copyDatabase");
     // Create collection
+    var authorizeErrorCode = 13;
     assert.commandFailedWithCode(
         mongo.getDB("test").createCollection("log", {capped: true, size: 5242880, max: 5000}),
         authorizeErrorCode,
@@ -88,9 +85,9 @@ var assertCanRunCommands = function(mongo) {
     // will throw on failure
     test.system.users.findOne();
 
-    assert.writeOK(test.foo.save({_id: 0}));
-    assert.writeOK(test.foo.update({_id: 0}, {$set: {x: 20}}));
-    assert.writeOK(test.foo.remove({_id: 0}));
+    assert.commandWorked(test.foo.save({_id: 0}));
+    assert.commandWorked(test.foo.update({_id: 0}, {$set: {x: 20}}));
+    assert.commandWorked(test.foo.remove({_id: 0}));
 
     test.foo.mapReduce(
         function() {

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,7 +53,7 @@ public:
     static const int kNoPrimary = -1;
 
     OplogQueryMetadata() = default;
-    OplogQueryMetadata(repl::OpTime lastOpCommitted,
+    OplogQueryMetadata(repl::OpTimeAndWallTime lastOpCommitted,
                        repl::OpTime lastOpApplied,
                        int rbid,
                        int currentPrimaryIndex,
@@ -62,6 +63,7 @@ public:
      * format:
      * {
      *     lastOpCommitted: {ts: Timestamp(0, 0), term: 0},
+     *     lastCommittedWall: ISODate("2018-07-25T19:21:22.449Z")
      *     lastOpApplied: {ts: Timestamp(0, 0), term: 0},
      *     rbid: 0
      *     primaryIndex: 0,
@@ -74,7 +76,7 @@ public:
     /**
      * Returns the OpTime of the most recently committed op of which the sender was aware.
      */
-    repl::OpTime getLastOpCommitted() const {
+    repl::OpTimeAndWallTime getLastOpCommitted() const {
         return _lastOpCommitted;
     }
 
@@ -86,11 +88,13 @@ public:
     }
 
     /**
-     * Returns the index of the current primary from the perspective of the sender.
-     * Returns kNoPrimary if there is no primary.
+     * True if the sender thinks there is a primary.
+     *
+     * Note: the $oplogQueryData's primaryIndex isn't safe to use, we don't know which config
+     * version it's from. All we can safely say is whether the sender thinks there's a primary.
      */
-    int getPrimaryIndex() const {
-        return _currentPrimaryIndex;
+    bool hasPrimaryIndex() const {
+        return _currentPrimaryIndex != kNoPrimary;
     }
 
     /**
@@ -114,7 +118,7 @@ public:
     std::string toString() const;
 
 private:
-    repl::OpTime _lastOpCommitted;
+    repl::OpTimeAndWallTime _lastOpCommitted;
     repl::OpTime _lastOpApplied;
     int _rbid = -1;
     int _currentPrimaryIndex = kNoPrimary;

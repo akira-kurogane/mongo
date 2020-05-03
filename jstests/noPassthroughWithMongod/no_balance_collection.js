@@ -1,4 +1,5 @@
 // Tests whether the noBalance flag disables balancing for collections
+// @tags: [requires_sharding]
 
 var st = new ShardingTest({shards: 2, mongos: 1});
 
@@ -71,7 +72,7 @@ sh.disableBalancing(collB);
 // Wait for the balancer to fully finish the last migration and write the changelog
 // MUST set db var here, ugly but necessary
 db = st.s0.getDB("config");
-st.awaitBalancerRound();
+st.waitForBalancer(true, 60000);
 
 // Make sure auto-migrates on insert don't move chunks
 var lastMigration = sh._lastMigration(collB);
@@ -80,7 +81,7 @@ var bulk = collB.initializeUnorderedBulkOp();
 for (var i = 0; i < 1000000; i++) {
     bulk.insert({_id: i, hello: "world"});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 printjson(lastMigration);
 printjson(sh._lastMigration(collB));

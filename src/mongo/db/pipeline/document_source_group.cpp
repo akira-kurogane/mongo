@@ -1,63 +1,137 @@
 /**
-*    Copyright (C) 2011 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/jsobj.h"
+#include <boost/filesystem/operations.hpp>
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/pipeline/value_comparator.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/destructor_guard.h"
 
 namespace mongo {
 
+namespace {
+
+/**
+ * Generates a new file name on each call using a static, atomic and monotonically increasing
+ * number.
+ *
+ * Each user of the Sorter must implement this function to ensure that all temporary files that the
+ * Sorter instances produce are uniquely identified using a unique file name extension with separate
+ * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
+ * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
+ */
+std::string nextFileName() {
+    static AtomicWord<unsigned> documentSourceGroupFileCounter;
+    return "extsort-doc-group." + std::to_string(documentSourceGroupFileCounter.fetchAndAdd(1));
+}
+
+}  // namespace
+
 using boost::intrusive_ptr;
-using std::shared_ptr;
 using std::pair;
+using std::shared_ptr;
 using std::vector;
+
+Document GroupFromFirstDocumentTransformation::applyTransformation(const Document& input) {
+    MutableDocument output(_accumulatorExprs.size());
+
+    for (auto&& expr : _accumulatorExprs) {
+        auto value = expr.second->evaluate(input, &expr.second->getExpressionContext()->variables);
+        output.addField(expr.first, value.missing() ? Value(BSONNULL) : value);
+    }
+
+    return output.freeze();
+}
+
+void GroupFromFirstDocumentTransformation::optimize() {
+    for (auto&& expr : _accumulatorExprs) {
+        expr.second = expr.second->optimize();
+    }
+}
+
+Document GroupFromFirstDocumentTransformation::serializeTransformation(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
+
+    MutableDocument newRoot(_accumulatorExprs.size());
+    for (auto&& expr : _accumulatorExprs) {
+        newRoot.addField(expr.first, expr.second->serialize(static_cast<bool>(explain)));
+    }
+
+    return {{"newRoot", newRoot.freezeToValue()}};
+}
+
+DepsTracker::State GroupFromFirstDocumentTransformation::addDependencies(DepsTracker* deps) const {
+    for (auto&& expr : _accumulatorExprs) {
+        expr.second->addDependencies(deps);
+    }
+
+    // This stage will replace the entire document with a new document, so any existing fields
+    // will be replaced and cannot be required as dependencies. We use EXHAUSTIVE_ALL here
+    // instead of EXHAUSTIVE_FIELDS, as in ReplaceRootTransformation, because the stages that
+    // follow a $group stage should not depend on document metadata.
+    return DepsTracker::State::EXHAUSTIVE_ALL;
+}
+
+DocumentSource::GetModPathsReturn GroupFromFirstDocumentTransformation::getModifiedPaths() const {
+    // Replaces the entire root, so all paths are modified.
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+}
+
+std::unique_ptr<GroupFromFirstDocumentTransformation> GroupFromFirstDocumentTransformation::create(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const std::string& groupId,
+    vector<pair<std::string, intrusive_ptr<Expression>>> accumulatorExprs) {
+    return std::make_unique<GroupFromFirstDocumentTransformation>(groupId,
+                                                                  std::move(accumulatorExprs));
+}
+
+constexpr StringData DocumentSourceGroup::kStageName;
 
 REGISTER_DOCUMENT_SOURCE(group,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceGroup::createFromBson);
 
 const char* DocumentSourceGroup::getSourceName() const {
-    return "$group";
+    return kStageName.rawData();
 }
 
-DocumentSource::GetNextResult DocumentSourceGroup::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceGroup::doGetNext() {
     if (!_initialized) {
         const auto initializationResult = initialize();
         if (initializationResult.isPaused()) {
@@ -72,8 +146,6 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNext() {
 
     if (_spilled) {
         return getNextSpilled();
-    } else if (_streaming) {
-        return getNextStreaming();
     } else {
         return getNextStandard();
     }
@@ -86,6 +158,17 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextSpilled() {
 
     _currentId = _firstPartOfNextGroup.first;
     const size_t numAccumulators = _accumulatedFields.size();
+
+    // Call startNewGroup on every accumulator.
+    Value expandedId = expandId(_currentId);
+    Document idDoc =
+        expandedId.getType() == BSONType::Object ? expandedId.getDocument() : Document();
+    for (size_t i = 0; i < numAccumulators; ++i) {
+        Value initializerValue =
+            _accumulatedFields[i].expr.initializer->evaluate(idDoc, &pExpCtx->variables);
+        _currentAccumulators[i]->startNewGroup(initializerValue);
+    }
+
     while (pExpCtx->getValueComparator().evaluate(_currentId == _firstPartOfNextGroup.first)) {
         // Inside of this loop, _firstPartOfNextGroup is the current data being processed.
         // At loop exit, it is the first value to be processed in the next group.
@@ -126,44 +209,6 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextStandard() {
     return std::move(out);
 }
 
-DocumentSource::GetNextResult DocumentSourceGroup::getNextStreaming() {
-    // Streaming optimization is active.
-    if (!_firstDocOfNextGroup) {
-        auto nextInput = pSource->getNext();
-        if (!nextInput.isAdvanced()) {
-            return nextInput;
-        }
-        _firstDocOfNextGroup = nextInput.releaseDocument();
-    }
-
-    Value id;
-    do {
-        // Add to the current accumulator(s).
-        for (size_t i = 0; i < _currentAccumulators.size(); i++) {
-            _currentAccumulators[i]->process(
-                _accumulatedFields[i].expression->evaluate(*_firstDocOfNextGroup), _doingMerge);
-        }
-
-        // Retrieve the next document.
-        auto nextInput = pSource->getNext();
-        if (!nextInput.isAdvanced()) {
-            return nextInput;
-        }
-
-        _firstDocOfNextGroup = nextInput.releaseDocument();
-
-
-        // Compute the id. If it does not match _currentId, we will exit the loop, leaving
-        // _firstDocOfNextGroup set for the next time getNext() is called.
-        id = computeId(*_firstDocOfNextGroup);
-    } while (pExpCtx->getValueComparator().evaluate(_currentId == id));
-
-    Document out = makeDocument(_currentId, _currentAccumulators, pExpCtx->needsMerge);
-    _currentId = std::move(id);
-
-    return std::move(out);
-}
-
 void DocumentSourceGroup::doDispose() {
     // Free our resources.
     _groups = pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
@@ -171,8 +216,6 @@ void DocumentSourceGroup::doDispose() {
 
     // Make us look done.
     groupsIterator = _groups->end();
-
-    _firstDocOfNextGroup = boost::none;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceGroup::optimize() {
@@ -184,7 +227,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::optimize() {
     }
 
     for (auto&& accumulatedField : _accumulatedFields) {
-        accumulatedField.expression = accumulatedField.expression->optimize();
+        accumulatedField.expr.initializer = accumulatedField.expr.initializer->optimize();
+        accumulatedField.expr.argument = accumulatedField.expr.argument->optimize();
     }
 
     return this;
@@ -209,10 +253,11 @@ Value DocumentSourceGroup::serialize(boost::optional<ExplainOptions::Verbosity> 
 
     // Add the remaining fields.
     for (auto&& accumulatedField : _accumulatedFields) {
-        intrusive_ptr<Accumulator> accum = accumulatedField.makeAccumulator(pExpCtx);
+        intrusive_ptr<AccumulatorState> accum = accumulatedField.makeAccumulator();
         insides[accumulatedField.fieldName] =
-            Value(DOC(accum->getOpName()
-                      << accumulatedField.expression->serialize(static_cast<bool>(explain))));
+            Value(accum->serialize(accumulatedField.expr.initializer,
+                                   accumulatedField.expr.argument,
+                                   static_cast<bool>(explain)));
     }
 
     if (_doingMerge) {
@@ -221,13 +266,10 @@ Value DocumentSourceGroup::serialize(boost::optional<ExplainOptions::Verbosity> 
         insides["$doingMerge"] = Value(true);
     }
 
-    if (explain && findRelevantInputSort()) {
-        return Value(DOC("$streamingGroup" << insides.freeze()));
-    }
     return Value(DOC(getSourceName() << insides.freeze()));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceGroup::getDependencies(DepsTracker* deps) const {
+DepsTracker::State DocumentSourceGroup::getDependencies(DepsTracker* deps) const {
     // add the _id
     for (size_t i = 0; i < _idExpressions.size(); i++) {
         _idExpressions[i]->addDependencies(deps);
@@ -235,19 +277,58 @@ DocumentSource::GetDepsReturn DocumentSourceGroup::getDependencies(DepsTracker* 
 
     // add the rest
     for (auto&& accumulatedField : _accumulatedFields) {
-        accumulatedField.expression->addDependencies(deps);
+        accumulatedField.expr.argument->addDependencies(deps);
+        // Don't add initializer, because it doesn't refer to docs from the input stream.
     }
 
-    return EXHAUSTIVE_ALL;
+    return DepsTracker::State::EXHAUSTIVE_ALL;
+}
+
+DocumentSource::GetModPathsReturn DocumentSourceGroup::getModifiedPaths() const {
+    // We preserve none of the fields, but any fields referenced as part of the group key are
+    // logically just renamed.
+    StringMap<std::string> renames;
+    for (std::size_t i = 0; i < _idExpressions.size(); ++i) {
+        auto idExp = _idExpressions[i];
+        auto pathToPutResultOfExpression =
+            _idFieldNames.empty() ? "_id" : "_id." + _idFieldNames[i];
+        auto computedPaths = idExp->getComputedPaths(pathToPutResultOfExpression);
+        for (auto&& rename : computedPaths.renames) {
+            renames[rename.first] = rename.second;
+        }
+    }
+
+    return {DocumentSource::GetModPathsReturn::Type::kAllExcept,
+            std::set<std::string>{},  // No fields are preserved.
+            std::move(renames)};
+}
+
+StringMap<boost::intrusive_ptr<Expression>> DocumentSourceGroup::getIdFields() const {
+    if (_idFieldNames.empty()) {
+        invariant(_idExpressions.size() == 1);
+        return {{"_id", _idExpressions[0]}};
+    } else {
+        invariant(_idFieldNames.size() == _idExpressions.size());
+        StringMap<boost::intrusive_ptr<Expression>> result;
+        for (std::size_t i = 0; i < _idFieldNames.size(); ++i) {
+            result["_id." + _idFieldNames[i]] = _idExpressions[i];
+        }
+        return result;
+    }
+}
+
+const std::vector<AccumulationStatement>& DocumentSourceGroup::getAccumulatedFields() const {
+    return _accumulatedFields;
 }
 
 intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     const boost::intrusive_ptr<Expression>& groupByExpression,
     std::vector<AccumulationStatement> accumulationStatements,
-    size_t maxMemoryUsageBytes) {
-    intrusive_ptr<DocumentSourceGroup> groupStage(
-        new DocumentSourceGroup(pExpCtx, maxMemoryUsageBytes));
+    boost::optional<size_t> maxMemoryUsageBytes) {
+    size_t memoryBytes = maxMemoryUsageBytes ? *maxMemoryUsageBytes
+                                             : internalDocumentSourceGroupMaxMemoryBytes.load();
+    intrusive_ptr<DocumentSourceGroup> groupStage(new DocumentSourceGroup(pExpCtx, memoryBytes));
     groupStage->setIdExpression(groupByExpression);
     for (auto&& statement : accumulationStatements) {
         groupStage->addAccumulator(statement);
@@ -257,16 +338,27 @@ intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
 }
 
 DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>& pExpCtx,
-                                         size_t maxMemoryUsageBytes)
-    : DocumentSource(pExpCtx),
+                                         boost::optional<size_t> maxMemoryUsageBytes)
+    : DocumentSource(kStageName, pExpCtx),
+      _usedDisk(false),
       _doingMerge(false),
-      _maxMemoryUsageBytes(maxMemoryUsageBytes),
-      _inputSort(BSONObj()),
-      _streaming(false),
+      _maxMemoryUsageBytes(maxMemoryUsageBytes ? *maxMemoryUsageBytes
+                                               : internalDocumentSourceGroupMaxMemoryBytes.load()),
       _initialized(false),
       _groups(pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()),
       _spilled(false),
-      _extSortAllowed(pExpCtx->extSortAllowed && !pExpCtx->inMongos) {}
+      _allowDiskUse(pExpCtx->allowDiskUse && !pExpCtx->inMongos) {
+    if (!pExpCtx->inMongos && (pExpCtx->allowDiskUse || kDebugBuild)) {
+        // We spill to disk in debug mode, regardless of allowDiskUse, to stress the system.
+        _fileName = pExpCtx->tempDir + "/" + nextFileName();
+    }
+}
+
+DocumentSourceGroup::~DocumentSourceGroup() {
+    if (_ownsFileDeletion) {
+        DESTRUCTOR_GUARD(boost::filesystem::remove(_fileName));
+    }
+}
 
 void DocumentSourceGroup::addAccumulator(AccumulationStatement accumulationStatement) {
     _accumulatedFields.push_back(accumulationStatement);
@@ -277,8 +369,11 @@ namespace {
 intrusive_ptr<Expression> parseIdExpression(const intrusive_ptr<ExpressionContext>& expCtx,
                                             BSONElement groupField,
                                             const VariablesParseState& vps) {
-    if (groupField.type() == Object && !groupField.Obj().isEmpty()) {
+    if (groupField.type() == Object) {
         // {_id: {}} is treated as grouping on a constant, not an expression
+        if (groupField.Obj().isEmpty()) {
+            return ExpressionConstant::create(expCtx, Value(groupField));
+        }
 
         const BSONObj idKeyObj = groupField.Obj();
         if (idKeyObj.firstElementFieldName()[0] == '$') {
@@ -292,12 +387,8 @@ intrusive_ptr<Expression> parseIdExpression(const intrusive_ptr<ExpressionContex
             }
             return ExpressionObject::parse(expCtx, idKeyObj, vps);
         }
-    } else if (groupField.type() == String && groupField.valuestr()[0] == '$') {
-        // grouping on a field path.
-        return ExpressionFieldPath::parse(expCtx, groupField.str(), vps);
     } else {
-        // constant id - single group
-        return ExpressionConstant::create(expCtx, Value(groupField));
+        return Expression::parseOperand(expCtx, groupField, vps);
     }
 }
 
@@ -333,14 +424,13 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::createFromBson(
     VariablesParseState vps = pExpCtx->variablesParseState;
     while (groupIterator.more()) {
         BSONElement groupField(groupIterator.next());
-        const char* pFieldName = groupField.fieldName();
-
-        if (str::equals(pFieldName, "_id")) {
+        StringData pFieldName = groupField.fieldNameStringData();
+        if (pFieldName == "_id") {
             uassert(
                 15948, "a group's _id may only be specified once", pGroup->_idExpressions.empty());
             pGroup->setIdExpression(parseIdExpression(pExpCtx, groupField, vps));
             invariant(!pGroup->_idExpressions.empty());
-        } else if (str::equals(pFieldName, "$doingMerge")) {
+        } else if (pFieldName == "$doingMerge") {
             massert(17030, "$doingMerge should be true if present", groupField.Bool());
 
             pGroup->setDoingMerge(true);
@@ -384,108 +474,19 @@ public:
 private:
     ValueComparator _valueComparator;
 };
-
-bool containsOnlyFieldPathsAndConstants(ExpressionObject* expressionObj) {
-    for (auto&& it : expressionObj->getChildExpressions()) {
-        const intrusive_ptr<Expression>& childExp = it.second;
-        if (dynamic_cast<ExpressionFieldPath*>(childExp.get())) {
-            continue;
-        } else if (dynamic_cast<ExpressionConstant*>(childExp.get())) {
-            continue;
-        } else if (auto expObj = dynamic_cast<ExpressionObject*>(childExp.get())) {
-            if (!containsOnlyFieldPathsAndConstants(expObj)) {
-                // A nested expression was not a FieldPath or a constant.
-                return false;
-            }
-        } else {
-            // expressionObj was something other than a FieldPath, a constant, or a nested object.
-            return false;
-        }
-    }
-    return true;
-}
-
-void getFieldPathMap(ExpressionObject* expressionObj,
-                     std::string prefix,
-                     StringMap<std::string>* fields) {
-    // Given an expression with only constant and FieldPath leaf nodes, such as {x: {y: "$a.b"}},
-    // attempt to compute a map from each FieldPath leaf to the path of that leaf. In the example,
-    // this method would return: {"a.b" : "x.y"}.
-
-    for (auto&& it : expressionObj->getChildExpressions()) {
-        intrusive_ptr<Expression> childExp = it.second;
-        ExpressionObject* expObj = dynamic_cast<ExpressionObject*>(childExp.get());
-        ExpressionFieldPath* expPath = dynamic_cast<ExpressionFieldPath*>(childExp.get());
-
-        std::string newPrefix = prefix.empty() ? it.first : prefix + "." + it.first;
-
-        if (expObj) {
-            getFieldPathMap(expObj, newPrefix, fields);
-        } else if (expPath) {
-            (*fields)[expPath->getFieldPath().tail().fullPath()] = newPrefix;
-        }
-    }
-}
-
-void getFieldPathListForSpilled(ExpressionObject* expressionObj,
-                                std::string prefix,
-                                std::vector<std::string>* fields) {
-    // Given an expression, attempt to compute a vector of strings, each representing the path
-    // through the object to a leaf. For example, for the expression represented by
-    // {x: 2, y: {z: "$a.b"}}, the output would be ["x", "y.z"].
-    for (auto&& it : expressionObj->getChildExpressions()) {
-        intrusive_ptr<Expression> childExp = it.second;
-        ExpressionObject* expObj = dynamic_cast<ExpressionObject*>(childExp.get());
-
-        std::string newPrefix = prefix.empty() ? it.first : prefix + "." + it.first;
-
-        if (expObj) {
-            getFieldPathListForSpilled(expObj, newPrefix, fields);
-        } else {
-            fields->push_back(newPrefix);
-        }
-    }
-}
 }  // namespace
 
 DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
     const size_t numAccumulators = _accumulatedFields.size();
 
-    boost::optional<BSONObj> inputSort = findRelevantInputSort();
-    if (inputSort) {
-        // We can convert to streaming.
-        _streaming = true;
-        _inputSort = *inputSort;
-
-        // Set up accumulators.
-        _currentAccumulators.reserve(numAccumulators);
-        for (auto&& accumulatedField : _accumulatedFields) {
-            _currentAccumulators.push_back(accumulatedField.makeAccumulator(pExpCtx));
-        }
-
-        // We only need to load the first document.
-        auto firstInput = pSource->getNext();
-        if (!firstInput.isAdvanced()) {
-            // Leave '_firstDocOfNextGroup' uninitialized and return.
-            return firstInput;
-        }
-        _firstDocOfNextGroup = firstInput.releaseDocument();
-
-        // Compute the _id value.
-        _currentId = computeId(*_firstDocOfNextGroup);
-        _initialized = true;
-        return DocumentSource::GetNextResult::makeEOF();
-    }
-
-
     // Barring any pausing, this loop exhausts 'pSource' and populates '_groups'.
     GetNextResult input = pSource->getNext();
     for (; input.isAdvanced(); input = pSource->getNext()) {
         if (_memoryUsageBytes > _maxMemoryUsageBytes) {
-            uassert(16945,
+            uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                     "Exceeded memory limit for $group, but didn't allow external sort."
                     " Pass allowDiskUse:true to opt in.",
-                    _extSortAllowed);
+                    _allowDiskUse);
             _sortedFiles.push_back(spill());
             _memoryUsageBytes = 0;
         }
@@ -499,16 +500,23 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         // accumulator. This is done in a somewhat odd way in order to avoid hashing 'id' and
         // looking it up in '_groups' multiple times.
         const size_t oldSize = _groups->size();
-        vector<intrusive_ptr<Accumulator>>& group = (*_groups)[id];
+        vector<intrusive_ptr<AccumulatorState>>& group = (*_groups)[id];
         const bool inserted = _groups->size() != oldSize;
 
         if (inserted) {
             _memoryUsageBytes += id.getApproximateSize();
 
-            // Add the accumulators
+            // Initialize and add the accumulators
+            Value expandedId = expandId(id);
+            Document idDoc =
+                expandedId.getType() == BSONType::Object ? expandedId.getDocument() : Document();
             group.reserve(numAccumulators);
             for (auto&& accumulatedField : _accumulatedFields) {
-                group.push_back(accumulatedField.makeAccumulator(pExpCtx));
+                auto accum = accumulatedField.makeAccumulator();
+                Value initializerValue =
+                    accumulatedField.expr.initializer->evaluate(idDoc, &pExpCtx->variables);
+                accum->startNewGroup(initializerValue);
+                group.push_back(accum);
             }
         } else {
             for (auto&& groupObj : group) {
@@ -521,8 +529,9 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         dassert(numAccumulators == group.size());
 
         for (size_t i = 0; i < numAccumulators; i++) {
-            group[i]->process(_accumulatedFields[i].expression->evaluate(rootDocument),
-                              _doingMerge);
+            group[i]->process(
+                _accumulatedFields[i].expr.argument->evaluate(rootDocument, &pExpCtx->variables),
+                _doingMerge);
 
             _memoryUsageBytes += group[i]->memUsageForSorter();
         }
@@ -531,7 +540,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
             // In debug mode, spill every time we have a duplicate id to stress merge logic.
             if (!inserted &&                 // is a dup
                 !pExpCtx->inMongos &&        // can't spill to disk in mongos
-                !_extSortAllowed &&          // don't change behavior when testing external sort
+                !_allowDiskUse &&            // don't change behavior when testing external sort
                 _sortedFiles.size() < 20) {  // don't open too many FDs
 
                 _sortedFiles.push_back(spill());
@@ -558,12 +567,16 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
                 _groups = pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
 
                 _sorterIterator.reset(Sorter<Value, Value>::Iterator::merge(
-                    _sortedFiles, SortOptions(), SorterComparator(pExpCtx->getValueComparator())));
+                    _sortedFiles,
+                    _fileName,
+                    SortOptions(),
+                    SorterComparator(pExpCtx->getValueComparator())));
+                _ownsFileDeletion = false;
 
                 // prepare current to accumulate data
                 _currentAccumulators.reserve(numAccumulators);
                 for (auto&& accumulatedField : _accumulatedFields) {
-                    _currentAccumulators.push_back(accumulatedField.makeAccumulator(pExpCtx));
+                    _currentAccumulators.push_back(accumulatedField.makeAccumulator());
                 }
 
                 verify(_sorterIterator->more());  // we put data in, we should get something out.
@@ -582,7 +595,12 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
     MONGO_UNREACHABLE;
 }
 
+bool DocumentSourceGroup::usedDisk() {
+    return _usedDisk;
+}
+
 shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
+    _usedDisk = true;
     vector<const GroupsMap::value_type*> ptrs;  // using pointers to speed sorting
     ptrs.reserve(_groups->size());
     for (GroupsMap::const_iterator it = _groups->begin(), end = _groups->end(); it != end; ++it) {
@@ -591,7 +609,8 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
 
     stable_sort(ptrs.begin(), ptrs.end(), SpillSTLComparator(pExpCtx->getValueComparator()));
 
-    SortedFileWriter<Value, Value> writer(SortOptions().TempDir(pExpCtx->tempDir));
+    SortedFileWriter<Value, Value> writer(
+        SortOptions().TempDir(pExpCtx->tempDir), _fileName, _nextSortedFileWriterOffset);
     switch (_accumulatedFields.size()) {  // same as ptrs[i]->second.size() for all i.
         case 0:                           // no values, essentially a distinct
             for (size_t i = 0; i < ptrs.size(); i++) {
@@ -619,161 +638,15 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
 
     _groups->clear();
 
-    return shared_ptr<Sorter<Value, Value>::Iterator>(writer.done());
+    Sorter<Value, Value>::Iterator* iteratorPtr = writer.done();
+    _nextSortedFileWriterOffset = writer.getFileEndOffset();
+    return shared_ptr<Sorter<Value, Value>::Iterator>(iteratorPtr);
 }
-
-boost::optional<BSONObj> DocumentSourceGroup::findRelevantInputSort() const {
-    if (true) {
-        // Until streaming $group correctly handles nullish values, the streaming behavior is
-        // disabled. See SERVER-23318.
-        return boost::none;
-    }
-
-    if (!pSource) {
-        // Sometimes when performing an explain, or using $group as the merge point, 'pSource' will
-        // not be set.
-        return boost::none;
-    }
-
-    BSONObjSet sorts = pSource->getOutputSorts();
-
-    // 'sorts' is a BSONObjSet. We need to check if our group pattern is compatible with one of the
-    // input sort patterns.
-
-    // We will only attempt to take advantage of a sorted input stream if the _id given to the
-    // $group contained only FieldPaths or constants. Determine if this is the case, and extract
-    // those FieldPaths if it is.
-    DepsTracker deps(DepsTracker::MetadataAvailable::kNoMetadata);  // We don't support streaming
-                                                                    // based off a text score.
-    for (auto&& exp : _idExpressions) {
-        if (dynamic_cast<ExpressionConstant*>(exp.get())) {
-            continue;
-        }
-        ExpressionObject* obj;
-        if ((obj = dynamic_cast<ExpressionObject*>(exp.get()))) {
-            // We can only perform an optimization if there are no operators in the _id expression.
-            if (!containsOnlyFieldPathsAndConstants(obj)) {
-                return boost::none;
-            }
-        } else if (!dynamic_cast<ExpressionFieldPath*>(exp.get())) {
-            return boost::none;
-        }
-        exp->addDependencies(&deps);
-    }
-
-    if (deps.needWholeDocument) {
-        // We don't swap to streaming if we need the entire document, which is likely because of
-        // $$ROOT.
-        return boost::none;
-    }
-
-    if (deps.fields.empty()) {
-        // Our _id field is constant, so we should stream, but the input sort we choose is
-        // irrelevant since we will output only one document.
-        return BSONObj();
-    }
-
-    for (auto&& obj : sorts) {
-        // Note that a sort order of, e.g., {a: 1, b: 1, c: 1} allows us to do a non-blocking group
-        // for every permutation of group by (a, b, c), since we are guaranteed that documents with
-        // the same value of (a, b, c) will be consecutive in the input stream, no matter what our
-        // _id is.
-        std::set<std::string> fieldNames;
-        obj.getFieldNames(fieldNames);
-        if (fieldNames == deps.fields) {
-            return obj;
-        }
-    }
-
-    return boost::none;
-}
-
-BSONObjSet DocumentSourceGroup::getOutputSorts() {
-    if (!_initialized) {
-        initialize();  // Note this might not finish initializing, but that's OK. We just want to
-                       // do some initialization to try to determine if we are streaming or spilled.
-                       // False negatives are OK.
-    }
-
-    if (!(_streaming || _spilled)) {
-        return SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
-
-    BSONObjBuilder sortOrder;
-
-    if (_idFieldNames.empty()) {
-        if (_spilled) {
-            sortOrder.append("_id", 1);
-        } else {
-            // We have an expression like {_id: "$a"}. Check if this is a FieldPath, and if it is,
-            // get the sort order out of it.
-            if (auto obj = dynamic_cast<ExpressionFieldPath*>(_idExpressions[0].get())) {
-                FieldPath _idSort = obj->getFieldPath();
-
-                sortOrder.append(
-                    "_id",
-                    _inputSort.getIntField(_idSort.getFieldName(_idSort.getPathLength() - 1)));
-            }
-        }
-    } else if (_streaming) {
-        // At this point, we know that _streaming is true, so _id must have only contained
-        // ExpressionObjects, ExpressionConstants or ExpressionFieldPaths. We now process each
-        // '_idExpression'.
-
-        // We populate 'fieldMap' such that each key is a field the input is sorted by, and the
-        // value is where that input field is located within the _id document. For example, if our
-        // _id object is {_id: {x: {y: "$a.b"}}}, 'fieldMap' would be: {'a.b': '_id.x.y'}.
-        StringMap<std::string> fieldMap;
-        for (size_t i = 0; i < _idFieldNames.size(); i++) {
-            intrusive_ptr<Expression> exp = _idExpressions[i];
-            if (auto obj = dynamic_cast<ExpressionObject*>(exp.get())) {
-                // _id is an object containing a nested document, such as: {_id: {x: {y: "$b"}}}.
-                getFieldPathMap(obj, "_id." + _idFieldNames[i], &fieldMap);
-            } else if (auto fieldPath = dynamic_cast<ExpressionFieldPath*>(exp.get())) {
-                FieldPath _idSort = fieldPath->getFieldPath();
-                fieldMap[_idSort.getFieldName(_idSort.getPathLength() - 1)] =
-                    "_id." + _idFieldNames[i];
-            }
-        }
-
-        // Because the order of '_inputSort' is important, we go through each field we are sorted on
-        // and append it to the BSONObjBuilder in order.
-        for (BSONElement sortField : _inputSort) {
-            std::string sortString = sortField.fieldNameStringData().toString();
-
-            auto itr = fieldMap.find(sortString);
-
-            // If our sort order is (a, b, c), we could not have converted to a streaming $group if
-            // our _id was predicated on (a, c) but not 'b'. Verify that this is true.
-            invariant(itr != fieldMap.end());
-
-            sortOrder.append(itr->second, _inputSort.getIntField(sortString));
-        }
-    } else {
-        // We are blocking and have spilled to disk.
-        std::vector<std::string> outputSort;
-        for (size_t i = 0; i < _idFieldNames.size(); i++) {
-            intrusive_ptr<Expression> exp = _idExpressions[i];
-            if (auto obj = dynamic_cast<ExpressionObject*>(exp.get())) {
-                // _id is an object containing a nested document, such as: {_id: {x: {y: "$b"}}}.
-                getFieldPathListForSpilled(obj, "_id." + _idFieldNames[i], &outputSort);
-            } else {
-                outputSort.push_back("_id." + _idFieldNames[i]);
-            }
-        }
-        for (auto&& field : outputSort) {
-            sortOrder.append(field, 1);
-        }
-    }
-
-    return allPrefixes(sortOrder.obj());
-}
-
 
 Value DocumentSourceGroup::computeId(const Document& root) {
     // If only one expression, return result directly
     if (_idExpressions.size() == 1) {
-        Value retValue = _idExpressions[0]->evaluate(root);
+        Value retValue = _idExpressions[0]->evaluate(root, &pExpCtx->variables);
         return retValue.missing() ? Value(BSONNULL) : std::move(retValue);
     }
 
@@ -781,7 +654,7 @@ Value DocumentSourceGroup::computeId(const Document& root) {
     vector<Value> vals;
     vals.reserve(_idExpressions.size());
     for (size_t i = 0; i < _idExpressions.size(); i++) {
-        vals.push_back(_idExpressions[i]->evaluate(root));
+        vals.push_back(_idExpressions[i]->evaluate(root, &pExpCtx->variables));
     }
     return Value(std::move(vals));
 }
@@ -828,32 +701,112 @@ Document DocumentSourceGroup::makeDocument(const Value& id,
     return out.freeze();
 }
 
-intrusive_ptr<DocumentSource> DocumentSourceGroup::getShardSource() {
-    return this;  // No modifications necessary when on shard
-}
-
-intrusive_ptr<DocumentSource> DocumentSourceGroup::getMergeSource() {
-    intrusive_ptr<DocumentSourceGroup> pMerger(new DocumentSourceGroup(pExpCtx));
-    pMerger->setDoingMerge(true);
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceGroup::distributedPlanLogic() {
+    intrusive_ptr<DocumentSourceGroup> mergingGroup(new DocumentSourceGroup(pExpCtx));
+    mergingGroup->setDoingMerge(true);
 
     VariablesParseState vps = pExpCtx->variablesParseState;
     /* the merger will use the same grouping key */
-    pMerger->setIdExpression(ExpressionFieldPath::parse(pExpCtx, "$$ROOT._id", vps));
+    mergingGroup->setIdExpression(ExpressionFieldPath::parse(pExpCtx, "$$ROOT._id", vps));
 
     for (auto&& accumulatedField : _accumulatedFields) {
         // The merger's output field names will be the same, as will the accumulator factories.
         // However, for some accumulators, the expression to be accumulated will be different. The
         // original accumulator may be collecting an expression based on a field expression or
         // constant.  Here, we accumulate the output of the same name from the prior group.
-        auto copiedAccumuledField = accumulatedField;
-        copiedAccumuledField.expression =
-            ExpressionFieldPath::parse(pExpCtx, "$$ROOT." + accumulatedField.fieldName, vps);
-        pMerger->addAccumulator(copiedAccumuledField);
+        auto copiedAccumulatedField = accumulatedField;
+        copiedAccumulatedField.expr.argument =
+            ExpressionFieldPath::parse(pExpCtx, "$$ROOT." + copiedAccumulatedField.fieldName, vps);
+        mergingGroup->addAccumulator(copiedAccumulatedField);
     }
 
-    return pMerger;
+    // {shardsStage, mergingStage, sortPattern}
+    return DistributedPlanLogic{this, mergingGroup, boost::none};
 }
+
+bool DocumentSourceGroup::pathIncludedInGroupKeys(const std::string& dottedPath) const {
+    return std::any_of(
+        _idExpressions.begin(), _idExpressions.end(), [&dottedPath](const auto& exp) {
+            if (auto fieldExp = dynamic_cast<ExpressionFieldPath*>(exp.get())) {
+                if (fieldExp->representsPath(dottedPath)) {
+                    return true;
+                }
+            }
+            return false;
+        });
 }
+
+bool DocumentSourceGroup::canRunInParallelBeforeWriteStage(
+    const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+    if (_doingMerge) {
+        return true;  // This is fine.
+    }
+
+    // Certain $group stages are allowed to execute on each exchange consumer. In order to
+    // guarantee each consumer will only group together data from its own shard, the $group must
+    // group on a superset of the shard key.
+    for (auto&& currentPathOfShardKey : nameOfShardKeyFieldsUponEntryToStage) {
+        if (!pathIncludedInGroupKeys(currentPathOfShardKey)) {
+            // This requires an exact path match, but as a future optimization certain path
+            // prefixes should be okay. For example, if the shard key path is "a.b", and we're
+            // grouping by "a", then each group of "a" is strictly more specific than "a.b", so
+            // we can deduce that grouping by "a" will not need to group together documents
+            // across different values of the shard key field "a.b", and thus as long as any
+            // other shard key fields are similarly preserved will not need to consume a merged
+            // stream to perform the group.
+            return false;
+        }
+    }
+    return true;
+}
+
+std::unique_ptr<GroupFromFirstDocumentTransformation>
+DocumentSourceGroup::rewriteGroupAsTransformOnFirstDocument() const {
+    if (!_idFieldNames.empty()) {
+        // This transformation is only intended for $group stages that group on a single field.
+        return nullptr;
+    }
+
+    invariant(_idExpressions.size() == 1);
+    auto fieldPathExpr = dynamic_cast<ExpressionFieldPath*>(_idExpressions.front().get());
+    if (!fieldPathExpr || !fieldPathExpr->isRootFieldPath()) {
+        return nullptr;
+    }
+
+    const auto fieldPath = fieldPathExpr->getFieldPath();
+    if (fieldPath.getPathLength() == 1) {
+        // The path is $$CURRENT or $$ROOT. This isn't really a sensible value to group by (since
+        // each document has a unique _id, it will just return the entire collection). We only
+        // apply the rewrite when grouping by a single field, so we cannot apply it in this case,
+        // where we are grouping by the entire document.
+        invariant(fieldPath.getFieldName(0) == "CURRENT" || fieldPath.getFieldName(0) == "ROOT");
+        return nullptr;
+    }
+
+    const auto groupId = fieldPath.tail().fullPath();
+
+    // We can't do this transformation if there are any non-$first accumulators.
+    for (auto&& accumulator : _accumulatedFields) {
+        if (AccumulatorDocumentsNeeded::kFirstDocument !=
+            accumulator.makeAccumulator()->documentsNeeded()) {
+            return nullptr;
+        }
+    }
+
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>> fields;
+    fields.push_back(std::make_pair("_id", ExpressionFieldPath::create(pExpCtx, groupId)));
+
+    for (auto&& accumulator : _accumulatedFields) {
+        fields.push_back(std::make_pair(accumulator.fieldName, accumulator.expr.argument));
+
+        // Since we don't attempt this transformation for non-$first accumulators,
+        // the initializer should always be trivial.
+    }
+
+    return GroupFromFirstDocumentTransformation::create(pExpCtx, groupId, std::move(fields));
+}
+
+}  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"
 // Explicit instantiation unneeded since we aren't exposing Sorter outside of this file.

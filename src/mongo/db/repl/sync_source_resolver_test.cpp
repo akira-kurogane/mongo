@@ -1,23 +1,24 @@
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <memory>
 
 #include "mongo/db/cursor_id.h"
@@ -38,8 +40,6 @@
 #include "mongo/db/repl/sync_source_selector_mock.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -51,18 +51,19 @@ using namespace mongo::repl;
 
 class TaskExecutorWithFailureInScheduleRemoteCommand : public unittest::TaskExecutorProxy {
 public:
-    using ShouldFailRequestFn = stdx::function<bool(const executor::RemoteCommandRequest&)>;
+    using ShouldFailRequestFn = std::function<bool(const executor::RemoteCommandRequest&)>;
 
     TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor,
                                                    ShouldFailRequestFn shouldFailRequest)
         : unittest::TaskExecutorProxy(executor), _shouldFailRequest(shouldFailRequest) {}
 
     StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb) override {
+                                                     const RemoteCommandCallbackFn& cb,
+                                                     const BatonHandle& baton = nullptr) override {
         if (_shouldFailRequest(request)) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
         }
-        return getExecutor()->scheduleRemoteCommand(request, cb);
+        return getExecutor()->scheduleRemoteCommand(request, cb, baton);
     }
 
 private:
@@ -93,7 +94,7 @@ void SyncSourceResolverTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
 
     _shouldFailRequest = [](const executor::RemoteCommandRequest&) { return false; };
-    _executorProxy = stdx::make_unique<TaskExecutorWithFailureInScheduleRemoteCommand>(
+    _executorProxy = std::make_unique<TaskExecutorWithFailureInScheduleRemoteCommand>(
         &getExecutor(), [this](const executor::RemoteCommandRequest& request) {
             return _shouldFailRequest(request);
         });
@@ -101,7 +102,7 @@ void SyncSourceResolverTest::setUp() {
     _response.syncSourceStatus = getDetectableErrorStatus();
     _onCompletion = [this](const SyncSourceResolverResponse& response) { _response = response; };
 
-    _selector = stdx::make_unique<SyncSourceSelectorMock>();
+    _selector = std::make_unique<SyncSourceSelectorMock>();
     _resolver = _makeResolver(lastOpTimeFetched, OpTime());
 
     launchExecutorThread();
@@ -118,7 +119,7 @@ void SyncSourceResolverTest::tearDown() {
 
 std::unique_ptr<SyncSourceResolver> SyncSourceResolverTest::_makeResolver(
     const OpTime& lastOpTimeFetched, const OpTime& requiredOpTime) {
-    return stdx::make_unique<SyncSourceResolver>(
+    return std::make_unique<SyncSourceResolver>(
         _executorProxy.get(),
         _selector.get(),
         lastOpTimeFetched,
@@ -186,16 +187,16 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
                                 AssertionException,
                                 ErrorCodes::BadValue,
                                 "required optime (if provided) must be more recent than last "
-                                "fetched optime. requiredOpTime: { ts: Timestamp 50000|1, t: 1 }, "
-                                "lastOpTimeFetched: { ts: Timestamp 100000|1, t: 1 }");
+                                "fetched optime. requiredOpTime: { ts: Timestamp(50, 1), t: 1 }, "
+                                "lastOpTimeFetched: { ts: Timestamp(100, 1), t: 1 }");
     ASSERT_THROWS_CODE_AND_WHAT(
         SyncSourceResolver(
             &getExecutor(), &selector, lastOpTimeFetched, lastOpTimeFetched, onCompletion),
         AssertionException,
         ErrorCodes::BadValue,
         "required optime (if provided) must be more recent than last fetched optime. "
-        "requiredOpTime: { ts: Timestamp 100000|1, t: 1 }, lastOpTimeFetched: { ts: Timestamp "
-        "100000|1, t: 1 }");
+        "requiredOpTime: { ts: Timestamp(100, 1), t: 1 }, lastOpTimeFetched: { ts: Timestamp("
+        "100, 1), t: 1 }");
 
     // Null callback function.
     ASSERT_THROWS_CODE_AND_WHAT(SyncSourceResolver(&getExecutor(),
@@ -297,7 +298,22 @@ void _scheduleFirstOplogEntryFetcherResponse(executor::NetworkInterfaceMock* net
  * Generates oplog entries with the given optime.
  */
 BSONObj _makeOplogEntry(Timestamp ts, long long term) {
-    return OplogEntry(OpTime(ts, term), 1LL, OpTypeEnum::kNoop, NamespaceString("a.a"), BSONObj())
+    return OplogEntry(OpTime(ts, term),                 // optime
+                      boost::none,                      // hash
+                      OpTypeEnum::kNoop,                // op type
+                      NamespaceString("a.a"),           // namespace
+                      boost::none,                      // uuid
+                      boost::none,                      // fromMigrate
+                      repl::OplogEntry::kOplogVersion,  // version
+                      BSONObj(),                        // o
+                      boost::none,                      // o2
+                      {},                               // sessionInfo
+                      boost::none,                      // upsert
+                      Date_t(),                         // wall clock time
+                      boost::none,                      // statement id
+                      boost::none,  // optime of previous write within same transaction
+                      boost::none,  // pre-image optime
+                      boost::none)  // post-image optime
         .toBSON();
 }
 
@@ -521,7 +537,7 @@ TEST_F(SyncSourceResolverTest,
 TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenTheFirstNodeHasAnEmptyOplog) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -546,7 +562,7 @@ TEST_F(SyncSourceResolverTest,
 TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenTheFirstNodeHasAnEmptyFirstOplogEntry) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -569,9 +585,35 @@ TEST_F(SyncSourceResolverTest,
 }
 
 TEST_F(SyncSourceResolverTest,
+       SyncSourceResolverWillTryOtherSourcesWhenFirstNodeContainsBadOplogEntry) {
+    HostAndPort candidate1("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
+    _selector->setChooseNewSyncSourceResult_forTest(candidate1);
+    ASSERT_OK(_resolver->startup());
+    ASSERT_TRUE(_resolver->isActive());
+
+    _scheduleFirstOplogEntryFetcherResponse(
+        getNet(), _selector.get(), candidate1, candidate2, {BSON("t" << 1)});
+
+    ASSERT_TRUE(_resolver->isActive());
+    ASSERT_EQUALS(candidate1, _selector->getLastBlacklistedSyncSource_forTest());
+    ASSERT_EQUALS(getExecutor().now() +
+                      SyncSourceResolver::kFirstOplogEntryNullTimestampBlacklistDuration,
+                  _selector->getLastBlacklistExpiration_forTest());
+
+    _scheduleFirstOplogEntryFetcherResponse(
+        getNet(), _selector.get(), candidate2, HostAndPort(), Timestamp(10, 2));
+    _scheduleRBIDResponse(getNet(), candidate2);
+
+    _resolver->join();
+    ASSERT_FALSE(_resolver->isActive());
+    ASSERT_EQUALS(candidate2, unittest::assertGet(_response.syncSourceStatus));
+}
+
+TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenFirstNodeContainsOplogEntryWithNullTimestamp) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -594,6 +636,26 @@ TEST_F(SyncSourceResolverTest,
     ASSERT_EQUALS(candidate2, unittest::assertGet(_response.syncSourceStatus));
 }
 
+
+TEST_F(SyncSourceResolverTest, SyncSourceResolverWillSucceedWithExtraFields) {
+    HostAndPort candidate1("node1", 12345);
+    _selector->setChooseNewSyncSourceResult_forTest(candidate1);
+    ASSERT_OK(_resolver->startup());
+    ASSERT_TRUE(_resolver->isActive());
+
+    _scheduleFirstOplogEntryFetcherResponse(getNet(),
+                                            _selector.get(),
+                                            candidate1,
+                                            HostAndPort(),
+                                            {BSON("ts" << Timestamp(1, 1) << "t" << 1 << "note"
+                                                       << "a")});
+
+    _scheduleRBIDResponse(getNet(), candidate1);
+
+    _resolver->join();
+    ASSERT_FALSE(_resolver->isActive());
+    ASSERT_EQUALS(candidate1, unittest::assertGet(_response.syncSourceStatus));
+}
 /**
  * Constructs and schedules a network interface response using the given documents to the required
  * optime on the sync source candidate.
@@ -612,7 +674,6 @@ void _scheduleRequiredOpTimeFetcherResponse(executor::NetworkInterfaceMock* net,
     auto firstElement = request.cmdObj.firstElement();
     ASSERT_EQUALS("find"_sd, firstElement.fieldNameStringData());
     ASSERT_EQUALS(SyncSourceResolver::kLocalOplogNss.coll(), firstElement.String());
-    ASSERT_TRUE(request.cmdObj.getBoolField("oplogReplay"));
     auto filter = request.cmdObj.getObjectField("filter");
     ASSERT_TRUE(filter.hasField("ts")) << request.cmdObj;
     auto tsFilter = filter.getObjectField("ts");
@@ -621,6 +682,9 @@ void _scheduleRequiredOpTimeFetcherResponse(executor::NetworkInterfaceMock* net,
     ASSERT_TRUE(tsFilter.hasField("$lte")) << request.cmdObj;
     ASSERT_EQUALS(requiredOpTime.getTimestamp(), tsFilter["$lte"].timestamp()) << request.cmdObj;
 
+    // The find command executed against the sync source should not specify the deprecated
+    // 'oplogReplay' flag.
+    ASSERT_FALSE(request.cmdObj["oplogReplay"]);
 
     net->runReadyNetworkOperations();
 }
@@ -643,9 +707,8 @@ void _scheduleRequiredOpTimeFetcherResponse(executor::NetworkInterfaceMock* net,
 
 const OpTime requiredOpTime(Timestamp(200, 1U), 1LL);
 
-TEST_F(
-    SyncSourceResolverTest,
-    SyncSourceResolverWillCheckForRequiredOpTimeUsingOplogReplayQueryIfRequiredOpTimeIsProvided) {
+TEST_F(SyncSourceResolverTest,
+       SyncSourceResolverWillCheckForRequiredOpTimeIfRequiredOpTimeIsProvided) {
     _resolver = _makeResolver(lastOpTimeFetched, requiredOpTime);
 
     HostAndPort candidate1("node1", 12345);
@@ -841,7 +904,19 @@ TEST_F(SyncSourceResolverTest,
     _resolver = _makeResolver(lastOpTimeFetched, requiredOpTime);
 
     _shouldFailRequest = [](const executor::RemoteCommandRequest& request) {
-        return request.cmdObj.getBoolField("oplogReplay");
+        // Fail find commands reading the oplog with filter containing a "ts" predicate.
+        if (StringData{request.cmdObj.getStringField("find")} !=
+            SyncSourceResolver::kLocalOplogNss.coll()) {
+            return false;
+        }
+
+        auto filterElt = request.cmdObj["filter"];
+        if (!filterElt || filterElt.type() != BSONType::Object) {
+            return false;
+        }
+
+        // Fail the request if the filter has a predicate over the "ts" field.
+        return static_cast<bool>(filterElt.embeddedObject()["ts"]);
     };
 
     HostAndPort candidate1("node1", 12345);

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,80 +40,93 @@
 namespace mongo {
 namespace {
 
+// getMore can run with any readConcern, because cursor-creating commands like find can run with any
+// readConcern.  However, since getMore automatically uses the readConcern of the command that
+// created the cursor, it is not appropriate to apply the default readConcern (just as
+// client-specified readConcern isn't appropriate).
+static const ReadConcernSupportResult kSupportsReadConcernResult{
+    Status::OK(),
+    {{ErrorCodes::InvalidOptions,
+      "default read concern not permitted (getMore uses the cursor's read concern)"}}};
+
 /**
  * Implements the getMore command on mongos. Retrieves more from an existing mongos cursor
  * corresponding to the cursor id passed from the application. In order to generate these results,
  * may issue getMore commands to remote nodes in one or more shards.
  */
-class ClusterGetMoreCmd final : public BasicCommand {
-    MONGO_DISALLOW_COPYING(ClusterGetMoreCmd);
-
+class ClusterGetMoreCmd final : public Command {
 public:
-    ClusterGetMoreCmd() : BasicCommand("getMore") {}
+    ClusterGetMoreCmd() : Command("getMore") {}
 
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& opMsgRequest) override {
+        return std::make_unique<Invocation>(this, opMsgRequest);
+    }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    class Invocation final : public CommandInvocation {
+    public:
+        Invocation(Command* cmd, const OpMsgRequest& request)
+            : CommandInvocation(cmd),
+              _request(uassertStatusOK(
+                  GetMoreRequest::parseFromBSON(request.getDatabase().toString(), request.body))) {}
+
+    private:
+        NamespaceString ns() const override {
+            return _request.nss;
+        }
+
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
+            return kSupportsReadConcernResult;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                ->checkAuthForGetMore(_request.nss,
+                                                      _request.cursorid,
+                                                      _request.term.is_initialized()));
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            // Counted as a getMore, not as a command.
+            globalOpCounters.gotGetMore();
+            auto bob = reply->getBodyBuilder();
+            auto response = uassertStatusOK(ClusterFind::runGetMore(opCtx, _request));
+            response.addToBSON(CursorResponse::ResponseType::SubsequentResponse, &bob);
+        }
+
+        const GetMoreRequest _request;
+    };
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
         return false;
     }
 
-    bool slaveOk() const final {
-        return true;
-    }
-
-    bool maintenanceOk() const final {
-        return false;
-    }
-
-    bool adminOnly() const final {
+    bool adminOnly() const override {
         return false;
     }
 
     /**
      * A getMore command increments the getMore counter, not the command counter.
      */
-    bool shouldAffectCommandCounter() const final {
+    bool shouldAffectCommandCounter() const override {
         return false;
     }
 
-    void help(std::stringstream& help) const final {
-        help << "retrieve more documents for a cursor id";
+    std::string help() const override {
+        return "retrieve more documents for a cursor id";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) final {
-        StatusWith<GetMoreRequest> parseStatus = GetMoreRequest::parseFromBSON(dbname, cmdObj);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
-        }
-        const GetMoreRequest& request = parseStatus.getValue();
-
-        return AuthorizationSession::get(client)->checkAuthForGetMore(
-            request.nss, request.cursorid, request.term.is_initialized());
+    LogicalOp getLogicalOp() const override {
+        return LogicalOp::opGetMore;
     }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) final {
-        // Counted as a getMore, not as a command.
-        globalOpCounters.gotGetMore();
-
-        StatusWith<GetMoreRequest> parseStatus = GetMoreRequest::parseFromBSON(dbname, cmdObj);
-        if (!parseStatus.isOK()) {
-            return appendCommandStatus(result, parseStatus.getStatus());
-        }
-        const GetMoreRequest& request = parseStatus.getValue();
-
-        auto response = ClusterFind::runGetMore(opCtx, request);
-        if (!response.isOK()) {
-            return appendCommandStatus(result, response.getStatus());
-        }
-
-        response.getValue().addToBSON(CursorResponse::ResponseType::SubsequentResponse, &result);
-        return true;
-    }
-
 } cmdGetMoreCluster;
 
 }  // namespace

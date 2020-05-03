@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +33,7 @@
 #include <string>
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -84,11 +86,19 @@ typedef std::map<ConnectionString, HostOpTime> HostOpTimeMap;
 class BatchWriteExecStats {
 public:
     BatchWriteExecStats()
-        : numRounds(0), numTargetErrors(0), numResolveErrors(0), numStaleBatches(0) {}
+        : numRounds(0),
+          numTargetErrors(0),
+          numResolveErrors(0),
+          numStaleShardBatches(0),
+          numStaleDbBatches(0) {}
 
     void noteWriteAt(const HostAndPort& host, repl::OpTime opTime, const OID& electionId);
+    void noteTargetedShard(const ShardId& shardId);
+    void noteNumShardsOwningChunks(const int nShardsOwningChunks);
 
+    const std::set<ShardId>& getTargetedShards() const;
     const HostOpTimeMap& getWriteOpTimes() const;
+    const boost::optional<int> getNumShardsOwningChunks() const;
 
     // Expose via helpers if this gets more complex
 
@@ -98,11 +108,15 @@ public:
     int numTargetErrors;
     // Number of times host resolution failed
     int numResolveErrors;
-    // Number of stale batches
-    int numStaleBatches;
+    // Number of stale batches due to StaleShardVersion
+    int numStaleShardBatches;
+    // Number of stale batches due to StaleDbVersion
+    int numStaleDbBatches;
 
 private:
+    std::set<ShardId> _targetedShards;
     HostOpTimeMap _writeOpTimes;
+    boost::optional<int> _numShardsOwningChunks;
 };
 
 }  // namespace mongo

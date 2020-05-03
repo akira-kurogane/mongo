@@ -1,23 +1,24 @@
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,6 +39,31 @@ namespace repl {
 
 class ReplicationCoordinatorExternalState;
 class ReplSetConfig;
+
+/**
+ * Checks if two configs are the same in content, ignoring 'version' and 'term' fields.
+ */
+bool sameConfigContents(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig);
+
+/**
+ * Finds the index of the one member configuration in "newConfig" that corresponds
+ * to the current node (as identified by "externalState").
+ *
+ * Returns an error if the current node does not appear or appears multiple times in
+ * "newConfig".
+ */
+StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalState,
+                                 const ReplSetConfig& newConfig,
+                                 ServiceContext* ctx);
+
+/**
+ * Like findSelfInConfig, above, but also returns an error if the member configuration
+ * for this node is not electable, as this is a requirement for nodes accepting
+ * reconfig or initiate commands.
+ */
+StatusWith<int> findSelfInConfigIfElectable(ReplicationCoordinatorExternalState* externalState,
+                                            const ReplSetConfig& newConfig,
+                                            ServiceContext* ctx);
 
 /**
  * Validates that "newConfig" is a legal configuration that the current
@@ -65,17 +91,13 @@ StatusWith<int> validateConfigForInitiate(ReplicationCoordinatorExternalState* e
  * Validates that "newConfig" is a legal successor configuration to "oldConfig" that can be
  * initiated by the current node (identified via "externalState").
  *
- * If "force" is set to true, then compatibility with the old configuration and electability of
- * the current node in "newConfig" are not considered when determining if the reconfig is valid.
+ * If "force" is set to true, then the single node change requirement is not checked.
  *
- * Returns the index of the current node's member configuration in "newConfig",
- * on success, and an indicative error on failure.
+ * Returns an indicative error on validation failure.
  */
-StatusWith<int> validateConfigForReconfig(ReplicationCoordinatorExternalState* externalState,
-                                          const ReplSetConfig& oldConfig,
-                                          const ReplSetConfig& newConfig,
-                                          ServiceContext* ctx,
-                                          bool force);
+Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
+                                 const ReplSetConfig& newConfig,
+                                 bool force);
 
 /**
  * Validates that "newConfig" is an acceptable configuration when received in a heartbeat

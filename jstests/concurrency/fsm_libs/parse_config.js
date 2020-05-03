@@ -11,7 +11,6 @@ function parseConfig(config) {
         'iterations',
         'passConnectionCache',
         'setup',
-        'skip',
         'startState',
         'states',
         'teardown',
@@ -62,8 +61,8 @@ function parseConfig(config) {
         assert.gt(Object.keys(config.transitions[fromState]).length, 0);
         Object.keys(config.transitions[fromState]).forEach(function(toState) {
             assert(config.states.hasOwnProperty(toState),
-                   'config.transitions.' + fromState + ' contains a state not in config.states: ' +
-                       toState);
+                   'config.transitions.' + fromState +
+                       ' contains a state not in config.states: ' + toState);
             assert.eq('number',
                       typeof config.transitions[fromState][toState],
                       'transitions.' + fromState + '.' + toState + ' should be a number');
@@ -74,11 +73,6 @@ function parseConfig(config) {
 
     config.setup = config.setup || function() {};
     assert.eq('function', typeof config.setup);
-
-    config.skip = config.skip || function() {
-        return {skip: false};
-    };
-    assert.eq('function', typeof config.skip);
 
     config.teardown = config.teardown || function() {};
     assert.eq('function', typeof config.teardown);

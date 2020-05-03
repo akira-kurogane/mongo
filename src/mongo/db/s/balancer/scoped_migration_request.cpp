@@ -1,53 +1,53 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/balancer/scoped_migration_request.h"
 
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
+
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
-                                                Seconds(15));
+                                                WriteConcernOptions::kWriteConcernTimeoutMigration);
 const int kDuplicateKeyErrorMaxRetries = 2;
-}
+
+}  // namespace
 
 ScopedMigrationRequest::ScopedMigrationRequest(OperationContext* opCtx,
                                                const NamespaceString& nss,
@@ -68,8 +68,11 @@ ScopedMigrationRequest::~ScopedMigrationRequest() {
         _opCtx, MigrationType::ConfigNS, migrationDocumentIdentifier, kMajorityWriteConcern);
 
     if (!result.isOK()) {
-        LOG(0) << "Failed to remove config.migrations document for migration '"
-               << migrationDocumentIdentifier.toString() << "'" << causedBy(redact(result));
+        LOGV2(21900,
+              "Failed to remove config.migrations document for migration '{migration}': {error}",
+              "Failed to remove config.migrations document for migration",
+              "migration"_attr = migrationDocumentIdentifier.toString(),
+              "error"_attr = redact(result));
     }
 }
 
@@ -93,12 +96,13 @@ ScopedMigrationRequest& ScopedMigrationRequest::operator=(ScopedMigrationRequest
 
 StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
     OperationContext* opCtx, const MigrateInfo& migrateInfo, bool waitForDelete) {
+    auto const grid = Grid::get(opCtx);
 
     // Try to write a unique migration document to config.migrations.
     const MigrationType migrationType(migrateInfo, waitForDelete);
 
     for (int retry = 0; retry < kDuplicateKeyErrorMaxRetries; ++retry) {
-        Status result = grid.catalogClient()->insertConfigDocument(
+        Status result = grid->catalogClient()->insertConfigDocument(
             opCtx, MigrationType::ConfigNS, migrationType.toBSON(), kMajorityWriteConcern);
 
         if (result == ErrorCodes::DuplicateKey) {
@@ -106,22 +110,19 @@ StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
             // for the request because this migration request will join the active one once
             // scheduled.
             auto statusWithMigrationQueryResult =
-                grid.shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+                grid->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
                     opCtx,
                     ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                     repl::ReadConcernLevel::kLocalReadConcern,
-                    NamespaceString(MigrationType::ConfigNS),
-                    BSON(MigrationType::name(migrateInfo.getName())),
+                    MigrationType::ConfigNS,
+                    migrateInfo.getMigrationTypeQuery(),
                     BSONObj(),
                     boost::none);
             if (!statusWithMigrationQueryResult.isOK()) {
-                return {statusWithMigrationQueryResult.getStatus().code(),
-                        str::stream()
-                            << "Failed to verify whether conflicting migration is in "
-                            << "progress for migration '"
-                            << redact(migrateInfo.toString())
-                            << "' while trying to query config.migrations."
-                            << causedBy(redact(statusWithMigrationQueryResult.getStatus()))};
+                return statusWithMigrationQueryResult.getStatus().withContext(
+                    str::stream() << "Failed to verify whether conflicting migration is in "
+                                  << "progress for migration '" << redact(migrateInfo.toString())
+                                  << "' while trying to query config.migrations.");
             }
             if (statusWithMigrationQueryResult.getValue().docs.empty()) {
                 // The document that caused the DuplicateKey error is no longer in the collection,
@@ -133,23 +134,26 @@ StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
             BSONObj activeMigrationBSON = statusWithMigrationQueryResult.getValue().docs.front();
             auto statusWithActiveMigration = MigrationType::fromBSON(activeMigrationBSON);
             if (!statusWithActiveMigration.isOK()) {
-                return {statusWithActiveMigration.getStatus().code(),
-                        str::stream() << "Failed to verify whether conflicting migration is in "
-                                      << "progress for migration '"
-                                      << redact(migrateInfo.toString())
-                                      << "' while trying to parse active migration document '"
-                                      << redact(activeMigrationBSON.toString())
-                                      << "'."
-                                      << causedBy(redact(statusWithActiveMigration.getStatus()))};
+                return statusWithActiveMigration.getStatus().withContext(
+                    str::stream() << "Failed to verify whether conflicting migration is in "
+                                  << "progress for migration '" << redact(migrateInfo.toString())
+                                  << "' while trying to parse active migration document '"
+                                  << redact(activeMigrationBSON.toString()) << "'.");
             }
 
             MigrateInfo activeMigrateInfo = statusWithActiveMigration.getValue().toMigrateInfo();
             if (activeMigrateInfo.to != migrateInfo.to ||
                 activeMigrateInfo.from != migrateInfo.from) {
-                log() << "Failed to write document '" << redact(migrateInfo.toString())
-                      << "' to config.migrations because there is already an active migration for"
-                      << " that chunk: '" << redact(activeMigrateInfo.toString()) << "'."
-                      << causedBy(redact(result));
+                LOGV2(
+                    21901,
+                    "Failed to write document '{newMigration}' to config.migrations because there "
+                    "is already an active migration for that chunk: "
+                    "'{activeMigration}': {error}",
+                    "Failed to write document to config.migrations because there "
+                    "is already an active migration for that chunk",
+                    "newMigration"_attr = redact(migrateInfo.toString()),
+                    "activeMigration"_attr = redact(activeMigrateInfo.toString()),
+                    "error"_attr = redact(result));
                 return result;
             }
 
@@ -159,8 +163,7 @@ StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
         // As long as there isn't a DuplicateKey error, the document may have been written, and it's
         // safe (won't delete another migration's document) and necessary to try to clean up the
         // document via the destructor.
-        ScopedMigrationRequest scopedMigrationRequest(
-            opCtx, NamespaceString(migrateInfo.ns), migrateInfo.minKey);
+        ScopedMigrationRequest scopedMigrationRequest(opCtx, migrateInfo.nss, migrateInfo.minKey);
 
         // If there was a write error, let the object go out of scope and clean up in the
         // destructor.
@@ -175,8 +178,7 @@ StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
                   str::stream() << "Failed to insert the config.migrations document after max "
                                 << "number of retries. Chunk '"
                                 << ChunkRange(migrateInfo.minKey, migrateInfo.maxKey).toString()
-                                << "' in collection '"
-                                << migrateInfo.ns
+                                << "' in collection '" << migrateInfo.nss.ns()
                                 << "' was being moved (somewhere) by another operation.");
 }
 
@@ -202,8 +204,13 @@ Status ScopedMigrationRequest::tryToRemoveMigration() {
 void ScopedMigrationRequest::keepDocumentOnDestruct() {
     invariant(_opCtx);
     _opCtx = nullptr;
-    LOG(1) << "Keeping config.migrations document with namespace '" << _nss << "' and minKey '"
-           << _minKey << "' for balancer recovery";
+    LOGV2_DEBUG(21902,
+                1,
+                "Keeping config.migrations document with namespace {namespace} and minKey "
+                "{minKey} for balancer recovery",
+                "Keeping config.migrations document for balancer recovery",
+                "namespace"_attr = _nss,
+                "minKey"_attr = _minKey);
 }
 
 }  // namespace mongo

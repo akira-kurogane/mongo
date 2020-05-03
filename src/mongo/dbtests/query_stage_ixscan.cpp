@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -47,22 +47,23 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 class IndexScanTest {
 public:
     IndexScanTest()
-        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X), _ctx(&_opCtx, ns()), _coll(NULL) {}
+        : _dbLock(&_opCtx, nsToDatabaseSubstring(ns()), MODE_X),
+          _ctx(&_opCtx, ns()),
+          _coll(nullptr),
+          _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss())) {}
 
     virtual ~IndexScanTest() {}
 
     virtual void setup() {
         WriteUnitOfWork wunit(&_opCtx);
 
-        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
-        _coll = _ctx.db()->createCollection(&_opCtx, ns());
+        _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
+        _coll = _ctx.db()->createCollection(&_opCtx, nss());
 
         ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
             &_opCtx,
-            BSON("ns" << ns() << "key" << BSON("x" << 1) << "name"
-                      << DBClientBase::genIndexName(BSON("x" << 1))
-                      << "v"
-                      << static_cast<int>(kIndexVersion))));
+            BSON("key" << BSON("x" << 1) << "name" << DBClientBase::genIndexName(BSON("x" << 1))
+                       << "v" << static_cast<int>(kIndexVersion))));
 
         wunit.commit();
     }
@@ -87,7 +88,6 @@ public:
 
             // There are certain states we shouldn't get.
             ASSERT_NE(PlanStage::IS_EOF, state);
-            ASSERT_NE(PlanStage::DEAD, state);
             ASSERT_NE(PlanStage::FAILURE, state);
         }
 
@@ -97,13 +97,12 @@ public:
 
     IndexScan* createIndexScanSimpleRange(BSONObj startKey, BSONObj endKey) {
         IndexCatalog* catalog = _coll->getIndexCatalog();
-        std::vector<IndexDescriptor*> indexes;
+        std::vector<const IndexDescriptor*> indexes;
         catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
         // We are not testing indexing here so use maximal bounds
-        IndexScanParams params;
-        params.descriptor = indexes[0];
+        IndexScanParams params(&_opCtx, indexes[0]);
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = startKey;
         params.bounds.endKey = endKey;
@@ -111,8 +110,8 @@ public:
         params.direction = 1;
 
         // This child stage gets owned and freed by the caller.
-        MatchExpression* filter = NULL;
-        return new IndexScan(&_opCtx, params, &_ws, filter);
+        MatchExpression* filter = nullptr;
+        return new IndexScan(_expCtx.get(), params, &_ws, filter);
     }
 
     IndexScan* createIndexScan(BSONObj startKey,
@@ -121,12 +120,11 @@ public:
                                bool endInclusive,
                                int direction = 1) {
         IndexCatalog* catalog = _coll->getIndexCatalog();
-        std::vector<IndexDescriptor*> indexes;
+        std::vector<const IndexDescriptor*> indexes;
         catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
-        IndexScanParams params;
-        params.descriptor = indexes[0];
+        IndexScanParams params(&_opCtx, indexes[0]);
         params.direction = direction;
 
         OrderedIntervalList oil("x");
@@ -136,12 +134,15 @@ public:
         oil.intervals.push_back(Interval(bob.obj(), startInclusive, endInclusive));
         params.bounds.fields.push_back(oil);
 
-        MatchExpression* filter = NULL;
-        return new IndexScan(&_opCtx, params, &_ws, filter);
+        MatchExpression* filter = nullptr;
+        return new IndexScan(_expCtx.get(), params, &_ws, filter);
     }
 
     static const char* ns() {
         return "unittest.QueryStageIxscan";
+    }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
     }
 
 protected:
@@ -153,6 +154,8 @@ protected:
     Collection* _coll;
 
     WorkingSet _ws;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
 // SERVER-15958: Some IndexScanStats info must be initialized on construction of an IndexScan.
@@ -198,10 +201,10 @@ public:
         ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert a few indexed docs.
-        ixscan->saveState();
+        static_cast<PlanStage*>(ixscan.get())->saveState();
         insert(fromjson("{_id: 4, x: 10}"));
         insert(fromjson("{_id: 5, x: 11}"));
-        ixscan->restoreState();
+        static_cast<PlanStage*>(ixscan.get())->restoreState();
 
         member = getNext(ixscan.get());
         ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
@@ -232,9 +235,9 @@ public:
         ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert an indexed doc.
-        ixscan->saveState();
+        static_cast<PlanStage*>(ixscan.get())->saveState();
         insert(fromjson("{_id: 4, x: 7}"));
-        ixscan->restoreState();
+        static_cast<PlanStage*>(ixscan.get())->restoreState();
 
         member = getNext(ixscan.get());
         ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
@@ -265,9 +268,9 @@ public:
         ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert an indexed doc.
-        ixscan->saveState();
+        static_cast<PlanStage*>(ixscan.get())->saveState();
         insert(fromjson("{_id: 4, x: 10}"));
-        ixscan->restoreState();
+        static_cast<PlanStage*>(ixscan.get())->restoreState();
 
         // Ensure that we're EOF and we don't erroneously return {'': 12}.
         WorkingSetID id;
@@ -298,10 +301,10 @@ public:
         ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 8));
 
         // Save state and insert an indexed doc.
-        ixscan->saveState();
+        static_cast<PlanStage*>(ixscan.get())->saveState();
         insert(fromjson("{_id: 4, x: 6}"));
         insert(fromjson("{_id: 5, x: 9}"));
-        ixscan->restoreState();
+        static_cast<PlanStage*>(ixscan.get())->restoreState();
 
         // Ensure that we don't erroneously return {'': 9} or {'':3}.
         member = getNext(ixscan.get());
@@ -314,9 +317,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("query_stage_ixscan") {}
+    All() : OldStyleSuiteSpecification("query_stage_ixscan") {}
 
     void setupTests() {
         add<QueryStageIxscanInitializeStats>();
@@ -325,6 +328,8 @@ public:
         add<QueryStageIxscanInsertDuringSaveExclusive2>();
         add<QueryStageIxscanInsertDuringSaveReverse>();
     }
-} QueryStageIxscanAll;
+};
+
+OldStyleSuiteInitializer<All> aueryStageIxscanAll;
 
 }  // namespace QueryStageIxscan

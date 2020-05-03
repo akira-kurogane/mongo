@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/near.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
@@ -46,7 +48,8 @@ namespace mongo {
  * Generic parameters for a GeoNear search
  */
 struct GeoNearParams {
-    GeoNearParams() : filter(NULL), nearQuery(NULL), addPointMeta(false), addDistMeta(false) {}
+    GeoNearParams()
+        : filter(nullptr), nearQuery(nullptr), addPointMeta(false), addDistMeta(false) {}
 
     // MatchExpression to apply to the index keys and fetched documents
     // Not owned here, owned by solution nodes
@@ -66,29 +69,50 @@ struct GeoNearParams {
 class GeoNear2DStage final : public NearStage {
 public:
     GeoNear2DStage(const GeoNearParams& nearParams,
-                   OperationContext* opCtx,
+                   ExpressionContext* expCtx,
                    WorkingSet* workingSet,
-                   Collection* collection,
-                   IndexDescriptor* twoDIndex);
+                   const IndexDescriptor* twoDIndex);
 
 protected:
     StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
                                               WorkingSet* workingSet,
-                                              Collection* collection) final;
+                                              const Collection* collection) final;
 
     StatusWith<double> computeDistance(WorkingSetMember* member) final;
 
     PlanStage::StageState initialize(OperationContext* opCtx,
                                      WorkingSet* workingSet,
-                                     Collection* collection,
                                      WorkingSetID* out) final;
 
 private:
-    const GeoNearParams _nearParams;
+    class DensityEstimator {
+    public:
+        DensityEstimator(PlanStage::Children* children,
+                         BSONObj infoObj,
+                         const GeoNearParams* nearParams,
+                         const R2Annulus& fullBounds);
 
-    // The 2D index we're searching over
-    // Not owned here
-    IndexDescriptor* const _twoDIndex;
+        PlanStage::StageState work(ExpressionContext* expCtx,
+                                   WorkingSet* workingSet,
+                                   const IndexDescriptor* twoDIndex,
+                                   WorkingSetID* out,
+                                   double* estimatedDistance);
+
+    private:
+        void buildIndexScan(ExpressionContext* expCtx,
+                            WorkingSet* workingSet,
+                            const IndexDescriptor* twoDIndex);
+
+        PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
+        const GeoNearParams* _nearParams;  // Not owned here.
+        const R2Annulus& _fullBounds;
+        IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
+        std::unique_ptr<GeoHashConverter> _converter;
+        GeoHash _centroidCell;
+        unsigned _currentLevel;
+    };
+
+    const GeoNearParams _nearParams;
 
     // The total search annulus
     const R2Annulus _fullBounds;
@@ -102,7 +126,6 @@ private:
     // Keeps track of the region that has already been scanned
     R2CellUnion _scannedCells;
 
-    class DensityEstimator;
     std::unique_ptr<DensityEstimator> _densityEstimator;
 };
 
@@ -112,31 +135,54 @@ private:
 class GeoNear2DSphereStage final : public NearStage {
 public:
     GeoNear2DSphereStage(const GeoNearParams& nearParams,
-                         OperationContext* opCtx,
+                         ExpressionContext* expCtx,
                          WorkingSet* workingSet,
-                         Collection* collection,
-                         IndexDescriptor* s2Index);
+                         const IndexDescriptor* s2Index);
 
     ~GeoNear2DSphereStage();
 
 protected:
     StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
                                               WorkingSet* workingSet,
-                                              Collection* collection) final;
+                                              const Collection* collection) final;
 
     StatusWith<double> computeDistance(WorkingSetMember* member) final;
 
     PlanStage::StageState initialize(OperationContext* opCtx,
                                      WorkingSet* workingSet,
-                                     Collection* collection,
                                      WorkingSetID* out) final;
 
 private:
-    const GeoNearParams _nearParams;
+    // Estimate the density of data by search the nearest cells level by level around center.
+    class DensityEstimator {
+    public:
+        DensityEstimator(PlanStage::Children* children,
+                         const GeoNearParams* nearParams,
+                         const S2IndexingParams& indexParams,
+                         const R2Annulus& fullBounds);
 
-    // The 2D index we're searching over
-    // Not owned here
-    IndexDescriptor* const _s2Index;
+        // Search for a document in neighbors at current level.
+        // Return IS_EOF is such document exists and set the estimated distance to the nearest doc.
+        PlanStage::StageState work(ExpressionContext* expCtx,
+                                   WorkingSet* workingSet,
+                                   const IndexDescriptor* s2Index,
+                                   WorkingSetID* out,
+                                   double* estimatedDistance);
+
+    private:
+        void buildIndexScan(ExpressionContext* expCtx,
+                            WorkingSet* workingSet,
+                            const IndexDescriptor* s2Index);
+
+        PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
+        const GeoNearParams* _nearParams;  // Not owned here.
+        const S2IndexingParams _indexParams;
+        const R2Annulus& _fullBounds;
+        int _currentLevel;
+        IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
+    };
+
+    const GeoNearParams _nearParams;
 
     S2IndexingParams _indexParams;
 
@@ -152,7 +198,6 @@ private:
     // Keeps track of the region that has already been scanned
     S2CellUnion _scannedCells;
 
-    class DensityEstimator;
     std::unique_ptr<DensityEstimator> _densityEstimator;
 };
 

@@ -1,83 +1,106 @@
-"""
-Interface for customizing the behavior of a test fixture.
-"""
+"""Interface for customizing the behavior of a test fixture."""
 
-from __future__ import absolute_import
+import sys
 
-from ... import logging
+from ..testcases import interface as testcase
+from ... import errors
+from ...logging import loggers
 from ...utils import registry
 
+_HOOKS = {}  # type: ignore
 
-_HOOKS = {}
 
-
-def make_custom_behavior(class_name, *args, **kwargs):
-    """
-    Factory function for creating CustomBehavior instances.
-    """
+def make_hook(class_name, *args, **kwargs):
+    """Provide factory function for creating Hook instances."""
 
     if class_name not in _HOOKS:
-        raise ValueError("Unknown custom behavior class '%s'" % (class_name))
+        raise ValueError("Unknown hook class '%s'" % class_name)
 
     return _HOOKS[class_name](*args, **kwargs)
 
 
-class CustomBehavior(object):
-    """
-    The common interface all CustomBehaviors will inherit from.
-    """
-
-    __metaclass__ = registry.make_registry_metaclass(_HOOKS)
+class Hook(object, metaclass=registry.make_registry_metaclass(_HOOKS)):
+    """Common interface all Hooks will inherit from."""
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
-    @staticmethod
-    def start_dynamic_test(hook_test_case, test_report):
-        """
-        If a CustomBehavior wants to add a test case that will show up
-        in the test report, it should use this method to add it to the
-        report, since we will need to count it as a dynamic test to get
-        the stats in the summary information right.
-        """
-        test_report.startTest(hook_test_case, dynamic=True)
-
     def __init__(self, hook_logger, fixture, description):
-        """
-        Initializes the CustomBehavior with the specified fixture.
-        """
+        """Initialize the Hook with the specified fixture."""
 
-        if not isinstance(hook_logger, logging.Logger):
-            raise TypeError("logger must be a Logger instance")
+        if not isinstance(hook_logger, loggers.HookLogger):
+            raise TypeError("logger must be a HookLogger instance")
 
         self.logger = hook_logger
         self.fixture = fixture
-        self.hook_test_case = None
-        self.logger_name = self.__class__.__name__
         self.description = description
 
     def before_suite(self, test_report):
-        """
-        The test runner calls this exactly once before they start
-        running the suite.
-        """
+        """Test runner calls this exactly once before they start running the suite."""
         pass
 
     def after_suite(self, test_report):
-        """
-        The test runner calls this exactly once after all tests have
-        finished executing. Be sure to reset the behavior back to its
-        original state so that it can be run again.
+        """Invoke by test runner calls this exactly once after all tests have finished executing.
+
+        Be sure to reset the behavior back to its original state so that it can be run again.
         """
         pass
 
     def before_test(self, test, test_report):
-        """
-        Each test will call this before it executes.
-        """
+        """Each test will call this before it executes."""
         pass
 
     def after_test(self, test, test_report):
-        """
-        Each test will call this after it executes.
-        """
+        """Each test will call this after it executes."""
         pass
+
+
+class DynamicTestCase(testcase.TestCase):  # pylint: disable=abstract-method
+    """DynamicTestCase class."""
+
+    def __init__(  # pylint: disable=too-many-arguments
+            self, logger, test_name, description, base_test_name, hook):
+        """Initialize DynamicTestCase."""
+        testcase.TestCase.__init__(self, logger, "Hook", test_name, dynamic=True)
+        self.description = description
+        self._hook = hook
+        self._base_test_name = base_test_name
+
+    def run_dynamic_test(self, test_report):
+        """Provide helper method to run a dynamic test and update the test report."""
+        test_report.startTest(self)
+        try:
+            self.run_test()
+        except (errors.TestFailure, self.failureException) as err:
+            self.return_code = 1
+            self.logger.error("{0} failed".format(self.description))
+            test_report.addFailure(self, sys.exc_info())
+            raise errors.TestFailure(err.args[0])
+        except:
+            self.return_code = 2
+            test_report.addFailure(self, sys.exc_info())
+            raise
+        else:
+            self.return_code = 0
+            test_report.addSuccess(self)
+        finally:
+            test_report.stopTest(self)
+
+    @classmethod
+    def create_before_test(cls, logger, base_test, hook, *args, **kwargs):
+        """Create a hook dynamic test to be run before an existing test."""
+        base_test_name = base_test.short_name()
+        test_name = cls._make_test_name(base_test_name, hook)
+        description = "{} before running '{}'".format(hook.description, base_test_name)
+        return cls(logger, test_name, description, base_test_name, hook, *args, **kwargs)
+
+    @classmethod
+    def create_after_test(cls, logger, base_test, hook, *args, **kwargs):
+        """Create a hook dynamic test to be run after an existing test."""
+        base_test_name = base_test.short_name()
+        test_name = cls._make_test_name(base_test_name, hook)
+        description = "{} after running '{}'".format(hook.description, base_test_name)
+        return cls(logger, test_name, description, base_test_name, hook, *args, **kwargs)
+
+    @staticmethod
+    def _make_test_name(base_test_name, hook):
+        return "{}:{}".format(base_test_name, hook.__class__.__name__)

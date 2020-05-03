@@ -1,9 +1,9 @@
 /*
  * Test that replSetReconfig prohibits w:0 in getLastErrorDefaults,
  * SERVER-13055.
+ *
+ * @tags: [requires_fcv_46]
  */
-
-var NewReplicaSetConfigurationIncompatible = 103;
 
 var replTest = new ReplSetTest({name: 'prohibit_w0', nodes: 1});
 var nodes = replTest.nodeList();
@@ -20,7 +20,7 @@ function testReconfig(gleDefaults) {
     conf.version++;
 
     var response = admin.runCommand({replSetReconfig: conf});
-    assert.commandFailedWithCode(response, NewReplicaSetConfigurationIncompatible);
+    assert.commandFailedWithCode(response, ErrorCodes.InvalidReplicaSetConfig);
 }
 
 /*

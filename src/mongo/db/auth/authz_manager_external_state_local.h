@@ -1,43 +1,43 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
+#include <functional>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -50,7 +50,8 @@ class Document;
  * and user information are stored locally.
  */
 class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
-    MONGO_DISALLOW_COPYING(AuthzManagerExternalStateLocal);
+    AuthzManagerExternalStateLocal(const AuthzManagerExternalStateLocal&) = delete;
+    AuthzManagerExternalStateLocal& operator=(const AuthzManagerExternalStateLocal&) = delete;
 
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
@@ -59,7 +60,7 @@ public:
 
     Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) override;
     Status getUserDescription(OperationContext* opCtx,
-                              const UserName& userName,
+                              const UserRequest& user,
                               BSONObj* result) override;
     Status getRoleDescription(OperationContext* opCtx,
                               const RoleName& roleName,
@@ -72,13 +73,21 @@ public:
                                AuthenticationRestrictionsFormat,
                                BSONObj* result) override;
     Status getRoleDescriptionsForDB(OperationContext* opCtx,
-                                    const std::string& dbname,
+                                    StringData dbname,
                                     PrivilegeFormat showPrivileges,
                                     AuthenticationRestrictionsFormat,
                                     bool showBuiltinRoles,
                                     std::vector<BSONObj>* result) override;
 
-    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) override;
+    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) final {
+        return _hasAnyPrivilegeDocuments.load();
+    }
+
+    void setHasAnyPrivilegeDocuments() {
+        // HAPD is deliberately only ever promoted to true, never reset to false.
+        // Regaining localhost auth bypass intentionally requires an empty privDB and restart.
+        _hasAnyPrivilegeDocuments.store(true);
+    }
 
     /**
      * Finds a document matching "query" in "collectionName", and store a shared-ownership
@@ -100,13 +109,14 @@ public:
                          const NamespaceString& collectionName,
                          const BSONObj& query,
                          const BSONObj& projection,
-                         const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
+                         const std::function<void(const BSONObj&)>& resultProcessor) = 0;
 
-    virtual void logOp(OperationContext* opCtx,
-                       const char* op,
-                       const NamespaceString& ns,
-                       const BSONObj& o,
-                       const BSONObj* o2);
+    void logOp(OperationContext* opCtx,
+               AuthorizationManagerImpl* authManager,
+               const char* op,
+               const NamespaceString& ns,
+               const BSONObj& o,
+               const BSONObj* o2) final;
 
     /**
      * Takes a user document, and processes it with the RoleGraph, in order to recursively
@@ -144,6 +154,12 @@ private:
                                       PrivilegeFormat showPrivileges,
                                       AuthenticationRestrictionsFormat showRestrictions,
                                       BSONObj* result);
+
+    /**
+     * Returns true if the auth DB contains any users or roles.
+     */
+    bool _checkHasAnyPrivilegeDocuments(OperationContext* opCtx);
+
     /**
      * Eventually consistent, in-memory representation of all roles in the system (both
      * user-defined and built-in).  Synchronized via _roleGraphMutex.
@@ -159,7 +175,15 @@ private:
     /**
      * Guards _roleGraphState and _roleGraph.
      */
-    stdx::mutex _roleGraphMutex;
+    Mutex _roleGraphMutex = MONGO_MAKE_LATCH("AuthzManagerExternalStateLocal::_roleGraphMutex");
+
+    /**
+     * Once *any* privilege document is observed we cache the state forever,
+     * even if these collections are emptied/dropped.
+     * This ensures that the only way to recover localHostAuthBypass is to
+     * is to clear that in-memory cache by restarting the server.
+     */
+    AtomicWord<bool> _hasAnyPrivilegeDocuments{false};
 };
 
 }  // namespace mongo

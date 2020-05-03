@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/util/net/message.h"
+#include "mongo/rpc/message.h"
 
 namespace mongo {
 class BSONObj;
@@ -57,14 +58,9 @@ enum class Protocol : std::uint64_t {
     kOpQuery = 1 << 0,
 
     /**
-     * The 3.2-3.6 OP_COMMAND protocol.
-     */
-    kOpCommandV1 = 1 << 1,
-
-    /**
      * The 3.6+ OP_MSG protocol.
      */
-    kOpMsg = 1 << 2,
+    kOpMsg = 1 << 1,
 };
 
 /**
@@ -79,9 +75,8 @@ namespace supports {
 
 const ProtocolSet kNone = ProtocolSet{0};
 const ProtocolSet kOpQueryOnly = static_cast<ProtocolSet>(Protocol::kOpQuery);
-const ProtocolSet kOpCommandOnly = static_cast<ProtocolSet>(Protocol::kOpCommandV1);
 const ProtocolSet kOpMsgOnly = static_cast<ProtocolSet>(Protocol::kOpMsg);
-const ProtocolSet kAll = kOpQueryOnly | kOpCommandOnly | kOpMsgOnly;
+const ProtocolSet kAll = kOpQueryOnly | kOpMsgOnly;
 
 }  // namespace supports
 
@@ -138,8 +133,8 @@ StatusWith<ProtocolSetAndWireVersionInfo> parseProtocolSetFromIsMasterReply(
     const BSONObj& isMasterReply);
 
 /**
-  * Computes supported protocols from wire versions.
-  */
+ * Computes supported protocols from wire versions.
+ */
 ProtocolSet computeProtocolSet(const WireVersionInfo version);
 
 }  // namespace rpc

@@ -1,34 +1,34 @@
 /**
-*    Copyright (C) 2017 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
@@ -59,8 +59,6 @@ class StorageInterface;
  *                  ts: <Timestamp>,
  *                  t: <long long>
  *             },                           // field for 'appliedThrough'
- *      oplogDeleteFromPoint: <Timestamp>,  // only exists on unclean upgrade
- *                                          // TODO (SERVER-30556): Remove after 3.6
  * }
  *
  * The oplogTruncateAfterPoint document, in 'local.replset.oplogTruncateAfterPoint', is used to
@@ -74,9 +72,20 @@ class StorageInterface;
  * }
  *
  * See below for explanations of each field.
+ *
+ * The initialSyncId document, in 'local.replset.initialSyncId', is used to detect when nodes have
+ * been resynced. It is set at the end of initial sync, or whenever replication is started when the
+ * document does not exist.
+ *
+ * Example of all fields:
+ * {
+ *      _id: <UUID>,
+ *      wallTime: <Date_t>
+ * }
  */
 class ReplicationConsistencyMarkers {
-    MONGO_DISALLOW_COPYING(ReplicationConsistencyMarkers);
+    ReplicationConsistencyMarkers(const ReplicationConsistencyMarkers&) = delete;
+    ReplicationConsistencyMarkers& operator=(const ReplicationConsistencyMarkers&) = delete;
 
 public:
     // Constructor and Destructor.
@@ -145,41 +154,101 @@ public:
     // -------- Oplog Truncate After Point ----------
 
     /**
-     * The oplog truncate after point is set to the beginning of a batch of oplog entries before
-     * the oplog entries are written into the oplog, and reset before we begin applying the batch.
-     * On startup all oplog entries with a value >= the oplog truncate after point should be
-     * deleted. We write operations to the oplog in parallel so if we crash mid-batch there could
-     * be holes in the oplog. Deleting them at startup keeps us consistent.
+     * Ensures that the fast-count counter for the oplogTruncateAfterPoint collection is properly
+     * set. An unclean shutdown can result in a miscount, if the persisted size store is not updated
+     * before the crash. Rollback usually handles this for user collections, but local, unreplicated
+     * collections are not adjusted.
+     */
+    virtual void ensureFastCountOnOplogTruncateAfterPoint(OperationContext* opCtx) = 0;
+
+    /**
+     * On startup all oplog entries with a ts field >= the oplog truncate after point will be
+     * deleted. If the truncate point is null, no oplog entries are truncated. A null truncate point
+     * can be found on startup if the server was certain at the time of shutdown that there were no
+     * parallel writes running.
      *
-     * If null, no documents should be deleted.
+     * Write operations are done in parallel, creating momentary oplog 'holes' where writes at an
+     * earlier timestamp are not yet committed. Secondaries can read an oplog entry from a
+     * sync-source as soon as there are no holes behind the oplog entry in-memory, but before there
+     * are no holes behind the oplog entry on disk. Therefore, after a crash, the oplog is truncated
+     * back to its on-disk no holes point that is guaranteed to be consistent with the rest of the
+     * replica set.
      *
-     * If we are in feature compatibility version 3.4 and there is no oplog truncate after point
-     * document, we fall back on the old oplog delete from point field in the minValid
-     * collection.
+     * A primary will update the oplog truncate after point before every journal flush to disk with
+     * the storage engine tracked in-memory no holes point.
+     *
+     * For other replication states than PRIMARY, the oplog truncate after point is updated
+     * directly. For batch application, the oplog truncate after point is set to the current
+     * lastApplied timestamp prior to writing a batch of oplog entries into the oplog, and reset to
+     * null once the parallel oplog entry writes are complete.
+     *
+     * Concurrency control and serialization is the responsibility of the caller.
      */
     virtual void setOplogTruncateAfterPoint(OperationContext* opCtx,
                                             const Timestamp& timestamp) = 0;
     virtual Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const = 0;
 
     /**
-     * The oplog delete from point may still exist on upgrade from an unclean shutdown. This
-     * function removes the field so it's gone after 3.6.
+     * Turns updating the OplogTruncateAfterPoint in refreshOplogTruncateAfterPointIfPrimary on/off.
      *
-     * TODO (SERVER-30556): Delete this function in 3.8 because the old oplog delete from point
-     * cannot exist.
+     * Any already running calls to refreshOplogTruncateAfterPointIfPrimary must be interrupted to
+     * ensure that the updates to the truncate point via that function have stopped.
      */
-    virtual void removeOldOplogDeleteFromPointField(OperationContext* opCtx) = 0;
+    virtual void startUsingOplogTruncateAfterPointForPrimary() = 0;
+    virtual void stopUsingOplogTruncateAfterPointForPrimary() = 0;
+
+    /**
+     * Indicates whether the oplog truncate after point is currently in use (being periodically
+     * refreshed), which is only done while in state PRIMARY.
+     *
+     * This class stores its own relevant replication state knowledge to avoid potential deadlocks
+     * in accessing the replication coordinator's mutex to check; and will remain false for
+     * standalones that do not use timestamps.
+     */
+    virtual bool isOplogTruncateAfterPointBeingUsedForPrimary() const = 0;
+
+    /**
+     * Initializes the oplog truncate after point with the timestamp of the latest oplog entry.
+     *
+     * On stepup to primary, the truncate point must be initialized to protect the window of time
+     * between completion of stepup and the first periodic flush to disk that prompts a truncate
+     * point update. Otherwise, in-memory writes (with no holes) can replicate while the on-disk
+     * writes still have holes, at which point we could crash, leaving this node with unknown data
+     * holes that other nodes do not have (they have the data).
+     */
+    virtual void setOplogTruncateAfterPointToTopOfOplog(OperationContext* opCtx) = 0;
+
+    /**
+     * Updates the OplogTruncateAfterPoint with the latest no-holes oplog timestamp.
+     *
+     * If primary, returns the OpTime and WallTime of the oplog entry associated with the updated
+     * oplog truncate after point.
+     * Returns boost::none if isOplogTruncateAfterPointBeingUsedForPrimary returns false.
+     *
+     * stopUsingOplogTruncateAfterPointForPrimary() will cause new calls to this function to do
+     * nothing, but any already running callers of this function will need to be interrupted to
+     * ensure the state change is in effect (that an update will not racily go ahead).
+     */
+    virtual boost::optional<OpTimeAndWallTime> refreshOplogTruncateAfterPointIfPrimary(
+        OperationContext* opCtx) = 0;
 
     // -------- Applied Through ----------
 
     /**
      * The applied through point is a persistent record of which oplog entries we've applied.
      * If we crash while applying a batch of oplog entries, this OpTime tells us where to start
-     * applying operations on startup.
-     *
-     * If null, the applied through point is the top of the oplog.
+     * applying operations on startup. If 'setTimestamp' is true, the write will be timestamped with
+     * the timestamp from 'optime'.
      */
-    virtual void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) = 0;
+    virtual void setAppliedThrough(OperationContext* opCtx,
+                                   const OpTime& optime,
+                                   bool setTimestamp = true) = 0;
+
+    /**
+     * Unsets the applied through OpTime at the given 'writeTimestamp'.
+     * Once cleared, the applied through point is the top of the oplog.
+     */
+    virtual void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) = 0;
 
     /**
      * You should probably be calling ReplicationCoordinator::getLastAppliedOpTime() instead.
@@ -190,15 +259,27 @@ public:
      */
     virtual OpTime getAppliedThrough(OperationContext* opCtx) const = 0;
 
-    // -------- Checkpoint Timestamp ----------
+    /**
+     * Create the set of collections required for steady-state replication to work. E.g: `minvalid`
+     * or `oplogTruncateAfterPoint`.
+     */
+    virtual Status createInternalCollections(OperationContext* opCtx) = 0;
 
     /**
-     * The checkpoint timestamp is the latest timestamp that the database can recover to. It is the
-     * job of a storage engine to call this function with the timestamp of the checkpoint it is
-     * about to take.
+     * Set the initial sync ID and wall time if it is not already set.  This will create the
+     * collection if necessary.
      */
-    virtual void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp) = 0;
-    virtual Timestamp getCheckpointTimestamp(OperationContext* opCtx) = 0;
+    virtual void setInitialSyncIdIfNotSet(OperationContext* opCtx) = 0;
+
+    /**
+     * Clears the initial sync ID by dropping the collection.
+     */
+    virtual void clearInitialSyncId(OperationContext* opCtx) = 0;
+
+    /**
+     * Returns the initial sync id object, or an empty object if none.
+     */
+    virtual BSONObj getInitialSyncId(OperationContext* opCtx) = 0;
 };
 
 }  // namespace repl

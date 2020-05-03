@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,7 +34,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/write_concern_options.h"
@@ -82,7 +82,8 @@ struct ConnectionPoolStats;
  * move to be run on the config server primary.
  */
 class ShardingCatalogClient {
-    MONGO_DISALLOW_COPYING(ShardingCatalogClient);
+    ShardingCatalogClient(const ShardingCatalogClient&) = delete;
+    ShardingCatalogClient& operator=(const ShardingCatalogClient&) = delete;
 
     // Allows ShardingCatalogManager to access _exhaustiveFindOnConfig
     friend class ShardingCatalogManager;
@@ -109,13 +110,6 @@ public:
     virtual void shutDown(OperationContext* opCtx) = 0;
 
     /**
-     * Updates or creates the metadata for a given database.
-     */
-    virtual Status updateDatabase(OperationContext* opCtx,
-                                  const std::string& dbName,
-                                  const DatabaseType& db) = 0;
-
-    /**
      * Retrieves the metadata for a given database, if it exists.
      *
      * @param dbName name of the database (case sensitive)
@@ -131,9 +125,17 @@ public:
         repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
+     * Retrieves all databases in a cluster.
+     *
+     * Returns a !OK status if an error occurs.
+     */
+    virtual StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
+        OperationContext* opCtx, repl::ReadConcernLevel readConcern) = 0;
+
+    /**
      * Retrieves the metadata for a given collection, if it exists.
      *
-     * @param collectionNs fully qualified name of the collection (case sensitive)
+     * @param nss fully qualified name of the collection (case sensitive)
      *
      * Returns Status::OK along with the collection information and the OpTime of the config server
      * which the collection information was based upon. Otherwise, returns an error code indicating
@@ -141,42 +143,44 @@ public:
      *  - NamespaceNotFound - collection does not exist
      */
     virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
-        OperationContext* opCtx, const std::string& collNs) = 0;
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
      * Retrieves all collections undera specified database (or in the system).
      *
      * @param dbName an optional database name. Must be nullptr or non-empty. If nullptr is
      *      specified, all collections on the system are returned.
-     * @param collections variable to receive the set of collections.
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that collections can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
      *
-     * Returns a !OK status if an error occurs.
+     * Returns the set of collections, or a !OK status if an error occurs.
      */
-    virtual Status getCollections(OperationContext* opCtx,
-                                  const std::string* dbName,
-                                  std::vector<CollectionType>* collections,
-                                  repl::OpTime* optime) = 0;
+    virtual StatusWith<std::vector<CollectionType>> getCollections(
+        OperationContext* opCtx,
+        const std::string* dbName,
+        repl::OpTime* optime,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
-     * Drops the specified collection from the collection metadata store.
+     * Returns the set of collections for the specified database, which have been marked as sharded.
+     * Goes directly to the config server's metadata, without checking the local cache so it should
+     * not be used in frequently called code paths.
      *
-     * Returns Status::OK if successful or any error code indicating the failure. These are
-     * some of the known failures:
-     *  - NamespaceNotFound - collection does not exist
+     * Throws exception on errors.
      */
-    virtual Status dropCollection(OperationContext* opCtx, const NamespaceString& ns) = 0;
+    virtual std::vector<NamespaceString> getAllShardedCollectionsForDb(
+        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves all databases for a shard.
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual Status getDatabasesForShard(OperationContext* opCtx,
-                                        const ShardId& shardId,
-                                        std::vector<std::string>* dbs) = 0;
+    virtual StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
+                                                                      const ShardId& shardId) = 0;
 
     /**
      * Gets the requested number of chunks (of type ChunkType) that satisfy a query.
@@ -184,28 +188,28 @@ public:
      * @param filter The query to filter out the results.
      * @param sort Fields to use for sorting the results. Pass empty BSON object for no sort.
      * @param limit The number of chunk entries to return. Pass boost::none for no limit.
-     * @param chunks Vector entry to receive the results
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that chunks can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
      * @param readConcern The readConcern to use while querying for chunks.
      *
-     * Returns a !OK status if an error occurs.
+     * Returns a vector of ChunkTypes, or a !OK status if an error occurs.
      */
-    virtual Status getChunks(OperationContext* opCtx,
-                             const BSONObj& filter,
-                             const BSONObj& sort,
-                             boost::optional<int> limit,
-                             std::vector<ChunkType>* chunks,
-                             repl::OpTime* opTime,
-                             repl::ReadConcernLevel readConcern) = 0;
+    virtual StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
+                                                         const BSONObj& filter,
+                                                         const BSONObj& sort,
+                                                         boost::optional<int> limit,
+                                                         repl::OpTime* opTime,
+                                                         repl::ReadConcernLevel readConcern) = 0;
 
     /**
-     * Retrieves all tags for the specified collection.
+     * Retrieves all zones defined for the specified collection. The returned vector is sorted based
+     * on the min key of the zones.
+     *
+     * Returns a !OK status if an error occurs.
      */
-    virtual Status getTagsForCollection(OperationContext* opCtx,
-                                        const std::string& collectionNs,
-                                        std::vector<TagsType>* tags) = 0;
+    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
+                                                                   const NamespaceString& nss) = 0;
 
     /**
      * Retrieves all shards in this sharded cluster.
@@ -240,7 +244,7 @@ public:
 
     /**
      * Applies oplog entries to the config servers.
-     * Used by mergeChunk, splitChunk, and moveChunk commands.
+     * Used by mergeChunk and splitChunk commands.
      *
      * @param updateOps: documents to write to the chunks collection.
      * @param preCondition: preconditions for applying documents.
@@ -259,27 +263,10 @@ public:
     virtual Status applyChunkOpsDeprecated(OperationContext* opCtx,
                                            const BSONArray& updateOps,
                                            const BSONArray& preCondition,
-                                           const std::string& nss,
+                                           const NamespaceString& nss,
                                            const ChunkVersion& lastChunkVersion,
                                            const WriteConcernOptions& writeConcern,
                                            repl::ReadConcernLevel readConcern) = 0;
-
-    /**
-     * Writes a diagnostic event to the action log.
-     */
-    virtual Status logAction(OperationContext* opCtx,
-                             const std::string& what,
-                             const std::string& ns,
-                             const BSONObj& detail) = 0;
-
-    /**
-     * Writes a diagnostic event to the change log.
-     */
-    virtual Status logChange(OperationContext* opCtx,
-                             const std::string& what,
-                             const std::string& ns,
-                             const BSONObj& detail,
-                             const WriteConcernOptions& writeConcern) = 0;
 
     /**
      * Reads global sharding settings from the confing.settings collection. The key parameter is
@@ -330,13 +317,26 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status insertConfigDocument(OperationContext* opCtx,
-                                        const std::string& ns,
+                                        const NamespaceString& nss,
                                         const BSONObj& doc,
                                         const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Updates a single document in the specified namespace on the config server. The document must
-     * have an _id index. Must only be used for updates to the 'config' database.
+     * Directly inserts documents in the specified namespace on the config server. Inserts said
+     * documents using a retryable write. Underneath, a session is created and destroyed -- this
+     * ad-hoc session creation strategy should never be used outside of specific, non-performant
+     * code paths.
+     *
+     * Must only be used for insertions in the 'config' database.
+     */
+    virtual void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
+                                                       const NamespaceString& nss,
+                                                       std::vector<BSONObj> docs,
+                                                       const WriteConcernOptions& writeConcern) = 0;
+
+    /**
+     * Updates a single document in the specified namespace on the config server. Must only be used
+     * for updates to the 'config' database.
      *
      * This method retries the operation on NotMaster or network errors, so it should only be used
      * with modifications which are idempotent.
@@ -349,7 +349,7 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
-                                                  const std::string& ns,
+                                                  const NamespaceString& nss,
                                                   const BSONObj& query,
                                                   const BSONObj& update,
                                                   bool upsert,
@@ -362,18 +362,9 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status removeConfigDocuments(OperationContext* opCtx,
-                                         const std::string& ns,
+                                         const NamespaceString& nss,
                                          const BSONObj& query,
                                          const WriteConcernOptions& writeConcern) = 0;
-
-    /**
-     * Appends the information about the config and admin databases in the config server with the
-     * format for listDatabases, based on the listDatabases command parameters in
-     * 'listDatabasesCmd'.
-     */
-    virtual Status appendInfoForConfigServerDatabases(OperationContext* opCtx,
-                                                      const BSONObj& listDatabasesCmd,
-                                                      BSONArrayBuilder* builder) = 0;
 
     /**
      * Obtains a reference to the distributed lock manager instance to use for synchronizing

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -34,6 +35,7 @@
 
 #include <algorithm>
 #include <math.h>
+#include <memory>
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/catalog/collection.h"
@@ -42,13 +44,12 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/db/storage/record_fetcher.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -56,30 +57,42 @@ using std::endl;
 using std::list;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MultiPlanStage::kStageType = "MULTI_PLAN";
 
-MultiPlanStage::MultiPlanStage(OperationContext* opCtx,
+namespace {
+void markShouldCollectTimingInfoOnSubtree(PlanStage* root) {
+    root->markShouldCollectTimingInfo();
+    for (auto&& child : root->getChildren()) {
+        markShouldCollectTimingInfoOnSubtree(child.get());
+    }
+}
+}  // namespace
+
+MultiPlanStage::MultiPlanStage(ExpressionContext* expCtx,
                                const Collection* collection,
                                CanonicalQuery* cq,
                                CachingMode cachingMode)
-    : PlanStage(kStageType, opCtx),
-      _collection(collection),
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _cachingMode(cachingMode),
       _query(cq),
       _bestPlanIdx(kNoSuchPlan),
       _backupPlanIdx(kNoSuchPlan),
       _failure(false),
       _failureCount(0),
-      _statusMemberId(WorkingSet::INVALID_ID) {
-    invariant(_collection);
-}
+      _statusMemberId(WorkingSet::INVALID_ID) {}
 
-void MultiPlanStage::addPlan(QuerySolution* solution, PlanStage* root, WorkingSet* ws) {
-    _candidates.push_back(CandidatePlan(solution, root, ws));
-    _children.emplace_back(root);
+void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
+                             std::unique_ptr<PlanStage> root,
+                             WorkingSet* ws) {
+    _children.emplace_back(std::move(root));
+    _candidates.push_back(CandidatePlan(std::move(solution), _children.back().get(), ws));
+
+    // Tell the new candidate plan that it must collect timing info. This timing info will
+    // later be stored in the plan cache, and may be used for explain output.
+    PlanStage* newChild = _children.back().get();
+    markShouldCollectTimingInfoOnSubtree(newChild);
 }
 
 bool MultiPlanStage::isEOF() {
@@ -109,7 +122,7 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
     // Look for an already produced result that provides the data the caller wants.
     if (!bestPlan.results.empty()) {
         *out = bestPlan.results.front();
-        bestPlan.results.pop_front();
+        bestPlan.results.pop();
         return PlanStage::ADVANCED;
     }
 
@@ -118,7 +131,7 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
     StageState state = bestPlan.root->work(out);
 
     if (PlanStage::FAILURE == state && hasBackupPlan()) {
-        LOG(5) << "Best plan errored out switching to backup";
+        LOGV2_DEBUG(20588, 5, "Best plan errored out switching to backup");
         // Uncache the bad solution if we fall back
         // on the backup solution.
         //
@@ -127,7 +140,10 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
         // if the best solution fails. Alternatively we could try to
         // defer cache insertion to be after the first produced result.
 
-        _collection->infoCache()->getPlanCache()->remove(*_query).transitional_ignore();
+        CollectionQueryInfo::get(collection())
+            .getPlanCache()
+            ->remove(*_query)
+            .transitional_ignore();
 
         _bestPlanIdx = _backupPlanIdx;
         _backupPlanIdx = kNoSuchPlan;
@@ -136,7 +152,7 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
     }
 
     if (hasBackupPlan() && PlanStage::ADVANCED == state) {
-        LOG(5) << "Best plan had a blocking stage, became unblocked";
+        LOGV2_DEBUG(20589, 5, "Best plan had a blocking stage, became unblocked");
         _backupPlanIdx = kNoSuchPlan;
     }
 
@@ -146,11 +162,11 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
 Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     // These are the conditions which can cause us to yield:
     //   1) The yield policy's timer elapsed, or
-    //   2) some stage requested a yield due to a document fetch, or
+    //   2) some stage requested a yield, or
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
-    if (yieldPolicy->shouldYield()) {
-        auto yieldStatus = yieldPolicy->yield(_fetcher.get());
+    if (yieldPolicy->shouldYieldOrInterrupt()) {
+        auto yieldStatus = yieldPolicy->yieldOrInterrupt();
 
         if (!yieldStatus.isOK()) {
             _failure = true;
@@ -160,10 +176,6 @@ Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
         }
     }
 
-    // We're done using the fetcher, so it should be freed. We don't want to
-    // use the same RecordFetcher twice.
-    _fetcher.reset();
-
     return Status::OK();
 }
 
@@ -172,7 +184,7 @@ size_t MultiPlanStage::getTrialPeriodWorks(OperationContext* opCtx, const Collec
     // Run each plan some number of times. This number is at least as great as
     // 'internalQueryPlanEvaluationWorks', but may be larger for big collections.
     size_t numWorks = internalQueryPlanEvaluationWorks.load();
-    if (NULL != collection) {
+    if (nullptr != collection) {
         // For large collections, the number of works is set to be this
         // fraction of the collection size.
         double fraction = internalQueryPlanEvaluationCollFraction;
@@ -203,49 +215,71 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
     // execution work that happens here, so this is needed for the time accounting to
     // make sense.
-    ScopedTimer timer(getClock(), &_commonStats.executionTimeMillis);
+    auto optTimer = getOptTimer();
 
-    size_t numWorks = getTrialPeriodWorks(getOpCtx(), _collection);
+    size_t numWorks = getTrialPeriodWorks(opCtx(), collection());
     size_t numResults = getTrialPeriodNumToReturn(*_query);
 
-    // Work the plans, stopping when a plan hits EOF or returns some
-    // fixed number of results.
-    for (size_t ix = 0; ix < numWorks; ++ix) {
-        bool moreToDo = workAllPlans(numResults, yieldPolicy);
-        if (!moreToDo) {
-            break;
+    try {
+        // Work the plans, stopping when a plan hits EOF or returns some fixed number of results.
+        for (size_t ix = 0; ix < numWorks; ++ix) {
+            bool moreToDo = workAllPlans(numResults, yieldPolicy);
+            if (!moreToDo) {
+                break;
+            }
         }
+    } catch (DBException& e) {
+        e.addContext("exception thrown while multiplanner was selecting best plan");
+        throw;
     }
 
     if (_failure) {
         invariant(WorkingSet::INVALID_ID != _statusMemberId);
         WorkingSetMember* member = _candidates[0].ws->get(_statusMemberId);
-        return WorkingSetCommon::getMemberStatus(*member);
+        return WorkingSetCommon::getMemberStatus(*member).withContext(
+            "multiplanner encountered a failure while selecting best plan");
     }
 
     // After picking best plan, ranking will own plan stats from
     // candidate solutions (winner and losers).
-    std::unique_ptr<PlanRankingDecision> ranking(new PlanRankingDecision);
-    _bestPlanIdx = PlanRanker::pickBestPlan(_candidates, ranking.get());
+    auto statusWithRanking = PlanRanker::pickBestPlan(_candidates);
+    if (!statusWithRanking.isOK()) {
+        return statusWithRanking.getStatus();
+    }
+
+    auto ranking = std::move(statusWithRanking.getValue());
+    // Since the status was ok there should be a ranking containing at least one successfully ranked
+    // plan.
+    invariant(ranking);
+    _bestPlanIdx = ranking->candidateOrder[0];
+
     verify(_bestPlanIdx >= 0 && _bestPlanIdx < static_cast<int>(_candidates.size()));
 
-    // Copy candidate order. We will need this to sort candidate stats for explain
-    // after transferring ownership of 'ranking' to plan cache.
+    // Copy candidate order and failed candidates. We will need this to sort candidate stats for
+    // explain after transferring ownership of 'ranking' to plan cache.
     std::vector<size_t> candidateOrder = ranking->candidateOrder;
+    std::vector<size_t> failedCandidates = ranking->failedCandidates;
 
     CandidatePlan& bestCandidate = _candidates[_bestPlanIdx];
-    std::list<WorkingSetID>& alreadyProduced = bestCandidate.results;
+    const auto& alreadyProduced = bestCandidate.results;
     const auto& bestSolution = bestCandidate.solution;
 
-    LOG(5) << "Winning solution:\n" << redact(bestSolution->toString());
-    LOG(2) << "Winning plan: " << redact(Explain::getPlanSummary(bestCandidate.root));
+    LOGV2_DEBUG(20590,
+                5,
+                "Winning solution:\n{bestSolution}",
+                "bestSolution"_attr = redact(bestSolution->toString()));
+    LOGV2_DEBUG(20591,
+                2,
+                "Winning plan: {Explain_getPlanSummary_bestCandidate_root}",
+                "Explain_getPlanSummary_bestCandidate_root"_attr =
+                    Explain::getPlanSummary(bestCandidate.root));
 
     _backupPlanIdx = kNoSuchPlan;
     if (bestSolution->hasBlockingStage && (0 == alreadyProduced.size())) {
-        LOG(5) << "Winner has blocking stage, looking for backup plan...";
-        for (size_t ix = 0; ix < _candidates.size(); ++ix) {
+        LOGV2_DEBUG(20592, 5, "Winner has blocking stage, looking for backup plan...");
+        for (auto&& ix : candidateOrder) {
             if (!_candidates[ix].solution->hasBlockingStage) {
-                LOG(5) << "Candidate " << ix << " is backup child";
+                LOGV2_DEBUG(20593, 5, "Candidate {ix} is backup child", "ix"_attr = ix);
                 _backupPlanIdx = ix;
                 break;
             }
@@ -273,12 +307,20 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             size_t winnerIdx = ranking->candidateOrder[0];
             size_t runnerUpIdx = ranking->candidateOrder[1];
 
-            LOG(1) << "Winning plan tied with runner-up. Not caching."
-                   << " ns: " << _collection->ns() << " " << redact(_query->toStringShort())
-                   << " winner score: " << ranking->scores[0] << " winner summary: "
-                   << redact(Explain::getPlanSummary(_candidates[winnerIdx].root))
-                   << " runner-up score: " << ranking->scores[1] << " runner-up summary: "
-                   << redact(Explain::getPlanSummary(_candidates[runnerUpIdx].root));
+            LOGV2_DEBUG(20594,
+                        1,
+                        "Winning plan tied with runner-up. Not caching. query: {query_Short} "
+                        "winner score: {ranking_scores_0} winner summary: "
+                        "{Explain_getPlanSummary_candidates_winnerIdx_root} runner-up score: "
+                        "{ranking_scores_1} runner-up summary: "
+                        "{Explain_getPlanSummary_candidates_runnerUpIdx_root}",
+                        "query_Short"_attr = redact(_query->toStringShort()),
+                        "ranking_scores_0"_attr = ranking->scores[0],
+                        "Explain_getPlanSummary_candidates_winnerIdx_root"_attr =
+                            Explain::getPlanSummary(_candidates[winnerIdx].root),
+                        "ranking_scores_1"_attr = ranking->scores[1],
+                        "Explain_getPlanSummary_candidates_runnerUpIdx_root"_attr =
+                            Explain::getPlanSummary(_candidates[runnerUpIdx].root));
         }
 
         if (alreadyProduced.empty()) {
@@ -287,10 +329,15 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             canCache = false;
 
             size_t winnerIdx = ranking->candidateOrder[0];
-            LOG(1) << "Winning plan had zero results. Not caching."
-                   << " ns: " << _collection->ns() << " " << redact(_query->toStringShort())
-                   << " winner score: " << ranking->scores[0] << " winner summary: "
-                   << redact(Explain::getPlanSummary(_candidates[winnerIdx].root));
+            LOGV2_DEBUG(20595,
+                        1,
+                        "Winning plan had zero results. Not caching. query: {query_Short} winner "
+                        "score: {ranking_scores_0} winner summary: "
+                        "{Explain_getPlanSummary_candidates_winnerIdx_root}",
+                        "query_Short"_attr = redact(_query->toStringShort()),
+                        "ranking_scores_0"_attr = ranking->scores[0],
+                        "Explain_getPlanSummary_candidates_winnerIdx_root"_attr =
+                            Explain::getPlanSummary(_candidates[winnerIdx].root));
         }
     }
 
@@ -302,9 +349,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         std::vector<QuerySolution*> solutions;
 
         // Generate solutions and ranking decisions sorted by score.
-        for (size_t orderingIndex = 0; orderingIndex < candidateOrder.size(); ++orderingIndex) {
-            // index into candidates/ranking
-            size_t ix = candidateOrder[orderingIndex];
+        for (auto&& ix : candidateOrder) {
+            solutions.push_back(_candidates[ix].solution.get());
+        }
+        // Insert the failed plans in the back.
+        for (auto&& ix : failedCandidates) {
             solutions.push_back(_candidates[ix].solution.get());
         }
 
@@ -313,18 +362,24 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         // XXX: One known example is 2D queries
         bool validSolutions = true;
         for (size_t ix = 0; ix < solutions.size(); ++ix) {
-            if (NULL == solutions[ix]->cacheData.get()) {
-                LOG(5) << "Not caching query because this solution has no cache data: "
-                       << redact(solutions[ix]->toString());
+            if (nullptr == solutions[ix]->cacheData.get()) {
+                LOGV2_DEBUG(
+                    20596,
+                    5,
+                    "Not caching query because this solution has no cache data: {solutions_ix}",
+                    "solutions_ix"_attr = redact(solutions[ix]->toString()));
                 validSolutions = false;
                 break;
             }
         }
 
         if (validSolutions) {
-            _collection->infoCache()
-                ->getPlanCache()
-                ->add(*_query, solutions, ranking.release())
+            CollectionQueryInfo::get(collection())
+                .getPlanCache()
+                ->set(*_query,
+                      solutions,
+                      std::move(ranking),
+                      opCtx()->getServiceContext()->getPreciseClockSource()->now())
                 .transitional_ignore();
         }
     }
@@ -355,7 +410,7 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we choose to
             // return the results from the 'candidate' plan.
             member->makeObjOwnedIfNeeded();
-            candidate.results.push_back(id);
+            candidate.results.push(id);
 
             // Once a plan returns enough results, stop working.
             if (candidate.results.size() >= numResults) {
@@ -366,14 +421,9 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // Assumes that the ranking will pick this plan.
             doneWorking = true;
         } else if (PlanStage::NEED_YIELD == state) {
-            if (id == WorkingSet::INVALID_ID) {
-                if (!yieldPolicy->canAutoYield())
-                    throw WriteConflictException();
-            } else {
-                WorkingSetMember* member = candidate.ws->get(id);
-                invariant(member->hasFetcher());
-                // Transfer ownership of the fetcher and yield.
-                _fetcher.reset(member->releaseFetcher());
+            invariant(id == WorkingSet::INVALID_ID);
+            if (!yieldPolicy->canAutoYield()) {
+                throw WriteConflictException();
             }
 
             if (yieldPolicy->canAutoYield()) {
@@ -384,16 +434,17 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
                 return false;
             }
         } else if (PlanStage::NEED_TIME != state) {
-            // FAILURE or DEAD.  Do we want to just tank that plan and try the rest?  We
-            // probably want to fail globally as this shouldn't happen anyway.
+            // On FAILURE, mark this candidate as failed, but keep executing the other
+            // candidates. The MultiPlanStage as a whole only fails when every candidate
+            // plan fails.
 
             candidate.failed = true;
             ++_failureCount;
 
             // Propagate most recent seen failure to parent.
-            if (PlanStage::FAILURE == state) {
-                _statusMemberId = id;
-            }
+            invariant(state == PlanStage::FAILURE);
+            _statusMemberId = id;
+
 
             if (_failureCount == _candidates.size()) {
                 _failure = true;
@@ -403,45 +454,6 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
     }
 
     return !doneWorking;
-}
-
-namespace {
-
-void invalidateHelper(OperationContext* opCtx,
-                      WorkingSet* ws,  // may flag for review
-                      const RecordId& recordId,
-                      list<WorkingSetID>* idsToInvalidate,
-                      const Collection* collection) {
-    for (auto it = idsToInvalidate->begin(); it != idsToInvalidate->end(); ++it) {
-        WorkingSetMember* member = ws->get(*it);
-        if (member->hasRecordId() && member->recordId == recordId) {
-            WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, collection);
-        }
-    }
-}
-
-}  // namespace
-
-void MultiPlanStage::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& recordId,
-                                  InvalidationType type) {
-    if (_failure) {
-        return;
-    }
-
-    if (bestPlanChosen()) {
-        CandidatePlan& bestPlan = _candidates[_bestPlanIdx];
-        invalidateHelper(opCtx, bestPlan.ws, recordId, &bestPlan.results, _collection);
-        if (hasBackupPlan()) {
-            CandidatePlan& backupPlan = _candidates[_backupPlanIdx];
-            invalidateHelper(opCtx, backupPlan.ws, recordId, &backupPlan.results, _collection);
-        }
-    } else {
-        for (size_t ix = 0; ix < _candidates.size(); ++ix) {
-            invalidateHelper(
-                opCtx, _candidates[ix].ws, recordId, &_candidates[ix].results, _collection);
-        }
-    }
 }
 
 bool MultiPlanStage::hasBackupPlan() const {
@@ -458,15 +470,16 @@ int MultiPlanStage::bestPlanIdx() const {
 
 QuerySolution* MultiPlanStage::bestSolution() {
     if (_bestPlanIdx == kNoSuchPlan)
-        return NULL;
+        return nullptr;
 
     return _candidates[_bestPlanIdx].solution.get();
 }
 
 unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
-    ret->specific = make_unique<MultiPlanStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
+    ret->specific = std::make_unique<MultiPlanStats>(_specificStats);
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
     }

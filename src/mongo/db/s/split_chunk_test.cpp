@@ -1,46 +1,48 @@
-/*    Copyright 2017 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
 
-#include "mongo/db/s/split_chunk.h"
-
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/split_chunk.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -53,7 +55,6 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -66,7 +67,8 @@ public:
     void setUp() override {
         ShardServerTestFixture::setUp();
 
-        CatalogCacheLoader::get(getServiceContext()).initializeReplicaSetRole(true);
+        ShardingState::get(operationContext())->setInitialized(_shardId, OID::gen());
+        getCatalogCacheLoaderForFiltering(getServiceContext()).initializeReplicaSetRole(true);
 
         // Instantiate names.
         _epoch = OID::gen();
@@ -167,8 +169,8 @@ void SplitChunkTest::expectLock() {
     dynamic_cast<DistLockManagerMock*>(distLock())
         ->expectLock(
             [this](StringData name, StringData whyMessage, Milliseconds) {
-                LOG(0) << name;
-                LOG(0) << whyMessage;
+                LOGV2(22105, "Lock name", "name"_attr = name);
+                LOGV2(22106, "Reason for lock", "reason"_attr = whyMessage);
             },
             Status::OK());
 }
@@ -210,7 +212,6 @@ void SplitChunkTest::emptyResponse() {
 }
 
 TEST_F(SplitChunkTest, HashedKeyPatternNumberLongSplitKeys) {
-
     BSONObj keyPatternObj = BSON("foo"
                                  << "hashed");
     _coll.setKeyPattern(BSON("_id"
@@ -221,9 +222,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternNumberLongSplitKeys) {
     for (long long i = 256; i <= 1024; i += 256) {
         validSplitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -256,11 +254,10 @@ TEST_F(SplitChunkTest, HashedKeyPatternNumberLongSplitKeys) {
     collResponse();
     chunkResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, HashedKeyPatternIntegerSplitKeys) {
-
     BSONObj keyPatternObj = BSON("foo"
                                  << "hashed");
     _coll.setKeyPattern(BSON("_id"
@@ -271,9 +268,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternIntegerSplitKeys) {
     std::vector<BSONObj> invalidSplitKeys{
         BSON("foo" << -1), BSON("foo" << 0), BSON("foo" << 1), BSON("foo" << 42)};
 
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
-
     expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
@@ -298,11 +292,10 @@ TEST_F(SplitChunkTest, HashedKeyPatternIntegerSplitKeys) {
     chunkResponse();
     shardResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, HashedKeyPatternDoubleSplitKeys) {
-
     BSONObj keyPatternObj = BSON("foo"
                                  << "hashed");
     _coll.setKeyPattern(BSON("_id"
@@ -313,9 +306,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternDoubleSplitKeys) {
     std::vector<BSONObj> invalidSplitKeys{
         BSON("foo" << 47.21230129), BSON("foo" << 1.0), BSON("foo" << 0.0), BSON("foo" << -0.001)};
 
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
-
     expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
@@ -340,11 +330,10 @@ TEST_F(SplitChunkTest, HashedKeyPatternDoubleSplitKeys) {
     chunkResponse();
     shardResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, HashedKeyPatternStringSplitKeys) {
-
     BSONObj keyPatternObj = BSON("foo"
                                  << "hashed");
     _coll.setKeyPattern(BSON("_id"
@@ -361,9 +350,6 @@ TEST_F(SplitChunkTest, HashedKeyPatternStringSplitKeys) {
                                           BSON("foo"
                                                << "")};
 
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
-
     expectLock();
 
     // Call the splitChunk function asynchronously on a different thread, so that we do not block,
@@ -388,11 +374,10 @@ TEST_F(SplitChunkTest, HashedKeyPatternStringSplitKeys) {
     chunkResponse();
     shardResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, ValidRangeKeyPatternSplitKeys) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of valid split keys, which contains values that may not necessarily be able
@@ -405,9 +390,6 @@ TEST_F(SplitChunkTest, ValidRangeKeyPatternSplitKeys) {
                                         BSON("foo"
                                              << ""),
                                         BSON("foo" << 3.1415926535)};
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -440,11 +422,10 @@ TEST_F(SplitChunkTest, ValidRangeKeyPatternSplitKeys) {
     collResponse();
     chunkResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, SplitChunkWithNoErrors) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -453,9 +434,6 @@ TEST_F(SplitChunkTest, SplitChunkWithNoErrors) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -505,11 +483,10 @@ TEST_F(SplitChunkTest, SplitChunkWithNoErrors) {
     collResponse();
     chunkResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, AttemptSplitWithConfigsvrError) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 0} and end at {"foo" : 1024},
@@ -518,9 +495,6 @@ TEST_F(SplitChunkTest, AttemptSplitWithConfigsvrError) {
     for (int i = 0; i <= 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -553,11 +527,10 @@ TEST_F(SplitChunkTest, AttemptSplitWithConfigsvrError) {
     collResponse();
     chunkResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, AttemptSplitOnNoDatabases) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -566,9 +539,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoDatabases) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -591,11 +561,10 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoDatabases) {
     emptyResponse();
     emptyResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, AttemptSplitOnNoCollections) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -604,9 +573,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoCollections) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -632,11 +598,10 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoCollections) {
     emptyResponse();
     shardResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, AttemptSplitOnNoChunks) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -645,9 +610,6 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoChunks) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -679,11 +641,10 @@ TEST_F(SplitChunkTest, AttemptSplitOnNoChunks) {
     collResponse();
     emptyResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, NoCollectionAfterSplit) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -692,9 +653,6 @@ TEST_F(SplitChunkTest, NoCollectionAfterSplit) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -727,11 +685,10 @@ TEST_F(SplitChunkTest, NoCollectionAfterSplit) {
     // Finally, give an empty response to a request regarding a find on the original collection.
     emptyResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(SplitChunkTest, NoChunksAfterSplit) {
-
     BSONObj keyPatternObj = BSON("foo" << 1);
 
     // Build a vector of split keys. Note that we start at {"foo" : 256} and end at {"foo" : 768},
@@ -740,9 +697,6 @@ TEST_F(SplitChunkTest, NoChunksAfterSplit) {
     for (int i = 256; i < 1024; i += 256) {
         splitKeys.push_back(BSON("foo" << i));
     }
-
-    // Force-set the sharding state to enabled with the _shardId, for testing purposes.
-    ShardingState::get(operationContext())->setEnabledForTest(_shardId.toString());
 
     expectLock();
 
@@ -781,7 +735,7 @@ TEST_F(SplitChunkTest, NoChunksAfterSplit) {
     collResponse();
     emptyResponse();
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

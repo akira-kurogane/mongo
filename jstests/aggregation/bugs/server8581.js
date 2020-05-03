@@ -79,55 +79,55 @@ a3result = [{
 
 a4result = [
     {
-      _id: 1,
-      level: 1,
-      b: {
-          level: 3,
-          c: 5,
-          d: [{level: 1, e: 4}, {f: 6}, "NOT AN OBJECT!!11!", [2, 3, 4, {level: 1, r: 11}]]
-      },
-      h: {level: 2, i: {level: 4, j: {level: 1, k: 8}}},
-      l: {m: {level: 3, n: 12}},
-      o: [],
-      q: 14
+        _id: 1,
+        level: 1,
+        b: {
+            level: 3,
+            c: 5,
+            d: [{level: 1, e: 4}, {f: 6}, "NOT AN OBJECT!!11!", [2, 3, 4, {level: 1, r: 11}]]
+        },
+        h: {level: 2, i: {level: 4, j: {level: 1, k: 8}}},
+        l: {m: {level: 3, n: 12}},
+        o: [],
+        q: 14
     },
     {
-      _id: 2,
-      level: 4,
+        _id: 2,
+        level: 4,
     }
 ];
 
 a5result = [
     {
-      _id: 1,
-      level: 1,
-      b: {
-          level: 3,
-          c: 5,
-          d: [
-              {level: 1, e: 4},
-              {f: 6},
-              {level: 5, g: 9},
-              "NOT AN OBJECT!!11!",
-              [2, 3, 4, {level: 1, r: 11}, {level: 5, s: 99}]
-          ]
-      },
-      h: {level: 2, i: {level: 4, j: {level: 1, k: 8}}},
-      l: {m: {level: 3, n: 12}},
-      o: [{level: 5, p: 19}],
-      q: 14
+        _id: 1,
+        level: 1,
+        b: {
+            level: 3,
+            c: 5,
+            d: [
+                {level: 1, e: 4},
+                {f: 6},
+                {level: 5, g: 9},
+                "NOT AN OBJECT!!11!",
+                [2, 3, 4, {level: 1, r: 11}, {level: 5, s: 99}]
+            ]
+        },
+        h: {level: 2, i: {level: 4, j: {level: 1, k: 8}}},
+        l: {m: {level: 3, n: 12}},
+        o: [{level: 5, p: 19}],
+        q: 14
     },
     {
-      _id: 2,
-      level: 4,
+        _id: 2,
+        level: 4,
     }
 ];
 
-assert.eq(a1.toArray(), a1result);
-assert.eq(a2.toArray(), a2result);
-assert.eq(a3.toArray(), a3result);
-assert.eq(a4.toArray(), a4result);
-assert.eq(a5.toArray(), a5result);
+assert(anyEq(a1.toArray(), a1result));
+assert(anyEq(a2.toArray(), a2result));
+assert(anyEq(a3.toArray(), a3result));
+assert(anyEq(a4.toArray(), a4result));
+assert(anyEq(a5.toArray(), a5result));
 
 // Test redacts that are just a variable access (this can happen as a result of optimizations)
 assert.eq(t.aggregate({$redact: "$$PRUNE"}).toArray(), []);

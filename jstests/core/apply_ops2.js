@@ -1,5 +1,13 @@
 // Test applyops upsert flag SERVER-7452
 
+// @tags: [
+//     requires_non_retryable_commands,
+//     requires_fastcount,
+//
+//     # applyOps uses the oplog that require replication support
+//     requires_replication,
+// ]
+
 var t = db.apply_ops2;
 t.drop();
 
@@ -44,12 +52,7 @@ print("Testing applyOps with default alwaysUpsert");
 res = db.runCommand({
     applyOps: [
         {op: "u", ns: t.getFullName(), o2: {_id: 1}, o: {$set: {x: "upsert=default existing"}}},
-        {
-          op: "u",
-          ns: t.getFullName(),
-          o2: {_id: 4},
-          o: {$set: {x: "upsert=defaults non-existing"}}
-        }
+        {op: "u", ns: t.getFullName(), o2: {_id: 4}, o: {$set: {x: "upsert=defaults non-existing"}}}
     ]
 });
 

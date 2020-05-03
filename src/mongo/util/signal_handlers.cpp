@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -41,34 +42,21 @@
 
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/signal_win32.h"
-
-#if defined(_WIN32)
-namespace {
-const char* strsignal(int signalNum) {
-    // should only see SIGABRT on windows
-    switch (signalNum) {
-        case SIGABRT:
-            return "SIGABRT";
-        default:
-            return "UNKNOWN";
-    }
-}
-}
-#endif
+#include "mongo/util/stacktrace.h"
 
 namespace mongo {
-
-using std::endl;
 
 /*
  * WARNING: PLEASE READ BEFORE CHANGING THIS MODULE
@@ -91,24 +79,26 @@ namespace {
 #ifdef _WIN32
 void consoleTerminate(const char* controlCodeName) {
     setThreadName("consoleTerminate");
-    log() << "got " << controlCodeName << ", will terminate after current cmd ends";
+    LOGV2(23371,
+          "got {controlCodeName}, will terminate after current cmd ends",
+          "controlCodeName"_attr = controlCodeName);
     exitCleanly(EXIT_KILL);
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     switch (fdwCtrlType) {
         case CTRL_C_EVENT:
-            log() << "Ctrl-C signal";
+            LOGV2(23372, "Ctrl-C signal");
             consoleTerminate("CTRL_C_EVENT");
             return TRUE;
 
         case CTRL_CLOSE_EVENT:
-            log() << "CTRL_CLOSE_EVENT signal";
+            LOGV2(23373, "CTRL_CLOSE_EVENT signal");
             consoleTerminate("CTRL_CLOSE_EVENT");
             return TRUE;
 
         case CTRL_BREAK_EVENT:
-            log() << "CTRL_BREAK_EVENT signal";
+            LOGV2(23374, "CTRL_BREAK_EVENT signal");
             consoleTerminate("CTRL_BREAK_EVENT");
             return TRUE;
 
@@ -117,7 +107,7 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
             return FALSE;
 
         case CTRL_SHUTDOWN_EVENT:
-            log() << "CTRL_SHUTDOWN_EVENT signal";
+            LOGV2(23375, "CTRL_SHUTDOWN_EVENT signal");
             consoleTerminate("CTRL_SHUTDOWN_EVENT");
             return TRUE;
 
@@ -129,76 +119,184 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
 void eventProcessingThread() {
     std::string eventName = getShutdownSignalName(ProcessId::getCurrent().asUInt32());
 
-    HANDLE event = CreateEventA(NULL, TRUE, FALSE, eventName.c_str());
-    if (event == NULL) {
-        warning() << "eventProcessingThread CreateEvent failed: " << errnoWithDescription();
+    HANDLE event = CreateEventA(nullptr, TRUE, FALSE, eventName.c_str());
+    if (event == nullptr) {
+        LOGV2_WARNING(23382,
+                      "eventProcessingThread CreateEvent failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errnoWithDescription());
         return;
     }
 
-    ON_BLOCK_EXIT(CloseHandle, event);
+    ON_BLOCK_EXIT([&] { CloseHandle(event); });
 
     int returnCode = WaitForSingleObject(event, INFINITE);
     if (returnCode != WAIT_OBJECT_0) {
         if (returnCode == WAIT_FAILED) {
-            warning() << "eventProcessingThread WaitForSingleObject failed: "
-                      << errnoWithDescription();
+            LOGV2_WARNING(
+                23383,
+                "eventProcessingThread WaitForSingleObject failed: {errnoWithDescription}",
+                "errnoWithDescription"_attr = errnoWithDescription());
             return;
         } else {
-            warning() << "eventProcessingThread WaitForSingleObject failed: "
-                      << errnoWithDescription(returnCode);
+            LOGV2_WARNING(23384,
+                          "eventProcessingThread WaitForSingleObject failed: "
+                          "{errnoWithDescription_returnCode}",
+                          "errnoWithDescription_returnCode"_attr =
+                              errnoWithDescription(returnCode));
             return;
         }
     }
 
     setThreadName("eventTerminate");
 
-    log() << "shutdown event signaled, will terminate after current cmd ends";
+    LOGV2(23376, "shutdown event signaled, will terminate after current cmd ends");
     exitCleanly(EXIT_CLEAN);
 }
 
 #else
 
-// The signals in asyncSignals will be processed by this thread only, in order to
-// ensure the db and log mutexes aren't held. Because this is run in a different thread, it does
-// not need to be safe to call in signal context.
-sigset_t asyncSignals;
-void signalProcessingThread(LogFileStatus rotate) {
-    setThreadName("signalProcessingThread");
+/**
+ * Filled by the `waitForSignal` function.
+ * Only Linux has `sigwaitinfo` to synchronously get a signal with its `siginfo_t`.
+ * Only Linux has a procfs from which to read metadata for such signal sending process.
+ * So outside Linux we just get the `sig`.
+ */
+struct SignalWaitResult {
+    int sig;
+#if defined(__linux__)
+    siginfo_t si;
+#endif  // defined(__linux__)
+};
 
-    time_t signalTimeSeconds = -1;
-    time_t lastSignalTimeSeconds = -1;
+/** Fill `result` with a caught signal from `sigset`. Return true on success. */
+bool waitForSignal(const sigset_t& sigset, SignalWaitResult* result) {
+    MONGO_IDLE_THREAD_BLOCK;
+#if defined(__linux__)
+    while (true) {
+        errno = 0;
+        result->sig = sigwaitinfo(&sigset, &result->si);
+        int errsv = errno;
+        if (result->sig == -1) {
+            if (errsv == EINTR)
+                continue;
+            LOGV2_FATAL_CONTINUE(23385,
+                                 "sigwaitinfo failed with error:{strerror_errsv}",
+                                 "strerror_errsv"_attr = strerror(errsv));
+            return false;
+        }
+        return true;
+    }
+#else
+    return sigwait(&sigset, &result->sig) == 0;
+#endif
+}
+
+const int kSignalProcessingThreadExclusives[] = {SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGXCPU};
+
+struct LogRotationState {
+    static constexpr auto kNever = static_cast<time_t>(-1);
+    LogFileStatus logFileStatus;
+    time_t previous;
+};
+
+void handleOneSignal(const SignalWaitResult& waited, LogRotationState* rotation) {
+    int sig = waited.sig;
+    LOGV2(23377,
+          "got signal {sig} ({strsignal_sig})",
+          "sig"_attr = sig,
+          "strsignal_sig"_attr = strsignal(sig));
+#if defined(__linux__)
+    const siginfo_t& si = waited.si;
+    switch (si.si_code) {
+        case SI_USER:
+        case SI_QUEUE:
+            LOGV2(23378,
+                  "kill from pid:{si_si_pid} uid:{si_si_uid}",
+                  "si_si_pid"_attr = si.si_pid,
+                  "si_si_uid"_attr = si.si_uid);
+            break;
+        case SI_TKILL:
+            LOGV2(23379, "tgkill");
+            break;
+        case SI_KERNEL:
+            LOGV2(23380, "kernel");
+            break;
+    }
+#endif  // __linux__
+
+    if (sig == SIGUSR1) {
+        // log rotate signal
+        {
+            // Rate limit: 1 second per signal
+            auto now = time(nullptr);
+            if (rotation->previous != rotation->kNever && difftime(now, rotation->previous) <= 1.0)
+                return;
+            rotation->previous = now;
+        }
+        fassert(16782, logv2::rotateLogs(serverGlobalParams.logRenameOnRotate));
+        if (rotation->logFileStatus == LogFileStatus::kNeedToRotateLogFile) {
+            logProcessDetailsForLogRotate(getGlobalServiceContext());
+        }
+        return;
+    }
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
+    if (sig == stackTraceSignal()) {
+        // If there's a stackTraceSignal at all, catch it here so we don't die from it.
+        // Can dump all threads if we can, else silently ignore it.
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+        printAllThreadStacks();
+#endif
+        return;
+    }
+#endif
+
+    // interrupt/terminate signal
+    LOGV2(23381, "will terminate after current cmd ends");
+    exitCleanly(EXIT_CLEAN);
+}
+
+/**
+ * The signals in `kSignalProcessingThreadExclusives` will be delivered to this thread only,
+ * to ensure the db and log mutexes aren't held.
+ */
+void signalProcessingThread(LogFileStatus rotate) {
+    setThreadName("SignalHandler");
+
+    LogRotationState logRotationState{rotate, logRotationState.kNever};
+
+    sigset_t waitSignals;
+    sigemptyset(&waitSignals);
+
+    for (int sig : kSignalProcessingThreadExclusives)
+        sigaddset(&waitSignals, sig);
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
+    // On this thread, block the stackTraceSignal and rely on a signal wait to deliver it.
+    sigaddset(&waitSignals, stackTraceSignal());
+#endif
+
+    errno = 0;
+    if (int r = pthread_sigmask(SIG_SETMASK, &waitSignals, nullptr); r != 0) {
+        int errsv = errno;
+        LOGV2_FATAL(31377,
+                    "pthread_sigmask failed with error:{strerror_errsv}",
+                    "strerror_errsv"_attr = strerror(errsv));
+    }
+
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+    // Must happen after blocking the signal, so this thread doesn't get
+    // confused and forward the stack trace signal to itself.
+    markAsStackTraceProcessingThread();
+#endif
 
     while (true) {
-        int actualSignal = 0;
-        int status = [&] {
-            MONGO_IDLE_THREAD_BLOCK;
-            return sigwait(&asyncSignals, &actualSignal);
-        }();
-        fassert(16781, status == 0);
-        switch (actualSignal) {
-            case SIGUSR1:
-                // log rotate signal
-                signalTimeSeconds = time(0);
-                if (signalTimeSeconds <= lastSignalTimeSeconds) {
-                    // ignore multiple signals in the same or earlier second.
-                    break;
-                }
-
-                lastSignalTimeSeconds = signalTimeSeconds;
-                fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate));
-                if (rotate == LogFileStatus::kNeedToRotateLogFile) {
-                    logProcessDetailsForLogRotate();
-                }
-                break;
-            default:
-                // interrupt/terminate signal
-                log() << "got signal " << actualSignal << " (" << strsignal(actualSignal)
-                      << "), will terminate after current cmd ends" << endl;
-                exitCleanly(EXIT_CLEAN);
-                break;
-        }
+        SignalWaitResult waited;
+        fassert(16781, waitForSignal(waitSignals, &waited));
+        handleOneSignal(waited, &logRotationState);
     }
 }
+
 #endif
 }  // namespace
 
@@ -209,14 +307,6 @@ void setupSignalHandlers() {
             "Couldn't register Windows Ctrl-C handler",
             SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), TRUE));
 #else
-    // asyncSignals is a global variable listing the signals that should be handled by the
-    // interrupt thread, once it is started via startSignalProcessingThread().
-    sigemptyset(&asyncSignals);
-    sigaddset(&asyncSignals, SIGHUP);
-    sigaddset(&asyncSignals, SIGINT);
-    sigaddset(&asyncSignals, SIGTERM);
-    sigaddset(&asyncSignals, SIGUSR1);
-    sigaddset(&asyncSignals, SIGXCPU);
 #endif
 }
 
@@ -224,8 +314,23 @@ void startSignalProcessingThread(LogFileStatus rotate) {
 #ifdef _WIN32
     stdx::thread(eventProcessingThread).detach();
 #else
+
+    // The signals that should be handled by the SignalProcessingThread, once it is started via
+    // startSignalProcessingThread().
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    for (int sig : kSignalProcessingThreadExclusives)
+        sigaddset(&sigset, sig);
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL) && !defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+    // On a Unixlike build without the stacktrace behavior, we still want to handle SIGUSR2 to
+    // print a message, but it must only go to the signalProcessingThread, not on other threads.
+    // It's as if stackTraceSignal (e.g. SIGUSR2) is a member of kSignalProcessingThreadExclusives.
+    sigaddset(&sigset, stackTraceSignal());
+#endif
+
     // Mask signals in the current (only) thread. All new threads will inherit this mask.
-    invariant(pthread_sigmask(SIG_SETMASK, &asyncSignals, 0) == 0);
+    invariant(pthread_sigmask(SIG_SETMASK, &sigset, nullptr) == 0);
     // Spawn a thread to capture the signals we just masked off.
     stdx::thread(signalProcessingThread, rotate).detach();
 #endif

@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,7 +32,8 @@
 #include <jsapi.h>
 #include <vm/PosixNSPR.h>
 
-#include "mongo/client/dbclientcursor.h"
+
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/bindata.h"
 #include "mongo/scripting/mozjs/bson.h"
 #include "mongo/scripting/mozjs/code.h"
@@ -45,6 +47,7 @@
 #include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/scripting/mozjs/error.h"
+#include "mongo/scripting/mozjs/freeOpToJSContext.h"
 #include "mongo/scripting/mozjs/global.h"
 #include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/jsthread.h"
@@ -60,9 +63,11 @@
 #include "mongo/scripting/mozjs/oid.h"
 #include "mongo/scripting/mozjs/regexp.h"
 #include "mongo/scripting/mozjs/session.h"
+#include "mongo/scripting/mozjs/status.h"
 #include "mongo/scripting/mozjs/timestamp.h"
 #include "mongo/scripting/mozjs/uri.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace mozjs {
@@ -80,17 +85,18 @@ namespace mozjs {
  * For more information about overriden fields, see mongo::Scope
  */
 class MozJSImplScope final : public Scope {
-    MONGO_DISALLOW_COPYING(MozJSImplScope);
+    MozJSImplScope(const MozJSImplScope&) = delete;
+    MozJSImplScope& operator=(const MozJSImplScope&) = delete;
 
 public:
-    explicit MozJSImplScope(MozJSScriptEngine* engine);
+    explicit MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
     ~MozJSImplScope();
 
     void init(const BSONObj* data) override;
 
     void reset() override;
 
-    void kill();
+    void kill() override;
 
     void interrupt();
 
@@ -102,8 +108,6 @@ public:
 
     void unregisterOperation() override;
 
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
-
     void externalSetup() override;
 
     std::string getError() override;
@@ -111,6 +115,8 @@ public:
     bool hasOutOfMemoryException() override;
 
     void gc() override;
+
+    void sleep(Milliseconds ms);
 
     bool isJavaScriptProtectionEnabled() const;
 
@@ -148,7 +154,7 @@ public:
               bool assertOnError,
               int timeoutMs) override;
 
-    void injectNative(const char* field, NativeFunction func, void* data = 0) override;
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
 
     ScriptingFunction _createFunction(const char* code) override;
 
@@ -242,11 +248,6 @@ public:
     }
 
     template <typename T>
-    typename std::enable_if<std::is_same<T, MongoLocalInfo>::value, WrapType<T>&>::type getProto() {
-        return _mongoLocalProto;
-    }
-
-    template <typename T>
     typename std::enable_if<std::is_same<T, NativeFunctionInfo>::value, WrapType<T>&>::type
     getProto() {
         return _nativeFunctionProto;
@@ -294,6 +295,12 @@ public:
     }
 
     template <typename T>
+    typename std::enable_if<std::is_same<T, MongoStatusInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _statusProto;
+    }
+
+    template <typename T>
     typename std::enable_if<std::is_same<T, TimestampInfo>::value, WrapType<T>&>::type getProto() {
         return _timestampProto;
     }
@@ -301,6 +308,11 @@ public:
     template <typename T>
     typename std::enable_if<std::is_same<T, URIInfo>::value, WrapType<T>&>::type getProto() {
         return _uriProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, GlobalInfo>::value, WrapType<T>&>::type getProto() {
+        return _globalProto;
     }
 
     static const char* const kExecResult;
@@ -350,6 +362,8 @@ public:
         static ASANHandles* getThreadASANHandles();
     };
 
+    void setStatus(Status status);
+
 private:
     template <typename ImplScopeFunction>
     auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
@@ -364,30 +378,25 @@ private:
      */
     struct MozRuntime {
     public:
-        MozRuntime(const MozJSScriptEngine* engine);
+        MozRuntime(const MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
 
-        std::unique_ptr<PRThread, std::function<void(PRThread*)>> _thread;
         std::unique_ptr<JSRuntime, std::function<void(JSRuntime*)>> _runtime;
         std::unique_ptr<JSContext, std::function<void(JSContext*)>> _context;
     };
 
     /**
      * The connection state of the scope.
-     *
-     * This is for dbeval and the shell
      */
     enum class ConnectState : char {
         Not,
-        Local,
         External,
     };
 
     struct MozJSEntry;
     friend struct MozJSEntry;
 
-    static void _reportError(JSContext* cx, const char* message, JSErrorReport* report);
     static bool _interruptCallback(JSContext* cx);
-    static void _gcCallback(JSRuntime* rt, JSGCStatus status, void* data);
+    static void _gcCallback(JSContext* rt, JSGCStatus status, void* data);
     bool _checkErrorState(bool success, bool reportError = true, bool assertOnError = true);
 
     void installDBAccess();
@@ -399,24 +408,29 @@ private:
     ASANHandles _asanHandles;
     MozJSScriptEngine* _engine;
     MozRuntime _mr;
-    JSRuntime* _runtime;
     JSContext* _context;
     WrapType<GlobalInfo> _globalProto;
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
+    StringMap<ScriptingFunction> _funcCodeToHandleMap;
     InternedStringTable _internedStrings;
-    std::atomic<bool> _pendingKill;
+    Status _killStatus;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("MozJSImplScope::_mutex");
+    stdx::condition_variable _sleepCondition;
     std::string _error;
-    unsigned int _opId;        // op id for this scope
-    OperationContext* _opCtx;  // Op context for DbEval
+    unsigned int _opId;               // op id for this scope
+    OperationContext* _opCtx;         // Op context for DbEval
+    stdx::thread::id _opCtxThreadId;  // Id of the thread that owns '_opCtx'
     std::size_t _inOp;
-    std::atomic<bool> _pendingGC;
+    std::atomic<bool> _pendingGC;  // NOLINT
     ConnectState _connectState;
     Status _status;
     std::string _parentStack;
     std::size_t _generation;
     bool _requireOwnedObjects;
     bool _hasOutOfMemoryException;
+
+    bool _inReportError;
 
     WrapType<BinDataInfo> _binDataProto;
     WrapType<BSONInfo> _bsonProto;
@@ -435,7 +449,6 @@ private:
     WrapType<MinKeyInfo> _minKeyProto;
     WrapType<MongoExternalInfo> _mongoExternalProto;
     WrapType<MongoHelpersInfo> _mongoHelpersProto;
-    WrapType<MongoLocalInfo> _mongoLocalProto;
     WrapType<NativeFunctionInfo> _nativeFunctionProto;
     WrapType<NumberDecimalInfo> _numberDecimalProto;
     WrapType<NumberIntInfo> _numberIntProto;
@@ -444,6 +457,7 @@ private:
     WrapType<OIDInfo> _oidProto;
     WrapType<RegExpInfo> _regExpProto;
     WrapType<SessionInfo> _sessionProto;
+    WrapType<MongoStatusInfo> _statusProto;
     WrapType<TimestampInfo> _timestampProto;
     WrapType<URIInfo> _uriProto;
 };
@@ -452,9 +466,10 @@ inline MozJSImplScope* getScope(JSContext* cx) {
     return static_cast<MozJSImplScope*>(JS_GetContextPrivate(cx));
 }
 
-inline MozJSImplScope* getScope(JSFreeOp* fop) {
-    return static_cast<MozJSImplScope*>(JS_GetRuntimePrivate(fop->runtime()));
+inline MozJSImplScope* getScope(js::FreeOp* fop) {
+    return getScope(freeOpToJSContext(fop));
 }
+
 
 }  // namespace mozjs
 }  // namespace mongo

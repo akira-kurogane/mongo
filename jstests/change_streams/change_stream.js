@@ -1,398 +1,267 @@
 // Basic $changeStream tests.
+// Mark as assumes_read_preference_unchanged since reading from the non-replicated "system.profile"
+// collection results in a failure in the secondary reads suite.
+// @tags: [assumes_read_preference_unchanged]
 (function() {
-    "use strict";
+"use strict";
 
-    load('jstests/libs/uuid_util.js');
-    load("jstests/libs/fixture_helpers.js");  // For 'FixtureHelpers'.
+load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
+load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
+load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest and
+                                                   // assert[Valid|Invalid]ChangeStreamNss.
 
-    const oplogProjection = {$project: {"_id.clusterTime": 0}};
+const isMongos = FixtureHelpers.isMongos(db);
 
-    function getCollectionNameFromFullNamespace(ns) {
-        return ns.split(/\.(.+)/)[1];
-    }
+// Drop and recreate the collections to be used in this set of tests.
+assertDropAndRecreateCollection(db, "t1");
+assertDropAndRecreateCollection(db, "t2");
 
-    // We will use this to keep track of cursors opened during this test, so that we can be sure to
-    // clean them up before this test completes.
-    let allCursors = [];
+// Test that $changeStream only accepts an object as its argument.
+function checkArgFails(arg) {
+    assert.commandFailedWithCode(
+        db.runCommand({aggregate: "t1", pipeline: [{$changeStream: arg}], cursor: {}}), 50808);
+}
 
-    // Helpers for testing that pipeline returns correct set of results.  Run startWatchingChanges
-    // with the pipeline, then insert the changes, then run assertNextBatchMatches with the result
-    // of startWatchingChanges and the expected set of results.
-    function startWatchingChanges({pipeline, collection, includeTs, aggregateOptions}) {
-        aggregateOptions = aggregateOptions || {cursor: {}};
+checkArgFails(1);
+checkArgFails("invalid");
+checkArgFails(false);
+checkArgFails([1, 2, "invalid", {x: 1}]);
 
-        if (!includeTs) {
-            // Strip the oplog fields we aren't testing.
-            pipeline.push(oplogProjection);
-        }
+// Test that a change stream cannot be opened on collections in the "admin", "config", or
+// "local" databases.
+assertInvalidChangeStreamNss("admin", "testColl");
+assertInvalidChangeStreamNss("config", "testColl");
+// Not allowed to access 'local' database through mongos.
+if (!isMongos) {
+    assertInvalidChangeStreamNss("local", "testColl");
+}
 
-        // TODO: SERVER-29126
-        // While change streams still uses read concern level local instead of read concern level
-        // majority, we need to use causal consistency to be able to immediately read our own writes
-        // out of the oplog.  Once change streams read from the majority snapshot, we can remove
-        // these synchronization points from this test.
-        assert.commandWorked(db.runCommand({
-            find: "foo",
-            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
-        }));
+// Test that a change stream cannot be opened on 'system.' collections.
+assertInvalidChangeStreamNss(db.getName(), "system.users");
+assertInvalidChangeStreamNss(db.getName(), "system.profile");
+assertInvalidChangeStreamNss(db.getName(), "system.version");
 
-        // Waiting for replication assures no previous operations will be included.
-        FixtureHelpers.awaitReplication();
-        let res = assert.commandWorked(db.runCommand(
-            Object.merge({aggregate: collection.getName(), pipeline: pipeline}, aggregateOptions)));
-        assert.neq(res.cursor.id, 0);
-        allCursors.push({db: db.getName(), coll: collection.getName(), cursorId: res.cursor.id});
-        return res.cursor;
-    }
+// Test that a change stream can be opened on namespaces with 'system' in the name, but not
+// considered an internal 'system dot' namespace.
+assertValidChangeStreamNss(db.getName(), "systemindexes");
+assertValidChangeStreamNss(db.getName(), "system_users");
 
-    function assertNextBatchMatches({cursor, expectedBatch}) {
-        // TODO: SERVER-29126
-        assert.commandWorked(db.runCommand({
-            find: "foo",
-            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
-        }));
-        FixtureHelpers.awaitReplication();
-        if (expectedBatch.length == 0)
-            FixtureHelpers.runCommandOnEachPrimary({
-                dbName: "admin",
-                cmdObj: {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "alwaysOn"}
-            });
-        let res = assert.commandWorked(db.runCommand({
-            getMore: cursor.id,
-            collection: getCollectionNameFromFullNamespace(cursor.ns),
-            maxTimeMS: 5 * 60 * 1000,
-            batchSize: (expectedBatch.length + 1)
-        }));
-        if (expectedBatch.length == 0)
-            FixtureHelpers.runCommandOnEachPrimary({
-                dbName: "admin",
-                cmdObj: {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "off"}
-            });
-        assert.docEq(res.cursor.nextBatch, expectedBatch);
-    }
+// Similar test but for DB names that are not considered internal.
+assert.commandWorked(db.getSiblingDB("admincustomDB")["test"].insert({}));
+assertValidChangeStreamNss("admincustomDB");
 
-    jsTestLog("Testing single insert");
-    db.t1.drop();
-    let cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.insert({_id: 0, a: 1}));
-    const t1Uuid = getUUIDFromListCollections(db, db.t1.getName());
-    let expected = {
-        _id: {
-            documentKey: {_id: 0},
-            uuid: t1Uuid,
-        },
-        documentKey: {_id: 0},
-        fullDocument: {_id: 0, a: 1},
-        ns: {db: "test", coll: "t1"},
-        operationType: "insert",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+assert.commandWorked(db.getSiblingDB("local_")["test"].insert({}));
+assertValidChangeStreamNss("local_");
 
-    jsTestLog("Testing second insert");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.insert({_id: 1, a: 2}));
-    expected = {
-        _id: {
-            documentKey: {_id: 1},
-            uuid: t1Uuid,
-        },
-        documentKey: {_id: 1},
-        fullDocument: {_id: 1, a: 2},
-        ns: {db: "test", coll: "t1"},
-        operationType: "insert",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+assert.commandWorked(db.getSiblingDB("_config_")["test"].insert({}));
+assertValidChangeStreamNss("_config_");
 
-    jsTestLog("Testing update");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.update({_id: 0}, {a: 3}));
-    expected = {
-        _id: {documentKey: {_id: 0}, uuid: t1Uuid},
-        documentKey: {_id: 0},
-        fullDocument: {_id: 0, a: 3},
-        ns: {db: "test", coll: "t1"},
-        operationType: "replace",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+let cst = new ChangeStreamTest(db);
+let cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
 
-    jsTestLog("Testing update of another field");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.update({_id: 0}, {b: 3}));
-    expected = {
-        _id: {documentKey: {_id: 0}, uuid: t1Uuid},
-        documentKey: {_id: 0},
-        fullDocument: {_id: 0, b: 3},
-        ns: {db: "test", coll: "t1"},
-        operationType: "replace",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+jsTestLog("Testing single insert");
+// Test that if there are no changes, we return an empty batch.
+assert.eq(0, cursor.firstBatch.length, "Cursor had changes: " + tojson(cursor));
 
-    jsTestLog("Testing upsert");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.update({_id: 2}, {a: 4}, {upsert: true}));
-    expected = {
-        _id: {
-            documentKey: {_id: 2},
-            uuid: t1Uuid,
-        },
-        documentKey: {_id: 2},
-        fullDocument: {_id: 2, a: 4},
-        ns: {db: "test", coll: "t1"},
-        operationType: "insert",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+assert.commandWorked(db.t1.insert({_id: 0, a: 1}));
+let expected = {
+    documentKey: {_id: 0},
+    fullDocument: {_id: 0, a: 1},
+    ns: {db: "test", coll: "t1"},
+    operationType: "insert",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
 
-    jsTestLog("Testing partial update with $inc");
-    assert.writeOK(db.t1.insert({_id: 3, a: 5, b: 1}));
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.update({_id: 3}, {$inc: {b: 2}}));
-    expected = {
-        _id: {documentKey: {_id: 3}, uuid: t1Uuid},
-        documentKey: {_id: 3},
+// Test that if there are no changes during a subsequent 'getMore', we return an empty batch.
+cursor = cst.getNextBatch(cursor);
+assert.eq(0, cursor.nextBatch.length, "Cursor had changes: " + tojson(cursor));
+
+jsTestLog("Testing second insert");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.insert({_id: 1, a: 2}));
+expected = {
+    documentKey: {_id: 1},
+    fullDocument: {_id: 1, a: 2},
+    ns: {db: "test", coll: "t1"},
+    operationType: "insert",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing update");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.update({_id: 0}, {_id: 0, a: 3}));
+expected = {
+    documentKey: {_id: 0},
+    fullDocument: {_id: 0, a: 3},
+    ns: {db: "test", coll: "t1"},
+    operationType: "replace",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing update of another field");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.update({_id: 0}, {_id: 0, b: 3}));
+expected = {
+    documentKey: {_id: 0},
+    fullDocument: {_id: 0, b: 3},
+    ns: {db: "test", coll: "t1"},
+    operationType: "replace",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing upsert");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.update({_id: 2}, {_id: 2, a: 4}, {upsert: true}));
+expected = {
+    documentKey: {_id: 2},
+    fullDocument: {_id: 2, a: 4},
+    ns: {db: "test", coll: "t1"},
+    operationType: "insert",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing partial update with $inc");
+assert.commandWorked(db.t1.insert({_id: 3, a: 5, b: 1}));
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.update({_id: 3}, {$inc: {b: 2}}));
+expected = {
+    documentKey: {_id: 3},
+    ns: {db: "test", coll: "t1"},
+    operationType: "update",
+    updateDescription: {removedFields: [], updatedFields: {b: 3}},
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing multi:true update");
+assert.commandWorked(db.t1.insert({_id: 4, a: 0, b: 1}));
+assert.commandWorked(db.t1.insert({_id: 5, a: 0, b: 1}));
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.update({a: 0}, {$set: {b: 2}}, {multi: true}));
+expected = [
+    {
+        documentKey: {_id: 4},
         ns: {db: "test", coll: "t1"},
         operationType: "update",
-        updateDescription: {removedFields: [], updatedFields: {b: 3}},
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
+        updateDescription: {removedFields: [], updatedFields: {b: 2}}
+    },
+    {
+        documentKey: {_id: 5},
+        ns: {db: "test", coll: "t1"},
+        operationType: "update",
+        updateDescription: {removedFields: [], updatedFields: {b: 2}}
+    }
+];
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: expected});
 
-    jsTestLog("Testing delete");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    assert.writeOK(db.t1.remove({_id: 1}));
-    expected = {
-        _id: {documentKey: {_id: 1}, uuid: t1Uuid},
-        documentKey: {_id: 1},
+jsTestLog("Testing delete");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.remove({_id: 1}));
+expected = {
+    documentKey: {_id: 1},
+    ns: {db: "test", coll: "t1"},
+    operationType: "delete",
+};
+cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
+
+jsTestLog("Testing justOne:false delete");
+assert.commandWorked(db.t1.insert({_id: 6, a: 1, b: 1}));
+assert.commandWorked(db.t1.insert({_id: 7, a: 1, b: 1}));
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+assert.commandWorked(db.t1.remove({a: 1}, {justOne: false}));
+expected = [
+    {
+        documentKey: {_id: 6},
         ns: {db: "test", coll: "t1"},
         operationType: "delete",
-    };
-    assertNextBatchMatches({cursor: cursor, expectedBatch: [expected]});
-
-    jsTestLog("Testing intervening write on another collection");
-    cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
-    let t2cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t2});
-    assert.writeOK(db.t2.insert({_id: 100, c: 1}));
-    const t2Uuid = getUUIDFromListCollections(db, db.t2.getName());
-    assertNextBatchMatches({cursor: cursor, expectedBatch: []});
-    expected = {
-        _id: {
-            documentKey: {_id: 100},
-            uuid: t2Uuid,
-        },
-        documentKey: {_id: 100},
-        fullDocument: {_id: 100, c: 1},
-        ns: {db: "test", coll: "t2"},
-        operationType: "insert",
-    };
-    assertNextBatchMatches({cursor: t2cursor, expectedBatch: [expected]});
-
-    jsTestLog("Testing drop of unrelated collection");
-    assert.writeOK(db.dropping.insert({}));
-    db.dropping.drop();
-    // Should still see the previous change from t2, shouldn't see anything about 'dropping'.
-
-    jsTestLog("Testing rename");
-    db.t3.drop();
-    t2cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t2});
-    assert.writeOK(db.t2.renameCollection("t3"));
-    expected = {_id: {uuid: t2Uuid}, operationType: "invalidate"};
-    assertNextBatchMatches({cursor: t2cursor, expectedBatch: [expected]});
-
-    jsTestLog("Testing insert that looks like rename");
-    db.dne1.drop();
-    db.dne2.drop();
-    const dne1cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.dne1});
-    const dne2cursor = startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.dne2});
-    assert.writeOK(db.t3.insert({_id: 101, renameCollection: "test.dne1", to: "test.dne2"}));
-    assertNextBatchMatches({cursor: dne1cursor, expectedBatch: []});
-    assertNextBatchMatches({cursor: dne2cursor, expectedBatch: []});
-
-    // Now make sure the cursor behaves like a tailable awaitData cursor.
-    jsTestLog("Testing tailability");
-    db.tailable1.drop();
-    const tailableCursor = db.tailable1.aggregate([{$changeStream: {}}, oplogProjection]);
-    assert(!tailableCursor.hasNext());
-    assert.writeOK(db.tailable1.insert({_id: 101, a: 1}));
-    const tailable1Uuid = getUUIDFromListCollections(db, db.tailable1.getName());
-    assert(tailableCursor.hasNext());
-    assert.docEq(tailableCursor.next(), {
-        _id: {
-            documentKey: {_id: 101},
-            uuid: tailable1Uuid,
-        },
-        documentKey: {_id: 101},
-        fullDocument: {_id: 101, a: 1},
-        ns: {db: "test", coll: "tailable1"},
-        operationType: "insert",
-    });
-
-    jsTestLog("Testing awaitdata");
-    db.tailable2.drop();
-    db.createCollection("tailable2");
-    const tailable2Uuid = getUUIDFromListCollections(db, db.tailable2.getName());
-    let aggcursor =
-        startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.tailable2});
-
-    // We should get a valid cursor.
-    assert.neq(aggcursor.id, 0);
-
-    // Initial batch size should be zero as there should be no data.
-    assert.eq(aggcursor.firstBatch.length, 0);
-
-    // No data, so should return no results, but cursor should remain valid.  Note we are
-    // specifically testing awaitdata behavior here, so we cannot use the failpoint to skip the
-    // wait.
-    let res = assert.commandWorked(
-        db.runCommand({getMore: aggcursor.id, collection: "tailable2", maxTimeMS: 1000}));
-    aggcursor = res.cursor;
-    assert.neq(aggcursor.id, 0);
-    assert.eq(aggcursor.nextBatch.length, 0);
-
-    // Now insert something in parallel while waiting for it.
-    let insertshell = startParallelShell(function() {
-        // Wait for the getMore to appear in currentop.
-        assert.soon(function() {
-            return db.currentOp({op: "getmore", "command.collection": "tailable2"}).inprog.length ==
-                1;
-        });
-        assert.writeOK(db.tailable2.insert({_id: 102, a: 2}));
-    });
-    res = assert.commandWorked(
-        db.runCommand({getMore: aggcursor.id, collection: "tailable2", maxTimeMS: 5 * 60 * 1000}));
-    aggcursor = res.cursor;
-    assert.eq(aggcursor.nextBatch.length, 1);
-    assert.docEq(aggcursor.nextBatch[0], {
-        _id: {
-            documentKey: {_id: 102},
-            uuid: tailable2Uuid,
-        },
-        documentKey: {_id: 102},
-        fullDocument: {_id: 102, a: 2},
-        ns: {db: "test", coll: "tailable2"},
-        operationType: "insert",
-    });
-
-    // Wait for insert shell to terminate.
-    insertshell();
-
-    const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
-    if (!isMongos) {
-        jsTestLog("Ensuring attempt to read with legacy operations fails.");
-        db.getMongo().forceReadMode('legacy');
-        const legacyCursor = db.tailable2.aggregate([{$changeStream: {}}, oplogProjection],
-                                                    {cursor: {batchSize: 0}});
-        assert.throws(function() {
-            legacyCursor.next();
-        }, [], "Legacy getMore expected to fail on changeStream cursor.");
-        db.getMongo().forceReadMode('commands');
+    },
+    {
+        documentKey: {_id: 7},
+        ns: {db: "test", coll: "t1"},
+        operationType: "delete",
     }
+];
+cst.assertNextChangesEqualUnordered({cursor: cursor, expectedChanges: expected});
 
-    /**
-     * Gets one document from the cursor using getMore with awaitData disabled. Asserts if no
-     * document is present.
-     */
-    function getOneDoc(cursor) {
-        // TODO: SERVER-29126
-        assert.commandWorked(db.runCommand({
-            find: "foo",
-            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
-        }));
-        FixtureHelpers.awaitReplication();
-        FixtureHelpers.runCommandOnEachPrimary({
-            dbName: "admin",
-            cmdObj: {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "alwaysOn"}
-        });
-        let res = assert.commandWorked(db.runCommand({
-            getMore: cursor.id,
-            collection: getCollectionNameFromFullNamespace(cursor.ns),
-            batchSize: 1
-        }));
-        assert.eq(res.cursor.nextBatch.length, 1);
-        FixtureHelpers.runCommandOnEachPrimary({
-            dbName: "admin",
-            cmdObj: {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "off"}
-        });
-        return res.cursor.nextBatch[0];
-    }
+jsTestLog("Testing intervening write on another collection");
+cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});
+let t2cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t2});
+assert.commandWorked(db.t2.insert({_id: 100, c: 1}));
+cst.assertNoChange(cursor);
+expected = {
+    documentKey: {_id: 100},
+    fullDocument: {_id: 100, c: 1},
+    ns: {db: "test", coll: "t2"},
+    operationType: "insert",
+};
+cst.assertNextChangesEqual({cursor: t2cursor, expectedChanges: [expected]});
 
-    /**
-     * Attempts to get a document from the cursor with awaitData disabled, and asserts if a
-     * document
-     * is present.
-     */
-    function assertNextBatchIsEmpty(cursor) {
-        // TODO: SERVER-29126
-        assert.commandWorked(db.runCommand({
-            find: "foo",
-            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
-        }));
-        FixtureHelpers.awaitReplication();
-        assert.commandWorked(db.adminCommand(
-            {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "alwaysOn"}));
-        let res = assert.commandWorked(db.runCommand({
-            getMore: cursor.id,
-            collection: getCollectionNameFromFullNamespace(cursor.ns),
-            batchSize: 1
-        }));
-        assert.eq(res.cursor.nextBatch.length, 0);
-        assert.commandWorked(
-            db.adminCommand({configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "off"}));
-    }
+jsTestLog("Testing drop of unrelated collection");
+assert.commandWorked(db.dropping.insert({}));
+assertDropCollection(db, db.dropping.getName());
+// Should still see the previous change from t2, shouldn't see anything about 'dropping'.
 
-    jsTestLog("Testing resumability");
-    db.resume1.drop();
-    assert.commandWorked(db.createCollection("resume1"));
+jsTestLog("Testing insert that looks like rename");
+assertDropCollection(db, "dne1");
+assertDropCollection(db, "dne2");
+const dne1cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.dne1});
+const dne2cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.dne2});
+assert.commandWorked(db.t2.insert({_id: 101, renameCollection: "test.dne1", to: "test.dne2"}));
+cst.assertNoChange(dne1cursor);
+cst.assertNoChange(dne2cursor);
 
-    // Note we do not project away 'id.ts' as it is part of the resume token.
-    let resumeCursor = startWatchingChanges(
-        {pipeline: [{$changeStream: {}}], collection: db.resume1, includeTs: true});
+if (!isMongos) {
+    jsTestLog("Ensuring attempt to read with legacy operations fails.");
+    db.getMongo().forceReadMode('legacy');
+    const legacyCursor = db.tailable2.aggregate([{$changeStream: {}}], {cursor: {batchSize: 0}});
+    assert.throws(function() {
+        legacyCursor.next();
+    }, [], "Legacy getMore expected to fail on changeStream cursor.");
+    db.getMongo().forceReadMode('commands');
+}
 
-    // Insert a document and save the resulting change stream.
-    assert.writeOK(db.resume1.insert({_id: 1}));
-    const firstInsertChangeDoc = getOneDoc(resumeCursor);
-    assert.docEq(firstInsertChangeDoc.fullDocument, {_id: 1});
+jsTestLog("Testing resumability");
+assertDropAndRecreateCollection(db, "resume1");
 
-    jsTestLog("Testing resume after one document.");
-    resumeCursor = startWatchingChanges({
-        pipeline: [{$changeStream: {resumeAfter: firstInsertChangeDoc._id}}],
-        collection: db.resume1,
-        includeTs: true,
-        aggregateOptions: {cursor: {batchSize: 0}},
-    });
-    assertNextBatchIsEmpty(resumeCursor);
+// Note we do not project away 'id.ts' as it is part of the resume token.
+let resumeCursor =
+    cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.resume1});
 
-    jsTestLog("Inserting additional documents.");
-    assert.writeOK(db.resume1.insert({_id: 2}));
-    const secondInsertChangeDoc = getOneDoc(resumeCursor);
-    assert.docEq(secondInsertChangeDoc.fullDocument, {_id: 2});
-    assert.writeOK(db.resume1.insert({_id: 3}));
-    const thirdInsertChangeDoc = getOneDoc(resumeCursor);
-    assert.docEq(thirdInsertChangeDoc.fullDocument, {_id: 3});
-    assertNextBatchIsEmpty(resumeCursor);
+// Insert a document and save the resulting change stream.
+assert.commandWorked(db.resume1.insert({_id: 1}));
+const firstInsertChangeDoc = cst.getOneChange(resumeCursor);
+assert.docEq(firstInsertChangeDoc.fullDocument, {_id: 1});
 
-    jsTestLog("Testing resume after first document of three.");
-    resumeCursor = startWatchingChanges({
-        pipeline: [{$changeStream: {resumeAfter: firstInsertChangeDoc._id}}],
-        collection: db.resume1,
-        includeTs: true,
-        aggregateOptions: {cursor: {batchSize: 0}},
-    });
-    assert.docEq(getOneDoc(resumeCursor), secondInsertChangeDoc);
-    assert.docEq(getOneDoc(resumeCursor), thirdInsertChangeDoc);
-    assertNextBatchIsEmpty(resumeCursor);
+jsTestLog("Testing resume after one document.");
+resumeCursor = cst.startWatchingChanges({
+    pipeline: [{$changeStream: {resumeAfter: firstInsertChangeDoc._id}}],
+    collection: db.resume1,
+    aggregateOptions: {cursor: {batchSize: 0}},
+});
 
-    jsTestLog("Testing resume after second document of three.");
-    resumeCursor = startWatchingChanges({
-        pipeline: [{$changeStream: {resumeAfter: secondInsertChangeDoc._id}}],
-        collection: db.resume1,
-        includeTs: true,
-        aggregateOptions: {cursor: {batchSize: 0}},
-    });
-    assert.docEq(getOneDoc(resumeCursor), thirdInsertChangeDoc);
-    assertNextBatchIsEmpty(resumeCursor);
+jsTestLog("Inserting additional documents.");
+assert.commandWorked(db.resume1.insert({_id: 2}));
+const secondInsertChangeDoc = cst.getOneChange(resumeCursor);
+assert.docEq(secondInsertChangeDoc.fullDocument, {_id: 2});
+assert.commandWorked(db.resume1.insert({_id: 3}));
+const thirdInsertChangeDoc = cst.getOneChange(resumeCursor);
+assert.docEq(thirdInsertChangeDoc.fullDocument, {_id: 3});
 
-    for (let testCursor of allCursors) {
-        assert.commandWorked(db.getSiblingDB(testCursor.db).runCommand({
-            killCursors: testCursor.coll,
-            cursors: [testCursor.cursorId]
-        }));
-    }
+jsTestLog("Testing resume after first document of three.");
+resumeCursor = cst.startWatchingChanges({
+    pipeline: [{$changeStream: {resumeAfter: firstInsertChangeDoc._id}}],
+    collection: db.resume1,
+    aggregateOptions: {cursor: {batchSize: 0}},
+});
+assert.docEq(cst.getOneChange(resumeCursor), secondInsertChangeDoc);
+assert.docEq(cst.getOneChange(resumeCursor), thirdInsertChangeDoc);
+
+jsTestLog("Testing resume after second document of three.");
+resumeCursor = cst.startWatchingChanges({
+    pipeline: [{$changeStream: {resumeAfter: secondInsertChangeDoc._id}}],
+    collection: db.resume1,
+    aggregateOptions: {cursor: {batchSize: 0}},
+});
+assert.docEq(cst.getOneChange(resumeCursor), thirdInsertChangeDoc);
+
+cst.cleanUp();
 }());

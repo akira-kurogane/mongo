@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,8 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -133,7 +135,7 @@ public:
         return _slaveDelay;
     }
 
-    const unordered_map<std::string, std::string> getTags() const {
+    const stdx::unordered_map<std::string, std::string> getTags() const {
         return _tags;
     }
 
@@ -173,6 +175,10 @@ public:
         return _lastMajorityWrite->value;
     }
 
+    boost::optional<TopologyVersion> getTopologyVersion() const {
+        return _topologyVersion;
+    }
+
     /**
      * If false, calls to toBSON/addToBSON will ignore all other fields and add a specific
      * message to indicate that we have no replica set config.
@@ -196,7 +202,7 @@ public:
 
     void setIsSecondary(bool secondary);
 
-    void setReplSetName(const std::string& setName);
+    void setReplSetName(StringData setName);
 
     void setReplSetVersion(long long version);
 
@@ -215,6 +221,8 @@ public:
     void setIsHidden(bool hidden);
 
     void setShouldBuildIndexes(bool buildIndexes);
+
+    void setTopologyVersion(TopologyVersion topologyVersion);
 
     void setSlaveDelay(Seconds slaveDelay);
 
@@ -270,13 +278,14 @@ private:
     bool _buildIndexesSet;
     Seconds _slaveDelay;
     bool _slaveDelaySet;
-    unordered_map<std::string, std::string> _tags;
+    stdx::unordered_map<std::string, std::string> _tags;
     bool _tagsSet;
     HostAndPort _me;
     bool _meSet;
     OID _electionId;
     boost::optional<OpTimeWith<time_t>> _lastWrite;
     boost::optional<OpTimeWith<time_t>> _lastMajorityWrite;
+    boost::optional<TopologyVersion> _topologyVersion;
 
     // If _configSet is false this means we don't have a valid repl set config, so toBSON
     // will return a set of hardcoded values that indicate this.

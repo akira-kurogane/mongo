@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -33,78 +34,124 @@
 
 namespace mongo {
 
-class DocumentSourceGeoNear : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
+class DocumentSourceGeoNear : public DocumentSource {
 public:
-    static const long long kDefaultLimit;
+    static constexpr StringData kKeyFieldName = "key"_sd;
+    static constexpr StringData kStageName = "$geoNear"_sd;
 
-    // virtuals from DocumentSource
-    GetNextResult getNext() final;
-    const char* getSourceName() const final;
     /**
-     * Attempts to combine with a subsequent limit stage, setting the internal limit field
-     * as a result.
+     * Only exposed for testing.
      */
-    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
+    static boost::intrusive_ptr<DocumentSourceGeoNear> create(
+        const boost::intrusive_ptr<ExpressionContext>&);
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
-        constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
-        return constraints;
+    const char* getSourceName() const final {
+        return DocumentSourceGeoNear::kStageName.rawData();
+    }
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kFirst,
+                HostTypeRequirement::kAnyShard,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kNotAllowed,
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
+    }
+
+    /**
+     * DocumentSourceGeoNear should always be replaced by a DocumentSourceGeoNearCursor before
+     * executing a pipeline, so this method should never be called.
+     */
+    GetNextResult doGetNext() final {
+        MONGO_UNREACHABLE;
     }
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    BSONObjSet getOutputSorts() final {
-        return SimpleBSONObjComparator::kInstance.makeBSONObjSet(
-            {BSON(distanceField->fullPath() << -1)});
-    }
-
-    // Virtuals for SplittableDocumentSource
-    boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
-    static char geoNearName[];
-
-    long long getLimit() {
-        return limit;
-    }
-
+    /**
+     * A query predicate to apply to the documents in addition to the "near" predicate.
+     */
     BSONObj getQuery() const {
         return query;
     };
 
-    // this should only be used for testing
-    static boost::intrusive_ptr<DocumentSourceGeoNear> create(
-        const boost::intrusive_ptr<ExpressionContext>& pCtx);
+    /**
+     * Set the query predicate to apply to the documents in addition to the "near" predicate.
+     */
+    void setQuery(BSONObj newQuery) {
+        query = newQuery.getOwned();
+    };
+
+    /**
+     * The field in which the computed distance will be stored.
+     */
+    FieldPath getDistanceField() const {
+        return *distanceField;
+    }
+
+    /**
+     * The field in which the matching point will be stored, if requested.
+     */
+    boost::optional<FieldPath> getLocationField() const {
+        return includeLocs;
+    }
+
+    /**
+     * The field over which to apply the "near" predicate, if specified.
+     */
+    boost::optional<FieldPath> getKeyField() const {
+        return keyFieldPath;
+    }
+
+    /**
+     * A scaling factor to apply to the distance, if specified by the user.
+     */
+    boost::optional<double> getDistanceMultiplier() const {
+        return distanceMultiplier;
+    }
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    /**
+     * Returns true if the $geoNear specification requires the geoNear point metadata.
+     */
+    bool needsGeoNearPoint() const;
+
+    /**
+     * Converts this $geoNear aggregation stage into an equivalent $near or $nearSphere query on
+     * 'nearFieldName'.
+     */
+    BSONObj asNearQuery(StringData nearFieldName) const;
+
+    /**
+     * In a sharded cluster, this becomes a merge sort by distance, from nearest to furthest.
+     */
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
 private:
     explicit DocumentSourceGeoNear(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    /**
+     * Parses the fields in the object 'options', throwing if an error occurs.
+     */
     void parseOptions(BSONObj options);
-    BSONObj buildGeoNearCmd() const;
-    void runCommand();
 
     // These fields describe the command to run.
-    // coords and distanceField are required, rest are optional
+    // 'coords' and 'distanceField' are required; the rest are optional.
     BSONObj coords;  // "near" option, but near is a reserved keyword on windows
     bool coordsIsArray;
     std::unique_ptr<FieldPath> distanceField;  // Using unique_ptr because FieldPath can't be empty
-    long long limit;
-    double maxDistance;
-    double minDistance;
     BSONObj query;
     bool spherical;
-    double distanceMultiplier;
-    std::unique_ptr<FieldPath> includeLocs;
-
-    // these fields are used while processing the results
-    BSONObj cmdOutput;
-    std::unique_ptr<BSONObjIterator> resultsIterator;  // iterator over cmdOutput["results"]
+    boost::optional<double> maxDistance;
+    boost::optional<double> minDistance;
+    boost::optional<double> distanceMultiplier;
+    boost::optional<FieldPath> includeLocs;
+    boost::optional<FieldPath> keyFieldPath;
 };
-
 }  // namespace mongo

@@ -1,5 +1,14 @@
 // End-to-end testing for index scan explosion + merge sort.
 // SERVER-5063 and SERVER-1205.
+
+// @tags: [
+//     requires_non_retryable_writes,
+//
+//     # Uses $where operator
+//     requires_scripting,
+//     assumes_balancer_off
+// ]
+
 t = db.jstests_sortk;
 t.drop();
 

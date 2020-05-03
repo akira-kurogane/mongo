@@ -3,6 +3,9 @@
  * also checks that fields that should not be in the document are absent
  */
 
+// Skip db hash check because node 2 is slave delayed and may time out on awaitReplication.
+TestData.skipCheckDBHashes = true;
+
 load("jstests/replsets/rslib.js");
 
 // function create the error message if an assert fails
@@ -54,7 +57,7 @@ var checkMember = function(memberInfo) {
     // make sure the result has proper values for fields with known values
     var badValues = [];  // each mistake will be saved as three entries (key, badvalue, goodvalue)
     for (field in memberInfo.goodValues) {
-        if (typeof(memberInfo.goodValues[field]) === "object") {
+        if (typeof (memberInfo.goodValues[field]) === "object") {
             // assumes nested obj is disk in tags this is currently true, but may change
             if (result[field].disk !== memberInfo.goodValues[field].disk) {
                 badValues.push("tags.disk");
@@ -89,7 +92,6 @@ config.members[3].arbiterOnly = true;
 replTest.initiate(config);
 
 var agreeOnPrimaryAndSetVersion = function(setVersion) {
-
     print("Waiting for primary and replica set version " + setVersion);
 
     var nodes = replTest.nodes;
@@ -137,7 +139,7 @@ checkMember({
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[0],
+    conn: replTest._slaves[0],
     name: "slave",
     goodValues: {
         setName: "ismaster",
@@ -153,7 +155,7 @@ checkMember({
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[1],
+    conn: replTest._slaves[1],
     name: "delayed_slave",
     goodValues: {
         setName: "ismaster",
@@ -171,7 +173,7 @@ checkMember({
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[2],
+    conn: replTest._slaves[2],
     name: "arbiter",
     goodValues: {
         setName: "ismaster",
@@ -225,12 +227,11 @@ checkMember({
         ok: 1
     },
     wantedFields: ["hosts", "arbiters", "primary", "me", "maxBsonObjectSize", "localTime"],
-    unwantedFields:
-        ["arbiterOnly", "passives", "passive", "slaveDelay", "hidden", "buildIndexes"]
+    unwantedFields: ["arbiterOnly", "passives", "passive", "slaveDelay", "hidden", "buildIndexes"]
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[0],
+    conn: replTest._slaves[0],
     name: "first_slave",
     goodValues: {
         setName: "ismaster",
@@ -247,7 +248,7 @@ checkMember({
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[1],
+    conn: replTest._slaves[1],
     name: "very_delayed_slave",
     goodValues: {
         setName: "ismaster",
@@ -266,7 +267,7 @@ checkMember({
 });
 
 checkMember({
-    conn: replTest.liveNodes.slaves[2],
+    conn: replTest._slaves[2],
     name: "arbiter",
     goodValues: {
         setName: "ismaster",

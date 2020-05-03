@@ -1,3 +1,5 @@
+// @tags: [requires_fastcount]
+
 t = db.minmaxtest;
 t.drop();
 t.insert({
@@ -21,11 +23,5 @@ t.insert({
 printjson(t.find()
               .min({"_id": "IBM.N|00000000000000000000"})
               .max({"_id": "IBM.N|99999999999999999999"})
+              .hint({_id: 1})
               .toArray());
-
-// this should be 2!!  add assertion when fixed
-// http://jira.mongodb.org/browse/SERVER-675
-print(t.find()
-          .min({"_id": "IBM.N|00000000000000000000"})
-          .max({"_id": "IBM.N|99999999999999999999"})
-          .count());

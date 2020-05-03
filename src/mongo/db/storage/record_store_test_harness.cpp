@@ -1,25 +1,24 @@
-// record_store_test_harness.cpp
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,9 +37,22 @@
 
 namespace mongo {
 namespace {
+std::function<std::unique_ptr<RecordStoreHarnessHelper>()> recordStoreHarnessFactory;
+}
 
-using std::unique_ptr;
+void registerRecordStoreHarnessHelperFactory(
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>()> factory) {
+    recordStoreHarnessFactory = std::move(factory);
+}
+
+auto newRecordStoreHarnessHelper() -> std::unique_ptr<RecordStoreHarnessHelper> {
+    return recordStoreHarnessFactory();
+}
+
+namespace {
+
 using std::string;
+using std::unique_ptr;
 
 TEST(RecordStoreTestHarness, Simple1) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
@@ -60,7 +72,7 @@ TEST(RecordStoreTestHarness, Simple1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc1 = res.getValue();
             uow.commit();
@@ -76,7 +88,7 @@ TEST(RecordStoreTestHarness, Simple1) {
 
         RecordData rd;
         ASSERT(!rs->findRecord(opCtx.get(), RecordId(111, 17), &rd));
-        ASSERT(rd.data() == NULL);
+        ASSERT(rd.data() == nullptr);
 
         ASSERT(rs->findRecord(opCtx.get(), loc1, &rd));
         ASSERT_EQUALS(s, rd.data());
@@ -87,7 +99,7 @@ TEST(RecordStoreTestHarness, Simple1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             uow.commit();
         }
@@ -96,49 +108,6 @@ TEST(RecordStoreTestHarness, Simple1) {
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         ASSERT_EQUALS(2, rs->numRecords(opCtx.get()));
-    }
-}
-
-namespace {
-class DummyDocWriter final : public DocWriter {
-public:
-    virtual ~DummyDocWriter() {}
-
-    virtual void writeDocument(char* buf) const {
-        memcpy(buf, "eliot", 6);
-    }
-
-    virtual size_t documentSize() const {
-        return 6;
-    }
-
-    virtual bool addPadding() const {
-        return false;
-    }
-};
-}
-
-
-TEST(RecordStoreTestHarness, Simple1InsertDocWroter) {
-    const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
-
-    RecordId loc1;
-
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-
-        {
-            WriteUnitOfWork uow(opCtx.get());
-            DummyDocWriter dw;
-            StatusWith<RecordId> res =
-                rs->insertRecordWithDocWriter(opCtx.get(), &dw, Timestamp(1));
-            ASSERT_OK(res.getStatus());
-            loc1 = res.getValue();
-            uow.commit();
-        }
-
-        ASSERT_EQUALS(string("eliot"), rs->dataFor(opCtx.get(), loc1).data());
     }
 }
 
@@ -160,7 +129,7 @@ TEST(RecordStoreTestHarness, Delete1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -205,9 +174,9 @@ TEST(RecordStoreTestHarness, Delete2) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
-            res = rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+            res = rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -248,7 +217,7 @@ TEST(RecordStoreTestHarness, Update1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s1.c_str(), s1.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s1.c_str(), s1.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -264,22 +233,8 @@ TEST(RecordStoreTestHarness, Update1) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            Status status =
-                rs->updateRecord(opCtx.get(), loc, s2.c_str(), s2.size() + 1, false, NULL);
-
-            if (ErrorCodes::NeedsDocumentMove == status) {
-                // NeedsDocumentMove should only be possible under MMAPv1. We don't have the means
-                // to check storageEngine here but asserting 'supportsDocLocking()' is false
-                // provides an equivalent check as only MMAPv1 will/should return false.
-                ASSERT_FALSE(harnessHelper->supportsDocLocking());
-                StatusWith<RecordId> newLocation =
-                    rs->insertRecord(opCtx.get(), s2.c_str(), s2.size() + 1, Timestamp(), false);
-                ASSERT_OK(newLocation.getStatus());
-                rs->deleteRecord(opCtx.get(), loc);
-                loc = newLocation.getValue();
-            } else {
-                ASSERT_OK(status);
-            }
+            Status status = rs->updateRecord(opCtx.get(), loc, s2.c_str(), s2.size() + 1);
+            ASSERT_OK(status);
 
             uow.commit();
         }
@@ -309,7 +264,7 @@ TEST(RecordStoreTestHarness, UpdateInPlace1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s1Rec.data(), s1Rec.size(), Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s1Rec.data(), s1Rec.size(), Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -363,7 +318,7 @@ TEST(RecordStoreTestHarness, Truncate1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -413,7 +368,7 @@ TEST(RecordStoreTestHarness, Cursor1) {
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < N; i++) {
                 string s = str::stream() << "eliot" << i;
-                ASSERT_OK(rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false)
+                ASSERT_OK(rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp())
                               .getStatus());
             }
             uow.commit();

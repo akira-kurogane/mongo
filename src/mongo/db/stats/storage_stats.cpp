@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -55,15 +56,20 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
     bool verbose = param["verbose"].trueValue();
 
     AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    if (!ctx.getDb()) {
-        return {ErrorCodes::BadValue,
-                str::stream() << "Database [" << nss.db().toString() << "] not found."};
-    }
-
-    Collection* collection = ctx.getCollection();
-    if (!collection) {
-        return {ErrorCodes::BadValue,
-                str::stream() << "Collection [" << nss.toString() << "] not found."};
+    Collection* collection = ctx.getCollection();  // Will be set if present
+    if (!ctx.getDb() || !collection) {
+        result->appendNumber("size", 0);
+        result->appendNumber("count", 0);
+        result->appendNumber("storageSize", 0);
+        result->append("totalSize", 0);
+        result->append("nindexes", 0);
+        result->appendNumber("totalIndexSize", 0);
+        result->append("indexDetails", BSONObj());
+        result->append("indexSizes", BSONObj());
+        result->append("scaleFactor", scale);
+        std::string errmsg = !(ctx.getDb()) ? "Database [" + nss.db().toString() + "] not found."
+                                            : "Collection [" + nss.toString() + "] not found.";
+        return {ErrorCodes::NamespaceNotFound, errmsg};
     }
 
     long long size = collection->dataSize(opCtx) / scale;
@@ -75,36 +81,51 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         result->append("avgObjSize", collection->averageObjectSize(opCtx));
 
     RecordStore* recordStore = collection->getRecordStore();
-    result->appendNumber(
-        "storageSize",
-        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0)) / scale);
+    auto storageSize =
+        static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0));
+    result->appendNumber("storageSize", storageSize / scale);
+
+    auto freeStorageSize = static_cast<long long>(recordStore->freeStorageSize(opCtx));
+    if (freeStorageSize != 0) {
+        result->appendNumber("freeStorageSize", freeStorageSize / scale);
+    }
 
     recordStore->appendCustomStats(opCtx, result, scale);
 
     IndexCatalog* indexCatalog = collection->getIndexCatalog();
-    result->append("nindexes", indexCatalog->numIndexesReady(opCtx));
+    result->append("nindexes", indexCatalog->numIndexesTotal(opCtx));
 
     BSONObjBuilder indexDetails;
+    std::vector<std::string> indexBuilds;
 
-    IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(opCtx, false);
-    while (i.more()) {
-        const IndexDescriptor* descriptor = i.next();
-        IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
+    std::unique_ptr<IndexCatalog::IndexIterator> it =
+        indexCatalog->getIndexIterator(opCtx, /*includeUnfinishedIndexes=*/true);
+    while (it->more()) {
+        const IndexCatalogEntry* entry = it->next();
+        const IndexDescriptor* descriptor = entry->descriptor();
+        const IndexAccessMethod* iam = entry->accessMethod();
         invariant(iam);
 
         BSONObjBuilder bob;
         if (iam->appendCustomStats(opCtx, &bob, scale)) {
             indexDetails.append(descriptor->indexName(), bob.obj());
         }
+
+        if (!entry->isReady(opCtx)) {
+            indexBuilds.push_back(descriptor->indexName());
+        }
     }
 
     result->append("indexDetails", indexDetails.obj());
+    result->append("indexBuilds", indexBuilds);
 
     BSONObjBuilder indexSizes;
     long long indexSize = collection->getIndexSize(opCtx, &indexSizes, scale);
 
     result->appendNumber("totalIndexSize", indexSize / scale);
+    result->appendNumber("totalSize", (storageSize + indexSize) / scale);
     result->append("indexSizes", indexSizes.obj());
+    result->append("scaleFactor", scale);
 
     return Status::OK();
 }

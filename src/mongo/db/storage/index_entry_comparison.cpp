@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,10 +28,16 @@
  */
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/storage/index_entry_comparison.h"
+
 #include <ostream>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/key_string.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
 
@@ -106,62 +113,146 @@ int IndexEntryComparison::compare(const IndexKeyEntry& lhs, const IndexKeyEntry&
     return lhs.loc.compare(rhs.loc);  // is supposed to ignore ordering
 }
 
-// reading the comment in the .h file is highly recommended if you need to understand what this
-// function is doing
-BSONObj IndexEntryComparison::makeQueryObject(const BSONObj& keyPrefix,
-                                              int prefixLen,
-                                              bool prefixExclusive,
-                                              const std::vector<const BSONElement*>& keySuffix,
-                                              const std::vector<bool>& suffixInclusive,
-                                              const int cursorDirection) {
-    // Please read the comments in the header file to see why this is done.
-    // The basic idea is that we use the field name to store a byte which indicates whether
-    // each field in the query object is inclusive and exclusive, and if it is exclusive, in
-    // which direction.
-    const char exclusiveByte = (cursorDirection == 1 ? greater : less);
+KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+    const IndexSeekPoint& seekPoint, KeyString::Version version, Ordering ord, bool isForward) {
 
-    const StringData exclusiveFieldName(&exclusiveByte, 1);
+    // Determines the discriminator used to build the KeyString.
+    auto suffixExclusive = [&]() {
+        for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
+            if (!seekPoint.suffixInclusive[i])
+                return true;
+        }
+        return false;
+    };
+    bool inclusive = !seekPoint.prefixExclusive && !suffixExclusive();
+    const auto discriminator = isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
+                                                      : KeyString::Discriminator::kExclusiveAfter;
 
-    BSONObjBuilder bb;
+    KeyString::Builder builder(version, ord, discriminator);
 
-    // handle the prefix
-    if (prefixLen > 0) {
-        BSONObjIterator it(keyPrefix);
-        for (int i = 0; i < prefixLen; i++) {
+    // Appends keyPrefix elements to the builder.
+    if (seekPoint.prefixLen > 0) {
+        BSONObjIterator it(seekPoint.keyPrefix);
+        for (int i = 0; i < seekPoint.prefixLen; i++) {
             invariant(it.more());
             const BSONElement e = it.next();
-
-            if (prefixExclusive && i == prefixLen - 1) {
-                bb.appendAs(e, exclusiveFieldName);
-            } else {
-                bb.appendAs(e, StringData());
-            }
+            builder.appendBSONElement(e);
         }
     }
 
-    // If the prefix is exclusive then the suffix does not matter as it will never be used
-    if (prefixExclusive) {
-        invariant(prefixLen > 0);
-        return bb.obj();
+    // If the prefix is exclusive then the suffix does not matter as it will never be used.
+    if (seekPoint.prefixExclusive) {
+        invariant(seekPoint.prefixLen > 0);
+        return builder.getValueCopy();
     }
 
-    // Handle the suffix. Note that the useful parts of the suffix start at index prefixLen
-    // rather than at 0.
-    invariant(keySuffix.size() == suffixInclusive.size());
-    for (size_t i = prefixLen; i < keySuffix.size(); i++) {
-        invariant(keySuffix[i]);
-        if (suffixInclusive[i]) {
-            bb.appendAs(*keySuffix[i], StringData());
+    // Handles the suffix. Note that the useful parts of the suffix start at index prefixLen rather
+    // than at 0.
+    invariant(seekPoint.keySuffix.size() == seekPoint.suffixInclusive.size());
+    for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
+        invariant(seekPoint.keySuffix[i]);
+        builder.appendBSONElement(*seekPoint.keySuffix[i]);
+
+        // If an exclusive field exists then no fields after this will matter, since an
+        // exclusive field never evaluates as equal.
+        if (!seekPoint.suffixInclusive[i]) {
+            return builder.getValueCopy();
+        }
+    }
+    return builder.getValueCopy();
+}
+
+KeyString::Value IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(const BSONObj& bsonKey,
+                                                                       KeyString::Version version,
+                                                                       Ordering ord,
+                                                                       bool isForward,
+                                                                       bool inclusive) {
+    BSONObj finalKey = BSONObj::stripFieldNames(bsonKey);
+    KeyString::Builder builder(version,
+                               finalKey,
+                               ord,
+                               isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
+                                                      : KeyString::Discriminator::kExclusiveAfter);
+    return builder.getValueCopy();
+}
+
+Status buildDupKeyErrorStatus(const BSONObj& key,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation) {
+    const bool hasCollation = !indexCollation.isEmpty();
+
+    StringBuilder sb;
+    sb << "E11000 duplicate key error";
+    sb << " collection: " << collectionNamespace;
+    sb << " index: " << indexName;
+    if (hasCollation) {
+        sb << " collation: " << indexCollation;
+    }
+    sb << " dup key: ";
+
+    // For the purpose of producing a useful error message, generate a representation of the key
+    // with field names hydrated and with invalid UTF-8 hex-encoded.
+    BSONObjBuilder builderForErrmsg;
+
+    // Used to build a version of the key after hydrating with field names but without hex encoding
+    // invalid UTF-8. This key is attached to the extra error info and consumed by callers who may
+    // wish to retry on duplicate key errors. The field names are rehydrated so that we don't return
+    // BSON with duplicate key names to clients.
+    BSONObjBuilder builderForErrorExtraInfo;
+
+    // key is a document with forms like: '{ : 123}', '{ : {num: 123} }', '{ : 123, : "str" }'
+    BSONObjIterator keyValueIt(key);
+    // keyPattern is a document with only one level. e.g. '{a : 1, b : -1}', '{a.b : 1}'
+    BSONObjIterator keyNameIt(keyPattern);
+    // Combine key and keyPattern into one document which represents a mapping from indexFieldName
+    // to indexKey.
+    while (1) {
+        BSONElement keyValueElem = keyValueIt.next();
+        BSONElement keyNameElem = keyNameIt.next();
+        if (keyNameElem.eoo())
+            break;
+
+        builderForErrorExtraInfo.appendAs(keyValueElem, keyNameElem.fieldName());
+
+        // If the duplicate key value contains a string, then it's possible that the string contains
+        // binary data which is not valid UTF-8. This is true for all indexes with a collation,
+        // since the index stores collation keys rather than raw user strings. But it's also
+        // possible that the application has stored binary data inside a string, which the system
+        // has never rejected.
+        //
+        // If the string in the key is invalid UTF-8, then we hex encode it before adding it to the
+        // error message so that the driver can assume valid UTF-8 when reading the reply.
+        const bool shouldHexEncode = keyValueElem.type() == BSONType::String &&
+            (hasCollation || !isValidUTF8(keyValueElem.valueStringData()));
+
+        if (shouldHexEncode) {
+            auto stringToEncode = keyValueElem.valueStringData();
+            builderForErrmsg.append(
+                keyNameElem.fieldName(),
+                str::stream() << "0x"
+                              << toHexLower(stringToEncode.rawData(), stringToEncode.size()));
         } else {
-            bb.appendAs(*keySuffix[i], exclusiveFieldName);
-
-            // If an exclusive field exists then no fields after this will matter, since an
-            // exclusive field never evaluates as equal
-            return bb.obj();
+            builderForErrmsg.appendAs(keyValueElem, keyNameElem.fieldName());
         }
     }
 
-    return bb.obj();
+    sb << builderForErrmsg.obj();
+
+    return Status(DuplicateKeyErrorInfo(keyPattern, builderForErrorExtraInfo.obj()), sb.str());
+}
+
+Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation,
+                              const Ordering& ordering) {
+    const BSONObj key = KeyString::toBson(
+        keyString.getBuffer(), keyString.getSize(), ordering, keyString.getTypeBits());
+
+    return buildDupKeyErrorStatus(key, collectionNamespace, indexName, keyPattern, indexCollation);
 }
 
 }  // namespace mongo

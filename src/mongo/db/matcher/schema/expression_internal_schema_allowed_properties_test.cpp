@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,17 +32,18 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
-constexpr auto kSimpleCollator = nullptr;
 
 TEST(InternalSchemaAllowedPropertiesMatchExpression, MatchesObjectsWithListedProperties) {
     auto filter = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a', 'b'],"
         "namePlaceholder: 'i', patternProperties: [], otherwise: {i: 0}}}");
-    auto expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
 
     ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{a: 1, b: 1}")));
@@ -60,7 +62,8 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, MatchesObjectsWithMatchingP
             ],
             otherwise: {i: {$type: 'string'}}
         }})");
-    auto expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
 
     ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{puppies: 2, kittens: 3, phoneNum: 1234}")));
@@ -73,7 +76,8 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression,
     auto filter = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'a',"
         "patternProperties: [{regex: /a/, expression: {a: {$gt: 5}}}], otherwise: {a: 0}}}");
-    auto expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
 
     ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{a: 6}")));
@@ -92,7 +96,8 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, OtherwiseEnforcedWhenApprop
             ],
             otherwise: {i: {$type: 'string'}}
         }})");
-    auto expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
 
     ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{foo: 'bar'}")));
@@ -103,7 +108,8 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
     auto filter = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'i',"
         "patternProperties: [{regex: /a/, expression: {i: 1}}], otherwise: {i: 7}}}");
-    auto expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
     auto clone = expr.getValue()->shallowClone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
@@ -111,7 +117,7 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
     filter = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: [], namePlaceholder: 'i',"
         "patternProperties: [], otherwise: {}}}");
-    expr = MatchExpressionParser::parse(filter, kSimpleCollator);
+    expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
     clone = expr.getValue()->shallowClone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
@@ -121,7 +127,8 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, HasCorrectNumberOfChilden) 
     auto query = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'i',"
         "patternProperties: [{regex: /a/, expression: {i: 1}}], otherwise: {i: 7}}}");
-    auto objMatch = MatchExpressionParser::parse(query, nullptr);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto objMatch = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(objMatch.getStatus());
 
     ASSERT_EQ(objMatch.getValue()->numChildren(), 2U);
@@ -134,7 +141,8 @@ DEATH_TEST(InternalSchemaAllowedPropertiesMatchExpression,
     auto query = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'i',"
         "patternProperties: [{regex: /a/, expression: {i: 1}}], otherwise: {i: 7}}}");
-    auto objMatch = MatchExpressionParser::parse(query, nullptr);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto objMatch = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(objMatch.getStatus());
 
     const size_t numChildren = 2;

@@ -6,11 +6,11 @@
  * Creates a capped collection and then repeatedly executes the renameCollection
  * command against it. Inserts documents into the "to" namespace and specifies
  * dropTarget=true.
+ *
+ * @tags: [requires_capped]
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropCollections
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as a prefix for the collection name,
         // since the workload name is assumed to be unique.
@@ -18,7 +18,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         var options = {capped: true, size: 4096};
 
         function uniqueCollectionName(prefix, tid, num) {
@@ -28,7 +27,7 @@ var $config = (function() {
         function insert(db, collName, numDocs) {
             for (var i = 0; i < numDocs; ++i) {
                 var res = db[collName].insert({});
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
                 assertAlways.eq(1, res.nInserted);
             }
         }
@@ -70,15 +69,9 @@ var $config = (function() {
         }
 
         return {init: init, rename: rename};
-
     })();
 
     var transitions = {init: {rename: 1}, rename: {rename: 1}};
-
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropCollections(db, pattern);
-    }
 
     return {
         threadCount: 10,
@@ -86,7 +79,5 @@ var $config = (function() {
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
-
 })();

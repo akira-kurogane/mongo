@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,11 +36,11 @@
 #include <boost/math/distributions/beta.hpp>
 
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 using boost::intrusive_ptr;
@@ -49,14 +50,14 @@ DocumentSourceSampleFromRandomCursor::DocumentSourceSampleFromRandomCursor(
     long long size,
     std::string idField,
     long long nDocsInCollection)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _size(size),
       _idField(std::move(idField)),
       _seenDocs(pExpCtx->getValueComparator().makeUnorderedValueSet()),
       _nDocsInColl(nDocsInCollection) {}
 
 const char* DocumentSourceSampleFromRandomCursor::getSourceName() const {
-    return "$sampleFromRandomCursor";
+    return kStageName.rawData();
 }
 
 namespace {
@@ -74,9 +75,7 @@ double smallestFromSampleOfUniform(PseudoRandom* prng, size_t N) {
 }
 }  // namespace
 
-DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::doGetNext() {
     if (_seenDocs.size() >= static_cast<size_t>(_size))
         return GetNextResult::makeEOF();
 
@@ -91,11 +90,12 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNext() {
     _randMetaFieldVal -= smallestFromSampleOfUniform(&prng, _nDocsInColl);
 
     MutableDocument md(nextResult.releaseDocument());
-    md.setRandMetaField(_randMetaFieldVal);
+    md.metadata().setRandVal(_randMetaFieldVal);
     if (pExpCtx->needsMerge) {
         // This stage will be merged by sorting results according to this random metadata field, but
         // the merging logic expects to sort by the sort key metadata.
-        md.setSortKeyMetaField(BSON("" << _randMetaFieldVal));
+        const bool isSingleElementKey = true;
+        md.metadata().setSortKey(Value(_randMetaFieldVal), isSingleElementKey);
     }
     return md.freeze();
 }
@@ -115,16 +115,16 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNextNonDu
                             << _idField
                             << " field in order to de-duplicate results, but encountered a "
                                "document without a "
-                            << _idField
-                            << " field: "
-                            << nextInput.getDocument().toString(),
+                            << _idField << " field: " << nextInput.getDocument().toString(),
                         !idField.missing());
 
                 if (_seenDocs.insert(std::move(idField)).second) {
                     return nextInput;
                 }
-                LOG(1) << "$sample encountered duplicate document: "
-                       << nextInput.getDocument().toString();
+                LOGV2_DEBUG(20903,
+                            1,
+                            "$sample encountered duplicate document: {nextInput_getDocument}",
+                            "nextInput_getDocument"_attr = nextInput.getDocument().toString());
                 break;  // Try again with the next document.
             }
             case GetNextResult::ReturnStatus::kPauseExecution: {
@@ -148,10 +148,9 @@ Value DocumentSourceSampleFromRandomCursor::serialize(
     return Value(DOC(getSourceName() << DOC("size" << _size)));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceSampleFromRandomCursor::getDependencies(
-    DepsTracker* deps) const {
+DepsTracker::State DocumentSourceSampleFromRandomCursor::getDependencies(DepsTracker* deps) const {
     deps->fields.insert(_idField);
-    return SEE_NEXT;
+    return DepsTracker::State::SEE_NEXT;
 }
 
 intrusive_ptr<DocumentSourceSampleFromRandomCursor> DocumentSourceSampleFromRandomCursor::create(
@@ -163,4 +162,4 @@ intrusive_ptr<DocumentSourceSampleFromRandomCursor> DocumentSourceSampleFromRand
         new DocumentSourceSampleFromRandomCursor(expCtx, size, idField, nDocsInCollection));
     return source;
 }
-}  // mongo
+}  // namespace mongo

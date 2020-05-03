@@ -1,47 +1,47 @@
-// get_last_error.cpp
-
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -60,19 +60,19 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
 
     bool requiresAuth() const override {
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "reset error state (used with getpreverror)";
+    std::string help() const override {
+        return "reset error state";
     }
     CmdResetError() : BasicCommand("resetError", "reseterror") {}
     bool run(OperationContext* opCtx,
@@ -90,26 +90,26 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
 
     bool requiresAuth() const override {
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "return error status of the last operation on this connection\n"
-             << "options:\n"
-             << "  { fsync:true } - fsync before returning, or wait for journal commit if running "
-                "with --journal\n"
-             << "  { j:true } - wait for journal commit if running with --journal\n"
-             << "  { w:n } - await replication to n servers (including self) before returning\n"
-             << "  { w:'majority' } - await replication to majority of set\n"
-             << "  { wtimeout:m} - timeout for w in m milliseconds";
+    std::string help() const override {
+        return "return error status of the last operation on this connection\n"
+               "options:\n"
+               "  { fsync:true } - fsync before returning, or wait for journal commit if running "
+               "with --journal\n"
+               "  { j:true } - wait for journal commit if running with --journal\n"
+               "  { w:n } - await replication to n servers (including self) before returning\n"
+               "  { w:'majority' } - await replication to majority of set\n"
+               "  { wtimeout:m} - timeout for w in m milliseconds";
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -146,15 +146,11 @@ public:
 
         // Always append lastOp and connectionId
         Client& c = *opCtx->getClient();
-        auto replCoord = repl::getGlobalReplicationCoordinator();
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
             const repl::OpTime lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
             if (!lastOp.isNull()) {
-                if (replCoord->isV1ElectionProtocol()) {
-                    lastOp.append(&result, "lastOp");
-                } else {
-                    result.append("lastOp", lastOp.getTimestamp());
-                }
+                lastOp.append(&result, "lastOp");
             }
         }
 
@@ -176,15 +172,13 @@ public:
             Status status = bsonExtractOpTimeField(cmdObj, "wOpTime", &lastOpTime);
             if (!status.isOK()) {
                 result.append("badGLE", cmdObj);
-                return appendCommandStatus(result, status);
+                return CommandHelpers::appendCommandStatusNoThrow(result, status);
             }
         } else {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "Expected \"wOpTime\" field in getLastError to "
-                                        "have type Date, Timestamp, or OpTime but found type "
-                                     << typeName(opTimeElement.type())));
+            uasserted(ErrorCodes::TypeMismatch,
+                      str::stream() << "Expected \"wOpTime\" field in getLastError to "
+                                       "have type Date, Timestamp, or OpTime but found type "
+                                    << typeName(opTimeElement.type()));
         }
 
 
@@ -194,7 +188,7 @@ public:
             FieldParser::extract(cmdObj, wElectionIdField, &electionId, &errmsg);
         if (!extracted) {
             result.append("badGLE", cmdObj);
-            appendCommandStatus(result, false, errmsg);
+            CommandHelpers::appendSimpleCommandStatus(result, false, errmsg);
             return false;
         }
 
@@ -213,7 +207,7 @@ public:
         BSONObj writeConcernDoc = ([&] {
             BSONObjBuilder bob;
             for (auto&& elem : cmdObj) {
-                if (!Command::isGenericArgument(elem.fieldNameStringData()))
+                if (!isGenericArgument(elem.fieldNameStringData()))
                     bob.append(elem);
             }
             return bob.obj();
@@ -227,24 +221,23 @@ public:
         WriteConcernOptions writeConcern;
 
         if (useDefaultGLEOptions) {
-            writeConcern = repl::getGlobalReplicationCoordinator()->getGetLastErrorDefault();
+            writeConcern = repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
         }
 
-        Status status = writeConcern.parse(writeConcernDoc);
+        auto sw = WriteConcernOptions::parse(writeConcernDoc);
+        Status status = sw.getStatus();
 
         //
         // Validate write concern no matter what, this matches 2.4 behavior
         //
         if (status.isOK()) {
-            // Ensure options are valid for this host. Since getLastError doesn't do writes itself,
-            // treat it as if these are admin database writes, which need to be replicated so we do
-            // the strictest checks write concern checks.
-            status = validateWriteConcern(opCtx, writeConcern, NamespaceString::kAdminDb);
+            writeConcern = sw.getValue();
+            status = validateWriteConcern(opCtx, writeConcern);
         }
 
         if (!status.isOK()) {
             result.append("badGLE", writeConcernDoc);
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
         // Don't wait for replication if there was an error reported - this matches 2.4 behavior
@@ -259,7 +252,7 @@ public:
 
         // If we got an electionId, make sure it matches
         if (electionIdPresent) {
-            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+            if (repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
                 repl::ReplicationCoordinator::modeReplSet) {
                 // Ignore electionIds of 0 from mongos.
                 if (electionId != OID()) {
@@ -269,9 +262,14 @@ public:
                     return false;
                 }
             } else {
-                if (electionId != repl::getGlobalReplicationCoordinator()->getElectionId()) {
-                    LOG(3) << "oid passed in is " << electionId << ", but our id is "
-                           << repl::getGlobalReplicationCoordinator()->getElectionId();
+                if (electionId != repl::ReplicationCoordinator::get(opCtx)->getElectionId()) {
+                    LOGV2_DEBUG(20476,
+                                3,
+                                "oid passed in is {electionId}, but our id is "
+                                "{repl_ReplicationCoordinator_get_opCtx_getElectionId}",
+                                "electionId"_attr = electionId,
+                                "repl_ReplicationCoordinator_get_opCtx_getElectionId"_attr =
+                                    repl::ReplicationCoordinator::get(opCtx)->getElectionId());
                     errmsg = "election occurred after write";
                     result.append("code", ErrorCodes::WriteConcernFailed);
                     result.append("codeName",
@@ -288,7 +286,19 @@ public:
 
         WriteConcernResult wcResult;
         status = waitForWriteConcern(opCtx, lastOpTime, writeConcern, &wcResult);
-        wcResult.appendTo(writeConcern, &result);
+        // getLastError command returns a document that contains the writtenTo array. So we compute
+        // the writtenTo array here if we have waited for replication before. The call to
+        // getHostsWrittenTo needs to lock the ReplicationCoordinator mutex to guard against
+        // topology changes. Thus, we only compute this array here for the getLastError command
+        // (instead of in waitForWriteConcern for every single write) to avoid a serialization point
+        // for all writes.
+        if (!lastOpTime.isNull() && writeConcern.needToWaitForOtherNodes()) {
+            wcResult.writtenTo = replCoord->getHostsWrittenTo(
+                lastOpTime,
+                replCoord->populateUnsetWriteConcernOptionsSyncMode(writeConcern).syncMode ==
+                    WriteConcernOptions::SyncMode::JOURNAL);
+        }
+        wcResult.appendTo(&result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0
         if (wcResult.wTimedOut) {
@@ -300,43 +310,10 @@ public:
             return true;
         }
 
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatusNoThrow(result, status);
     }
 
 } cmdGetLastError;
-
-class CmdGetPrevError : public BasicCommand {
-public:
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual void help(stringstream& help) const {
-        help << "check for errors since last reseterror commandcal";
-    }
-    virtual bool slaveOk() const {
-        return true;
-    }
-    bool requiresAuth() const override {
-        return false;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
-    CmdGetPrevError() : BasicCommand("getPrevError", "getpreverror") {}
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        LastError* le = &LastError::get(opCtx->getClient());
-        le->disable();
-        le->appendSelf(result, true);
-        if (le->isValid())
-            result.append("nPrev", le->getNPrev());
-        else
-            result.append("nPrev", -1);
-        return true;
-    }
-} cmdGetPrevError;
 
 }  // namespace
 }  // namespace mongo

@@ -1,7 +1,6 @@
 load("jstests/replsets/rslib.js");
 
 doTest = function(signal) {
-
     // Test basic replica set functionality.
     // -- Replication
     // -- Failover
@@ -33,7 +32,7 @@ doTest = function(signal) {
     // and slaves in the set and wait until the change has replicated.
     replTest.awaitReplication();
 
-    slaves = replTest.liveNodes.slaves;
+    slaves = replTest._slaves;
     assert(slaves.length == 2, "Expected 2 slaves but length was " + slaves.length);
     slaves.forEach(function(slave) {
         // try to read from slave
@@ -45,34 +44,6 @@ doTest = function(signal) {
         print("Doing a findOne to verify we can get a row");
         var one = slave.getDB("foo").foo.findOne();
         printjson(one);
-
-        //        stats = slave.getDB("foo").adminCommand({replSetGetStatus:1});
-        //        printjson(stats);
-
-        print("Calling group() with slaveOk=true, must succeed");
-        slave.slaveOk = true;
-        count = slave.getDB("foo").foo.group({
-            initial: {n: 0},
-            reduce: function(obj, out) {
-                out.n++;
-            }
-        });
-        printjson(count);
-        assert.eq(len, count[0].n, "slave group count wrong: " + slave);
-
-        print("Calling group() with slaveOk=false, must fail");
-        slave.slaveOk = false;
-        try {
-            count = slave.getDB("foo").foo.group({
-                initial: {n: 0},
-                reduce: function(obj, out) {
-                    out.n++;
-                }
-            });
-            assert(false, "group() succeeded with slaveOk=false");
-        } catch (e) {
-            print("Received exception: " + e);
-        }
 
         print("Calling inline mr() with slaveOk=true, must succeed");
         slave.slaveOk = true;
@@ -111,7 +82,6 @@ doTest = function(signal) {
         } catch (e) {
             print("Received exception: " + e);
         }
-
     });
 
     // Shut down the set and finish the test.

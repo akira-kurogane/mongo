@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,55 +30,34 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
-#include <boost/optional/optional_io.hpp>
 #include <map>
+#include <memory>
 #include <string>
-#include <type_traits>
 #include <vector>
 
-#include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
 #include "mongo/bson/json.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/remote_command_targeter_factory_mock.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/executor/task_executor_pool.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/dist_lock_catalog_mock.h"
 #include "mongo/s/catalog/replset_dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
-#include "mongo/s/client/shard_factory.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/client/shard_remote.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/sharding_mongod_test_fixture.h"
+#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/tick_source_mock.h"
 #include "mongo/util/time_support.h"
 
 /**
- * Tests for ReplSetDistLockManager. Note that unlock and ping operations are executed on a
- * separate thread. And since this thread cannot capture the assertion exceptions, all the
- * assertion calls should be performed on the main thread.
+ * Tests for ReplSetDistLockManager. Note that unlock and ping operations are executed on a separate
+ * thread. And since this thread cannot capture the assertion exceptions, all the assertion calls
+ * should be performed on the main thread.
  */
-
 namespace mongo {
 namespace {
-
-using std::map;
-using std::string;
-using std::vector;
 
 // Max duration to wait to satisfy test invariant before joining with main test thread.
 const Seconds kJoinTimeout(30);
@@ -88,8 +68,34 @@ const Seconds kLockExpiration(10);
  * Basic fixture for ReplSetDistLockManager that starts it up before the test begins
  * and shuts it down when a test finishes.
  */
-class ReplSetDistLockManagerFixture : public ShardingMongodTestFixture {
-public:
+class ReplSetDistLockManagerFixture : public ShardServerTestFixture {
+protected:
+    void tearDown() override {
+        // Don't care about what shutDown passes to stopPing here.
+        getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
+
+        ShardServerTestFixture::tearDown();
+    }
+
+    std::unique_ptr<DistLockManager> makeDistLockManager(
+        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
+        invariant(distLockCatalog);
+        return std::make_unique<ReplSetDistLockManager>(getServiceContext(),
+                                                        _processID,
+                                                        std::move(distLockCatalog),
+                                                        kPingInterval,
+                                                        kLockExpiration);
+    }
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager) override {
+        return std::make_unique<ShardingCatalogClientMock>(std::move(distLockManager));
+    }
+
+    std::unique_ptr<BalancerConfiguration> makeBalancerConfiguration() override {
+        return std::make_unique<BalancerConfiguration>();
+    }
+
     /**
      * Returns the mocked catalog used by the lock manager being tested.
      */
@@ -102,96 +108,45 @@ public:
     /**
      * Get the process id that was initialized with the lock manager being tested.
      */
-    string getProcessID() const {
+    std::string getProcessID() const {
         return _processID;
     }
 
-protected:
-    virtual std::unique_ptr<TickSource> makeTickSource() {
-        return stdx::make_unique<SystemTickSource>();
-    }
-
-    void setUp() override {
-        ShardingMongodTestFixture::setUp();
-
-        getServiceContext()->setTickSource(makeTickSource());
-
-        // Initialize sharding components as a shard server.
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        ConnectionString configCS = ConnectionString::forReplicaSet(
-            "configReplSet", std::vector<HostAndPort>{HostAndPort{"config"}});
-        uassertStatusOK(initializeGlobalShardingStateForMongodForTest(configCS));
-    }
-
-    void tearDown() override {
-        // Don't care about what shutDown passes to stopPing here.
-        getMockCatalog()->expectStopPing([](StringData) {}, Status::OK());
-        ShardingMongodTestFixture::tearDown();
-    }
-
-    std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override {
-        return stdx::make_unique<DistLockCatalogMock>();
-    }
-
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        invariant(distLockCatalog);
-        return stdx::make_unique<ReplSetDistLockManager>(getServiceContext(),
-                                                         _processID,
-                                                         std::move(distLockCatalog),
-                                                         kPingInterval,
-                                                         kLockExpiration);
-    }
-
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) {
-        return stdx::make_unique<ShardingCatalogClientMock>(std::move(distLockManager));
-    }
-
-    std::unique_ptr<BalancerConfiguration> makeBalancerConfiguration() {
-        return stdx::make_unique<BalancerConfiguration>();
-    }
-
 private:
-    string _processID = "test";
+    std::string _processID = "test";
 };
 
 class RSDistLockMgrWithMockTickSource : public ReplSetDistLockManagerFixture {
-public:
-    /**
-     * Override the way the fixture gets the tick source to install to use a mock tick source.
-     */
-    std::unique_ptr<TickSource> makeTickSource() override {
-        return stdx::make_unique<TickSourceMock>();
+protected:
+    RSDistLockMgrWithMockTickSource() {
+        getServiceContext()->setTickSource(std::make_unique<TickSourceMock<>>());
     }
 
     /**
      * Returns the mock tick source.
      */
-    TickSourceMock* getMockTickSource() {
-        return dynamic_cast<TickSourceMock*>(getGlobalServiceContext()->getTickSource());
+    TickSourceMock<>* getMockTickSource() {
+        return dynamic_cast<TickSourceMock<>*>(getServiceContext()->getTickSource());
     }
 };
 
 std::string mapToString(const std::map<OID, int>& map) {
     StringBuilder str;
-
     for (const auto& entry : map) {
         str << "(" << entry.first.toString() << ": " << entry.second << ")";
     }
 
     return str.str();
-};
+}
 
 std::string vectorToString(const std::vector<OID>& list) {
     StringBuilder str;
-
     for (const auto& entry : list) {
         str << "(" << entry.toString() << ")";
     }
 
     return str.str();
-};
+}
 
 /**
  * Test scenario:
@@ -200,9 +155,9 @@ std::string vectorToString(const std::vector<OID>& list) {
  * 3. Check lock id used in lock and unlock are the same.
  */
 TEST_F(ReplSetDistLockManagerFixture, BasicLockLifeCycle) {
-    string lockName("test");
+    std::string lockName("test");
     Date_t now(Date_t::now());
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     LocksType retLockDoc;
     retLockDoc.setName(lockName);
@@ -262,11 +217,11 @@ TEST_F(ReplSetDistLockManagerFixture, BasicLockLifeCycle) {
  * 4. Check lock id used in lock and unlock are the same.
  */
 TEST_F(RSDistLockMgrWithMockTickSource, LockSuccessAfterRetry) {
-    string lockName("test");
-    string me("me");
+    std::string lockName("test");
+    std::string me("me");
     boost::optional<OID> lastTS;
     Date_t lastTime(Date_t::now());
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     int retryAttempt = 0;
     const int kMaxRetryAttempt = 3;
@@ -297,7 +252,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockSuccessAfterRetry) {
             ASSERT_EQUALS(lockName, lockID);
             // Lock session ID should be the same after first attempt.
             if (lastTS) {
-                ASSERT_EQUALS(lastTS, lockSessionID);
+                ASSERT_EQUALS(*lastTS, lockSessionID);
             }
             ASSERT_EQUALS(getProcessID(), processId);
             ASSERT_GREATER_THAN_OR_EQUALS(time, lastTime);
@@ -319,7 +274,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockSuccessAfterRetry) {
                         ASSERT_EQUALS(lockName, lockID);
                         // Lock session ID should be the same after first attempt.
                         if (lastTS) {
-                            ASSERT_EQUALS(lastTS, lockSessionID);
+                            ASSERT_EQUALS(*lastTS, lockSessionID);
                         }
                         ASSERT_TRUE(lockSessionID.isSet());
                         ASSERT_EQUALS(getProcessID(), processId);
@@ -385,7 +340,8 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockSuccessAfterRetry) {
     }
 
     ASSERT_EQUALS(1, unlockCallCount);
-    ASSERT_EQUALS(lastTS, unlockSessionIDPassed);
+    ASSERT(lastTS);
+    ASSERT_EQUALS(*lastTS, unlockSessionIDPassed);
 }
 
 /**
@@ -396,11 +352,11 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockSuccessAfterRetry) {
  * 4. Make sure that unlock is called to cleanup the last lock attempted that error out.
  */
 TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
-    string lockName("test");
-    string me("me");
+    std::string lockName("test");
+    std::string me("me");
     boost::optional<OID> lastTS;
     Date_t lastTime(Date_t::now());
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     int retryAttempt = 0;
     const int kMaxRetryAttempt = 3;
@@ -416,7 +372,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
             ASSERT_EQUALS(lockName, lockID);
             // Lock session ID should be the same after first attempt.
             if (lastTS) {
-                ASSERT_EQUALS(lastTS, lockSessionID);
+                ASSERT_EQUALS(*lastTS, lockSessionID);
             }
             ASSERT_EQUALS(getProcessID(), processId);
             ASSERT_GREATER_THAN_OR_EQUALS(time, lastTime);
@@ -438,7 +394,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
                         ASSERT_EQUALS(lockName, lockID);
                         // Lock session ID should be the same after first attempt.
                         if (lastTS) {
-                            ASSERT_EQUALS(lastTS, lockSessionID);
+                            ASSERT_EQUALS(*lastTS, lockSessionID);
                         }
                         lastTS = lockSessionID;
                         ASSERT_TRUE(lockSessionID.isSet());
@@ -457,7 +413,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
     getMockCatalog()->expectGetLockByName([](StringData) {},
                                           {ErrorCodes::LockNotFound, "not found!"});
 
-    stdx::mutex unlockMutex;
+    auto unlockMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable unlockCV;
     OID unlockSessionIDPassed;
     int unlockCallCount = 0;
@@ -465,7 +421,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
     getMockCatalog()->expectUnLock(
         [&unlockMutex, &unlockCV, &unlockCallCount, &unlockSessionIDPassed](
             const OID& lockSessionID) {
-            stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+            stdx::unique_lock<Latch> lk(unlockMutex);
             unlockCallCount++;
             unlockSessionIDPassed = lockSessionID;
             unlockCV.notify_all();
@@ -479,7 +435,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+        stdx::unique_lock<Latch> lk(unlockMutex);
         if (unlockCallCount == 0) {
             didTimeout =
                 unlockCV.wait_for(lk, kJoinTimeout.toSystemDuration()) == stdx::cv_status::timeout;
@@ -498,7 +454,8 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockFailsAfterRetry) {
 
     ASSERT_FALSE(didTimeout);
     ASSERT_EQUALS(1, unlockCallCount);
-    ASSERT_EQUALS(lastTS, unlockSessionIDPassed);
+    ASSERT(lastTS);
+    ASSERT_EQUALS(*lastTS, unlockSessionIDPassed);
 }
 
 TEST_F(ReplSetDistLockManagerFixture, LockBusyNoRetry) {
@@ -526,11 +483,11 @@ TEST_F(ReplSetDistLockManagerFixture, LockBusyNoRetry) {
  * 5. Implicitly check that unlock is not called (default setting of mock catalog).
  */
 TEST_F(RSDistLockMgrWithMockTickSource, LockRetryTimeout) {
-    string lockName("test");
-    string me("me");
+    std::string lockName("test");
+    std::string me("me");
     boost::optional<OID> lastTS;
     Date_t lastTime(Date_t::now());
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     int retryAttempt = 0;
 
@@ -544,7 +501,7 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockRetryTimeout) {
             ASSERT_EQUALS(lockName, lockID);
             // Lock session ID should be the same after first attempt.
             if (lastTS) {
-                ASSERT_EQUALS(lastTS, lockSessionID);
+                ASSERT_EQUALS(*lastTS, lockSessionID);
             }
             ASSERT_EQUALS(getProcessID(), processId);
             ASSERT_GREATER_THAN_OR_EQUALS(time, lastTime);
@@ -578,10 +535,10 @@ TEST_F(RSDistLockMgrWithMockTickSource, LockRetryTimeout) {
  * 4. Check that lockSessionID used on all unlock is the same as the one used to grab lock.
  */
 TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
-    string lockName("test");
-    string me("me");
+    std::string lockName("test");
+    std::string me("me");
     OID lastTS;
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     getMockCatalog()->expectGrabLock(
         [this, &lockName, &lastTS, &me, &whyMsg](StringData lockID,
@@ -601,7 +558,7 @@ TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
         },
         {ErrorCodes::ExceededMemoryLimit, "bad remote server"});
 
-    stdx::mutex unlockMutex;
+    auto unlockMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable unlockCV;
     int unlockCallCount = 0;
     OID unlockSessionIDPassed;
@@ -609,7 +566,7 @@ TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
     getMockCatalog()->expectUnLock(
         [&unlockMutex, &unlockCV, &unlockCallCount, &unlockSessionIDPassed](
             const OID& lockSessionID) {
-            stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+            stdx::unique_lock<Latch> lk(unlockMutex);
             unlockCallCount++;
             unlockSessionIDPassed = lockSessionID;
             unlockCV.notify_all();
@@ -623,7 +580,7 @@ TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+        stdx::unique_lock<Latch> lk(unlockMutex);
         if (unlockCallCount == 0) {
             didTimeout =
                 unlockCV.wait_for(lk, kJoinTimeout.toSystemDuration()) == stdx::cv_status::timeout;
@@ -652,13 +609,13 @@ TEST_F(ReplSetDistLockManagerFixture, MustUnlockOnLockError) {
  * 3. Check that correct process is being pinged.
  */
 TEST_F(ReplSetDistLockManagerFixture, LockPinging) {
-    stdx::mutex testMutex;
+    auto testMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable ping3TimesCV;
-    vector<string> processIDList;
+    std::vector<std::string> processIDList;
 
     getMockCatalog()->expectPing(
         [&testMutex, &ping3TimesCV, &processIDList](StringData processIDArg, Date_t ping) {
-            stdx::lock_guard<stdx::mutex> lk(testMutex);
+            stdx::lock_guard<Latch> lk(testMutex);
             processIDList.push_back(processIDArg.toString());
 
             if (processIDList.size() >= 3) {
@@ -669,7 +626,7 @@ TEST_F(ReplSetDistLockManagerFixture, LockPinging) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(testMutex);
+        stdx::unique_lock<Latch> lk(testMutex);
         if (processIDList.size() < 3) {
             didTimeout = ping3TimesCV.wait_for(lk, kJoinTimeout.toSystemDuration()) ==
                 stdx::cv_status::timeout;
@@ -702,21 +659,21 @@ TEST_F(ReplSetDistLockManagerFixture, LockPinging) {
  * 4. Check that lockSessionID used on all unlock is the same as the one used to grab lock.
  */
 TEST_F(ReplSetDistLockManagerFixture, UnlockUntilNoError) {
-    stdx::mutex unlockMutex;
+    auto unlockMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable unlockCV;
     const unsigned int kUnlockErrorCount = 3;
-    vector<OID> lockSessionIDPassed;
+    std::vector<OID> lockSessionIDPassed;
 
     getMockCatalog()->expectUnLock(
         [this, &unlockMutex, &unlockCV, &kUnlockErrorCount, &lockSessionIDPassed](
             const OID& lockSessionID) {
-            stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+            stdx::unique_lock<Latch> lk(unlockMutex);
             lockSessionIDPassed.push_back(lockSessionID);
 
             if (lockSessionIDPassed.size() >= kUnlockErrorCount) {
                 getMockCatalog()->expectUnLock(
                     [&lockSessionIDPassed, &unlockMutex, &unlockCV](const OID& lockSessionID) {
-                        stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+                        stdx::unique_lock<Latch> lk(unlockMutex);
                         lockSessionIDPassed.push_back(lockSessionID);
                         unlockCV.notify_all();
                     },
@@ -748,7 +705,7 @@ TEST_F(ReplSetDistLockManagerFixture, UnlockUntilNoError) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+        stdx::unique_lock<Latch> lk(unlockMutex);
         if (lockSessionIDPassed.size() < kUnlockErrorCount) {
             didTimeout =
                 unlockCV.wait_for(lk, kJoinTimeout.toSystemDuration()) == stdx::cv_status::timeout;
@@ -782,11 +739,10 @@ TEST_F(ReplSetDistLockManagerFixture, UnlockUntilNoError) {
  * 5. Check that the lock session id used when lock was called matches with unlock.
  */
 TEST_F(ReplSetDistLockManagerFixture, MultipleQueuedUnlock) {
-    stdx::mutex testMutex;
+    auto testMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable unlockCV;
-
-    vector<OID> lockSessionIDPassed;
-    map<OID, int> unlockIDMap;  // id -> count
+    std::vector<OID> lockSessionIDPassed;
+    std::map<OID, int> unlockIDMap;  // id -> count
 
     /**
      * Returns true if all values in the map are greater than 2.
@@ -805,14 +761,14 @@ TEST_F(ReplSetDistLockManagerFixture, MultipleQueuedUnlock) {
     getMockCatalog()->expectUnLock(
         [this, &unlockIDMap, &testMutex, &unlockCV, &mapEntriesGreaterThanTwo](
             const OID& lockSessionID) {
-            stdx::unique_lock<stdx::mutex> lk(testMutex);
+            stdx::unique_lock<Latch> lk(testMutex);
             unlockIDMap[lockSessionID]++;
 
             // Wait until we see at least 2 unique lockSessionID more than twice.
             if (unlockIDMap.size() >= 2 && mapEntriesGreaterThanTwo(unlockIDMap)) {
                 getMockCatalog()->expectUnLock(
                     [&testMutex, &unlockCV](const OID& lockSessionID) {
-                        stdx::unique_lock<stdx::mutex> lk(testMutex);
+                        stdx::unique_lock<Latch> lk(testMutex);
                         unlockCV.notify_all();
                     },
                     Status::OK());
@@ -836,7 +792,7 @@ TEST_F(ReplSetDistLockManagerFixture, MultipleQueuedUnlock) {
                                            StringData processId,
                                            Date_t time,
                                            StringData why) {
-            stdx::unique_lock<stdx::mutex> lk(testMutex);
+            stdx::unique_lock<Latch> lk(testMutex);
             lockSessionIDPassed.push_back(lockSessionIDArg);
         },
         retLockDoc);
@@ -848,7 +804,7 @@ TEST_F(ReplSetDistLockManagerFixture, MultipleQueuedUnlock) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(testMutex);
+        stdx::unique_lock<Latch> lk(testMutex);
 
         if (unlockIDMap.size() < 2 || !mapEntriesGreaterThanTwo(unlockIDMap)) {
             didTimeout =
@@ -1435,7 +1391,6 @@ TEST_F(ReplSetDistLockManagerFixture, CannotOvertakeIfOwnerJustChanged) {
     currentLockDoc.setWho("me");
     currentLockDoc.setWhy("why");
 
-    Date_t currentPing;
     LockpingsType pingDoc;
     pingDoc.setProcess("otherProcess");
     pingDoc.setPing(Date_t());
@@ -1533,7 +1488,6 @@ TEST_F(ReplSetDistLockManagerFixture, CannotOvertakeIfElectionIdChanged) {
     currentLockDoc.setWho("me");
     currentLockDoc.setWhy("why");
 
-    Date_t currentPing;
     LockpingsType pingDoc;
     pingDoc.setProcess("otherProcess");
     pingDoc.setPing(Date_t());
@@ -1633,7 +1587,6 @@ TEST_F(ReplSetDistLockManagerFixture, CannotOvertakeIfNoMaster) {
     currentLockDoc.setWho("me");
     currentLockDoc.setWhy("why");
 
-    Date_t currentPing;
     LockpingsType pingDoc;
     pingDoc.setProcess("otherProcess");
     pingDoc.setPing(Date_t());
@@ -1786,11 +1739,11 @@ TEST_F(ReplSetDistLockManagerFixture, LockOvertakingResultsInError) {
 
     OID unlockSessionIDPassed;
 
-    stdx::mutex unlockMutex;
+    auto unlockMutex = MONGO_MAKE_LATCH();
     stdx::condition_variable unlockCV;
     getMockCatalog()->expectUnLock(
         [&unlockSessionIDPassed, &unlockMutex, &unlockCV](const OID& lockSessionID) {
-            stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+            stdx::unique_lock<Latch> lk(unlockMutex);
             unlockSessionIDPassed = lockSessionID;
             unlockCV.notify_all();
         },
@@ -1803,7 +1756,7 @@ TEST_F(ReplSetDistLockManagerFixture, LockOvertakingResultsInError) {
 
     bool didTimeout = false;
     {
-        stdx::unique_lock<stdx::mutex> lk(unlockMutex);
+        stdx::unique_lock<Latch> lk(unlockMutex);
         if (!unlockSessionIDPassed.isSet()) {
             didTimeout =
                 unlockCV.wait_for(lk, kJoinTimeout.toSystemDuration()) == stdx::cv_status::timeout;
@@ -2079,9 +2032,9 @@ TEST_F(RSDistLockMgrWithMockTickSource, CanOvertakeIfNoPingDocument) {
 }
 
 TEST_F(ReplSetDistLockManagerFixture, TryLockWithLocalWriteConcernBusy) {
-    string lockName("test");
+    std::string lockName("test");
     Date_t now(Date_t::now());
-    string whyMsg("because");
+    std::string whyMsg("because");
 
     LocksType retLockDoc;
     retLockDoc.setName(lockName);

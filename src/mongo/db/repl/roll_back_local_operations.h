@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,15 +29,16 @@
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace repl {
@@ -46,20 +48,51 @@ namespace repl {
 // two separate files, rs_rollback and rs_rollback_no_uuid. However, after
 // MongoDB 3.8 is released, we no longer need to maintain rs_rollback_no_uuid
 // code and these forward declares can be removed. See SERVER-29766.
-MONGO_FP_FORWARD_DECLARE(rollbackHangBeforeFinish);
-MONGO_FP_FORWARD_DECLARE(rollbackHangThenFailAfterWritingMinValid);
+extern FailPoint rollbackHangBeforeFinish;
+extern FailPoint rollbackHangThenFailAfterWritingMinValid;
+
+// This is needed by rs_rollback and rollback_impl.
+extern FailPoint rollbackHangAfterTransitionToRollback;
 
 class RollBackLocalOperations {
-    MONGO_DISALLOW_COPYING(RollBackLocalOperations);
+    RollBackLocalOperations(const RollBackLocalOperations&) = delete;
+    RollBackLocalOperations& operator=(const RollBackLocalOperations&) = delete;
 
 public:
+    class RollbackCommonPoint {
+
+    public:
+        RollbackCommonPoint(BSONObj oplogBSON, RecordId recordId, BSONObj nextOplogBSON);
+
+        RecordId getRecordId() const {
+            return _recordId;
+        }
+
+        OpTime getOpTime() const {
+            return _opTime;
+        }
+
+        Date_t getWallClockTime() const {
+            return _wallClockTime;
+        }
+
+        Date_t getFirstOpWallClockTimeAfterCommonPoint() {
+            return _firstWallClockTimeAfterCommonPoint;
+        }
+
+    private:
+        RecordId _recordId;
+        OpTime _opTime;
+        Date_t _wallClockTime;
+        // The wall clock time of the first operation after the common point if it exists.
+        Date_t _firstWallClockTimeAfterCommonPoint;
+    };
+
     /**
      * Type of function to roll back an operation or process it for future use.
      * It can return any status except ErrorCodes::NoSuchKey. See onRemoteOperation().
      */
-    using RollbackOperationFn = stdx::function<Status(const BSONObj&)>;
-
-    using RollbackCommonPoint = std::pair<OpTime, RecordId>;
+    using RollbackOperationFn = std::function<Status(const BSONObj&)>;
 
     /**
      * Initializes rollback processor with a valid local oplog.

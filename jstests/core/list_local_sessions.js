@@ -1,13 +1,27 @@
 // Basic tests for the $listLocalSessions aggregation stage.
+//
+// @tags: [
+//   # This test attempts to start a session and find it using the $listLocalSessions stage. The
+//   # former operation must be routed to the primary in a replica set, whereas the latter may be
+//   # routed to a secondary.
+//   assumes_read_preference_unchanged,
+//   # Sessions are asynchronously flushed to disk, so a stepdown immediately after calling
+//   # startSession may cause this test to fail to find the returned sessionId.
+//   does_not_support_stepdowns,
+// ]
 
 (function() {
-    'use strict';
+'use strict';
 
-    const admin = db.getSisterDB('admin');
-    function listLocalSessions() {
-        return admin.aggregate([{'$listLocalSessions': {allUsers: false}}]);
-    }
+const admin = db.getSisterDB('admin');
+function listLocalSessions() {
+    return admin.aggregate([{'$listLocalSessions': {allUsers: false}}]);
+}
 
+// Get current log level.
+let originalLogLevel = assert.commandWorked(admin.setLogLevel(1)).was.verbosity;
+
+try {
     // Start a new session and capture its sessionId.
     const myid = assert.commandWorked(db.runCommand({startSession: 1})).id.id;
     assert(myid !== undefined);
@@ -38,9 +52,32 @@
         assert(authUsers[0].db !== undefined);
         return {user: authUsers[0].user, db: authUsers[0].db};
     })();
-    function listMyLocalSessions() {
+
+    const listMyLocalSessions = function() {
         return admin.aggregate([{'$listLocalSessions': {users: [myusername]}}]);
-    }
-    const myArray = assert.doesNotThrow(listMyLocalSessions).toArray();
-    assert.eq(myArray.length, resultArray.length);
+    };
+
+    const myArray = assert.doesNotThrow(listMyLocalSessions)
+                        .toArray()
+                        .map(function(sess) {
+                            return sess._id.id;
+                        })
+                        .filter(function(id) {
+                            return 0 == bsonWoCompare({x: id}, {x: myid});
+                        });
+    assert.eq(myArray.length, 1);
+
+    print("sessions returned from $listLocalSessions filtered by user:          [ " + myArray +
+          " ]");
+    print("sessions returned from un-filtered $listLocalSessions for this user: [ " +
+          resultArrayMine + " ]");
+
+    assert.eq(
+        0,
+        bsonWoCompare(myArray, resultArrayMine),
+        "set of listed sessions for user contains different sessions from prior $listLocalSessions run");
+
+} finally {
+    admin.setLogLevel(originalLogLevel);
+}
 })();

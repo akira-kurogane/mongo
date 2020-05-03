@@ -1,30 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *    GNU Affero General Public License for more details.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -40,7 +40,6 @@ namespace {
 
 using unittest::assertGet;
 
-const std::string kName = "TestDB.TestColl-a_10";
 const std::string kNs = "TestDB.TestColl";
 const BSONObj kMin = BSON("a" << 10);
 const BSONObj kMax = BSON("a" << 20);
@@ -52,28 +51,32 @@ TEST(MigrationTypeTest, ConvertFromMigrationInfo) {
     const ChunkVersion version(1, 2, OID::gen());
 
     BSONObjBuilder chunkBuilder;
-    chunkBuilder.append(ChunkType::name(), kName);
+    chunkBuilder.append(ChunkType::name(), OID::gen());
     chunkBuilder.append(ChunkType::ns(), kNs);
     chunkBuilder.append(ChunkType::min(), kMin);
     chunkBuilder.append(ChunkType::max(), kMax);
-    version.appendForChunk(&chunkBuilder);
+    version.appendLegacyWithField(&chunkBuilder, ChunkType::lastmod());
     chunkBuilder.append(ChunkType::shard(), kFromShard.toString());
 
     ChunkType chunkType = assertGet(ChunkType::fromConfigBSON(chunkBuilder.obj()));
     ASSERT_OK(chunkType.validate());
 
-    MigrateInfo migrateInfo(kToShard, chunkType);
+    MigrateInfo migrateInfo(kToShard,
+                            chunkType,
+                            MoveChunkRequest::ForceJumbo::kDoNotForce,
+                            MigrateInfo::chunksImbalance);
     MigrationType migrationType(migrateInfo, kWaitForDelete);
 
     BSONObjBuilder builder;
-    builder.append(MigrationType::name(), kName);
     builder.append(MigrationType::ns(), kNs);
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
     builder.append(MigrationType::waitForDelete(), kWaitForDelete);
+    builder.append(MigrationType::forceJumbo(),
+                   MoveChunkRequest::forceJumboToString(MoveChunkRequest::ForceJumbo::kDoNotForce));
 
     BSONObj obj = builder.obj();
 
@@ -84,14 +87,15 @@ TEST(MigrationTypeTest, FromAndToBSON) {
     const ChunkVersion version(1, 2, OID::gen());
 
     BSONObjBuilder builder;
-    builder.append(MigrationType::name(), kName);
     builder.append(MigrationType::ns(), kNs);
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
     builder.append(MigrationType::waitForDelete(), kWaitForDelete);
+    builder.append(MigrationType::forceJumbo(),
+                   MoveChunkRequest::forceJumboToString(MoveChunkRequest::ForceJumbo::kDoNotForce));
 
     BSONObj obj = builder.obj();
 
@@ -107,7 +111,7 @@ TEST(MigrationTypeTest, MissingRequiredNamespaceField) {
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
 
     BSONObj obj = builder.obj();
 
@@ -124,7 +128,7 @@ TEST(MigrationTypeTest, MissingRequiredMinField) {
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
 
     BSONObj obj = builder.obj();
 
@@ -141,7 +145,7 @@ TEST(MigrationTypeTest, MissingRequiredMaxField) {
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
 
     BSONObj obj = builder.obj();
 
@@ -158,7 +162,7 @@ TEST(MigrationTypeTest, MissingRequiredFromShardField) {
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::toShard(), kToShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
 
     BSONObj obj = builder.obj();
 
@@ -175,7 +179,7 @@ TEST(MigrationTypeTest, MissingRequiredToShardField) {
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::max(), kMax);
     builder.append(MigrationType::fromShard(), kFromShard.toString());
-    version.appendWithFieldForCommands(&builder, "chunkVersion");
+    version.appendWithField(&builder, "chunkVersion");
 
     BSONObj obj = builder.obj();
 
@@ -186,7 +190,6 @@ TEST(MigrationTypeTest, MissingRequiredToShardField) {
 
 TEST(MigrationTypeTest, MissingRequiredVersionField) {
     BSONObjBuilder builder;
-    builder.append(MigrationType::name(), kName);
     builder.append(MigrationType::ns(), kNs);
     builder.append(MigrationType::min(), kMin);
     builder.append(MigrationType::max(), kMax);

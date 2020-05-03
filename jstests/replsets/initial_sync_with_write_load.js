@@ -35,7 +35,7 @@ assert(master == conns[0], "conns[0] assumed to be master");
 assert(a_conn.host == master.host);
 
 // create an oplog entry with an insert
-assert.writeOK(
+assert.commandWorked(
     A.foo.insert({x: 1}, {writeConcern: {w: 1, wtimeout: ReplSetTest.kDefaultTimeoutMS}}));
 replTest.stop(BID);
 
@@ -44,7 +44,7 @@ var work = function() {
     print("starting loadgen");
     var start = new Date().getTime();
 
-    assert.writeOK(db.timeToStartTrigger.insert({_id: 1}));
+    assert.commandWorked(db.timeToStartTrigger.insert({_id: 1}));
 
     while (true) {
         for (x = 0; x < 100; x++) {
@@ -89,6 +89,9 @@ assert.soon(function() {
 
 print("waiting for load generation to finish");
 loadGen();
+
+// Wait for initial sync to finish.
+replTest.awaitSecondaryNodes();
 
 // Make sure oplogs & dbHashes match
 replTest.checkOplogs(testName);

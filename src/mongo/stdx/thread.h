@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,13 +30,97 @@
 #pragma once
 
 #include <chrono>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <ctime>
 #include <exception>
 #include <thread>
 #include <type_traits>
 
+#include "mongo/stdx/exception.h"
+#include "mongo/util/thread_safety_context.h"
+
+#if defined(__linux__) || defined(__FreeBSD__)
+#define MONGO_HAS_SIGALTSTACK 1
+#else
+#define MONGO_HAS_SIGALTSTACK 0
+#endif
+
 namespace mongo {
 namespace stdx {
+namespace support {
+
+/**
+ * Manages an alternate stack for signal handlers.
+ * A dummy implementation is provided on platforms which do not support `sigaltstack`.
+ */
+class SigAltStackController {
+public:
+#if MONGO_HAS_SIGALTSTACK
+    /** Return an object that installs and uninstalls our `_stackStorage` as `sigaltstack`. */
+    auto makeInstallGuard() const {
+        struct Guard {
+            explicit Guard(const SigAltStackController& controller) : _controller(controller) {
+                _controller._install();
+            }
+
+            ~Guard() {
+                _controller._uninstall();
+            }
+
+            const SigAltStackController& _controller;
+        };
+        return Guard{*this};
+    }
+
+private:
+    void _install() const {
+        stack_t ss = {};
+        ss.ss_sp = _stackStorage.get();
+        ss.ss_flags = 0;
+        ss.ss_size = kStackSize;
+        if (sigaltstack(&ss, nullptr)) {
+            abort();
+        }
+    }
+
+    void _uninstall() const {
+        stack_t ss = {};
+        ss.ss_flags = SS_DISABLE;
+        if (sigaltstack(&ss, nullptr)) {
+            abort();
+        }
+    }
+
+    // Signal stack consumption was measured in mongo/util/stacktrace_test.
+    // 64 kiB is 4X our worst case, so that should be enough.
+    //   .                                    signal handler action
+    //   .  --use-libunwind : ----\       =============================
+    //   .  --dbg=on        : -\   \      minimal |  print  | backtrace
+    //   .                     =   =      ========|=========|==========
+    //   .                     N   N :      4,344 |   7,144 |     5,096
+    //   .                     Y   N :      4,424 |   7,528 |     5,160
+    //   .                     N   Y :      4,344 |  13,048 |     7,352
+    //   .                     Y   Y :      4,424 |  13,672 |     8,392
+    //   ( https://jira.mongodb.org/secure/attachment/233569/233569_stacktrace-writeup.txt )
+    static constexpr std::size_t kMongoMinSignalStackSize = std::size_t{64} << 10;
+
+    static constexpr std::size_t kStackSize =
+        std::max(kMongoMinSignalStackSize, std::size_t{MINSIGSTKSZ});
+    std::unique_ptr<std::byte[]> _stackStorage = std::make_unique<std::byte[]>(kStackSize);
+
+#else   // !MONGO_HAS_SIGALTSTACK
+    auto makeInstallGuard() const {
+        struct Guard {
+            ~Guard() {}  // needed to suppress 'unused variable' warnings.
+        };
+        return Guard{};
+    }
+#endif  // !MONGO_HAS_SIGALTSTACK
+};
+
+}  // namespace support
 
 /**
  * We're wrapping std::thread here, rather than aliasing it, because we'd like
@@ -45,6 +130,8 @@ namespace stdx {
  * retrying.  Therefore, all throwing does is remove context as to which part
  * of the system failed thread creation (as the exception itself is caught at
  * the top of the stack).
+ *
+ * We also want to allocate and install a `sigaltstack` to diagnose stack overflows.
  *
  * We're putting this in stdx, rather than having it as some kind of
  * mongo::Thread, because the signature and use of the type is otherwise
@@ -56,52 +143,63 @@ namespace stdx {
  */
 class thread : private ::std::thread {  // NOLINT
 public:
-    using ::std::thread::native_handle_type;  // NOLINT
     using ::std::thread::id;                  // NOLINT
+    using ::std::thread::native_handle_type;  // NOLINT
 
-    thread() noexcept : ::std::thread::thread() {}  // NOLINT
+    thread() noexcept = default;
 
+    ~thread() noexcept = default;
     thread(const thread&) = delete;
-
-    thread(thread&& other) noexcept
-        : ::std::thread::thread(static_cast<::std::thread&&>(std::move(other))) {}  // NOLINT
+    thread(thread&& other) noexcept = default;
+    thread& operator=(const thread&) = delete;
+    thread& operator=(thread&& other) noexcept = default;
 
     /**
      * As of C++14, the Function overload for std::thread requires that this constructor only
      * participate in overload resolution if std::decay_t<Function> is not the same type as thread.
      * That prevents this overload from intercepting calls that might generate implicit conversions
      * before binding to other constructors (specifically move/copy constructors).
+     *
+     * NOTE: The `Function f` parameter must be taken by value, not reference or forwarding
+     * reference, as it is used on the far side of the thread launch, and this ctor has to properly
+     * transfer ownership to the far side's thread.
      */
-    template <
-        class Function,
-        class... Args,
-        typename std::enable_if<!std::is_same<thread, typename std::decay<Function>::type>::value,
-                                int>::type = 0>
-    explicit thread(Function&& f, Args&&... args) try:
-        ::std::thread::thread(std::forward<Function>(f), std::forward<Args>(args)...) {}  // NOLINT
-    catch (...) {
-        std::terminate();
+    template <class Function,
+              class... Args,
+              std::enable_if_t<!std::is_same_v<thread, std::decay_t<Function>>, int> = 0>
+    explicit thread(Function f, Args&&... args) noexcept
+        : ::std::thread::thread(  // NOLINT
+              [
+                  sigAltStackController = support::SigAltStackController(),
+                  f = std::move(f),
+                  pack = std::make_tuple(std::forward<Args>(args)...)
+              ]() mutable noexcept {
+#if defined(_WIN32)
+                  // On Win32 we have to set the terminate handler per thread.
+                  // We set it to our universal terminate handler, which people can register via the
+                  // `stdx::set_terminate` hook.
+                  ::std::set_terminate(  // NOLINT
+                      ::mongo::stdx::TerminateHandlerDetailsInterface::dispatch);
+#endif
+                  ThreadSafetyContext::getThreadSafetyContext()->onThreadCreate();
+                  auto sigAltStackGuard = sigAltStackController.makeInstallGuard();
+                  return std::apply(std::move(f), std::move(pack));
+              }) {
     }
 
-    thread& operator=(const thread&) = delete;
-
-    thread& operator=(thread&& other) noexcept {
-        return static_cast<thread&>(
-            ::std::thread::operator=(static_cast<::std::thread&&>(std::move(other))));  // NOLINT
-    };
-
-    using ::std::thread::joinable;              // NOLINT
     using ::std::thread::get_id;                // NOLINT
-    using ::std::thread::native_handle;         // NOLINT
     using ::std::thread::hardware_concurrency;  // NOLINT
+    using ::std::thread::joinable;              // NOLINT
+    using ::std::thread::native_handle;         // NOLINT
 
-    using ::std::thread::join;    // NOLINT
     using ::std::thread::detach;  // NOLINT
+    using ::std::thread::join;    // NOLINT
 
     void swap(thread& other) noexcept {
-        ::std::thread::swap(static_cast<::std::thread&>(other));  // NOLINT
+        this->::std::thread::swap(other);  // NOLINT
     }
 };
+
 
 inline void swap(thread& lhs, thread& rhs) noexcept {
     lhs.swap(rhs);
@@ -141,4 +239,7 @@ void sleep_until(const std::chrono::time_point<Clock, Duration>& sleep_time) {  
 }  // namespace this_thread
 
 }  // namespace stdx
+
+static_assert(std::is_move_constructible_v<stdx::thread>);
+static_assert(std::is_move_assignable_v<stdx::thread>);
 }  // namespace mongo

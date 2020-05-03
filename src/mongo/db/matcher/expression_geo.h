@@ -1,25 +1,24 @@
-// expression_geo.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,7 +42,8 @@ class GeometryContainer;
 
 // This represents either a $within or a $geoIntersects.
 class GeoExpression {
-    MONGO_DISALLOW_COPYING(GeoExpression);
+    GeoExpression(const GeoExpression&) = delete;
+    GeoExpression& operator=(const GeoExpression&) = delete;
 
 public:
     GeoExpression();
@@ -78,20 +78,18 @@ private:
 
 class GeoMatchExpression : public LeafMatchExpression {
 public:
-    GeoMatchExpression() : LeafMatchExpression(GEO), _canSkipValidation(false) {}
+    GeoMatchExpression(StringData path, const GeoExpression* query, const BSONObj& rawObj);
+    GeoMatchExpression(StringData path,
+                       std::shared_ptr<const GeoExpression> query,
+                       const BSONObj& rawObj);
 
     virtual ~GeoMatchExpression() {}
 
-    /**
-     * Takes ownership of the passed-in GeoExpression.
-     */
-    Status init(StringData path, const GeoExpression* query, const BSONObj& rawObj);
-
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -110,6 +108,10 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     // The original geo specification provided by the user.
     BSONObj _rawObj;
 
@@ -122,7 +124,8 @@ private:
 // TODO: Make a struct, turn parse stuff into something like
 // static Status parseNearQuery(const BSONObj& obj, NearQuery** out);
 class GeoNearExpression {
-    MONGO_DISALLOW_COPYING(GeoNearExpression);
+    GeoNearExpression(const GeoNearExpression&) = delete;
+    GeoNearExpression& operator=(const GeoNearExpression&) = delete;
 
 public:
     GeoNearExpression();
@@ -163,10 +166,12 @@ private:
 
 class GeoNearMatchExpression : public LeafMatchExpression {
 public:
-    GeoNearMatchExpression() : LeafMatchExpression(GEO_NEAR) {}
-    virtual ~GeoNearMatchExpression() {}
+    GeoNearMatchExpression(StringData path, const GeoNearExpression* query, const BSONObj& rawObj);
+    GeoNearMatchExpression(StringData path,
+                           std::shared_ptr<const GeoNearExpression> query,
+                           const BSONObj& rawObj);
 
-    Status init(StringData path, const GeoNearExpression* query, const BSONObj& rawObj);
+    virtual ~GeoNearMatchExpression() {}
 
     /**
      * Stub implementation that should never be called, since geoNear execution requires an
@@ -174,9 +179,9 @@ public:
      */
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out) const;
+    BSONObj getSerializedRightHandSide() const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -187,6 +192,10 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     // The original geo specification provided by the user.
     BSONObj _rawObj;
 

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -46,58 +47,93 @@ public:
     }
 
     virtual ClientState getClientState() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     virtual LockerId getId() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     stdx::thread::id getThreadId() const override {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
-    virtual LockResult lockGlobal(LockMode mode) {
-        invariant(false);
+    void updateThreadIdToCurrentThread() override {
+        MONGO_UNREACHABLE;
     }
 
-    virtual LockResult lockGlobalBegin(LockMode mode, Milliseconds timeout) {
-        invariant(false);
+    void unsetThreadId() override {
+        MONGO_UNREACHABLE;
     }
 
-    virtual LockResult lockGlobalComplete(Milliseconds timeout) {
-        invariant(false);
+    void setSharedLocksShouldTwoPhaseLock(bool sharedLocksShouldTwoPhaseLock) override {
+        MONGO_UNREACHABLE;
     }
 
-    virtual void lockMMAPV1Flush() {
-        invariant(false);
+    void setMaxLockTimeout(Milliseconds maxTimeout) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool hasMaxLockTimeout() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void unsetMaxLockTimeout() override {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void lockGlobal(LockMode mode, Date_t deadline) {
+        MONGO_UNREACHABLE;
     }
 
     virtual bool unlockGlobal() {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
-    virtual void downgradeGlobalXtoSForMMAPV1() {
-        invariant(false);
-    }
+    virtual void beginWriteUnitOfWork() override {}
 
-    virtual void beginWriteUnitOfWork() {}
-
-    virtual void endWriteUnitOfWork() {}
+    virtual void endWriteUnitOfWork() override {}
 
     virtual bool inAWriteUnitOfWork() const {
-        invariant(false);
+        return false;
     }
 
-    virtual LockResult lock(ResourceId resId,
-                            LockMode mode,
-                            Milliseconds timeout,
-                            bool checkDeadlock) {
-        return LockResult::LOCK_OK;
+    virtual bool wasGlobalLockTakenForWrite() const {
+        return false;
     }
+
+    virtual bool wasGlobalLockTakenInModeConflictingWithWrites() const {
+        return false;
+    }
+
+    virtual bool wasGlobalLockTaken() const {
+        return false;
+    }
+
+    virtual void setGlobalLockTakenInMode(LockMode mode) {}
+
+    virtual LockResult lockRSTLBegin(OperationContext* opCtx, LockMode mode) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual bool unlockRSTLforPrepare() {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void lock(OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline) {}
+
+    virtual void lock(ResourceId resId, LockMode mode, Date_t deadline) {}
 
     virtual void downgrade(ResourceId resId, LockMode newMode) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     virtual bool unlock(ResourceId resId) {
@@ -105,7 +141,7 @@ public:
     }
 
     virtual LockMode getLockMode(ResourceId resId) const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     virtual bool isLockHeldForMode(ResourceId resId, LockMode mode) const {
@@ -116,52 +152,100 @@ public:
         return true;
     }
 
-    virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const {
+    virtual bool isCollectionLockedForMode(const NamespaceString& nss, LockMode mode) const {
         return true;
     }
 
     virtual ResourceId getWaitingResource() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
-    virtual void getLockerInfo(LockerInfo* lockerInfo) const {
-        invariant(false);
+    virtual void getLockerInfo(LockerInfo* lockerInfo,
+                               boost::optional<SingleThreadedLockStats> lockStatsBase) const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual boost::optional<LockerInfo> getLockerInfo(
+        boost::optional<SingleThreadedLockStats> lockStatsBase) const {
+        return boost::none;
     }
 
     virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
+    virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) {
+        MONGO_UNREACHABLE;
+    }
     virtual void restoreLockState(const LockSnapshot& stateToRestore) {
-        invariant(false);
+        MONGO_UNREACHABLE;
+    }
+
+    bool releaseWriteUnitOfWorkAndUnlock(LockSnapshot* stateOut) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreWriteUnitOfWorkAndLock(OperationContext* opCtx,
+                                       const LockSnapshot& stateToRestore) override {
+        MONGO_UNREACHABLE;
+    };
+
+    void releaseWriteUnitOfWork(WUOWLockSnapshot* stateOut) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreWriteUnitOfWork(const WUOWLockSnapshot& stateToRestore) override {
+        MONGO_UNREACHABLE;
+    };
+
+    virtual void releaseTicket() {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual void reacquireTicket(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
     }
 
     virtual void dump() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     virtual bool isW() const {
-        invariant(false);
+        return true;
     }
 
     virtual bool isR() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     virtual bool isLocked() const {
+        // This is necessary because replication makes decisions based on the answer to this, and
+        // we wrote unit tests to test the behavior specifically when this returns "false".
         return false;
     }
 
     virtual bool isWriteLocked() const {
-        return false;
+        return true;
     }
 
     virtual bool isReadLocked() const {
-        invariant(false);
+        return true;
+    }
+
+    virtual bool isRSTLExclusive() const {
+        return true;
+    }
+
+    virtual bool isRSTLLocked() const {
+        return true;
     }
 
     virtual bool hasLockPending() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
+    }
+
+    bool isGlobalLockedRecursively() override {
+        return false;
     }
 };
 

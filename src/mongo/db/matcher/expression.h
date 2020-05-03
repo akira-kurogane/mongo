@@ -1,25 +1,24 @@
-// expression.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,17 +29,25 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <functional>
+#include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/match_details.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+
+/**
+ * Enabling the disableMatchExpressionOptimization fail point will stop match expressions from
+ * being optimized.
+ */
+extern FailPoint disableMatchExpressionOptimization;
 
 class CollatorInterface;
 class MatchExpression;
@@ -49,7 +56,8 @@ class TreeMatchExpression;
 typedef StatusWith<std::unique_ptr<MatchExpression>> StatusWithMatchExpression;
 
 class MatchExpression {
-    MONGO_DISALLOW_COPYING(MatchExpression);
+    MatchExpression(const MatchExpression&) = delete;
+    MatchExpression& operator=(const MatchExpression&) = delete;
 
 public:
     enum MatchType {
@@ -96,14 +104,19 @@ public:
         TEXT,
 
         // Expressions that are only created internally
-        INTERNAL_2DSPHERE_KEY_IN_REGION,
-        INTERNAL_2D_KEY_IN_REGION,
         INTERNAL_2D_POINT_IN_ANNULUS,
+
+        // Used to represent an expression language equality in a match expression tree, since $eq
+        // in the expression language has different semantics than the equality match expression.
+        INTERNAL_EXPR_EQ,
 
         // JSON Schema expressions.
         INTERNAL_SCHEMA_ALLOWED_PROPERTIES,
         INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+        INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
+        INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
         INTERNAL_SCHEMA_COND,
+        INTERNAL_SCHEMA_EQ,
         INTERNAL_SCHEMA_FMOD,
         INTERNAL_SCHEMA_MATCH_ARRAY_INDEX,
         INTERNAL_SCHEMA_MAX_ITEMS,
@@ -113,10 +126,52 @@ public:
         INTERNAL_SCHEMA_MIN_LENGTH,
         INTERNAL_SCHEMA_MIN_PROPERTIES,
         INTERNAL_SCHEMA_OBJECT_MATCH,
+        INTERNAL_SCHEMA_ROOT_DOC_EQ,
         INTERNAL_SCHEMA_TYPE,
         INTERNAL_SCHEMA_UNIQUE_ITEMS,
         INTERNAL_SCHEMA_XOR,
     };
+
+    /**
+     * Make simplifying changes to the structure of a MatchExpression tree without altering its
+     * semantics. This function may return:
+     *   - a pointer to the original, unmodified MatchExpression,
+     *   - a pointer to the original MatchExpression that has been mutated, or
+     *   - a pointer to a new MatchExpression.
+     *
+     * The value of 'expression' must not be nullptr.
+     */
+    static std::unique_ptr<MatchExpression> optimize(std::unique_ptr<MatchExpression> expression) {
+        // If the disableMatchExpressionOptimization failpoint is enabled, optimizations are skipped
+        // and the expression is left unmodified.
+        if (MONGO_unlikely(disableMatchExpressionOptimization.shouldFail())) {
+            return expression;
+        }
+
+        auto optimizer = expression->getOptimizer();
+
+        try {
+            return optimizer(std::move(expression));
+        } catch (DBException& ex) {
+            ex.addContext("Failed to optimize expression");
+            throw;
+        }
+    }
+
+    /**
+     * Traverses expression tree post-order. Sorts children at each non-leaf node by (MatchType,
+     * path(), children, number of children).
+     */
+    static void sortTree(MatchExpression* tree);
+
+    /**
+     * Convenience method which normalizes a MatchExpression tree by optimizing and then sorting it.
+     */
+    static std::unique_ptr<MatchExpression> normalize(std::unique_ptr<MatchExpression> tree) {
+        tree = optimize(std::move(tree));
+        sortTree(tree.get());
+        return tree;
+    }
 
     MatchExpression(MatchType type);
     virtual ~MatchExpression() {}
@@ -146,11 +201,12 @@ public:
 
     /**
      * For MatchExpression nodes that can participate in tree restructuring (like AND/OR), returns a
-     * non-const vector of MatchExpression* child nodes.
+     * non-const vector of MatchExpression* child nodes. If the MatchExpression does not
+     * participated in tree restructuring, returns boost::none.
      * Do not use to traverse the MatchExpression tree. Use numChildren() and getChild(), which
      * provide access to all nodes.
      */
-    virtual std::vector<MatchExpression*>* getChildVector() = 0;
+    virtual boost::optional<std::vector<MatchExpression*>&> getChildVector() = 0;
 
     /**
      * Get the path of the leaf.  Returns StringData() if there is no path (node is logical).
@@ -173,7 +229,12 @@ public:
 
     virtual MatchCategory getCategory() const = 0;
 
-    // XXX: document
+    /**
+     * This method will perform a clone of the entire match expression tree, but will not clone the
+     * memory pointed to by underlying BSONElements. To perform a "deep clone" use this method and
+     * also ensure that the buffer held by the underlying BSONObj will not be destroyed during the
+     * lifetime of the clone.
+     */
     virtual std::unique_ptr<MatchExpression> shallowClone() const = 0;
 
     // XXX document
@@ -247,17 +308,64 @@ public:
     /**
      * Serialize the MatchExpression to BSON, appending to 'out'. Output of this method is expected
      * to be a valid query object, that, when parsed, produces a logically equivalent
-     * MatchExpression.
+     * MatchExpression. If 'includePath' is false then the serialization should assume it's in a
+     * context where the path has been serialized elsewhere, such as within an $elemMatch value.
      */
-    virtual void serialize(BSONObjBuilder* out) const = 0;
+    virtual void serialize(BSONObjBuilder* out, bool includePath = true) const = 0;
+
+    /**
+     * Convenience method which serializes this MatchExpression to a BSONObj.
+     */
+    BSONObj serialize(bool includePath = true) const {
+        BSONObjBuilder bob;
+        serialize(&bob, includePath);
+        return bob.obj();
+    }
+
+    /**
+     * Returns true if this expression will always evaluate to false, such as an $or with no
+     * children.
+     */
+    virtual bool isTriviallyFalse() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this expression will always evaluate to true, such as an $and with no
+     * children.
+     */
+    virtual bool isTriviallyTrue() const {
+        return false;
+    }
 
     //
     // Debug information
     //
-    virtual std::string toString() const;
-    virtual void debugString(StringBuilder& debug, int level = 0) const = 0;
+
+    /**
+     * Returns a debug string representing the match expression tree, including any tags attached
+     * for planning. This debug string format may spill across multiple lines, so it is not suitable
+     * for logging at low debug levels or for error messages.
+     */
+    std::string debugString() const;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const = 0;
+
+    /**
+     * Serializes this MatchExpression to BSON, and then returns a standard string representation of
+     * the resulting BSON object.
+     */
+    std::string toString() const;
 
 protected:
+    /**
+     * An ExpressionOptimizerFunc implements tree simplifications for a MatchExpression tree with a
+     * specific type of MatchExpression at the root. Except for requiring a specific MatchExpression
+     * subclass, an ExpressionOptimizerFunc has the same requirements and functionality as described
+     * in the specification of MatchExpression::getOptimizer(std::unique_ptr<MatchExpression>).
+     */
+    using ExpressionOptimizerFunc =
+        std::function<std::unique_ptr<MatchExpression>(std::unique_ptr<MatchExpression>)>;
+
     /**
      * Subclasses that are collation-aware must implement this method in order to capture changes
      * to the collator that occur after initialization time.
@@ -266,10 +374,27 @@ protected:
 
     virtual void _doAddDependencies(DepsTracker* deps) const {}
 
-    void _debugAddSpace(StringBuilder& debug, int level) const;
+    void _debugAddSpace(StringBuilder& debug, int indentationLevel) const;
 
 private:
+    /**
+     * Subclasses should implement this function to provide an ExpressionOptimizerFunc specific to
+     * the subclass. This function is only called by
+     * MatchExpression::optimize(std::unique_ptr<MatchExpression>), which is responsible for calling
+     * MatchExpression::getOptimizer() on its input MatchExpression and then passing the same
+     * MatchExpression to the resulting ExpressionOptimizerFunc. There should be no other callers
+     * to this function.
+     *
+     * Any MatchExpression subclass that stores child MatchExpression objects is responsible for
+     * returning an ExpressionOptimizerFunc that recursively calls
+     * MatchExpression::optimize(std::unique_ptr<MatchExpression>) on those children.
+     *
+     * See the descriptions of MatchExpression::optimize(std::unique_ptr<MatchExpression>) and
+     * ExpressionOptimizerFunc for additional explanation of their interfaces and functionality.
+     */
+    virtual ExpressionOptimizerFunc getOptimizer() const = 0;
+
     MatchType _matchType;
     std::unique_ptr<TagData> _tagData;
 };
-}
+}  // namespace mongo

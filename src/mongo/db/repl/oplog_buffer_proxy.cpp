@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -50,35 +51,23 @@ void OplogBufferProxy::startup(OperationContext* opCtx) {
 
 void OplogBufferProxy::shutdown(OperationContext* opCtx) {
     {
-        stdx::lock_guard<stdx::mutex> backLock(_lastPushedMutex);
-        stdx::lock_guard<stdx::mutex> frontLock(_lastPeekedMutex);
+        stdx::lock_guard<Latch> backLock(_lastPushedMutex);
+        stdx::lock_guard<Latch> frontLock(_lastPeekedMutex);
         _lastPushed.reset();
         _lastPeeked.reset();
     }
     _target->shutdown(opCtx);
 }
 
-void OplogBufferProxy::pushEvenIfFull(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->pushEvenIfFull(opCtx, value);
-}
-
-void OplogBufferProxy::push(OperationContext* opCtx, const Value& value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
-    _lastPushed = value;
-    _target->push(opCtx, value);
-}
-
-void OplogBufferProxy::pushAllNonBlocking(OperationContext* opCtx,
-                                          Batch::const_iterator begin,
-                                          Batch::const_iterator end) {
+void OplogBufferProxy::push(OperationContext* opCtx,
+                            Batch::const_iterator begin,
+                            Batch::const_iterator end) {
     if (begin == end) {
         return;
     }
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
+    stdx::lock_guard<Latch> lk(_lastPushedMutex);
     _lastPushed = *(end - 1);
-    _target->pushAllNonBlocking(opCtx, begin, end);
+    _target->push(opCtx, begin, end);
 }
 
 void OplogBufferProxy::waitForSpace(OperationContext* opCtx, std::size_t size) {
@@ -102,16 +91,16 @@ std::size_t OplogBufferProxy::getCount() const {
 }
 
 void OplogBufferProxy::clear(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> backLock(_lastPushedMutex);
-    stdx::lock_guard<stdx::mutex> frontLock(_lastPeekedMutex);
+    stdx::lock_guard<Latch> backLock(_lastPushedMutex);
+    stdx::lock_guard<Latch> frontLock(_lastPeekedMutex);
     _lastPushed.reset();
     _lastPeeked.reset();
     _target->clear(opCtx);
 }
 
 bool OplogBufferProxy::tryPop(OperationContext* opCtx, Value* value) {
-    stdx::lock_guard<stdx::mutex> backLock(_lastPushedMutex);
-    stdx::lock_guard<stdx::mutex> frontLock(_lastPeekedMutex);
+    stdx::lock_guard<Latch> backLock(_lastPushedMutex);
+    stdx::lock_guard<Latch> frontLock(_lastPeekedMutex);
     if (!_target->tryPop(opCtx, value)) {
         return false;
     }
@@ -125,7 +114,7 @@ bool OplogBufferProxy::tryPop(OperationContext* opCtx, Value* value) {
 
 bool OplogBufferProxy::waitForData(Seconds waitDuration) {
     {
-        stdx::unique_lock<stdx::mutex> lk(_lastPushedMutex);
+        stdx::unique_lock<Latch> lk(_lastPushedMutex);
         if (_lastPushed) {
             return true;
         }
@@ -134,7 +123,7 @@ bool OplogBufferProxy::waitForData(Seconds waitDuration) {
 }
 
 bool OplogBufferProxy::peek(OperationContext* opCtx, Value* value) {
-    stdx::lock_guard<stdx::mutex> lk(_lastPeekedMutex);
+    stdx::lock_guard<Latch> lk(_lastPeekedMutex);
     if (_lastPeeked) {
         *value = *_lastPeeked;
         return true;
@@ -148,7 +137,7 @@ bool OplogBufferProxy::peek(OperationContext* opCtx, Value* value) {
 
 boost::optional<OplogBuffer::Value> OplogBufferProxy::lastObjectPushed(
     OperationContext* opCtx) const {
-    stdx::lock_guard<stdx::mutex> lk(_lastPushedMutex);
+    stdx::lock_guard<Latch> lk(_lastPushedMutex);
     if (!_lastPushed) {
         return boost::none;
     }
@@ -156,7 +145,7 @@ boost::optional<OplogBuffer::Value> OplogBufferProxy::lastObjectPushed(
 }
 
 boost::optional<OplogBuffer::Value> OplogBufferProxy::getLastPeeked_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_lastPeekedMutex);
+    stdx::lock_guard<Latch> lk(_lastPeekedMutex);
     return _lastPeeked;
 }
 

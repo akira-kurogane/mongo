@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -39,13 +40,16 @@ namespace mongo {
  * The ObjectMatcher is used when the $pull condition is specified as an object and the first field
  * of that object is not an operator (like $gt).
  */
-class PullNode::ObjectMatcher final : public PullNode::ElementMatcher {
+class PullNode::ObjectMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
-    ObjectMatcher(BSONObj matchCondition, const CollatorInterface* collator)
-        : _matchExpr(matchCondition, collator) {}
+    ObjectMatcher(BSONObj matchCondition, const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : _matchExpr(matchCondition,
+                     expCtx,
+                     std::make_unique<ExtensionsCallbackNoop>(),
+                     MatchExpressionParser::kBanAllSpecialFeatures) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<ObjectMatcher>(*this);
+        return std::make_unique<ObjectMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
@@ -61,6 +65,10 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return BSON("" << _matchExpr.inputBSON());
+    }
+
     CopyableMatchExpression _matchExpr;
 };
 
@@ -71,13 +79,17 @@ private:
  * empty object so that we are comparing the MatchCondition and the array element at the same level.
  * This hack allows us to use a MatchExpression to check a BSONElement.
  */
-class PullNode::WrappedObjectMatcher final : public PullNode::ElementMatcher {
+class PullNode::WrappedObjectMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
-    WrappedObjectMatcher(BSONElement matchCondition, const CollatorInterface* collator)
-        : _matchExpr(matchCondition.wrap(""), collator) {}
+    WrappedObjectMatcher(BSONElement matchCondition,
+                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : _matchExpr(matchCondition.wrap(""),
+                     expCtx,
+                     std::make_unique<ExtensionsCallbackNoop>(),
+                     MatchExpressionParser::kBanAllSpecialFeatures) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<WrappedObjectMatcher>(*this);
+        return std::make_unique<WrappedObjectMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
@@ -90,6 +102,10 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return _matchExpr.inputBSON();
+    }
+
     CopyableMatchExpression _matchExpr;
 };
 
@@ -97,13 +113,13 @@ private:
  * The EqualityMatcher is used when the condition is a primitive value or an array value. We require
  * an exact match.
  */
-class PullNode::EqualityMatcher final : public PullNode::ElementMatcher {
+class PullNode::EqualityMatcher final : public ArrayCullingNode::ElementMatcher {
 public:
     EqualityMatcher(BSONElement modExpr, const CollatorInterface* collator)
         : _modExpr(modExpr), _collator(collator) {}
 
     std::unique_ptr<ElementMatcher> clone() const final {
-        return stdx::make_unique<EqualityMatcher>(*this);
+        return std::make_unique<EqualityMatcher>(*this);
     }
 
     bool match(const mutablebson::ConstElement& element) final {
@@ -115,22 +131,26 @@ public:
     }
 
 private:
+    BSONObj value() const final {
+        return BSON("" << _modExpr);
+    }
+
     BSONElement _modExpr;
     const CollatorInterface* _collator;
 };
 
-Status PullNode::init(BSONElement modExpr, const CollatorInterface* collator) {
+Status PullNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
 
     try {
         if (modExpr.type() == mongo::Object &&
             !MatchExpressionParser::parsePathAcceptingKeyword(
                 modExpr.embeddedObject().firstElement())) {
-            _matcher = stdx::make_unique<ObjectMatcher>(modExpr.embeddedObject(), collator);
+            _matcher = std::make_unique<ObjectMatcher>(modExpr.embeddedObject(), expCtx);
         } else if (modExpr.type() == mongo::Object || modExpr.type() == mongo::RegEx) {
-            _matcher = stdx::make_unique<WrappedObjectMatcher>(modExpr, collator);
+            _matcher = std::make_unique<WrappedObjectMatcher>(modExpr, expCtx);
         } else {
-            _matcher = stdx::make_unique<EqualityMatcher>(modExpr, collator);
+            _matcher = std::make_unique<EqualityMatcher>(modExpr, expCtx->getCollator());
         }
     } catch (AssertionException& exception) {
         return exception.toStatus();

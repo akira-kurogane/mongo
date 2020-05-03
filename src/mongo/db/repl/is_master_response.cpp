@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +37,7 @@
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -46,6 +47,7 @@ const std::string kIsMasterFieldName = "ismaster";
 const std::string kSecondaryFieldName = "secondary";
 const std::string kSetNameFieldName = "setName";
 const std::string kSetVersionFieldName = "setVersion";
+const std::string kTopologyVersionFieldName = "topologyVersion";
 const std::string kHostsFieldName = "hosts";
 const std::string kPassivesFieldName = "passives";
 const std::string kArbitersFieldName = "arbiters";
@@ -101,6 +103,11 @@ IsMasterResponse::IsMasterResponse()
       _shutdownInProgress(false) {}
 
 void IsMasterResponse::addToBSON(BSONObjBuilder* builder) const {
+    if (_topologyVersion) {
+        BSONObjBuilder topologyVersionBuilder(builder->subobjStart(kTopologyVersionFieldName));
+        _topologyVersion->serialize(&topologyVersionBuilder);
+    }
+
     if (_hostsSet) {
         std::vector<std::string> hosts;
         for (size_t i = 0; i < _hosts.size(); ++i) {
@@ -162,7 +169,7 @@ void IsMasterResponse::addToBSON(BSONObjBuilder* builder) const {
         builder->appendIntOrLL(kSlaveDelayFieldName, durationCount<Seconds>(_slaveDelay));
     if (_tagsSet) {
         BSONObjBuilder tags(builder->subobjStart(kTagsFieldName));
-        for (unordered_map<std::string, std::string>::const_iterator it = _tags.begin();
+        for (stdx::unordered_map<std::string, std::string>::const_iterator it = _tags.begin();
              it != _tags.end();
              ++it) {
             tags.append(it->first, it->second);
@@ -219,8 +226,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                           str::stream() << "Found \"" << kIsReplicaSetFieldName
                                         << "\" field which should indicate that no valid config "
                                            "is loaded, but we didn't also have an \""
-                                        << kInfoFieldName
-                                        << "\" field as we expected");
+                                        << kInfoFieldName << "\" field as we expected");
         }
     }
 
@@ -247,8 +253,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "Elements in \"" << kHostsFieldName
                                             << "\" array of isMaster response must be of type "
-                                            << typeName(String)
-                                            << " but found type "
+                                            << typeName(String) << " but found type "
                                             << typeName(hostElement.type()));
             }
             _hosts.push_back(HostAndPort(hostElement.String()));
@@ -268,8 +273,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "Elements in \"" << kPassivesFieldName
                                             << "\" array of isMaster response must be of type "
-                                            << typeName(String)
-                                            << " but found type "
+                                            << typeName(String) << " but found type "
                                             << typeName(passiveElement.type()));
             }
             _passives.push_back(HostAndPort(passiveElement.String()));
@@ -289,8 +293,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "Elements in \"" << kArbitersFieldName
                                             << "\" array of isMaster response must be of type "
-                                            << typeName(String)
-                                            << " but found type "
+                                            << typeName(String) << " but found type "
                                             << typeName(arbiterElement.type()));
             }
             _arbiters.push_back(HostAndPort(arbiterElement.String()));
@@ -363,8 +366,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                               str::stream() << "Elements in \"" << kTagsFieldName
                                             << "\" obj "
                                                "of isMaster response must be of type "
-                                            << typeName(String)
-                                            << " but found type "
+                                            << typeName(String) << " but found type "
                                             << typeName(tagsElement.type()));
             }
             _tags[tagElement.fieldNameStringData().toString()] = tagElement.String();
@@ -396,8 +398,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                               str::stream() << "Elements in \"" << kLastWriteOpTimeFieldName
                                             << "\" obj "
                                                "of isMaster response must be of type "
-                                            << typeName(Object)
-                                            << " but found type "
+                                            << typeName(Object) << " but found type "
                                             << typeName(lastWriteOpTimeElement.type()));
             }
             auto lastWriteOpTime = OpTime::parseFromOplogEntry(lastWriteOpTimeElement.Obj());
@@ -417,8 +418,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                               str::stream() << "Elements in \"" << kLastWriteDateFieldName
                                             << "\" obj "
                                                "of isMaster response must be of type "
-                                            << typeName(Date)
-                                            << " but found type "
+                                            << typeName(Date) << " but found type "
                                             << typeName(lastWriteDateElement.type()));
             }
             if (_lastWrite) {
@@ -438,8 +438,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                               str::stream() << "Elements in \"" << kLastMajorityWriteOpTimeFieldName
                                             << "\" obj "
                                                "of isMaster response must be of type "
-                                            << typeName(Object)
-                                            << " but found type "
+                                            << typeName(Object) << " but found type "
                                             << typeName(lastMajorityWriteOpTimeElement.type()));
             }
             auto lastMajorityWriteOpTime =
@@ -460,8 +459,7 @@ Status IsMasterResponse::initialize(const BSONObj& doc) {
                               str::stream() << "Elements in \"" << kLastMajorityWriteDateFieldName
                                             << "\" obj "
                                                "of isMaster response must be of type "
-                                            << typeName(Date)
-                                            << " but found type "
+                                            << typeName(Date) << " but found type "
                                             << typeName(lastMajorityWriteDateElement.type()));
             }
             if (_lastMajorityWrite) {
@@ -496,9 +494,9 @@ void IsMasterResponse::setIsSecondary(bool secondary) {
     _secondary = secondary;
 }
 
-void IsMasterResponse::setReplSetName(const std::string& setName) {
+void IsMasterResponse::setReplSetName(StringData setName) {
     _setNameSet = true;
-    _setName = setName;
+    _setName = setName.toString();
 }
 
 void IsMasterResponse::setReplSetVersion(long long version) {
@@ -544,6 +542,10 @@ void IsMasterResponse::setIsHidden(bool hidden) {
 void IsMasterResponse::setShouldBuildIndexes(bool buildIndexes) {
     _buildIndexesSet = true;
     _buildIndexes = buildIndexes;
+}
+
+void IsMasterResponse::setTopologyVersion(TopologyVersion topologyVersion) {
+    _topologyVersion = topologyVersion;
 }
 
 void IsMasterResponse::setSlaveDelay(Seconds slaveDelay) {

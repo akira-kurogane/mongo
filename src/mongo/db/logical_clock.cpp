@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,46 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_clock_gen.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/global_settings.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/time_proof_service.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
-
-constexpr Seconds LogicalClock::kMaxAcceptableLogicalClockDriftSecs;
-
-server_parameter_storage_type<long long, ServerParameterType::kStartupOnly>::value_type
-    maxAcceptableLogicalClockDriftSecs(LogicalClock::kMaxAcceptableLogicalClockDriftSecs.count());
-
-class MaxAcceptableLogicalClockDriftSecs
-    : public ExportedServerParameter<long long, ServerParameterType::kStartupOnly> {
-public:
-    MaxAcceptableLogicalClockDriftSecs()
-        : ExportedServerParameter<long long, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "maxAcceptableLogicalClockDriftSecs",
-              &maxAcceptableLogicalClockDriftSecs) {}
-
-    Status validate(const long long& potentialNewValue) {
-        if (potentialNewValue <= 0) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "maxAcceptableLogicalClockDriftSecs must be positive, "
-                                           "but attempted to set to: "
-                                        << potentialNewValue);
-        }
-
-        return Status::OK();
-    }
-} maxAcceptableLogicalClockDriftSecsParameter;
 
 namespace {
 const auto getLogicalClock = ServiceContext::declareDecoration<std::unique_ptr<LogicalClock>>();
@@ -74,6 +50,18 @@ bool lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks) {
     return time.asTimestamp().getSecs() <= LogicalClock::kMaxSignedInt &&
         time.asTimestamp().getInc() <= (LogicalClock::kMaxSignedInt - nTicks);
 }
+}  // namespace
+
+LogicalTime LogicalClock::getClusterTimeForReplicaSet(ServiceContext* svcCtx) {
+    if (getGlobalReplSettings().usingReplSets()) {
+        return get(svcCtx)->getClusterTime();
+    }
+
+    return {};
+}
+
+LogicalTime LogicalClock::getClusterTimeForReplicaSet(OperationContext* opCtx) {
+    return getClusterTimeForReplicaSet(opCtx->getClient()->getServiceContext());
 }
 
 LogicalClock* LogicalClock::get(ServiceContext* service) {
@@ -92,12 +80,12 @@ void LogicalClock::set(ServiceContext* service, std::unique_ptr<LogicalClock> cl
 LogicalClock::LogicalClock(ServiceContext* service) : _service(service) {}
 
 LogicalTime LogicalClock::getClusterTime() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
     return _clusterTime;
 }
 
 Status LogicalClock::advanceClusterTime(const LogicalTime newTime) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     auto rateLimitStatus = _passesRateLimiter_inlock(newTime);
     if (!rateLimitStatus.isOK()) {
@@ -115,7 +103,7 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 
     invariant(nTicks > 0 && nTicks <= kMaxSignedInt);
 
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<Latch> lock(_mutex);
 
     LogicalTime clusterTime = _clusterTime;
 
@@ -134,8 +122,9 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
     // second.
     else if (clusterTime.asTimestamp().getInc() > (kMaxSignedInt - nTicks)) {
 
-        log() << "Exceeded maximum allowable increment value within one second. Moving clusterTime "
-                 "forward to the next second.";
+        LOGV2(20709,
+              "Exceeded maximum allowable increment value within one second. Moving clusterTime "
+              "forward to the next second.");
 
         // Move time forward to the next second
         clusterTime = LogicalTime(Timestamp(clusterTime.asTimestamp().getSecs() + 1, 0));
@@ -158,8 +147,7 @@ LogicalTime LogicalClock::reserveTicks(uint64_t nTicks) {
 }
 
 void LogicalClock::setClusterTimeFromTrustedSource(LogicalTime newTime) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-
+    stdx::lock_guard<Latch> lock(_mutex);
     // Rate limit checks are skipped here so a server with no activity for longer than
     // maxAcceptableLogicalClockDriftSecs seconds can still have its cluster time initialized.
 
@@ -175,7 +163,7 @@ void LogicalClock::setClusterTimeFromTrustedSource(LogicalTime newTime) {
 Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
     const unsigned wallClockSecs =
         durationCount<Seconds>(_service->getFastClockSource()->now().toDurationSinceEpoch());
-    auto maxAcceptableDriftSecs = static_cast<const unsigned>(maxAcceptableLogicalClockDriftSecs);
+    auto maxAcceptableDriftSecs = static_cast<const unsigned>(gMaxAcceptableLogicalClockDriftSecs);
     auto newTimeSecs = newTime.asTimestamp().getSecs();
 
     // Both values are unsigned, so compare them first to avoid wrap-around.
@@ -183,8 +171,7 @@ Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
         return Status(ErrorCodes::ClusterTimeFailsRateLimiter,
                       str::stream() << "New cluster time, " << newTimeSecs
                                     << ", is too far from this node's wall clock time, "
-                                    << wallClockSecs
-                                    << ".");
+                                    << wallClockSecs << ".");
     }
 
     uassert(40484,
@@ -192,6 +179,16 @@ Status LogicalClock::_passesRateLimiter_inlock(LogicalTime newTime) {
             lessThanOrEqualToMaxPossibleTime(newTime, 0));
 
     return Status::OK();
+}
+
+bool LogicalClock::isEnabled() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _isEnabled;
+}
+
+void LogicalClock::disable() {
+    stdx::lock_guard<Latch> lock(_mutex);
+    _isEnabled = false;
 }
 
 }  // namespace mongo

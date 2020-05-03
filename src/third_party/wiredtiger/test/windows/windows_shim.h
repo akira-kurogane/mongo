@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -27,33 +27,33 @@
  */
 #include "wt_internal.h"
 
-#include <direct.h>						/* _mkdir */
+#include <direct.h> /* _mkdir */
 
 /* Windows does not define constants for access() */
-#define	R_OK	04
-#define	X_OK	R_OK
+#define R_OK 04
+#define X_OK R_OK
 
 /* snprintf does not exist on <= VS 2013 */
 #if _MSC_VER < 1900
-#define	snprintf __wt_snprintf
+#define snprintf __wt_snprintf
 #endif
 
-#define	strcasecmp	stricmp
+#define strcasecmp stricmp
 
 /*
  * Emulate <sys/stat.h>
  */
-#define	mkdir(path, mode) _mkdir(path)
+#define mkdir(path, mode) _mkdir(path)
 
 /*
  * Emulate <sys/time.h>
  */
 struct timeval {
-	time_t tv_sec;
-	int64_t tv_usec;
+    time_t tv_sec;
+    int64_t tv_usec;
 };
 
-int gettimeofday(struct timeval* tp, void* tzp);
+int gettimeofday(struct timeval *tp, void *tzp);
 
 /*
  * Emulate <unistd.h>
@@ -63,20 +63,18 @@ typedef uint32_t useconds_t;
 int sleep(int seconds);
 int usleep(useconds_t useconds);
 
-#define	lseek(fd, offset, origin)					\
-	_lseek(fd, (long)(offset), origin)
-#define	write(fd, buffer, count)					\
-	_write(fd, buffer, (unsigned int)(count))
+#define lseek(fd, offset, origin) _lseek(fd, (long)(offset), origin)
+#define write(fd, buffer, count) _write(fd, buffer, (unsigned int)(count))
 
 /*
  * Emulate the <pthread.h> support we need for tests and example code.
  */
-typedef CRITICAL_SECTION  pthread_mutex_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
 typedef CONDITION_VARIABLE pthread_cond_t;
 
 struct rwlock_wrapper {
-	SRWLOCK rwlock;
-	int exclusive_locked;
+    SRWLOCK rwlock;
+    DWORD exclusive_locked;
 };
 
 struct rwlock_wrapper;
@@ -87,12 +85,12 @@ typedef HANDLE pthread_t;
 typedef int pthread_rwlockattr_t;
 typedef int pthread_attr_t;
 
-int pthread_create(
-	pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+int pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 int pthread_join(pthread_t, void **);
 int pthread_rwlock_destroy(pthread_rwlock_t *);
 int pthread_rwlock_init(pthread_rwlock_t *, const pthread_rwlockattr_t *);
 int pthread_rwlock_rdlock(pthread_rwlock_t *);
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *);
 int pthread_rwlock_trywrlock(pthread_rwlock_t *);
 int pthread_rwlock_unlock(pthread_rwlock_t *);
 int pthread_rwlock_wrlock(pthread_rwlock_t *);

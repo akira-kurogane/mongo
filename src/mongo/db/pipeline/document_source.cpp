@@ -1,40 +1,47 @@
 /**
-*    Copyright (C) 2011 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_internal_shard_filter.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_sample.h"
+#include "mongo/db/pipeline/document_source_sequential_document_cache.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/semantic_analysis.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -45,20 +52,32 @@ using std::list;
 using std::string;
 using std::vector;
 
-DocumentSource::DocumentSource(const intrusive_ptr<ExpressionContext>& pCtx)
-    : pSource(NULL), pExpCtx(pCtx) {}
+DocumentSource::DocumentSource(const StringData stageName,
+                               const intrusive_ptr<ExpressionContext>& pCtx)
+    : pSource(nullptr), pExpCtx(pCtx), _commonStats(stageName.rawData()) {
+    if (pExpCtx->shouldCollectDocumentSourceExecStats()) {
+        _commonStats.executionTimeMillis.emplace(0);
+    }
+}
 
 namespace {
+struct ParserRegistration {
+    Parser parser;
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion;
+};
 // Used to keep track of which DocumentSources are registered under which name.
-static StringMap<Parser> parserMap;
+static StringMap<ParserRegistration> parserMap;
 }  // namespace
 
-void DocumentSource::registerParser(string name, Parser parser) {
+void DocumentSource::registerParser(
+    string name,
+    Parser parser,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion) {
     auto it = parserMap.find(name);
     massert(28707,
             str::stream() << "Duplicate document source (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = parser;
+    parserMap[name] = {parser, requiredMinVersion};
 }
 
 list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
@@ -76,7 +95,15 @@ list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
 
-    return it->second(stageSpec, expCtx);
+    uassert(ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << stageName
+                          << " is not allowed in the current feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !expCtx->maxFeatureCompatibilityVersion || !it->second.requiredMinVersion ||
+                (*it->second.requiredMinVersion <= *expCtx->maxFeatureCompatibilityVersion));
+
+    return it->second.parser(stageSpec, expCtx);
 }
 
 const char* DocumentSource::getSourceName() const {
@@ -89,41 +116,6 @@ intrusive_ptr<DocumentSource> DocumentSource::optimize() {
 }
 
 namespace {
-
-/**
- * Given a set of paths 'dependencies', determines which of those paths will be modified if all
- * paths except those in 'preservedPaths' are modified.
- *
- * For example, extractModifiedDependencies({'a', 'b', 'c.d', 'e'}, {'a', 'b.c', c'}) returns
- * {'b', 'e'}, since 'b' and 'e' are not preserved (only 'b.c' is preserved).
- */
-std::set<std::string> extractModifiedDependencies(const std::set<std::string>& dependencies,
-                                                  const std::set<std::string>& preservedPaths) {
-    std::set<std::string> modifiedDependencies;
-
-    // The modified dependencies is *almost* the set difference 'dependencies' - 'preservedPaths',
-    // except that if p in 'preservedPaths' is a "path prefix" of d in 'dependencies', then 'd'
-    // should not be included in the modified dependencies.
-    for (auto&& dependency : dependencies) {
-        bool preserved = false;
-        auto firstField = FieldPath::extractFirstFieldFromDottedPath(dependency).toString();
-        // If even a prefix is preserved, the path is preserved, so search for any prefixes of
-        // 'dependency' as well. 'preservedPaths' is an *ordered* set, so we only have to search the
-        // range ['firstField', 'dependency'] to find any prefixes of 'dependency'.
-        for (auto it = preservedPaths.lower_bound(firstField);
-             it != preservedPaths.upper_bound(dependency);
-             ++it) {
-            if (*it == dependency || expression::isPathPrefixOf(*it, dependency)) {
-                preserved = true;
-                break;
-            }
-        }
-        if (!preserved) {
-            modifiedDependencies.insert(dependency);
-        }
-    }
-    return modifiedDependencies;
-}
 
 /**
  * Returns a pair of pointers to $match stages, either of which can be null. The first entry in the
@@ -153,19 +145,43 @@ splitMatchByModifiedFields(const boost::intrusive_ptr<DocumentSourceMatch>& matc
             for (auto&& rename : modifiedPathsRet.renames) {
                 preservedPaths.insert(rename.first);
             }
-            modifiedPaths = extractModifiedDependencies(depsTracker.fields, preservedPaths);
+            modifiedPaths =
+                semantic_analysis::extractModifiedDependencies(depsTracker.fields, preservedPaths);
         }
     }
     return match->splitSourceBy(modifiedPaths, modifiedPathsRet.renames);
 }
 
+/**
+ * Verifies whether or not a $group is able to swap with a succeeding $match stage. While ordinarily
+ * $group can swap with a $match, it cannot if the following $match has an $exists predicate on _id,
+ * and the $group has exactly one field as the $group key.  This is because every document will have
+ * an _id field following such a $group stage, including those whose group key was missing before
+ * the $group. As an example, the following optimization would be incorrect as the post-optimization
+ * pipeline would handle documents that had nullish _id fields differently. Thus, given such a
+ * $group and $match, this function would return false.
+ *   {$group: {_id: "$x"}}
+ *   {$match: {_id: {$exists: true}}
+ * ---->
+ *   {$match: {x: {$exists: true}}
+ *   {$group: {_id: "$x"}}
+ */
+bool groupMatchSwapVerified(const DocumentSourceMatch& nextMatch,
+                            const DocumentSourceGroup& thisGroup) {
+    if (thisGroup.getIdFields().size() != 1) {
+        return true;
+    }
+    return !expression::hasExistencePredicateOnPath(*(nextMatch.getMatchExpression()), "_id"_sd);
+}
+
 }  // namespace
 
-Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    invariant(*itr == this && (std::next(itr) != container->end()));
+bool DocumentSource::pushMatchBefore(Pipeline::SourceContainer::iterator itr,
+                                     Pipeline::SourceContainer* container) {
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
-    if (constraints().canSwapWithMatch && nextMatch && !nextMatch->isTextQuery()) {
+    auto thisGroup = dynamic_cast<DocumentSourceGroup*>(this);
+    if (constraints().canSwapWithMatch && nextMatch && !nextMatch->isTextQuery() &&
+        (!thisGroup || groupMatchSwapVerified(*nextMatch, *thisGroup))) {
         // We're allowed to swap with a $match and the stage after us is a $match. Furthermore, the
         // $match does not contain a text search predicate, which we do not attempt to optimize
         // because such a $match must already be the first stage in the pipeline. We can attempt to
@@ -184,12 +200,37 @@ Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
                 container->insert(std::next(itr), std::move(splitMatch.second));
             }
 
-            // The stage before the new $match may be able to optimize further, if there is such a
-            // stage.
-            return std::prev(itr) == container->begin() ? std::prev(itr)
-                                                        : std::prev(std::prev(itr));
+            return true;
         }
     }
+    return false;
+}
+
+bool DocumentSource::pushSampleBefore(Pipeline::SourceContainer::iterator itr,
+                                      Pipeline::SourceContainer* container) {
+    auto nextSample = dynamic_cast<DocumentSourceSample*>((*std::next(itr)).get());
+    if (constraints().canSwapWithLimitAndSample && nextSample) {
+
+        container->insert(itr, std::move(nextSample));
+        container->erase(std::next(itr));
+
+        return true;
+    }
+    return false;
+}
+
+Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
+
+    // Attempt to swap 'itr' with a subsequent $match or subsequent $sample.
+    if (std::next(itr) != container->end() &&
+        (pushMatchBefore(itr, container) || pushSampleBefore(itr, container))) {
+        // The stage before the pushed before stage may be able to optimize further, if there is
+        // such a stage.
+        return std::prev(itr) == container->begin() ? std::prev(itr) : std::prev(std::prev(itr));
+    }
+
     return doOptimizeAt(itr, container);
 }
 
@@ -201,52 +242,4 @@ void DocumentSource::serializeToArray(vector<Value>& array,
     }
 }
 
-BSONObjSet DocumentSource::allPrefixes(BSONObj obj) {
-    BSONObjSet out = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-
-    BSONObj last = {};
-    for (auto&& field : obj) {
-        BSONObjBuilder builder(last.objsize() + field.size());
-        builder.appendElements(last);
-        builder.append(field);
-        last = builder.obj();
-        out.insert(last);
-    }
-
-    return out;
-}
-
-BSONObjSet DocumentSource::truncateSortSet(const BSONObjSet& sorts,
-                                           const std::set<std::string>& fields) {
-    BSONObjSet out = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-
-    for (auto&& sort : sorts) {
-        BSONObjBuilder outputSort;
-
-        for (auto&& key : sort) {
-            auto keyName = key.fieldNameStringData();
-
-            bool shouldAppend = true;
-            for (auto&& field : fields) {
-                if (keyName == field || keyName.startsWith(field + '.')) {
-                    shouldAppend = false;
-                    break;
-                }
-            }
-
-            if (!shouldAppend) {
-                break;
-            }
-
-            outputSort.append(key);
-        }
-
-        BSONObj outSortObj = outputSort.obj();
-        if (!outSortObj.isEmpty()) {
-            out.insert(outSortObj);
-        }
-    }
-
-    return out;
-}
-}
+}  // namespace mongo

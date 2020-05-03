@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,22 +29,19 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/keys_collection_manager_sharding.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/signed_logical_time.h"
 #include "mongo/db/time_proof_service.h"
-#include "mongo/platform/basic.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/config_server_test_fixture.h"
-#include "mongo/s/grid.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -60,20 +58,17 @@ protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
-        serverGlobalParams.featureCompatibility.version.store(
-            ServerGlobalParams::FeatureCompatibility::Version::k36);
-        serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(true);
-
-        auto clockSource = stdx::make_unique<ClockSourceMock>();
+        auto clockSource = std::make_unique<ClockSourceMock>();
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
-        auto catalogClient = Grid::get(operationContext())->catalogClient();
+        auto catalogClient = std::make_unique<KeysCollectionClientSharded>(
+            Grid::get(operationContext())->catalogClient());
 
         const LogicalTime currentTime(LogicalTime(Timestamp(1, 0)));
         LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
 
-        _keyManager =
-            std::make_shared<KeysCollectionManagerSharding>("dummy", catalogClient, Seconds(1000));
-        _validator = stdx::make_unique<LogicalTimeValidator>(_keyManager);
+        _keyManager = std::make_shared<KeysCollectionManager>(
+            "dummy", std::move(catalogClient), Seconds(1000));
+        _validator = std::make_unique<LogicalTimeValidator>(_keyManager);
         _validator->init(operationContext()->getServiceContext());
     }
 
@@ -82,10 +77,13 @@ protected:
         ConfigServerTestFixture::tearDown();
     }
 
+    /**
+     * Intentionally create a DistLockManagerMock, even though this is a config serfver test in
+     * order to avoid the lock pinger thread from executing and accessing uninitialized state.
+     */
     std::unique_ptr<DistLockManager> makeDistLockManager(
         std::unique_ptr<DistLockCatalog> distLockCatalog) override {
-        invariant(distLockCatalog);
-        return stdx::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
+        return std::make_unique<DistLockManagerMock>(std::move(distLockCatalog));
     }
 
     /**
@@ -97,7 +95,7 @@ protected:
 
 private:
     std::unique_ptr<LogicalTimeValidator> _validator;
-    std::shared_ptr<KeysCollectionManagerSharding> _keyManager;
+    std::shared_ptr<KeysCollectionManager> _keyManager;
 };
 
 TEST_F(LogicalTimeValidatorTest, GetTimeWithIncreasingTimes) {
@@ -182,6 +180,24 @@ TEST_F(LogicalTimeValidatorTest, ShouldGossipLogicalTimeIsFalseUntilKeysAreFound
 
     ASSERT_EQ(true, validator()->shouldGossipLogicalTime());
     ASSERT_OK(validator()->validate(operationContext(), newTime));
+}
+
+TEST_F(LogicalTimeValidatorTest, CanSignTimesAfterReset) {
+    validator()->enableKeyGenerator(operationContext(), true);
+
+    LogicalTime t1(Timestamp(10, 0));
+    auto newTime = validator()->trySignLogicalTime(t1);
+
+    ASSERT_EQ(t1.asTimestamp(), newTime.getTime().asTimestamp());
+    ASSERT_TRUE(newTime.getProof());
+
+    validator()->resetKeyManagerCache();
+
+    LogicalTime t2(Timestamp(20, 0));
+    auto newTime2 = validator()->trySignLogicalTime(t2);
+
+    ASSERT_EQ(t2.asTimestamp(), newTime2.getTime().asTimestamp());
+    ASSERT_TRUE(newTime2.getProof());
 }
 
 }  // unnamed namespace

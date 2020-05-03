@@ -1,3 +1,25 @@
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 """Tests for the graph class used in the dagger tool. Tests the add_edge and
 add_node methods, along with the methods for exporting and importing the graph
 from JSON
@@ -5,8 +27,8 @@ from JSON
 
 import json
 import unittest
-import graph
-import graph_consts
+from . import graph
+from . import graph_consts
 
 
 def generate_graph():
@@ -73,26 +95,33 @@ class CustomAssertions:
             raise AssertionError("Nodes not of same type")
 
         if node1.type == graph_consts.NODE_LIB:
-            if (node1._defined_symbols != node2._defined_symbols or
-                    node1._defined_files != node2._defined_files or
-                    node1._dependent_libs != node2._dependent_libs or
-                    node1._dependent_files != node2._dependent_files or
-                    node1._id != node2._id):
+            if (
+                node1._defined_symbols != node2._defined_symbols
+                or node1._defined_files != node2._defined_files
+                or node1._dependent_libs != node2._dependent_libs
+                or node1._dependent_files != node2._dependent_files
+                or node1._id != node2._id
+            ):
                 raise AssertionError("Nodes not equal")
 
         elif node1.type == graph_consts.NODE_SYM:
-            if (node1._libs != node2._libs or node1._files != node2._files or
-                    node1._dependent_libs != node2._dependent_libs or
-                    node1._dependent_files != node2._dependent_files or
-                    node1.id != node2.id):
+            if (
+                node1._libs != node2._libs
+                or node1._files != node2._files
+                or node1._dependent_libs != node2._dependent_libs
+                or node1._dependent_files != node2._dependent_files
+                or node1.id != node2.id
+            ):
                 raise AssertionError("Nodes not equal")
 
         else:
-            if (node1._lib != node2._lib or
-                    node1._dependent_libs != node2._dependent_libs or
-                    node1._dependent_files != node2._dependent_files or
-                    node1.id != node2.id or
-                    node1._defined_symbols != node2._defined_symbols):
+            if (
+                node1._lib != node2._lib
+                or node1._dependent_libs != node2._dependent_libs
+                or node1._dependent_files != node2._dependent_files
+                or node1.id != node2.id
+                or node1._defined_symbols != node2._defined_symbols
+            ):
                 raise AssertionError("Nodes not equal")
 
 
@@ -104,11 +133,9 @@ class TestGraphMethods(unittest.TestCase, CustomAssertions):
 
         self.from_node_lib = graph.NodeLib("from_node_lib", "from_node_lib")
         self.to_node_lib = graph.NodeLib("to_node_lib", "to_node_lib")
-        self.from_node_file = graph.NodeFile(
-            "from_node_file", "from_node_file")
+        self.from_node_file = graph.NodeFile("from_node_file", "from_node_file")
         self.to_node_file = graph.NodeFile("to_node_file", "to_node_file")
-        self.from_node_sym = graph.NodeSymbol(
-            "from_node_symbol", "from_node_symbol")
+        self.from_node_sym = graph.NodeSymbol("from_node_symbol", "from_node_symbol")
         self.to_node_sym = graph.NodeSymbol("to_node_symbol", "to_node_symbol")
 
         self.g.add_node(self.from_node_lib)
@@ -122,73 +149,102 @@ class TestGraphMethods(unittest.TestCase, CustomAssertions):
         node = graph.NodeLib("test_node", "test_node")
         self.g._nodes = {"test_node": node}
 
-        self.assertEquals(self.g.get_node("test_node"), node)
+        self.assertEqual(self.g.get_node("test_node"), node)
 
-        self.assertEquals(self.g.get_node("missing_node"), None)
+        self.assertEqual(self.g.get_node("missing_node"), None)
 
     def test_add_node(self):
         node = graph.NodeLib("test_node", "test_node")
         self.g.add_node(node)
 
-        self.assertEquals(self.g.get_node("test_node"), node)
+        self.assertEqual(self.g.get_node("test_node"), node)
 
         self.assertRaises(ValueError, self.g.add_node, node)
 
         self.assertRaises(TypeError, self.g.add_node, "not a node")
 
     def test_add_edge_exceptions(self):
-        self.assertRaises(TypeError, self.g.add_edge, "NOT A RELATIONSHIP",
-                          self.from_node_lib.id, self.to_node_lib.id)
+        self.assertRaises(
+            TypeError,
+            self.g.add_edge,
+            "NOT A RELATIONSHIP",
+            self.from_node_lib.id,
+            self.to_node_lib.id,
+        )
 
-        self.assertRaises(ValueError, self.g.add_edge,
-                          graph_consts.LIB_LIB, "not a node", "not a node")
+        self.assertRaises(
+            ValueError,
+            self.g.add_edge,
+            graph_consts.LIB_LIB,
+            "not a node",
+            "not a node",
+        )
 
     def test_add_edge_libs(self):
-        self.g.add_edge(graph_consts.LIB_LIB, self.from_node_lib.id,
-                        self.to_node_lib.id)
-        self.g.add_edge(graph_consts.LIB_LIB, self.from_node_lib.id,
-                        self.to_node_lib.id)
-        self.g.add_edge(graph_consts.LIB_SYM, self.from_node_lib.id,
-                        self.to_node_sym.id)
-        self.g.add_edge(graph_consts.LIB_FIL, self.from_node_lib.id,
-                        self.to_node_file.id)
+        self.g.add_edge(
+            graph_consts.LIB_LIB, self.from_node_lib.id, self.to_node_lib.id
+        )
+        self.g.add_edge(
+            graph_consts.LIB_LIB, self.from_node_lib.id, self.to_node_lib.id
+        )
+        self.g.add_edge(
+            graph_consts.LIB_SYM, self.from_node_lib.id, self.to_node_sym.id
+        )
+        self.g.add_edge(
+            graph_consts.LIB_FIL, self.from_node_lib.id, self.to_node_file.id
+        )
 
-        self.assertEquals(self.g.edges[graph_consts.LIB_LIB][
-            self.from_node_lib.id], set([self.to_node_lib.id]))
+        self.assertEqual(
+            self.g.edges[graph_consts.LIB_LIB][self.from_node_lib.id],
+            set([self.to_node_lib.id]),
+        )
 
-        self.assertEquals(self.g.edges[graph_consts.LIB_SYM][
-            self.from_node_lib.id], set([self.to_node_sym.id]))
+        self.assertEqual(
+            self.g.edges[graph_consts.LIB_SYM][self.from_node_lib.id],
+            set([self.to_node_sym.id]),
+        )
 
-        self.assertEquals(self.g.edges[graph_consts.LIB_FIL][
-            self.from_node_lib.id], set([self.to_node_file.id]))
+        self.assertEqual(
+            self.g.edges[graph_consts.LIB_FIL][self.from_node_lib.id],
+            set([self.to_node_file.id]),
+        )
 
-        self.assertEquals(self.to_node_lib.dependent_libs,
-                          set([self.from_node_lib.id]))
+        self.assertEqual(self.to_node_lib.dependent_libs, set([self.from_node_lib.id]))
 
     def test_add_edge_files(self):
-        self.g.add_edge(graph_consts.FIL_FIL, self.from_node_file.id,
-                        self.to_node_file.id)
-        self.g.add_edge(graph_consts.FIL_SYM, self.from_node_file.id,
-                        self.to_node_sym.id)
-        self.g.add_edge(graph_consts.FIL_LIB, self.from_node_file.id,
-                        self.to_node_lib.id)
+        self.g.add_edge(
+            graph_consts.FIL_FIL, self.from_node_file.id, self.to_node_file.id
+        )
+        self.g.add_edge(
+            graph_consts.FIL_SYM, self.from_node_file.id, self.to_node_sym.id
+        )
+        self.g.add_edge(
+            graph_consts.FIL_LIB, self.from_node_file.id, self.to_node_lib.id
+        )
 
-        self.assertEquals(self.g.edges[graph_consts.FIL_FIL][
-            self.from_node_file.id], set([self.to_node_file.id]))
-        self.assertEquals(self.g.edges[graph_consts.FIL_SYM][
-            self.from_node_file.id], set([self.to_node_sym.id]))
-        self.assertEquals(self.g.edges[graph_consts.FIL_LIB][
-            self.from_node_file.id], set([self.to_node_lib.id]))
+        self.assertEqual(
+            self.g.edges[graph_consts.FIL_FIL][self.from_node_file.id],
+            set([self.to_node_file.id]),
+        )
+        self.assertEqual(
+            self.g.edges[graph_consts.FIL_SYM][self.from_node_file.id],
+            set([self.to_node_sym.id]),
+        )
+        self.assertEqual(
+            self.g.edges[graph_consts.FIL_LIB][self.from_node_file.id],
+            set([self.to_node_lib.id]),
+        )
 
-        self.assertEquals(self.to_node_file.dependent_files,
-                          set([self.from_node_file.id]))
+        self.assertEqual(
+            self.to_node_file.dependent_files, set([self.from_node_file.id])
+        )
 
     def test_export_to_json(self):
         generated_graph = generate_graph()
         generated_graph.export_to_json("export_test.json")
         generated = open("export_test.json", "r")
         correct = open("test_graph.json", "r")
-        self.assertEquals(json.load(generated), json.load(correct))
+        self.assertEqual(json.load(generated), json.load(correct))
         generated.close()
         correct.close()
 
@@ -196,17 +252,18 @@ class TestGraphMethods(unittest.TestCase, CustomAssertions):
         graph_fromJSON = graph.Graph("test_graph.json")
         correct_graph = generate_graph()
 
-        for id in graph_fromJSON.nodes.keys():
+        for id in list(graph_fromJSON.nodes.keys()):
             # for some reason, neither
             # assertTrue(graph_fromJSON.get_node(id) == correct_graph.get_node(str(id)))
             # nor assertEquals() seem to call the correct eq method here, hence
             # the need for a custom assertion
 
             self.assertNodeEquals(
-                graph_fromJSON.get_node(id), correct_graph.get_node(id))
+                graph_fromJSON.get_node(id), correct_graph.get_node(id)
+            )
 
-        self.assertEquals(graph_fromJSON.edges, correct_graph.edges)
+        self.assertEqual(graph_fromJSON.edges, correct_graph.edges)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

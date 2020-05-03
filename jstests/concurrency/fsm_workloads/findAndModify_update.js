@@ -9,14 +9,12 @@
  * using either the $min or $max operator.
  */
 var $config = (function() {
-
     var data = {
         numDocsPerThread: 3,  // >1 for 'sort' to be meaningful
         shardKey: {tid: 1}
     };
 
     var states = (function() {
-
         function makeDoc(tid) {
             return {_id: new ObjectId(), tid: tid, value: 0};
         }
@@ -24,7 +22,7 @@ var $config = (function() {
         function init(db, collName) {
             for (var i = 0; i < this.numDocsPerThread; ++i) {
                 var res = db[collName].insert(makeDoc(this.tid));
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
                 assertAlways.eq(1, res.nInserted);
             }
         }
@@ -76,7 +74,6 @@ var $config = (function() {
             findAndModifyAscending: findAndModifyAscending,
             findAndModifyDescending: findAndModifyDescending
         };
-
     })();
 
     var transitions = {
@@ -98,5 +95,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

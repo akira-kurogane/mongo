@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -38,13 +40,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -52,10 +54,9 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -69,12 +70,16 @@ using std::string;
 using std::vector;
 using unittest::assertGet;
 
-using InsertRetryTest = ShardingCatalogTestFixture;
-using UpdateRetryTest = ShardingCatalogTestFixture;
+using InsertRetryTest = ShardingTestFixture;
+using UpdateRetryTest = ShardingTestFixture;
 
 const NamespaceString kTestNamespace("config.TestColl");
 const HostAndPort kTestHosts[] = {
     HostAndPort("TestHost1:12345"), HostAndPort("TestHost2:12345"), HostAndPort("TestHost3:12345")};
+
+Status getMockDuplicateKeyError() {
+    return {DuplicateKeyErrorInfo(BSON("mock" << 1), BSON("" << 1)), "Mock duplicate key error"};
+}
 
 TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
     configTargeter()->setFindHostReturnValue({kTestHosts[0]});
@@ -85,7 +90,7 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_OK(status);
@@ -105,7 +110,7 @@ TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
 
     expectInserts(kTestNamespace, {objToInsert});
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
@@ -117,7 +122,7 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_EQ(ErrorCodes::NetworkTimeout, status.code());
@@ -140,7 +145,7 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
         return Status(ErrorCodes::NetworkTimeout, "Network timeout");
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
@@ -152,7 +157,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_OK(status);
@@ -166,7 +171,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        return Status(ErrorCodes::DuplicateKey, "Duplicate key");
+        return getMockDuplicateKeyError();
     });
 
     onFindCommand([&](const RemoteCommandRequest& request) {
@@ -178,7 +183,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMatch) {
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
@@ -190,7 +195,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
@@ -204,7 +209,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        return Status(ErrorCodes::DuplicateKey, "Duplicate key");
+        return getMockDuplicateKeyError();
     });
 
     onFindCommand([&](const RemoteCommandRequest& request) {
@@ -216,7 +221,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorNotFound) {
         return vector<BSONObj>();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
@@ -228,7 +233,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_EQ(ErrorCodes::DuplicateKey, status.code());
@@ -242,7 +247,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[1]);
-        return Status(ErrorCodes::DuplicateKey, "Duplicate key");
+        return getMockDuplicateKeyError();
     });
 
     onFindCommand([&](const RemoteCommandRequest& request) {
@@ -255,7 +260,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterNetworkErrorMismatch) {
                                           << "TestValue has changed")};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
@@ -267,7 +272,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     auto future = launchAsync([&] {
         Status status =
             catalogClient()->insertConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToInsert,
                                                   ShardingCatalogClient::kMajorityWriteConcern);
         ASSERT_OK(status);
@@ -276,21 +281,19 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto insertOp = InsertOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), insertOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, insertOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setN(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
         wcRes.wTimedOut = true;
 
-        Status wcStatus(ErrorCodes::NetworkTimeout, "Failed to wait for write concern");
-        wcError->setErrCode(wcStatus.code());
-        wcError->setErrMessage(wcStatus.reason());
+        wcError->setStatus({ErrorCodes::NetworkTimeout, "Failed to wait for write concern"});
         wcError->setErrInfo(BSON("wtimeout" << true));
 
         response.setWriteConcernError(wcError.release());
@@ -300,7 +303,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
 
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQ(request.target, kTestHosts[0]);
-        return Status(ErrorCodes::DuplicateKey, "Duplicate key");
+        return getMockDuplicateKeyError();
     });
 
     onFindCommand([&](const RemoteCommandRequest& request) {
@@ -312,7 +315,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
         return vector<BSONObj>{objToInsert};
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, Success) {
@@ -326,7 +329,7 @@ TEST_F(UpdateRetryTest, Success) {
     auto future = launchAsync([&] {
         auto status =
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -337,16 +340,16 @@ TEST_F(UpdateRetryTest, Success) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setNModified(1);
 
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
@@ -360,7 +363,7 @@ TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
     auto future = launchAsync([&] {
         auto status =
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -370,16 +373,13 @@ TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
 
     for (int i = 0; i < 3; ++i) {
         onCommand([](const RemoteCommandRequest& request) {
-            BatchedCommandResponse response;
-            response.setOk(false);
-            response.setErrCode(ErrorCodes::NotMaster);
-            response.setErrMessage("not master");
-
-            return response.toBSON();
+            BSONObjBuilder bb;
+            CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+            return bb.obj();
         });
     }
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
@@ -393,7 +393,7 @@ TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
     auto future = launchAsync([&] {
         auto status =
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -401,7 +401,7 @@ TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
         ASSERT_EQUALS(ErrorCodes::NotMaster, status);
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
@@ -424,7 +424,7 @@ TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
     auto future = launchAsync([&] {
         ASSERT_OK(
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -434,30 +434,28 @@ TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(host1, request.target);
 
-        BatchedCommandResponse response;
-        response.setOk(false);
-        response.setErrCode(ErrorCodes::NotMaster);
-        response.setErrMessage("not master");
-
         // Ensure that when the catalog manager tries to retarget after getting the
         // NotMaster response, it will get back a new target.
         configTargeter()->setFindHostReturnValue(host2);
-        return response.toBSON();
+
+        BSONObjBuilder bb;
+        CommandHelpers::appendCommandStatusNoThrow(bb, {ErrorCodes::NotMaster, "not master"});
+        return bb.obj();
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setNModified(1);
 
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
@@ -471,7 +469,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     auto future = launchAsync([&] {
         auto status =
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -482,14 +480,15 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
+        response.setStatus(Status::OK());
 
-        auto writeErrDetail = stdx::make_unique<WriteErrorDetail>();
+        auto writeErrDetail = std::make_unique<WriteErrorDetail>();
         writeErrDetail->setIndex(0);
-        writeErrDetail->setErrCode(ErrorCodes::InterruptedDueToReplStateChange);
-        writeErrDetail->setErrMessage("Operation interrupted");
+        writeErrDetail->setStatus(
+            {ErrorCodes::InterruptedDueToReplStateChange, "Operation interrupted"});
         response.addToErrDetails(writeErrDetail.release());
 
         return response.toBSON();
@@ -498,16 +497,16 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setNModified(1);
 
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 TEST_F(UpdateRetryTest, WriteConcernFailure) {
@@ -521,7 +520,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     auto future = launchAsync([&] {
         auto status =
             catalogClient()->updateConfigDocument(operationContext(),
-                                                  kTestNamespace.ns(),
+                                                  kTestNamespace,
                                                   objToUpdate,
                                                   updateExpr,
                                                   false,
@@ -532,21 +531,19 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setNModified(1);
 
-        auto wcError = stdx::make_unique<WriteConcernErrorDetail>();
+        auto wcError = std::make_unique<WriteConcernErrorDetail>();
 
         WriteConcernResult wcRes;
         wcRes.err = "timeout";
         wcRes.wTimedOut = true;
 
-        Status wcStatus(ErrorCodes::NetworkTimeout, "Failed to wait for write concern");
-        wcError->setErrCode(wcStatus.code());
-        wcError->setErrMessage(wcStatus.reason());
+        wcError->setStatus({ErrorCodes::NetworkTimeout, "Failed to wait for write concern"});
         wcError->setErrInfo(BSON("wtimeout" << true));
 
         response.setWriteConcernError(wcError.release());
@@ -557,16 +554,16 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     onCommand([&](const RemoteCommandRequest& request) {
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
-        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+        ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
         BatchedCommandResponse response;
-        response.setOk(true);
+        response.setStatus(Status::OK());
         response.setNModified(0);
 
         return response.toBSON();
     });
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 }
 
 }  // namespace

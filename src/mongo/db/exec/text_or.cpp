@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,61 +30,61 @@
 #include "mongo/db/exec/text_or.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/matchable.h"
-#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+using std::string;
 using std::unique_ptr;
 using std::vector;
-using std::string;
-using stdx::make_unique;
 
 using fts::FTSSpec;
 
 const char* TextOrStage::kStageType = "TEXT_OR";
 
-TextOrStage::TextOrStage(OperationContext* opCtx,
+TextOrStage::TextOrStage(ExpressionContext* expCtx,
                          const FTSSpec& ftsSpec,
                          WorkingSet* ws,
                          const MatchExpression* filter,
-                         IndexDescriptor* index)
-    : PlanStage(kStageType, opCtx),
+                         const Collection* collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _ftsSpec(ftsSpec),
       _ws(ws),
       _scoreIterator(_scores.end()),
       _filter(filter),
-      _idRetrying(WorkingSet::INVALID_ID),
-      _index(index) {}
-
-TextOrStage::~TextOrStage() {}
+      _idRetrying(WorkingSet::INVALID_ID) {}
 
 void TextOrStage::addChild(unique_ptr<PlanStage> child) {
     _children.push_back(std::move(child));
+}
+
+void TextOrStage::addChildren(Children childrenToAdd) {
+    _children.insert(_children.end(),
+                     std::make_move_iterator(childrenToAdd.begin()),
+                     std::make_move_iterator(childrenToAdd.end()));
 }
 
 bool TextOrStage::isEOF() {
     return _internalState == State::kDone;
 }
 
-void TextOrStage::doSaveState() {
+void TextOrStage::doSaveStateRequiresCollection() {
     if (_recordCursor) {
         _recordCursor->saveUnpositioned();
     }
 }
 
-void TextOrStage::doRestoreState() {
+void TextOrStage::doRestoreStateRequiresCollection() {
     if (_recordCursor) {
         invariant(_recordCursor->restore());
     }
@@ -96,18 +97,7 @@ void TextOrStage::doDetachFromOperationContext() {
 
 void TextOrStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(getOpCtx());
-}
-
-void TextOrStage::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
-    // Remove the RecordID from the ScoreMap.
-    ScoreMap::iterator scoreIt = _scores.find(dl);
-    if (scoreIt != _scores.end()) {
-        if (scoreIt == _scoreIterator) {
-            _scoreIterator++;
-        }
-        _scores.erase(scoreIt);
-    }
+        _recordCursor->reattachToOperationContext(opCtx());
 }
 
 std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
@@ -119,8 +109,8 @@ std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
-    ret->specific = make_unique<TextOrStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
+    ret->specific = std::make_unique<TextOrStats>(_specificStats);
 
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
@@ -152,7 +142,7 @@ PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
             break;
         case State::kDone:
             // Should have been handled above.
-            invariant(false);
+            MONGO_UNREACHABLE;
             break;
     }
 
@@ -162,7 +152,7 @@ PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
 PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
     *out = WorkingSet::INVALID_ID;
     try {
-        _recordCursor = _index->getCollection()->getCursor(getOpCtx());
+        _recordCursor = collection()->getCursor(opCtx());
         _internalState = State::kReadingTerms;
         return PlanStage::NEED_TIME;
     } catch (const WriteConflictException&) {
@@ -212,7 +202,7 @@ PlanStage::StageState TextOrStage::readFromChildren(WorkingSetID* out) {
         // failed, in which case 'id' is valid.  If ID is invalid, we
         // create our own error message.
         if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "TEXT_OR stage failed to read in results from child";
             Status status(ErrorCodes::InternalError, ss);
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
@@ -245,86 +235,11 @@ PlanStage::StageState TextOrStage::returnResults(WorkingSetID* out) {
 
     WorkingSetMember* wsm = _ws->get(textRecordData.wsid);
 
-    // Populate the working set member with the text score and return it.
-    wsm->addComputed(new TextScoreComputedData(textRecordData.score));
+    // Populate the working set member with the text score metadata and return it.
+    wsm->metadata().setTextScore(textRecordData.score);
     *out = textRecordData.wsid;
     return PlanStage::ADVANCED;
 }
-
-/**
- * Provides support for covered matching on non-text fields of a compound text index.
- */
-class TextMatchableDocument : public MatchableDocument {
-public:
-    TextMatchableDocument(OperationContext* opCtx,
-                          const BSONObj& keyPattern,
-                          const BSONObj& key,
-                          WorkingSet* ws,
-                          WorkingSetID id,
-                          unowned_ptr<SeekableRecordCursor> recordCursor)
-        : _opCtx(opCtx),
-          _recordCursor(recordCursor),
-          _keyPattern(keyPattern),
-          _key(key),
-          _ws(ws),
-          _id(id) {}
-
-    BSONObj toBSON() const {
-        return getObj();
-    }
-
-    ElementIterator* allocateIterator(const ElementPath* path) const final {
-        WorkingSetMember* member = _ws->get(_id);
-        if (!member->hasObj()) {
-            // Try to look in the key.
-            BSONObjIterator keyPatternIt(_keyPattern);
-            BSONObjIterator keyDataIt(_key);
-
-            while (keyPatternIt.more()) {
-                BSONElement keyPatternElt = keyPatternIt.next();
-                verify(keyDataIt.more());
-                BSONElement keyDataElt = keyDataIt.next();
-
-                if (path->fieldRef().equalsDottedField(keyPatternElt.fieldName())) {
-                    if (Array == keyDataElt.type()) {
-                        return new SimpleArrayElementIterator(keyDataElt, true);
-                    } else {
-                        return new SingleElementElementIterator(keyDataElt);
-                    }
-                }
-            }
-        }
-
-        // Go to the raw document, fetching if needed.
-        return new BSONElementIterator(path, getObj());
-    }
-
-    void releaseIterator(ElementIterator* iterator) const final {
-        delete iterator;
-    }
-
-    // Thrown if we detect that the document being matched was deleted.
-    class DocumentDeletedException {};
-
-private:
-    BSONObj getObj() const {
-        if (!WorkingSetCommon::fetchIfUnfetched(_opCtx, _ws, _id, _recordCursor))
-            throw DocumentDeletedException();
-
-        WorkingSetMember* member = _ws->get(_id);
-
-        // Make it owned since we are buffering results.
-        member->makeObjOwnedIfNeeded();
-        return member->obj.value();
-    }
-
-    OperationContext* _opCtx;
-    unowned_ptr<SeekableRecordCursor> _recordCursor;
-    BSONObj _keyPattern;
-    BSONObj _key;
-    WorkingSet* _ws;
-    WorkingSetID _id;
-};
 
 PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out) {
     WorkingSetMember* wsm = _ws->get(wsid);
@@ -343,55 +258,27 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
     if (WorkingSet::INVALID_ID == textRecordData->wsid) {
         // We haven't seen this RecordId before.
         invariant(textRecordData->score == 0);
-        bool shouldKeep = true;
-        if (_filter) {
-            // We have not seen this document before and need to apply a filter.
-            bool wasDeleted = false;
-            try {
-                TextMatchableDocument tdoc(getOpCtx(),
-                                           newKeyData.indexKeyPattern,
-                                           newKeyData.keyData,
-                                           _ws,
-                                           wsid,
-                                           _recordCursor);
-                shouldKeep = _filter->matches(&tdoc);
-            } catch (const WriteConflictException&) {
-                // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may
-                // be freed when we yield.
-                wsm->makeObjOwnedIfNeeded();
-                _idRetrying = wsid;
-                *out = WorkingSet::INVALID_ID;
-                return NEED_YIELD;
-            } catch (const TextMatchableDocument::DocumentDeletedException&) {
-                // We attempted to fetch the document but decided it should be excluded from the
-                // result set.
-                shouldKeep = false;
-                wasDeleted = true;
-            }
 
-            if (wasDeleted || wsm->hasObj()) {
-                ++_specificStats.fetches;
-            }
-        }
-
-        if (shouldKeep && !wsm->hasObj()) {
-            // Our parent expects RID_AND_OBJ members, so we fetch the document here if we haven't
-            // already.
-            try {
-                shouldKeep = WorkingSetCommon::fetch(getOpCtx(), _ws, wsid, _recordCursor);
-                ++_specificStats.fetches;
-            } catch (const WriteConflictException&) {
-                wsm->makeObjOwnedIfNeeded();
-                _idRetrying = wsid;
-                *out = WorkingSet::INVALID_ID;
-                return NEED_YIELD;
-            }
-        }
-
-        if (!shouldKeep) {
+        if (!Filter::passes(newKeyData.keyData, newKeyData.indexKeyPattern, _filter)) {
             _ws->free(wsid);
             textRecordData->score = -1;
             return NEED_TIME;
+        }
+
+        // Our parent expects RID_AND_OBJ members, so we fetch the document here if we haven't
+        // already.
+        try {
+            if (!WorkingSetCommon::fetch(opCtx(), _ws, wsid, _recordCursor, collection()->ns())) {
+                _ws->free(wsid);
+                textRecordData->score = -1;
+                return NEED_TIME;
+            }
+            ++_specificStats.fetches;
+        } catch (const WriteConflictException&) {
+            wsm->makeObjOwnedIfNeeded();
+            _idRetrying = wsid;
+            *out = WorkingSet::INVALID_ID;
+            return NEED_YIELD;
         }
 
         textRecordData->wsid = wsid;

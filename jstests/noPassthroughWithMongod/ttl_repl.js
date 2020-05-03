@@ -1,8 +1,10 @@
-/** Test TTL collections with replication
+/**
+ * Test TTL collections with replication
  *  Part 1: Initiate replica set. Insert some docs and create a TTL index.
  *          Check that the correct # of docs age out.
  *  Part 2: Add a new member to the set. Check that it also gets the correct # of docs.
  *  Part 3: Change the TTL expireAfterSeconds field and check successful propogation to secondary.
+ *  @tags: [requires_replication]
  */
 
 load("jstests/replsets/rslib.js");
@@ -16,7 +18,7 @@ var nodes = rt.startSet();
 rt.initiate();
 var master = rt.getPrimary();
 rt.awaitSecondaryNodes();
-var slave1 = rt.liveNodes.slaves[0];
+var slave1 = rt._slaves[0];
 
 // shortcuts
 var masterdb = master.getDB('d');
@@ -24,9 +26,8 @@ var slave1db = slave1.getDB('d');
 var mastercol = masterdb['c'];
 var slave1col = slave1db['c'];
 
-// turn off usePowerOf2Sizes as this tests the flag is set automatically
 mastercol.drop();
-masterdb.createCollection(mastercol.getName(), {usePowerOf2Sizes: false});
+masterdb.createCollection(mastercol.getName());
 
 // create new collection. insert 24 docs, aged at one-hour intervalss
 now = (new Date()).getTime();
@@ -34,7 +35,7 @@ var bulk = mastercol.initializeUnorderedBulkOp();
 for (i = 0; i < 24; i++) {
     bulk.insert({x: new Date(now - (3600 * 1000 * i))});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 rt.awaitReplication();
 assert.eq(24, mastercol.count(), "docs not inserted on primary");
 assert.eq(24, slave1col.count(), "docs not inserted on secondary");

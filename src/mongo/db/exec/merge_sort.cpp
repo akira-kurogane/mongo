@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,12 +29,13 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include <memory>
+
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -41,28 +43,25 @@ using std::list;
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* MergeSortStage::kStageType = "SORT_MERGE";
 
-MergeSortStage::MergeSortStage(OperationContext* opCtx,
+MergeSortStage::MergeSortStage(ExpressionContext* expCtx,
                                const MergeSortStageParams& params,
-                               WorkingSet* ws,
-                               const Collection* collection)
-    : PlanStage(kStageType, opCtx),
-      _collection(collection),
+                               WorkingSet* ws)
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _pattern(params.pattern),
       _collator(params.collator),
       _dedup(params.dedup),
       _merging(StageWithValueComparison(ws, params.pattern, params.collator)) {}
 
-void MergeSortStage::addChild(PlanStage* child) {
-    _children.emplace_back(child);
+void MergeSortStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.emplace_back(std::move(child));
 
     // We have to call work(...) on every child before we can pick a min.
-    _noResultToMerge.push(child);
+    _noResultToMerge.push(_children.back().get());
 }
 
 bool MergeSortStage::isEOF() {
@@ -131,23 +130,16 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
             // anymore.
             _noResultToMerge.pop();
             return PlanStage::NEED_TIME;
-        } else if (PlanStage::FAILURE == code || PlanStage::DEAD == code) {
+        } else if (PlanStage::FAILURE == code) {
+            // The stage which produces a failure is responsible for allocating a working set member
+            // with error details.
+            invariant(WorkingSet::INVALID_ID != id);
             *out = id;
-            // If a stage fails, it may create a status WSM to indicate why it
-            // failed, in which case 'id' is valid.  If ID is invalid, we
-            // create our own error message.
-            if (WorkingSet::INVALID_ID == id) {
-                mongoutils::str::stream ss;
-                ss << "merge sort stage failed to read in results from child";
-                Status status(ErrorCodes::InternalError, ss);
-                *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-            }
+            return code;
+        } else if (PlanStage::NEED_YIELD == code) {
+            *out = id;
             return code;
         } else {
-            if (PlanStage::NEED_YIELD == code) {
-                *out = id;
-            }
-
             return code;
         }
     }
@@ -171,29 +163,6 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
     *out = idToTest;
 
     return PlanStage::ADVANCED;
-}
-
-
-void MergeSortStage::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& dl,
-                                  InvalidationType type) {
-    // Go through our data and see if we're holding on to the invalidated RecordId.
-    for (list<StageWithValue>::iterator valueIt = _mergingData.begin();
-         valueIt != _mergingData.end();
-         valueIt++) {
-        WorkingSetMember* member = _ws->get(valueIt->id);
-        if (member->hasRecordId() && (dl == member->recordId)) {
-            // Fetch the about-to-be mutated result.
-            WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, _collection);
-            ++_specificStats.forcedFetches;
-        }
-    }
-
-    // If we see the deleted RecordId again it is not the same record as it once was so we still
-    // want to return it.
-    if (_dedup && INVALIDATION_DELETION == type) {
-        _seen.erase(dl);
-    }
 }
 
 // Is lhs less than rhs?  Note that priority_queue is a max heap by default so we invert
@@ -235,8 +204,9 @@ unique_ptr<PlanStageStats> MergeSortStage::getStats() {
 
     _specificStats.sortPattern = _pattern;
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
-    ret->specific = make_unique<MergeSortStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SORT_MERGE);
+    ret->specific = std::make_unique<MergeSortStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
         ret->children.emplace_back(_children[i]->getStats());
     }

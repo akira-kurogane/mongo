@@ -52,6 +52,10 @@ class CacheWalkStat(Stat):
     def __init__(self, name, desc, flags=''):
         flags += ',cache_walk'
         Stat.__init__(self, name, CacheWalkStat.prefix, desc, flags)
+class CapacityStat(Stat):
+    prefix = 'capacity'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, CapacityStat.prefix, desc, flags)
 class CompressStat(Stat):
     prefix = 'compression'
     def __init__(self, name, desc, flags=''):
@@ -68,6 +72,10 @@ class DhandleStat(Stat):
     prefix = 'data-handle'
     def __init__(self, name, desc, flags=''):
         Stat.__init__(self, name, DhandleStat.prefix, desc, flags)
+class HistoryStat(Stat):
+    prefix = 'history'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, HistoryStat.prefix, desc, flags)
 class JoinStat(Stat):
     prefix = ''  # prefix is inserted dynamically
     def __init__(self, name, desc, flags=''):
@@ -84,14 +92,22 @@ class LSMStat(Stat):
     prefix = 'LSM'
     def __init__(self, name, desc, flags=''):
         Stat.__init__(self, name, LSMStat.prefix, desc, flags)
-class RecStat(Stat):
-    prefix = 'reconciliation'
-    def __init__(self, name, desc, flags=''):
-        Stat.__init__(self, name, RecStat.prefix, desc, flags)
 class SessionStat(Stat):
     prefix = 'session'
     def __init__(self, name, desc, flags=''):
         Stat.__init__(self, name, SessionStat.prefix, desc, flags)
+class PerfHistStat(Stat):
+    prefix = 'perf'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, PerfHistStat.prefix, desc, flags)
+class RecStat(Stat):
+    prefix = 'reconciliation'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, RecStat.prefix, desc, flags)
+class SessionOpStat(Stat):
+    prefix = 'session'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, SessionOpStat.prefix, desc, flags)
 class ThreadStat(Stat):
     prefix = 'thread-state'
     def __init__(self, name, desc, flags=''):
@@ -111,7 +127,7 @@ class YieldStat(Stat):
 # list of prefix tags that comprise that group.
 ##########################################
 groups = {}
-groups['cursor'] = [CursorStat.prefix, SessionStat.prefix]
+groups['cursor'] = [CursorStat.prefix, SessionOpStat.prefix]
 groups['evict'] = [
     BlockStat.prefix,
     CacheStat.prefix,
@@ -126,9 +142,11 @@ groups['memory'] = [
     ConnStat.prefix,
     RecStat.prefix]
 groups['system'] = [
+    CapacityStat.prefix,
     ConnStat.prefix,
     DhandleStat.prefix,
-    SessionStat.prefix,
+    PerfHistStat.prefix,
+    SessionOpStat.prefix,
     ThreadStat.prefix
 ]
 
@@ -175,21 +193,29 @@ connection_stats = [
     ##########################################
     BlockStat('block_byte_map_read', 'mapped bytes read', 'size'),
     BlockStat('block_byte_read', 'bytes read', 'size'),
+    BlockStat('block_byte_read_mmap', 'bytes read via memory map API', 'size'),
+    BlockStat('block_byte_read_syscall', 'bytes read via system call API', 'size'),
     BlockStat('block_byte_write', 'bytes written', 'size'),
     BlockStat('block_byte_write_checkpoint', 'bytes written for checkpoint', 'size'),
+    BlockStat('block_byte_write_mmap', 'bytes written via memory map API', 'size'),
+    BlockStat('block_byte_write_syscall', 'bytes written via system call API', 'size'),
     BlockStat('block_map_read', 'mapped blocks read'),
     BlockStat('block_preload', 'blocks pre-loaded'),
     BlockStat('block_read', 'blocks read'),
+    BlockStat('block_remap_file_resize', 'number of times the file was remapped because it changed size via fallocate or truncate'),
+    BlockStat('block_remap_file_write', 'number of times the region was remapped via write'),
     BlockStat('block_write', 'blocks written'),
 
     ##########################################
     # Cache and eviction statistics
     ##########################################
     CacheStat('cache_bytes_dirty', 'tracked dirty bytes in the cache', 'no_clear,no_scale,size'),
+    CacheStat('cache_bytes_dirty_total', 'bytes dirty in the cache cumulative', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_image', 'bytes belonging to page images in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_internal', 'tracked bytes belonging to internal pages in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_inuse', 'bytes currently in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_leaf', 'tracked bytes belonging to leaf pages in the cache', 'no_clear,no_scale,size'),
+    CacheStat('cache_bytes_hs', 'bytes belonging to the history store table in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_max', 'maximum bytes configured', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_other', 'bytes not belonging to page images in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_read', 'bytes read into cache', 'size'),
@@ -204,23 +230,34 @@ connection_stats = [
     CacheStat('cache_eviction_dirty', 'modified pages evicted'),
     CacheStat('cache_eviction_empty_score', 'eviction empty score', 'no_clear,no_scale'),
     CacheStat('cache_eviction_fail', 'pages selected for eviction unable to be evicted'),
-    CacheStat('cache_eviction_force', 'pages evicted because they exceeded the in-memory maximum count'),
-    CacheStat('cache_eviction_force_delete', 'pages evicted because they had chains of deleted items count'),
-    CacheStat('cache_eviction_force_delete_time', 'pages evicted because they had chains of deleted items time (usecs)'),
-    CacheStat('cache_eviction_force_fail', 'failed eviction of pages that exceeded the in-memory maximum count'),
-    CacheStat('cache_eviction_force_fail_time',  'failed eviction of pages that exceeded the in-memory maximum time (usecs)'),
+    CacheStat('cache_eviction_fail_active_children_on_an_internal_page', 'pages selected for eviction unable to be evicted because of active children on an internal page'),
+    CacheStat('cache_eviction_fail_in_reconciliation', 'pages selected for eviction unable to be evicted because of failure in reconciliation'),
+    CacheStat('cache_eviction_fail_parent_has_overflow_items', 'pages selected for eviction unable to be evicted as the parent page has overflow items'),
+    CacheStat('cache_eviction_fail_with_newer_modifications_on_a_clean_page', 'pages selected for eviction unable to be evicted due to newer modifications on a clean page'),
+    CacheStat('cache_eviction_force', 'forced eviction - pages selected count'),
+    CacheStat('cache_eviction_force_clean', 'forced eviction - pages evicted that were clean count'),
+    CacheStat('cache_eviction_force_clean_time', 'forced eviction - pages evicted that were clean time (usecs)'),
+    CacheStat('cache_eviction_force_delete', 'forced eviction - pages selected because of too many deleted items count'),
+    CacheStat('cache_eviction_force_dirty', 'forced eviction - pages evicted that were dirty count'),
+    CacheStat('cache_eviction_force_dirty_time', 'forced eviction - pages evicted that were dirty time (usecs)'),
+    CacheStat('cache_eviction_force_fail', 'forced eviction - pages selected unable to be evicted count'),
+    CacheStat('cache_eviction_force_fail_time', 'forced eviction - pages selected unable to be evicted time'),
     CacheStat('cache_eviction_force_retune', 'force re-tuning of eviction workers once in a while'),
-    CacheStat('cache_eviction_force_time', 'pages evicted because they exceeded the in-memory maximum time (usecs)'),
     CacheStat('cache_eviction_get_ref', 'eviction calls to get a page'),
     CacheStat('cache_eviction_get_ref_empty', 'eviction calls to get a page found queue empty'),
     CacheStat('cache_eviction_get_ref_empty2', 'eviction calls to get a page found queue empty after locking'),
     CacheStat('cache_eviction_hazard', 'hazard pointer blocked page eviction'),
     CacheStat('cache_eviction_internal', 'internal pages evicted'),
+    CacheStat('cache_eviction_internal_pages_seen', 'internal pages seen by eviction walk'),
+    CacheStat('cache_eviction_internal_pages_already_queued', 'internal pages seen by eviction walk that are already queued'),
+    CacheStat('cache_eviction_internal_pages_queued', 'internal pages queued for eviction'),
     CacheStat('cache_eviction_maximum_page_size', 'maximum page size at eviction', 'no_clear,no_scale,size'),
     CacheStat('cache_eviction_pages_queued', 'pages queued for eviction'),
     CacheStat('cache_eviction_pages_queued_oldest', 'pages queued for urgent eviction during walk'),
+    CacheStat('cache_eviction_pages_queued_post_lru', 'pages queued for eviction post lru sorting'),
     CacheStat('cache_eviction_pages_queued_urgent', 'pages queued for urgent eviction'),
     CacheStat('cache_eviction_pages_seen', 'pages seen by eviction walk'),
+    CacheStat('cache_eviction_pages_already_queued', 'pages seen by eviction walk that are already queued'),
     CacheStat('cache_eviction_queue_empty', 'eviction server candidate queue empty when topping up'),
     CacheStat('cache_eviction_queue_not_empty', 'eviction server candidate queue not empty when topping up'),
     CacheStat('cache_eviction_server_evicting', 'eviction server evicting pages'),
@@ -232,11 +269,15 @@ connection_stats = [
     CacheStat('cache_eviction_state', 'eviction state', 'no_clear,no_scale'),
     CacheStat('cache_eviction_target_page_ge128', 'eviction walk target pages histogram - 128 and higher'),
     CacheStat('cache_eviction_target_page_lt10', 'eviction walk target pages histogram - 0-9'),
+    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
     CacheStat('cache_eviction_target_page_lt32', 'eviction walk target pages histogram - 10-31'),
     CacheStat('cache_eviction_target_page_lt64', 'eviction walk target pages histogram - 32-63'),
-    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
+    CacheStat('cache_eviction_target_strategy_clean', 'eviction walk target strategy only clean pages'),
+    CacheStat('cache_eviction_target_strategy_dirty', 'eviction walk target strategy only dirty pages'),
+    CacheStat('cache_eviction_target_strategy_both_clean_and_dirty', 'eviction walk target strategy both clean and dirty pages'),
     CacheStat('cache_eviction_walk', 'pages walked for eviction'),
     CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
+    CacheStat('cache_eviction_walk_leaf_notfound', 'eviction server waiting for a leaf page'),
     CacheStat('cache_eviction_walk_passes', 'eviction passes of a file'),
     CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
     CacheStat('cache_eviction_walks_abandoned', 'eviction walks abandoned'),
@@ -252,10 +293,20 @@ connection_stats = [
     CacheStat('cache_hazard_checks', 'hazard pointer check calls'),
     CacheStat('cache_hazard_max', 'hazard pointer maximum array length', 'max_aggregate,no_scale'),
     CacheStat('cache_hazard_walks', 'hazard pointer check entries walked'),
+    CacheStat('cache_hs_insert', 'history store table insert calls'),
+    CacheStat('cache_hs_key_truncate_onpage_removal', 'history store key truncation due to the key being removed from the data page'),
+    CacheStat('cache_hs_key_truncate_mix_ts', 'history store key truncation due to mixed timestamps'),
+    CacheStat('cache_hs_ondisk', 'history store table on-disk size', 'no_clear,no_scale,size'),
+    CacheStat('cache_hs_ondisk_max', 'history store table max on-disk size', 'no_clear,no_scale,size'),
+    CacheStat('cache_hs_read', 'history store table reads'),
+    CacheStat('cache_hs_read_miss', 'history store table reads missed'),
+    CacheStat('cache_hs_read_squash', 'history store table reads requiring squashed modifies'),
+    CacheStat('cache_hs_remove_key_truncate', 'history store table remove calls due to key truncation'),
+    CacheStat('cache_hs_score', 'history store score', 'no_clear,no_scale'),
+    CacheStat('cache_hs_write_squash', 'history store table writes requiring squashed modifies'),
     CacheStat('cache_inmem_split', 'in-memory page splits'),
     CacheStat('cache_inmem_splittable', 'in-memory page passed criteria to be split'),
-    CacheStat('cache_lookaside_insert', 'lookaside table insert calls'),
-    CacheStat('cache_lookaside_remove', 'lookaside table remove calls'),
+    CacheStat('cache_lookaside_score', 'cache overflow score', 'no_clear,no_scale'),
     CacheStat('cache_overhead', 'percentage overhead', 'no_clear,no_scale'),
     CacheStat('cache_pages_dirty', 'tracked dirty pages in the cache', 'no_clear,no_scale'),
     CacheStat('cache_pages_inuse', 'pages currently held in the cache', 'no_clear,no_scale'),
@@ -263,35 +314,75 @@ connection_stats = [
     CacheStat('cache_read', 'pages read into cache'),
     CacheStat('cache_read_app_count', 'application threads page read from disk to cache count'),
     CacheStat('cache_read_app_time', 'application threads page read from disk to cache time (usecs)'),
-    CacheStat('cache_read_lookaside', 'pages read into cache requiring lookaside entries'),
+    CacheStat('cache_read_deleted', 'pages read into cache after truncate'),
+    CacheStat('cache_read_deleted_prepared', 'pages read into cache after truncate in prepare state'),
     CacheStat('cache_read_overflow', 'overflow pages read into cache'),
+    CacheStat('cache_timed_out_ops', 'operations timed out waiting for space in cache'),
     CacheStat('cache_write', 'pages written from cache'),
     CacheStat('cache_write_app_count', 'application threads page write from cache to disk count'),
     CacheStat('cache_write_app_time', 'application threads page write from cache to disk time (usecs)'),
-    CacheStat('cache_write_lookaside', 'page written requiring lookaside records'),
+    CacheStat('cache_write_hs', 'page written requiring history store records'),
     CacheStat('cache_write_restore', 'pages written requiring in-memory restoration'),
+
+    ##########################################
+    # Capacity statistics
+    ##########################################
+    CapacityStat('capacity_bytes_ckpt', 'bytes written for checkpoint'),
+    CapacityStat('capacity_bytes_evict', 'bytes written for eviction'),
+    CapacityStat('capacity_bytes_log', 'bytes written for log'),
+    CapacityStat('capacity_bytes_read', 'bytes read'),
+    CapacityStat('capacity_bytes_written', 'bytes written total'),
+    CapacityStat('capacity_threshold', 'threshold to call fsync'),
+    CapacityStat('capacity_time_ckpt', 'time waiting during checkpoint (usecs)'),
+    CapacityStat('capacity_time_evict', 'time waiting during eviction (usecs)'),
+    CapacityStat('capacity_time_log', 'time waiting during logging (usecs)'),
+    CapacityStat('capacity_time_read', 'time waiting during read (usecs)'),
+    CapacityStat('capacity_time_total', 'time waiting due to total capacity (usecs)'),
+    CapacityStat('fsync_all_fh', 'background fsync file handles synced'),
+    CapacityStat('fsync_all_fh_total', 'background fsync file handles considered'),
+    CapacityStat('fsync_all_time', 'background fsync time (msecs)', 'no_clear,no_scale'),
 
     ##########################################
     # Cursor operations
     ##########################################
+    CursorStat('cursor_open_count', 'open cursor count', 'no_clear,no_scale'),
+    CursorStat('cursor_cached_count', 'cached cursor count', 'no_clear,no_scale'),
+    CursorStat('cursor_cache', 'cursor close calls that result in cache'),
     CursorStat('cursor_create', 'cursor create calls'),
     CursorStat('cursor_insert', 'cursor insert calls'),
+    CursorStat('cursor_insert_bulk', 'cursor bulk loaded cursor insert calls'),
+    CursorStat('cursor_insert_bytes', 'cursor insert key and value bytes', 'size'),
     CursorStat('cursor_modify', 'cursor modify calls'),
+    CursorStat('cursor_modify_bytes', 'cursor modify key and value bytes affected', 'size'),
+    CursorStat('cursor_modify_bytes_touch', 'cursor modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'cursor next calls'),
     CursorStat('cursor_prev', 'cursor prev calls'),
     CursorStat('cursor_remove', 'cursor remove calls'),
+    CursorStat('cursor_remove_bytes', 'cursor remove key bytes removed', 'size'),
+    CursorStat('cursor_reopen', 'cursors reused from cache'),
     CursorStat('cursor_reserve', 'cursor reserve calls'),
     CursorStat('cursor_reset', 'cursor reset calls'),
-    CursorStat('cursor_restart', 'cursor restarted searches'),
+    CursorStat('cursor_restart', 'cursor operation restarted'),
     CursorStat('cursor_search', 'cursor search calls'),
     CursorStat('cursor_search_near', 'cursor search near calls'),
-    CursorStat('cursor_truncate', 'truncate calls'),
+    CursorStat('cursor_truncate', 'cursor truncate calls'),
     CursorStat('cursor_update', 'cursor update calls'),
+    CursorStat('cursor_update_bytes', 'cursor update key and value bytes', 'size'),
+    CursorStat('cursor_update_bytes_changed', 'cursor update value size change', 'size'),
+
+    ##########################################
+    # Cursor sweep
+    ##########################################
+    CursorStat('cursor_sweep', 'cursor sweeps'),
+    CursorStat('cursor_sweep_buckets', 'cursor sweep buckets'),
+    CursorStat('cursor_sweep_closed', 'cursor sweep cursors closed'),
+    CursorStat('cursor_sweep_examined', 'cursor sweep cursors examined'),
 
     ##########################################
     # Dhandle statistics
     ##########################################
     DhandleStat('dh_conn_handle_count', 'connection data handles currently active', 'no_clear,no_scale'),
+    DhandleStat('dh_conn_handle_size', 'connection data handle size', 'no_clear,no_scale,size'),
     DhandleStat('dh_session_handles', 'session dhandles swept'),
     DhandleStat('dh_session_sweeps', 'session sweep attempts'),
     DhandleStat('dh_sweep_close', 'connection sweep dhandles closed'),
@@ -301,18 +392,33 @@ connection_stats = [
     DhandleStat('dh_sweeps', 'connection sweeps'),
 
     ##########################################
+    # History statistics
+    ##########################################
+    HistoryStat('hs_gc_pages_evict', 'history pages added for eviction during garbage collection'),
+    HistoryStat('hs_gc_pages_removed', 'history pages removed for garbage collection'),
+    HistoryStat('hs_gc_pages_visited', 'history pages visited for garbage collection'),
+
+    ##########################################
     # Locking statistics
     ##########################################
     LockStat('lock_checkpoint_count', 'checkpoint lock acquisitions'),
     LockStat('lock_checkpoint_wait_application', 'checkpoint lock application thread wait time (usecs)'),
     LockStat('lock_checkpoint_wait_internal', 'checkpoint lock internal thread wait time (usecs)'),
     LockStat('lock_dhandle_read_count', 'dhandle read lock acquisitions'),
-    LockStat('lock_dhandle_wait_application', 'dhandle lock application thread time waiting for the dhandle lock (usecs)'),
-    LockStat('lock_dhandle_wait_internal', 'dhandle lock internal thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_dhandle_wait_application', 'dhandle lock application thread time waiting (usecs)'),
+    LockStat('lock_dhandle_wait_internal', 'dhandle lock internal thread time waiting (usecs)'),
     LockStat('lock_dhandle_write_count', 'dhandle write lock acquisitions'),
+    LockStat('lock_durable_timestamp_read_count', 'durable timestamp queue read lock acquisitions'),
+    LockStat('lock_durable_timestamp_wait_application', 'durable timestamp queue lock application thread time waiting (usecs)'),
+    LockStat('lock_durable_timestamp_wait_internal', 'durable timestamp queue lock internal thread time waiting (usecs)'),
+    LockStat('lock_durable_timestamp_write_count', 'durable timestamp queue write lock acquisitions'),
     LockStat('lock_metadata_count', 'metadata lock acquisitions'),
     LockStat('lock_metadata_wait_application', 'metadata lock application thread wait time (usecs)'),
     LockStat('lock_metadata_wait_internal', 'metadata lock internal thread wait time (usecs)'),
+    LockStat('lock_read_timestamp_read_count', 'read timestamp queue read lock acquisitions'),
+    LockStat('lock_read_timestamp_wait_application', 'read timestamp queue lock application thread time waiting (usecs)'),
+    LockStat('lock_read_timestamp_wait_internal', 'read timestamp queue lock internal thread time waiting (usecs)'),
+    LockStat('lock_read_timestamp_write_count', 'read timestamp queue write lock acquisitions'),
     LockStat('lock_schema_count', 'schema lock acquisitions'),
     LockStat('lock_schema_wait_application', 'schema lock application thread wait time (usecs)'),
     LockStat('lock_schema_wait_internal', 'schema lock internal thread wait time (usecs)'),
@@ -320,6 +426,10 @@ connection_stats = [
     LockStat('lock_table_wait_application', 'table lock application thread time waiting for the table lock (usecs)'),
     LockStat('lock_table_wait_internal', 'table lock internal thread time waiting for the table lock (usecs)'),
     LockStat('lock_table_write_count', 'table write lock acquisitions'),
+    LockStat('lock_txn_global_read_count', 'txn global read lock acquisitions'),
+    LockStat('lock_txn_global_wait_application', 'txn global lock application thread time waiting (usecs)'),
+    LockStat('lock_txn_global_wait_internal', 'txn global lock internal thread time waiting (usecs)'),
+    LockStat('lock_txn_global_write_count', 'txn global write lock acquisitions'),
 
     ##########################################
     # Logging statistics
@@ -334,7 +444,7 @@ connection_stats = [
     LogStat('log_compress_write_fails', 'log records not compressed'),
     LogStat('log_compress_writes', 'log records compressed'),
     LogStat('log_flush', 'log flush operations'),
-    LogStat('log_force_ckpt_sleep', 'force checkpoint calls slept'),
+    LogStat('log_force_archive_sleep', 'force archive time sleeping (usecs)'),
     LogStat('log_force_write', 'log force write operations'),
     LogStat('log_force_write_skip', 'log force write operations skipped'),
     LogStat('log_max_filesize', 'maximum log file size', 'no_clear,no_scale,size'),
@@ -386,6 +496,32 @@ connection_stats = [
     LSMStat('lsm_work_units_done', 'tree maintenance operations executed'),
 
     ##########################################
+    # Performance Histogram Stats
+    ##########################################
+    PerfHistStat('perf_hist_fsread_latency_gt1000', 'file system read latency histogram (bucket 6) - 1000ms+'),
+    PerfHistStat('perf_hist_fsread_latency_lt50', 'file system read latency histogram (bucket 1) - 10-49ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt100', 'file system read latency histogram (bucket 2) - 50-99ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt250', 'file system read latency histogram (bucket 3) - 100-249ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt500', 'file system read latency histogram (bucket 4) - 250-499ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt1000', 'file system read latency histogram (bucket 5) - 500-999ms'),
+    PerfHistStat('perf_hist_fswrite_latency_gt1000', 'file system write latency histogram (bucket 6) - 1000ms+'),
+    PerfHistStat('perf_hist_fswrite_latency_lt50', 'file system write latency histogram (bucket 1) - 10-49ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt100', 'file system write latency histogram (bucket 2) - 50-99ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt250', 'file system write latency histogram (bucket 3) - 100-249ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt500', 'file system write latency histogram (bucket 4) - 250-499ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt1000', 'file system write latency histogram (bucket 5) - 500-999ms'),
+    PerfHistStat('perf_hist_opread_latency_gt10000', 'operation read latency histogram (bucket 5) - 10000us+'),
+    PerfHistStat('perf_hist_opread_latency_lt250', 'operation read latency histogram (bucket 1) - 100-249us'),
+    PerfHistStat('perf_hist_opread_latency_lt500', 'operation read latency histogram (bucket 2) - 250-499us'),
+    PerfHistStat('perf_hist_opread_latency_lt1000', 'operation read latency histogram (bucket 3) - 500-999us'),
+    PerfHistStat('perf_hist_opread_latency_lt10000', 'operation read latency histogram (bucket 4) - 1000-9999us'),
+    PerfHistStat('perf_hist_opwrite_latency_gt10000', 'operation write latency histogram (bucket 5) - 10000us+'),
+    PerfHistStat('perf_hist_opwrite_latency_lt250', 'operation write latency histogram (bucket 1) - 100-249us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt500', 'operation write latency histogram (bucket 2) - 250-499us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt1000', 'operation write latency histogram (bucket 3) - 500-999us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt10000', 'operation write latency histogram (bucket 4) - 1000-9999us'),
+
+##########################################
     # Reconciliation statistics
     ##########################################
     RecStat('rec_page_delete', 'pages deleted'),
@@ -398,27 +534,29 @@ connection_stats = [
     ##########################################
     # Session operations
     ##########################################
-    SessionStat('session_cursor_open', 'open cursor count', 'no_clear,no_scale'),
-    SessionStat('session_open', 'open session count', 'no_clear,no_scale'),
-    SessionStat('session_table_alter_fail', 'table alter failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_alter_skip', 'table alter unchanged and skipped', 'no_clear,no_scale'),
-    SessionStat('session_table_alter_success', 'table alter successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_compact_fail', 'table compact failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_compact_success', 'table compact successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_create_fail', 'table create failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_create_success', 'table create successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_drop_fail', 'table drop failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_drop_success', 'table drop successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_rebalance_fail', 'table rebalance failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_rebalance_success', 'table rebalance successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_rename_fail', 'table rename failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_rename_success', 'table rename successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_salvage_fail', 'table salvage failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_salvage_success', 'table salvage successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_truncate_fail', 'table truncate failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_truncate_success', 'table truncate successful calls', 'no_clear,no_scale'),
-    SessionStat('session_table_verify_fail', 'table verify failed calls', 'no_clear,no_scale'),
-    SessionStat('session_table_verify_success', 'table verify successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_open', 'open session count', 'no_clear,no_scale'),
+    SessionOpStat('session_query_ts', 'session query timestamp calls'),
+    SessionOpStat('session_table_alter_fail', 'table alter failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_alter_skip', 'table alter unchanged and skipped', 'no_clear,no_scale'),
+    SessionOpStat('session_table_alter_success', 'table alter successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_compact_fail', 'table compact failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_compact_success', 'table compact successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_create_fail', 'table create failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_create_success', 'table create successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_drop_fail', 'table drop failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_drop_success', 'table drop successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_import_fail', 'table import failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_import_success', 'table import successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_rebalance_fail', 'table rebalance failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_rebalance_success', 'table rebalance successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_rename_fail', 'table rename failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_rename_success', 'table rename successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_salvage_fail', 'table salvage failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_salvage_success', 'table salvage successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_truncate_fail', 'table truncate failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_truncate_success', 'table truncate successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_verify_fail', 'table verify failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_verify_success', 'table verify successful calls', 'no_clear,no_scale'),
 
     ##########################################
     # Thread Count statistics
@@ -434,7 +572,13 @@ connection_stats = [
     TxnStat('txn_checkpoint', 'transaction checkpoints'),
     TxnStat('txn_checkpoint_fsync_post', 'transaction fsync calls for checkpoint after allocating the transaction ID'),
     TxnStat('txn_checkpoint_fsync_post_duration', 'transaction fsync duration for checkpoint after allocating the transaction ID (usecs)', 'no_clear,no_scale'),
+    TxnStat('txn_hs_ckpt_duration', 'transaction checkpoint history store file duration (usecs)'),
     TxnStat('txn_checkpoint_generation', 'transaction checkpoint generation', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_prep_max', 'transaction checkpoint prepare max time (msecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_prep_min', 'transaction checkpoint prepare min time (msecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_prep_recent', 'transaction checkpoint prepare most recent time (msecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_prep_running', 'transaction checkpoint prepare currently running', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_prep_total', 'transaction checkpoint prepare total time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_running', 'transaction checkpoint currently running', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_scrub_target', 'transaction checkpoint scrub dirty target', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_scrub_time', 'transaction checkpoint scrub time (msecs)', 'no_clear,no_scale'),
@@ -444,14 +588,45 @@ connection_stats = [
     TxnStat('txn_checkpoint_time_recent', 'transaction checkpoint most recent time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_time_total', 'transaction checkpoint total time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_commit', 'transactions committed'),
-    TxnStat('txn_fail_cache', 'transaction failures due to cache overflow'),
+    TxnStat('txn_durable_queue_empty', 'durable timestamp queue insert to empty'),
+    TxnStat('txn_durable_queue_head', 'durable timestamp queue inserts to head'),
+    TxnStat('txn_durable_queue_inserts', 'durable timestamp queue inserts total'),
+    TxnStat('txn_durable_queue_len', 'durable timestamp queue length'),
+    TxnStat('txn_durable_queue_walked', 'durable timestamp queue entries walked'),
+    TxnStat('txn_fail_cache', 'transaction failures due to history store'),
     TxnStat('txn_pinned_checkpoint_range', 'transaction range of IDs currently pinned by a checkpoint', 'no_clear,no_scale'),
     TxnStat('txn_pinned_range', 'transaction range of IDs currently pinned', 'no_clear,no_scale'),
-    TxnStat('txn_pinned_snapshot_range', 'transaction range of IDs currently pinned by named snapshots', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp', 'transaction range of timestamps currently pinned', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp_checkpoint', 'transaction range of timestamps pinned by a checkpoint', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp_oldest', 'transaction range of timestamps pinned by the oldest timestamp', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp_reader', 'transaction range of timestamps pinned by the oldest active read timestamp', 'no_clear,no_scale'),
+    TxnStat('txn_prepare', 'prepared transactions'),
+    TxnStat('txn_prepare_active', 'prepared transactions currently active'),
+    TxnStat('txn_prepare_commit', 'prepared transactions committed'),
+    TxnStat('txn_prepare_rollback', 'prepared transactions rolled back'),
+    TxnStat('txn_prepared_updates_count', 'Number of prepared updates'),
+    TxnStat('txn_query_ts', 'query timestamp calls'),
+    TxnStat('txn_read_queue_empty', 'read timestamp queue insert to empty'),
+    TxnStat('txn_read_queue_head', 'read timestamp queue inserts to head'),
+    TxnStat('txn_read_queue_inserts', 'read timestamp queue inserts total'),
+    TxnStat('txn_read_queue_len', 'read timestamp queue length'),
+    TxnStat('txn_read_queue_walked', 'read timestamp queue entries walked'),
     TxnStat('txn_rollback', 'transactions rolled back'),
-    TxnStat('txn_snapshots_created', 'number of named snapshots created'),
-    TxnStat('txn_snapshots_dropped', 'number of named snapshots dropped'),
+    TxnStat('txn_rts', 'rollback to stable calls'),
+    TxnStat('txn_rts_hs_removed', 'rollback to stable updates removed from history store'),
+    TxnStat('txn_rts_keys_removed', 'rollback to stable keys removed'),
+    TxnStat('txn_rts_keys_restored', 'rollback to stable keys restored'),
+    TxnStat('txn_rts_pages_visited', 'rollback to stable pages visited'),
+    TxnStat('txn_rts_upd_aborted', 'rollback to stable updates aborted'),
+    TxnStat('txn_set_ts', 'set timestamp calls'),
+    TxnStat('txn_set_ts_durable', 'set timestamp durable calls'),
+    TxnStat('txn_set_ts_durable_upd', 'set timestamp durable updates'),
+    TxnStat('txn_set_ts_oldest', 'set timestamp oldest calls'),
+    TxnStat('txn_set_ts_oldest_upd', 'set timestamp oldest updates'),
+    TxnStat('txn_set_ts_stable', 'set timestamp stable calls'),
+    TxnStat('txn_set_ts_stable_upd', 'set timestamp stable updates'),
     TxnStat('txn_sync', 'transaction sync calls'),
+    TxnStat('txn_timestamp_oldest_active_read', 'transaction read timestamp of the oldest active reader', 'no_clear,no_scale'),
     TxnStat('txn_update_conflict', 'update conflicts'),
 
     ##########################################
@@ -470,7 +645,7 @@ connection_stats = [
     YieldStat('page_locked_blocked', 'page acquire locked blocked'),
     YieldStat('page_read_blocked', 'page acquire read blocked'),
     YieldStat('page_sleep', 'page acquire time sleeping (usecs)'),
-    YieldStat('tree_descend_blocked', 'tree descend one level yielded for split page index update'),
+    YieldStat('prepared_transition_blocked_page', 'page access yielded due to prepare state change'),
     YieldStat('txn_release_blocked', 'connection close blocked waiting for transaction state stabilization'),
 ]
 
@@ -513,6 +688,7 @@ dsrc_stats = [
     BtreeStat('btree_maxleafpage', 'maximum leaf page size', 'max_aggregate,no_scale,size'),
     BtreeStat('btree_maxleafvalue', 'maximum leaf page value size', 'max_aggregate,no_scale,size'),
     BtreeStat('btree_overflow', 'overflow pages', 'no_scale,tree_walk'),
+    BtreeStat('btree_row_empty_values', 'row-store empty values', 'no_scale,tree_walk'),
     BtreeStat('btree_row_internal', 'row-store internal pages', 'no_scale,tree_walk'),
     BtreeStat('btree_row_leaf', 'row-store leaf pages', 'no_scale,tree_walk'),
 
@@ -520,6 +696,7 @@ dsrc_stats = [
     # Cache and eviction statistics
     ##########################################
     CacheStat('cache_bytes_dirty', 'tracked dirty bytes in the cache', 'no_clear,no_scale,size'),
+    CacheStat('cache_bytes_dirty_total', 'bytes dirty in the cache cumulative', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_inuse', 'bytes currently in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_read', 'bytes read into cache', 'size'),
     CacheStat('cache_bytes_write', 'bytes written from cache', 'size'),
@@ -535,9 +712,9 @@ dsrc_stats = [
     CacheStat('cache_eviction_split_leaf', 'leaf pages split during eviction'),
     CacheStat('cache_eviction_target_page_ge128', 'eviction walk target pages histogram - 128 and higher'),
     CacheStat('cache_eviction_target_page_lt10', 'eviction walk target pages histogram - 0-9'),
+    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
     CacheStat('cache_eviction_target_page_lt32', 'eviction walk target pages histogram - 10-31'),
     CacheStat('cache_eviction_target_page_lt64', 'eviction walk target pages histogram - 32-63'),
-    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
     CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
     CacheStat('cache_eviction_walk_passes', 'eviction walk passes of a file'),
     CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
@@ -546,14 +723,16 @@ dsrc_stats = [
     CacheStat('cache_eviction_walks_gave_up_no_targets', 'eviction walks gave up because they saw too many pages and found no candidates'),
     CacheStat('cache_eviction_walks_gave_up_ratio', 'eviction walks gave up because they saw too many pages and found too few candidates'),
     CacheStat('cache_eviction_walks_stopped', 'eviction walks gave up because they restarted their walk twice'),
+    CacheStat('cache_hs_read', 'history store table reads'),
     CacheStat('cache_inmem_split', 'in-memory page splits'),
     CacheStat('cache_inmem_splittable', 'in-memory page passed criteria to be split'),
     CacheStat('cache_pages_requested', 'pages requested from the cache'),
     CacheStat('cache_read', 'pages read into cache'),
-    CacheStat('cache_read_lookaside', 'pages read into cache requiring lookaside entries'),
+    CacheStat('cache_read_deleted', 'pages read into cache after truncate'),
+    CacheStat('cache_read_deleted_prepared', 'pages read into cache after truncate in prepare state'),
     CacheStat('cache_read_overflow', 'overflow pages read into cache'),
     CacheStat('cache_write', 'pages written from cache'),
-    CacheStat('cache_write_lookaside', 'page written requiring lookaside records'),
+    CacheStat('cache_write_hs', 'page written requiring history store records'),
     CacheStat('cache_write_restore', 'pages written requiring in-memory restoration'),
 
     ##########################################
@@ -584,10 +763,9 @@ dsrc_stats = [
     ##########################################
     # Compression statistics
     ##########################################
-    CompressStat('compress_raw_fail', 'raw compression call failed, no additional data available'),
-    CompressStat('compress_raw_fail_temporary', 'raw compression call failed, additional data available'),
-    CompressStat('compress_raw_ok', 'raw compression call succeeded'),
     CompressStat('compress_read', 'compressed pages read'),
+    CompressStat('compress_precomp_intl_max_page_size', 'compressed page maximum internal page size prior to compression', 'no_clear,no_scale,size'),
+    CompressStat('compress_precomp_leaf_max_page_size', 'compressed page maximum leaf page size prior to compression ', 'no_clear,no_scale,size'),
     CompressStat('compress_write', 'compressed pages written'),
     CompressStat('compress_write_fail', 'page written failed to compress'),
     CompressStat('compress_write_too_small', 'page written was too small to compress'),
@@ -595,23 +773,29 @@ dsrc_stats = [
     ##########################################
     # Cursor operations
     ##########################################
+    CursorStat('cursor_open_count', 'open cursor count', 'no_clear,no_scale'),
+    CursorStat('cursor_cache', 'close calls that result in cache'),
     CursorStat('cursor_create', 'create calls'),
     CursorStat('cursor_insert', 'insert calls'),
-    CursorStat('cursor_insert_bulk', 'bulk-loaded cursor-insert calls'),
-    CursorStat('cursor_insert_bytes', 'cursor-insert key and value bytes inserted', 'size'),
-    CursorStat('cursor_modify', 'modify calls'),
+    CursorStat('cursor_insert_bulk', 'bulk loaded cursor insert calls'),
+    CursorStat('cursor_insert_bytes', 'insert key and value bytes', 'size'),
+    CursorStat('cursor_modify', 'modify'),
+    CursorStat('cursor_modify_bytes', 'modify key and value bytes affected', 'size'),
+    CursorStat('cursor_modify_bytes_touch', 'modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'next calls'),
     CursorStat('cursor_prev', 'prev calls'),
     CursorStat('cursor_remove', 'remove calls'),
-    CursorStat('cursor_remove_bytes', 'cursor-remove key bytes removed', 'size'),
+    CursorStat('cursor_remove_bytes', 'remove key bytes removed', 'size'),
+    CursorStat('cursor_reopen', 'cache cursors reuse count'),
     CursorStat('cursor_reserve', 'reserve calls'),
     CursorStat('cursor_reset', 'reset calls'),
-    CursorStat('cursor_restart', 'restarted searches'),
+    CursorStat('cursor_restart', 'operation restarted'),
     CursorStat('cursor_search', 'search calls'),
     CursorStat('cursor_search_near', 'search near calls'),
     CursorStat('cursor_truncate', 'truncate calls'),
     CursorStat('cursor_update', 'update calls'),
-    CursorStat('cursor_update_bytes', 'cursor-update value bytes updated', 'size'),
+    CursorStat('cursor_update_bytes', 'update key and value bytes', 'size'),
+    CursorStat('cursor_update_bytes_changed', 'update value size change', 'size'),
 
     ##########################################
     # LSM statistics
@@ -650,8 +834,7 @@ dsrc_stats = [
     ##########################################
     # Session operations
     ##########################################
-    SessionStat('session_compact', 'object compaction'),
-    SessionStat('session_cursor_open', 'open cursor count', 'no_clear,no_scale'),
+    SessionOpStat('session_compact', 'object compaction'),
 
     ##########################################
     # Transaction statistics
@@ -673,3 +856,18 @@ join_stats = [
 ]
 
 join_stats = sorted(join_stats, key=attrgetter('desc'))
+
+##########################################
+# Session statistics
+##########################################
+session_stats = [
+    SessionStat('bytes_read', 'bytes read into cache'),
+    SessionStat('bytes_write', 'bytes written from cache'),
+    SessionStat('cache_time', 'time waiting for cache (usecs)'),
+    SessionStat('lock_dhandle_wait', 'dhandle lock wait time (usecs)'),
+    SessionStat('lock_schema_wait', 'schema lock wait time (usecs)'),
+    SessionStat('read_time', 'page read from disk to cache time (usecs)'),
+    SessionStat('write_time', 'page write from cache to disk time (usecs)'),
+]
+
+session_stats = sorted(session_stats, key=attrgetter('desc'))

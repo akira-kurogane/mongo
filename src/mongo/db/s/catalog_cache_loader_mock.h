@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +39,8 @@ namespace mongo {
  * facilitate testing of classes that use a CatalogCacheLoader.
  */
 class CatalogCacheLoaderMock final : public CatalogCacheLoader {
-    MONGO_DISALLOW_COPYING(CatalogCacheLoaderMock);
+    CatalogCacheLoaderMock(const CatalogCacheLoaderMock&) = delete;
+    CatalogCacheLoaderMock& operator=(const CatalogCacheLoaderMock&) = delete;
 
 public:
     CatalogCacheLoaderMock();
@@ -50,14 +52,19 @@ public:
     void initializeReplicaSetRole(bool isPrimary) override;
     void onStepDown() override;
     void onStepUp() override;
+    void shutDown() override;
     void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
+    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
 
     std::shared_ptr<Notification<void>> getChunksSince(
         const NamespaceString& nss,
         ChunkVersion version,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn)
-        override;
+        GetChunksSinceCallbackFn callbackFn) override;
+
+    void getDatabase(
+        StringData dbName,
+        std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) override;
 
     /**
      * Sets the mocked collection entry result that getChunksSince will use to construct its return
@@ -70,7 +77,16 @@ public:
      */
     void setChunkRefreshReturnValue(StatusWith<std::vector<ChunkType>> statusWithChunks);
 
+    /**
+     * Sets the mocked database entry result that getDatabase will use to construct its return
+     * value.
+     */
+    void setDatabaseRefreshReturnValue(StatusWith<DatabaseType> swDatabase);
+
 private:
+    StatusWith<DatabaseType> _swDatabaseReturnValue{
+        Status(ErrorCodes::InternalError, "config loader database response is uninitialized")};
+
     // These variables hold the mocked chunks and collection entry results used to construct the
     // return value of getChunksSince above.
     StatusWith<CollectionType> _swCollectionReturnValue{Status(

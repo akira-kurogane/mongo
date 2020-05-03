@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/date_time/gregorian/gregorian_types.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/optional.hpp>
 #include <vector>
 
@@ -40,7 +44,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/sharding_test_fixture.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -50,6 +54,12 @@ namespace {
 using executor::RemoteCommandRequest;
 using std::vector;
 using unittest::assertGet;
+
+boost::gregorian::date currentDate() {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    return now.date();
+}
+
 
 BSONObj getReplSecondaryOkMetadata() {
     BSONObjBuilder o;
@@ -103,7 +113,7 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -124,7 +134,7 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>(BSON("value" << 3)));
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -146,7 +156,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(!config.shouldBalance());
     ASSERT(!config.shouldBalanceForAutoSplit());
@@ -168,7 +178,7 @@ TEST_F(BalancerConfigurationTestFixture, AutoSplitSettingsDocumentOnly) {
     expectSettingsQuery(AutoSplitSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << false)));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -192,7 +202,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentBalanceForAutoS
     expectSettingsQuery(AutoSplitSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << true)));
 
-    future.timed_get(kFutureTimeout);
+    future.default_timed_get();
 
     ASSERT(!config.shouldBalance());
     ASSERT(config.shouldBalanceForAutoSplit());
@@ -300,8 +310,7 @@ TEST(BalancerSettingsType, InvalidBalancingWindowTimeFormat) {
 
     ASSERT_NOT_OK(BalancerSettingsType::fromBSON(BSON("activeWindow" << BSON("start"
                                                                              << "23:00"
-                                                                             << "stop"
-                                                                             << 6LL)))
+                                                                             << "stop" << 6LL)))
                       .getStatus());
 }
 

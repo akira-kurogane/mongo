@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -30,11 +30,15 @@
 #include <vector>
 #include <map>
 
+// For convenience: A type exposed to Python that cannot be negative.
+typedef unsigned int uint_t;
+
 namespace workgen {
 
 struct ContextInternal;
 struct OperationInternal;
 struct TableInternal;
+struct ThreadRunner;
 struct Thread;
 struct Transaction;
 
@@ -80,9 +84,12 @@ struct Track {
     // Threads maintain the total thread operation and total latency they've
     // experienced.
 
-    uint64_t ops;                       // Total operations */
+    uint64_t ops_in_progress;           // Total operations not completed */
+    uint64_t ops;                       // Total operations completed */
+    uint64_t rollbacks;                 // Total operations rolled back */
     uint64_t latency_ops;               // Total ops sampled for latency
     uint64_t latency;                   // Total latency */
+    uint64_t bucket_ops;                // Computed for percentile_latency
 
     // Minimum/maximum latency, shared with the monitor thread, that is, the
     // monitor thread clears it so it's recalculated again for each period.
@@ -97,10 +104,11 @@ struct Track {
     void add(Track&, bool reset = false);
     void assign(const Track&);
     uint64_t average_latency() const;
+    void begin();
     void clear();
-    void incr();
-    void incr_with_latency(uint64_t usecs);
-    void smooth(const Track&);
+    void complete();
+    void complete_with_latency(uint64_t usecs);
+    uint64_t percentile_latency(int percent) const;
     void subtract(const Track&);
     void track_latency(bool);
     bool track_latency() const { return (us != NULL); }
@@ -119,6 +127,7 @@ private:
 };
 
 struct Stats {
+    Track checkpoint;
     Track insert;
     Track not_found;
     Track read;
@@ -138,7 +147,6 @@ struct Stats {
     void final_report(std::ostream &os, timespec &totalsecs) const;
     void report(std::ostream &os) const;
 #endif
-    void smooth(const Stats&);
     void subtract(const Stats&);
     void track_latency(bool);
     bool track_latency() const { return (insert.track_latency()); }
@@ -169,8 +177,11 @@ struct Context {
 // properties are prevented, only existing properties can be set.
 //
 struct TableOptions {
-    int key_size;
-    int value_size;
+    uint_t key_size;
+    uint_t value_size;
+    uint_t value_compressibility;
+    bool random_value;
+    uint_t range;
 
     TableOptions();
     TableOptions(const TableOptions &other);
@@ -179,6 +190,8 @@ struct TableOptions {
     void describe(std::ostream &os) const {
 	os << "key_size " << key_size;
 	os << ", value_size " << value_size;
+	os << ", random_value " << random_value;
+	os << ", range " << range;
     }
 
     std::string help() const { return _options.help(); }
@@ -210,20 +223,55 @@ struct Table {
 #endif
 };
 
+struct ParetoOptions {
+    int param;
+    double range_low;
+    double range_high;
+    ParetoOptions(int param = 0);
+    ParetoOptions(const ParetoOptions &other);
+    ~ParetoOptions();
+
+    void describe(std::ostream &os) const {
+	os << "Pareto: parameter " << param;
+	if (range_low != 0.0 || range_high != 1.0) {
+	    os << "range [" << range_low << "-" << range_high << "]";
+	}
+    }
+
+    std::string help() const { return _options.help(); }
+    std::string help_description(const char *option_name) const {
+	return _options.help_description(option_name); }
+    std::string help_type(const char *option_name) const {
+	return _options.help_type(option_name); }
+
+    static ParetoOptions DEFAULT;
+private:
+    OptionsList _options;
+};
+
 struct Key {
     typedef enum {
 	KEYGEN_AUTO, KEYGEN_APPEND, KEYGEN_PARETO, KEYGEN_UNIFORM } KeyType;
     KeyType _keytype;
     int _size;
+    ParetoOptions _pareto;
 
     /* XXX specify more about key distribution */
-    Key() : _keytype(KEYGEN_AUTO), _size(0) {}
-    Key(KeyType keytype, int size) : _keytype(keytype), _size(size) {}
-    Key(const Key &other) : _keytype(other._keytype), _size(other._size) {}
+    Key() : _keytype(KEYGEN_AUTO), _size(0), _pareto(ParetoOptions::DEFAULT) {}
+    Key(KeyType keytype, int size=0,
+      const ParetoOptions &pareto=ParetoOptions::DEFAULT) :
+	_keytype(keytype), _size(size), _pareto(pareto) {}
+    Key(const Key &other) : _keytype(other._keytype), _size(other._size),
+	_pareto(other._pareto) {}
     ~Key() {}
 
     void describe(std::ostream &os) const {
-	os << "Key: type " << _keytype << ", size " << _size; }
+	os << "Key: type " << _keytype << ", size " << _size;
+        if (_pareto.param != ParetoOptions::DEFAULT.param) {
+            os << ", ";
+            _pareto.describe(os);
+        }
+    }
 };
 
 struct Value {
@@ -240,43 +288,45 @@ struct Value {
 
 struct Operation {
     enum OpType {
-	OP_NONE, OP_INSERT, OP_REMOVE, OP_SEARCH, OP_UPDATE };
+	OP_CHECKPOINT, OP_INSERT, OP_LOG_FLUSH, OP_NONE, OP_NOOP,
+	OP_REMOVE, OP_SEARCH, OP_SLEEP, OP_UPDATE };
     OpType _optype;
+    OperationInternal *_internal;
 
     Table _table;
     Key _key;
     Value _value;
     std::string _config;
-    Transaction *_transaction;
+    Transaction *transaction;
     std::vector<Operation> *_group;
     int _repeatgroup;
-
-#ifndef SWIG
-#define	WORKGEN_OP_REOPEN		0x0001 // reopen cursor for each op
-    uint32_t _flags;
-
-    int _keysize;    // derived from Key._size and Table.options.key_size
-    int _valuesize;
-    uint64_t _keymax;
-    uint64_t _valuemax;
-#endif
+    double _timed;
 
     Operation();
     Operation(OpType optype, Table table, Key key, Value value);
     Operation(OpType optype, Table table, Key key);
     Operation(OpType optype, Table table);
+    // Constructor with string applies to NOOP, SLEEP, CHECKPOINT
+    Operation(OpType optype, const char *config);
     Operation(const Operation &other);
     ~Operation();
 
+    // Check if adding (via Python '+') another operation to this one is
+    // as easy as appending the new operation to the _group.
+    bool combinable() const;
     void describe(std::ostream &os) const;
 #ifndef SWIG
     Operation& operator=(const Operation &other);
+    void init_internal(OperationInternal *other);
     void create_all();
     void get_static_counts(Stats &stats, int multiplier);
-    void kv_compute_max(bool);
-    void kv_gen(bool, uint64_t, char *) const;
+    bool is_table_op() const;
+    void kv_compute_max(bool iskey, bool has_random);
+    void kv_gen(ThreadRunner *runner, bool iskey, uint64_t compressibility,
+       uint64_t n, char *result) const;
     void kv_size_buffer(bool iskey, size_t &size) const;
     void size_check() const;
+    void synchronized_check() const;
 #endif
 };
 
@@ -285,8 +335,10 @@ struct Operation {
 //
 struct ThreadOptions {
     std::string name;
+    std::string session_config;
     double throttle;
     double throttle_burst;
+    bool synchronized;
 
     ThreadOptions();
     ThreadOptions(const ThreadOptions &other);
@@ -294,6 +346,9 @@ struct ThreadOptions {
 
     void describe(std::ostream &os) const {
 	os << "throttle " << throttle;
+	os << ", throttle_burst " << throttle_burst;
+	os << ", synchronized " << synchronized;
+	os << ", session_config " << session_config;
     }
 
     std::string help() const { return _options.help(); }
@@ -338,19 +393,36 @@ struct Thread {
 
 struct Transaction {
     bool _rollback;
+    bool use_commit_timestamp;
+    bool use_prepare_timestamp;
     std::string _begin_config;
     std::string _commit_config;
+    double read_timestamp_lag;
 
-    Transaction(const char *_config = NULL) : _rollback(false),
-       _begin_config(_config == NULL ? "" : _config), _commit_config() {}
+    Transaction() : _rollback(false), use_commit_timestamp(false),
+      use_prepare_timestamp(false), _begin_config(""), _commit_config(), read_timestamp_lag(0.0)
+    {}
+
+    Transaction(const Transaction &other) : _rollback(other._rollback),
+      use_commit_timestamp(other.use_commit_timestamp),
+      use_prepare_timestamp(other.use_prepare_timestamp),
+      _begin_config(other._begin_config), _commit_config(other._commit_config),
+      read_timestamp_lag(other.read_timestamp_lag)
+    {}
 
     void describe(std::ostream &os) const {
 	os << "Transaction: ";
 	if (_rollback)
 	    os << "(rollback) ";
+	if (use_commit_timestamp)
+	    os << "(use_commit_timestamp) ";
+	if (use_prepare_timestamp)
+	    os << "(use_prepare_timestamp) ";
 	os << "begin_config: " << _begin_config;
 	if (!_commit_config.empty())
 	    os << ", commit_config: " << _commit_config;
+	if (read_timestamp_lag != 0.0)
+	    os << ", read_timestamp_lag: " << read_timestamp_lag;
     }
 };
 
@@ -362,9 +434,13 @@ struct WorkloadOptions {
     std::string report_file;
     int report_interval;
     int run_time;
-    int sample_interval;
+    int sample_interval_ms;
     int sample_rate;
     std::string sample_file;
+    int warmup;
+    double oldest_timestamp_lag;
+    double stable_timestamp_lag;
+    double timestamp_advance;
 
     WorkloadOptions();
     WorkloadOptions(const WorkloadOptions &other);

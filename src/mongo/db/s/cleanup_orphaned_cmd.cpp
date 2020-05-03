@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,126 +27,221 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional.hpp>
 #include <string>
-#include <vector>
 
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/range_arithmetic.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
-#include "mongo/util/log.h"
-
-#include <boost/optional.hpp>
+#include "mongo/logv2/log.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
-
-using std::string;
-using str::stream;
-
 namespace {
 
-enum CleanupResult { CleanupResult_Done, CleanupResult_Continue, CleanupResult_Error };
+enum class CleanupResult { kDone, kContinue, kError };
 
 /**
+ * If the resumable range deleter is disabled:
  * Cleans up one range of orphaned data starting from a range that overlaps or starts at
  * 'startingFromKey'.  If empty, startingFromKey is the minimum key of the sharded range.
  *
- * @return CleanupResult_Continue and 'stoppedAtKey' if orphaned range was found and cleaned
- * @return CleanupResult_Done if no orphaned ranges remain
- * @return CleanupResult_Error and 'errMsg' if an error occurred
+ * If the resumable range deleter is enabled:
+ * Waits for all possibly orphaned ranges on 'nss' to be cleaned up.
  *
- * If the collection is not sharded, returns CleanupResult_Done.
+ * @return CleanupResult::kContinue and 'stoppedAtKey' if orphaned range was found and cleaned
+ * @return CleanupResult::kDone if no orphaned ranges remain
+ * @return CleanupResult::kError and 'errMsg' if an error occurred
+ *
+ * If the collection is not sharded, returns CleanupResult::kDone.
  */
 CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                                   const NamespaceString& ns,
                                   const BSONObj& startingFromKeyConst,
-                                  const WriteConcernOptions& secondaryThrottle,
                                   BSONObj* stoppedAtKey,
-                                  string* errMsg) {
-
-    BSONObj startingFromKey = startingFromKeyConst;
-    boost::optional<ChunkRange> targetRange;
-    CollectionShardingState::CleanupNotification notifn;
-    OID epoch;
-    {
-        AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-        auto css = CollectionShardingState::get(opCtx, ns.toString());
-        auto metadata = css->getMetadata();
-        if (!metadata) {
-            log() << "skipping orphaned data cleanup for " << ns.toString()
-                  << ", collection is not sharded";
-            return CleanupResult_Done;
-        }
-        epoch = metadata->getCollVersion().epoch();
-
-        BSONObj keyPattern = metadata->getKeyPattern();
-        if (!startingFromKey.isEmpty()) {
-            if (!metadata->isValidKey(startingFromKey)) {
-                *errMsg = stream() << "could not cleanup orphaned data, start key "
-                                   << startingFromKey << " does not match shard key pattern "
-                                   << keyPattern;
-
-                log() << *errMsg;
-                return CleanupResult_Error;
+                                  std::string* errMsg) {
+    // Note that 'disableResumableRangeDeleter' is a startup-only parameter, so it cannot change
+    // while this process is running.
+    if (!disableResumableRangeDeleter.load()) {
+        boost::optional<ChunkRange> range;
+        boost::optional<UUID> collectionUuid;
+        {
+            AutoGetCollection autoColl(opCtx, ns, MODE_IX);
+            if (!autoColl.getCollection()) {
+                LOGV2(4416000,
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "{namespace} does not exist",
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "collection does not exist",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
             }
-        } else {
-            startingFromKey = metadata->getMinKey();
+            collectionUuid.emplace(autoColl.getCollection()->uuid());
+
+            auto* const css = CollectionShardingRuntime::get(opCtx, ns);
+            const auto collDesc = css->getCollectionDescription();
+            if (!collDesc.isSharded()) {
+                LOGV2(4416001,
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "{namespace} is not sharded",
+                      "cleanupOrphaned skipping waiting for orphaned data cleanup because "
+                      "collection is not sharded",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
+            }
+            range.emplace(collDesc.getMinKey(), collDesc.getMaxKey());
+
+            // Though the 'startingFromKey' parameter is not used as the min key of the range to
+            // wait for, we still validate that 'startingFromKey' in the same way as the original
+            // cleanupOrphaned logic did if 'startingFromKey' is present.
+            BSONObj keyPattern = collDesc.getKeyPattern();
+            if (!startingFromKeyConst.isEmpty() && !collDesc.isValidKey(startingFromKeyConst)) {
+                LOGV2_ERROR_OPTIONS(
+                    4416002,
+                    {logv2::UserAssertAfterLog(ErrorCodes::OrphanedRangeCleanUpFailed)},
+                    "Could not cleanup orphaned data because start key does not match shard key "
+                    "pattern",
+                    "startKey"_attr = startingFromKeyConst,
+                    "shardKeyPattern"_attr = keyPattern);
+            }
         }
 
-        boost::optional<KeyRange> orphanRange = css->getNextOrphanRange(startingFromKey);
-        if (!orphanRange) {
-            LOG(1) << "cleanupOrphaned requested for " << ns.toString() << " starting from "
-                   << redact(startingFromKey) << ", no orphan ranges remain";
+        // We actually want to wait until there are no range deletion tasks for this namespace/UUID,
+        // but we don't have a good way to wait for that event, so instead we wait for there to be
+        // no tasks being processed in memory for this namespace/UUID.
+        // However, it's possible this node has recently stepped up, and the stepup recovery task to
+        // resubmit range deletion tasks for processing has not yet completed. In that case,
+        // waitForClean will return though there are still tasks in config.rangeDeletions, so we
+        // sleep for a short time and then try waitForClean again.
+        while (auto numRemainingDeletionTasks =
+                   migrationutil::checkForConflictingDeletions(opCtx, *range, *collectionUuid)) {
+            LOGV2(4416003,
+                  "cleanupOrphaned going to wait for range deletion tasks to complete",
+                  "namespace"_attr = ns.ns(),
+                  "collectionUUID"_attr = *collectionUuid,
+                  "numRemainingDeletionTasks"_attr = numRemainingDeletionTasks);
 
-            return CleanupResult_Done;
+            auto status =
+                CollectionShardingRuntime::waitForClean(opCtx, ns, *collectionUuid, *range);
+
+            if (!status.isOK()) {
+                *errMsg = status.reason();
+                return CleanupResult::kError;
+            }
+
+            opCtx->sleepFor(Milliseconds(1000));
         }
-        orphanRange->ns = ns.ns();
-        *stoppedAtKey = orphanRange->maxKey;
 
-        targetRange.emplace(
-            ChunkRange(orphanRange->minKey.getOwned(), orphanRange->maxKey.getOwned()));
-        notifn = css->cleanUpRange(*targetRange, CollectionShardingState::kNow);
+        return CleanupResult::kDone;
+    } else {
+
+        BSONObj startingFromKey = startingFromKeyConst;
+        boost::optional<ChunkRange> targetRange;
+        SharedSemiFuture<void> cleanupCompleteFuture;
+
+        {
+            AutoGetCollection autoColl(opCtx, ns, MODE_IX);
+            auto* const css = CollectionShardingRuntime::get(opCtx, ns);
+            const auto collDesc = css->getCollectionDescription();
+            if (!collDesc.isSharded()) {
+                LOGV2(21911,
+                      "cleanupOrphaned skipping orphaned data cleanup because collection is not "
+                      "sharded",
+                      "namespace"_attr = ns.ns());
+                return CleanupResult::kDone;
+            }
+
+            BSONObj keyPattern = collDesc.getKeyPattern();
+            if (!startingFromKey.isEmpty()) {
+                if (!collDesc.isValidKey(startingFromKey)) {
+                    LOGV2_ERROR_OPTIONS(
+                        21912,
+                        {logv2::UserAssertAfterLog(ErrorCodes::OrphanedRangeCleanUpFailed)},
+                        "Could not cleanup orphaned data, start key {startKey} does not match "
+                        "shard key pattern {shardKeyPattern}",
+                        "Could not cleanup orphaned data because start key does not match shard "
+                        "key pattern",
+                        "startKey"_attr = startingFromKey,
+                        "shardKeyPattern"_attr = keyPattern);
+                }
+            } else {
+                startingFromKey = collDesc.getMinKey();
+            }
+
+            targetRange = css->getNextOrphanRange(startingFromKey);
+            if (!targetRange) {
+                LOGV2_DEBUG(21913,
+                            1,
+                            "cleanupOrphaned returning because no orphan ranges remain",
+                            "namespace"_attr = ns.toString(),
+                            "startingFromKey"_attr = redact(startingFromKey));
+
+                return CleanupResult::kDone;
+            }
+
+            *stoppedAtKey = targetRange->getMax();
+
+            cleanupCompleteFuture =
+                css->cleanUpRange(*targetRange, boost::none, CollectionShardingRuntime::kNow);
+        }
+
+        // Sleep waiting for our own deletion. We don't actually care about any others, so there is
+        // no need to call css::waitForClean() here.
+
+        LOGV2_DEBUG(21914,
+                    1,
+                    "cleanupOrphaned requested for {namespace} starting from {startingFromKey}, "
+                    "removing next orphan range {targetRange}; waiting...",
+                    "cleanupOrphaned requested",
+                    "namespace"_attr = ns.toString(),
+                    "startingFromKey"_attr = redact(startingFromKey),
+                    "targetRange"_attr = redact(targetRange->toString()));
+
+        Status result = cleanupCompleteFuture.getNoThrow(opCtx);
+
+        LOGV2_DEBUG(21915,
+                    1,
+                    "Finished waiting for last {namespace} orphan range cleanup",
+                    "Finished waiting for last orphan range cleanup in collection",
+                    "namespace"_attr = ns.toString());
+
+        if (!result.isOK()) {
+            LOGV2_ERROR_OPTIONS(21916,
+                                {logv2::UserAssertAfterLog(result.code())},
+                                "Error waiting for last {namespace} orphan range cleanup: {error}",
+                                "Error waiting for last orphan range cleanup in collection",
+                                "namespace"_attr = ns.ns(),
+                                "error"_attr = redact(result.reason()));
+        }
+
+        return CleanupResult::kContinue;
     }
-
-    // Sleep waiting for our own deletion. We don't actually care about any others, so there is no
-    // need to call css::waitForClean() here.
-
-    LOG(1) << "cleanupOrphaned requested for " << ns.toString() << " starting from "
-           << redact(startingFromKey) << ", removing next orphan range "
-           << redact(targetRange->toString()) << "; waiting...";
-    Status result = notifn.waitStatus(opCtx);
-    LOG(1) << "Finished waiting for last " << ns.toString() << " orphan range cleanup";
-    if (!result.isOK()) {
-        log() << redact(result.reason());
-        *errMsg = result.reason();
-        return CleanupResult_Error;
-    }
-    return CleanupResult_Continue;
 }
 
 /**
- * Cleanup orphaned data command.  Called on a particular namespace, and if the collection
- * is sharded will clean up a single orphaned data range which overlaps or starts after a
- * passed-in 'startingFromKey'.  Returns true and a 'stoppedAtKey' (which will start a
- * search for the next orphaned range if the command is called again) or no key if there
- * are no more orphaned ranges in the collection.
+ * If 'disableResumableRangeDeleter=true':
+ *
+ * Called on a particular namespace, and if the collection is sharded will clean up a single
+ * orphaned data range which overlaps or starts after a passed-in 'startingFromKey'.  Returns true
+ * and a 'stoppedAtKey' (which will start a search for the next orphaned range if the command is
+ * called again) or no key if there are no more orphaned ranges in the collection.
  *
  * If the collection is not sharded, returns true but no 'stoppedAtKey'.
  * On failure, returns false and an error message.
@@ -167,21 +263,36 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
  *      // defaults to { w: "majority", wtimeout: 60000 }. Applies to individual writes.
  *      writeConcern: { <writeConcern options> }
  * }
+ *
+ * If 'disableResumableRangeDeleter=false':
+ *
+ * Called on a particular namespace, and if the collection is sharded will wait for the number of
+ * range deletion tasks on the collection on this shard to reach zero. Returns true on completion,
+ * but never returns 'stoppedAtKey', since it always returns once there are no more orphaned ranges.
+ *
+ * If the collection is not sharded, returns true and no 'stoppedAtKey'.
+ * On failure, returns false and an error message.
+ *
+ * Since the sharding state may change after this call returns, there is no guarantee that orphans
+ * won't re-appear as a result of migrations that commit after this call returns.
+ *
+ * Safe to call with the balancer on.
  */
 class CleanupOrphanedCommand : public ErrmsgCommandDeprecated {
 public:
     CleanupOrphanedCommand() : ErrmsgCommandDeprecated("cleanupOrphaned") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-    virtual bool adminOnly() const {
+
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::cleanupOrphaned)) {
             return Status(ErrorCodes::Unauthorized, "Not authorized for cleanupOrphaned command.");
@@ -189,23 +300,23 @@ public:
         return Status::OK();
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
     // Input
-    static BSONField<string> nsField;
+    static BSONField<std::string> nsField;
     static BSONField<BSONObj> startingFromKeyField;
 
     // Output
     static BSONField<BSONObj> stoppedAtKeyField;
 
     bool errmsgRun(OperationContext* opCtx,
-                   string const& db,
+                   std::string const& db,
                    const BSONObj& cmdObj,
-                   string& errmsg,
-                   BSONObjBuilder& result) {
-        string ns;
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
+        std::string ns;
         if (!FieldParser::extract(cmdObj, nsField, &ns, &errmsg)) {
             return false;
         }
@@ -220,11 +331,6 @@ public:
             return false;
         }
 
-        const auto secondaryThrottle =
-            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
-        const auto writeConcern = uassertStatusOK(
-            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(opCtx, secondaryThrottle));
-
         ShardingState* const shardingState = ShardingState::get(opCtx);
 
         if (!shardingState->enabled()) {
@@ -233,21 +339,20 @@ public:
             return false;
         }
 
-        ChunkVersion unusedShardVersion;
-        uassertStatusOK(shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion));
+        forceShardFilteringMetadataRefresh(opCtx, nss, true /* forceRefreshFromThisThread */);
 
         BSONObj stoppedAtKey;
         CleanupResult cleanupResult =
-            cleanupOrphanedData(opCtx, nss, startingFromKey, writeConcern, &stoppedAtKey, &errmsg);
+            cleanupOrphanedData(opCtx, nss, startingFromKey, &stoppedAtKey, &errmsg);
 
-        if (cleanupResult == CleanupResult_Error) {
+        if (cleanupResult == CleanupResult::kError) {
             return false;
         }
 
-        if (cleanupResult == CleanupResult_Continue) {
+        if (cleanupResult == CleanupResult::kContinue) {
             result.append(stoppedAtKeyField(), stoppedAtKey);
         } else {
-            dassert(cleanupResult == CleanupResult_Done);
+            dassert(cleanupResult == CleanupResult::kDone);
         }
 
         return true;
@@ -255,7 +360,7 @@ public:
 
 } cleanupOrphanedCmd;
 
-BSONField<string> CleanupOrphanedCommand::nsField("cleanupOrphaned");
+BSONField<std::string> CleanupOrphanedCommand::nsField("cleanupOrphaned");
 BSONField<BSONObj> CleanupOrphanedCommand::startingFromKeyField("startingFromKey");
 BSONField<BSONObj> CleanupOrphanedCommand::stoppedAtKeyField("stoppedAtKey");
 

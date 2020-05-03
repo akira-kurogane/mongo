@@ -1,28 +1,30 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -64,6 +66,7 @@ enum OptionSources {
     SourceYAMLConfig = 4,
     SourceAllConfig = SourceINIConfig | SourceYAMLConfig,
     SourceAllLegacy = SourceINIConfig | SourceCommandLine,
+    SourceYAMLCLI = SourceYAMLConfig | SourceCommandLine,
     SourceAll = SourceCommandLine | SourceINIConfig | SourceYAMLConfig
 };
 
@@ -73,18 +76,18 @@ enum OptionSources {
  * OptionSection instance and passed to an OptionsParser.
  */
 class OptionDescription {
-public:
-    OptionDescription(const std::string& dottedName,
-                      const std::string& singleName,
-                      const OptionType type,
-                      const std::string& description);
+private:
+    friend class OptionSection;
 
+    OptionDescription() = delete;
     OptionDescription(const std::string& dottedName,
                       const std::string& singleName,
                       const OptionType type,
                       const std::string& description,
-                      const std::vector<std::string>& deprecatedDottedNames);
+                      const std::vector<std::string>& deprecatedDottedNames = {},
+                      const std::vector<std::string>& deprecatedSingleNames = {});
 
+public:
     /*
      * The following functions are part of the chaining interface for option registration.  See
      * comments below for what each of these attributes mean, and the OptionSection class for
@@ -102,6 +105,12 @@ public:
      * Make this option hidden so it does not appear in command line help
      */
     OptionDescription& hidden();
+
+    /*
+     * Mark this option as sensitive so that attempts by a client to read this setting
+     * will only return a placeholder value rather than the real setting.
+     */
+    OptionDescription& redact();
 
     /*
      * Add a default value for this option if it is not specified
@@ -168,11 +177,6 @@ public:
      */
 
     /**
-     * Specifies the range allowed for this option.  Only allowed for options with numeric type.
-     */
-    OptionDescription& validRange(long min, long max);
-
-    /**
      * Specifies that this option is incompatible with another option.  The std::string provided
      * must be the dottedName, which is the name used to access the option in the result
      * Environment.
@@ -186,14 +190,14 @@ public:
      * provided must be the dottedName, which is the name used to access the option in the
      * result Environment.
      */
-    OptionDescription& requires(const std::string& otherDottedName);
+    OptionDescription& requiresOption(const std::string& otherDottedName);
 
     /**
-     * Specifies that this option is required to match the given format, specified as a regular
-     * expression.  The displayFormat argument is what gets printed to the user in the case
-     * where this constraint is not satisfied.  This is only allowed on std::string options.
+     * Specifies that this option should be canonicalized immediately after initial parse.
+     * Callback may alter the contents of the setting, rename the key its stored to, etc...
      */
-    OptionDescription& format(const std::string& regexFormat, const std::string& displayFormat);
+    using Canonicalize_t = std::function<Status(Environment*)>;
+    OptionDescription& canonicalize(Canonicalize_t);
 
     /**
      * Adds a constraint for this option.  During parsing, this Constraint will be added to the
@@ -210,6 +214,7 @@ public:
                                // (required by boost)
     std::string _description;  // Description of option printed in help output
     bool _isVisible;           // Visible in help output
+    bool _redact = false;      // Value should not be exposed to inquiry
     Value _default;            // Value if option is not specified
     Value _implicit;           // Value if option is specified with no argument
     bool _isComposing;         // Aggregate values from different sources instead of overriding
@@ -230,6 +235,55 @@ public:
 
     // Deprecated dotted names - aliases for '_dottedName'.
     std::vector<std::string> _deprecatedDottedNames;
+    // Deprecated single names - aliases for '_singleName'.
+    std::vector<std::string> _deprecatedSingleNames;
+
+    // Canonicalizer method.
+    Canonicalize_t _canonicalize;
+};
+
+template <OptionType T>
+struct OptionTypeMap;
+
+template <>
+struct OptionTypeMap<StringVector> {
+    using type = std::vector<std::string>;
+};
+template <>
+struct OptionTypeMap<StringMap> {
+    using type = std::vector<std::string>;
+};
+template <>
+struct OptionTypeMap<Bool> {
+    using type = bool;
+};
+template <>
+struct OptionTypeMap<Double> {
+    using type = double;
+};
+template <>
+struct OptionTypeMap<Int> {
+    using type = int;
+};
+template <>
+struct OptionTypeMap<Long> {
+    using type = long;
+};
+template <>
+struct OptionTypeMap<String> {
+    using type = std::string;
+};
+template <>
+struct OptionTypeMap<UnsignedLongLong> {
+    using type = unsigned long long;
+};
+template <>
+struct OptionTypeMap<Unsigned> {
+    using type = unsigned;
+};
+template <>
+struct OptionTypeMap<Switch> {
+    using type = bool;
 };
 
 }  // namespace optionenvironment

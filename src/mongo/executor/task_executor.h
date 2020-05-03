@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,14 +33,15 @@
 #include <memory>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/platform/hash_namespace.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/transport/baton.h"
+#include "mongo/util/future.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -69,18 +71,21 @@ struct ConnectionPoolStats;
  * If an event is unsignaled when shutdown is called, the executor will ensure that any threads
  * blocked in waitForEvent() eventually return.
  */
-class TaskExecutor {
-    MONGO_DISALLOW_COPYING(TaskExecutor);
+class TaskExecutor : public OutOfLineExecutor {
+    TaskExecutor(const TaskExecutor&) = delete;
+    TaskExecutor& operator=(const TaskExecutor&) = delete;
 
 public:
     struct CallbackArgs;
     struct RemoteCommandCallbackArgs;
+    struct RemoteCommandOnAnyCallbackArgs;
     class CallbackState;
     class CallbackHandle;
     class EventState;
     class EventHandle;
 
     using ResponseStatus = RemoteCommandResponse;
+    using ResponseOnAnyStatus = RemoteCommandOnAnyResponse;
 
     /**
      * Type of a regular callback function.
@@ -89,7 +94,7 @@ public:
      * the callback was canceled for any reason (including shutdown).  Otherwise, it should have
      * Status::OK().
      */
-    using CallbackFn = stdx::function<void(const CallbackArgs&)>;
+    using CallbackFn = unique_function<void(const CallbackArgs&)>;
 
     /**
      * Type of a callback from a request to run a command on a remote MongoDB node.
@@ -100,7 +105,9 @@ public:
      * the BSONObj returned by the command, with the "ok" field indicating the success of the
      * command in the usual way.
      */
-    using RemoteCommandCallbackFn = stdx::function<void(const RemoteCommandCallbackArgs&)>;
+    using RemoteCommandCallbackFn = std::function<void(const RemoteCommandCallbackArgs&)>;
+
+    using RemoteCommandOnAnyCallbackFn = std::function<void(const RemoteCommandOnAnyCallbackArgs&)>;
 
     /**
      * Destroys the task executor. Implicitly performs the equivalent of shutdown() and join()
@@ -135,6 +142,12 @@ public:
     virtual void join() = 0;
 
     /**
+     * Returns a future that becomes ready when shutdown() has been called and all outstanding
+     * callbacks have finished running.
+     */
+    virtual SharedSemiFuture<void> joinAsync() = 0;
+
+    /**
      * Writes diagnostic information into "b".
      */
     virtual void appendDiagnosticBSON(BSONObjBuilder* b) const = 0;
@@ -165,13 +178,19 @@ public:
      * Schedules a callback, "work", to run after "event" is signaled.  If "event"
      * has already been signaled, marks "work" as immediately runnable.
      *
+     * On success, returns a handle for waiting on or canceling the callback. The provided "work"
+     * argument is moved from and invalid for use in the caller. On error, returns
+     * ErrorCodes::ShutdownInProgress, and "work" is still valid. If you intend to call "work" after
+     * error, make sure it is an actual CallbackFn, not a lambda or other value that implicitly
+     * converts to CallbackFn, since such a value would be moved from and invalidated during
+     * conversion with no way to recover it.
+     *
      * If "event" has yet to be signaled when "shutdown()" is called, "work" will
      * be scheduled with a status of ErrorCodes::CallbackCanceled.
      *
      * May be called by client threads or callbacks running in the executor.
      */
-    virtual StatusWith<CallbackHandle> onEvent(const EventHandle& event,
-                                               const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn&& work) = 0;
 
     /**
      * Blocks the calling thread until "event" is signaled. Also returns if the event is never
@@ -185,39 +204,52 @@ public:
     virtual void waitForEvent(const EventHandle& event) = 0;
 
     /**
-     * Same as waitForEvent without an OperationContext, but returns an error if the event was not
-     * triggered but the operation was killed - see OperationContext::checkForInterruptNoAssert()
-     * for expected error codes.
+     * Same as waitForEvent without an OperationContext, but if the OperationContext gets
+     * interrupted, will return the kill code, or, if the the deadline passes, will return
+     * Status::OK with cv_status::timeout.
      */
-    virtual Status waitForEvent(OperationContext* opCtx, const EventHandle& event) = 0;
+    virtual StatusWith<stdx::cv_status> waitForEvent(OperationContext* opCtx,
+                                                     const EventHandle& event,
+                                                     Date_t deadline = Date_t::max()) = 0;
+
+
+    void schedule(OutOfLineExecutor::Task func) final override;
 
     /**
      * Schedules "work" to be run by the executor ASAP.
      *
-     * Returns a handle for waiting on or canceling the callback, or
-     * ErrorCodes::ShutdownInProgress.
+     * On success, returns a handle for waiting on or canceling the callback. The provided "work"
+     * argument is moved from and invalid for use in the caller. On error, returns
+     * ErrorCodes::ShutdownInProgress, and "work" is still valid. If you intend to call "work" after
+     * error, make sure it is an actual CallbackFn, not a lambda or other value that implicitly
+     * converts to CallbackFn, since such a value would be moved from and invalidated during
+     * conversion with no way to recover it.
      *
      * May be called by client threads or callbacks running in the executor.
      *
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
-    virtual StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) = 0;
 
     /**
      * Schedules "work" to be run by the executor no sooner than "when".
      *
      * If "when" is <= now(), then it schedules the "work" to be run ASAP.
      *
-     * Returns a handle for waiting on or canceling the callback, or
-     * ErrorCodes::ShutdownInProgress.
+     * On success, returns a handle for waiting on or canceling the callback. The provided "work"
+     * argument is moved from and invalid for use in the caller. On error, returns
+     * ErrorCodes::ShutdownInProgress, and "work" is still valid. If you intend to call "work" after
+     * error, make sure it is an actual CallbackFn, not a lambda or other value that implicitly
+     * converts to CallbackFn, since such a value would be moved from and invalidated during
+     * conversion with no way to recover it.
      *
      * May be called by client threads or callbacks running in the executor.
      *
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
-    virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) = 0;
 
     /**
      * Schedules "cb" to be run by the executor with the result of executing the remote command
@@ -232,7 +264,40 @@ public:
      * processing related to the callback.
      */
     virtual StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
-                                                             const RemoteCommandCallbackFn& cb) = 0;
+                                                             const RemoteCommandCallbackFn& cb,
+                                                             const BatonHandle& baton = nullptr);
+
+    virtual StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) = 0;
+
+    /**
+     * Schedules "cb" to be run by the executor on each reply recevied from executing the exhaust
+     * remote command described by "request".
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
+     *
+     * Contract: Implementations should guarantee that callback should be called *after* doing any
+     * processing related to the callback.
+     */
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommand(
+        const RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const BatonHandle& baton = nullptr);
+
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) = 0;
+
+    /**
+     * Returns true if there are any tasks scheduled on the executor.
+     */
+    virtual bool hasTasks() = 0;
 
     /**
      * If the callback referenced by "cbHandle" hasn't already executed, marks it as
@@ -250,8 +315,11 @@ public:
      * callback ran.
      *
      * NOTE: Do not call from a callback running in the executor.
+     *
+     * Prefer the version that takes an OperationContext* to this version.
      */
-    virtual void wait(const CallbackHandle& cbHandle) = 0;
+    virtual void wait(const CallbackHandle& cbHandle,
+                      Interruptible* interruptible = Interruptible::notInterruptible()) = 0;
 
     /**
      * Appends information about the underlying network interface's connections to the given
@@ -280,7 +348,8 @@ protected:
  * Class representing a scheduled callback and providing methods for interacting with it.
  */
 class TaskExecutor::CallbackState {
-    MONGO_DISALLOW_COPYING(CallbackState);
+    CallbackState(const CallbackState&) = delete;
+    CallbackState& operator=(const CallbackState&) = delete;
 
 public:
     virtual ~CallbackState();
@@ -324,12 +393,13 @@ public:
         return isValid();
     }
 
-    std::size_t hash() const {
-        return std::hash<decltype(_callback)>()(_callback);
-    }
-
     bool isCanceled() const {
         return getCallback()->isCanceled();
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const CallbackHandle& handle) {
+        return H::combine(std::move(h), handle._callback);
     }
 
 private:
@@ -348,7 +418,8 @@ private:
  * Class representing a scheduled event and providing methods for interacting with it.
  */
 class TaskExecutor::EventState {
-    MONGO_DISALLOW_COPYING(EventState);
+    EventState(const EventState&) = delete;
+    EventState& operator=(const EventState&) = delete;
 
 public:
     virtual ~EventState();
@@ -409,7 +480,7 @@ struct TaskExecutor::CallbackArgs {
     CallbackArgs(TaskExecutor* theExecutor,
                  CallbackHandle theHandle,
                  Status theStatus,
-                 OperationContext* opCtx = NULL);
+                 OperationContext* opCtx = nullptr);
 
     TaskExecutor* executor;
     CallbackHandle myHandle;
@@ -426,21 +497,25 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
                               const RemoteCommandRequest& theRequest,
                               const ResponseStatus& theResponse);
 
+    RemoteCommandCallbackArgs(const RemoteCommandOnAnyCallbackArgs& other, size_t idx);
+
     TaskExecutor* executor;
     CallbackHandle myHandle;
     RemoteCommandRequest request;
     ResponseStatus response;
 };
 
+struct TaskExecutor::RemoteCommandOnAnyCallbackArgs {
+    RemoteCommandOnAnyCallbackArgs(TaskExecutor* theExecutor,
+                                   const CallbackHandle& theHandle,
+                                   const RemoteCommandRequestOnAny& theRequest,
+                                   const ResponseOnAnyStatus& theResponse);
+
+    TaskExecutor* executor;
+    CallbackHandle myHandle;
+    RemoteCommandRequestOnAny request;
+    ResponseOnAnyStatus response;
+};
+
 }  // namespace executor
 }  // namespace mongo
-
-// Provide a specialization for hash<CallbackHandle> so it can easily be stored in unordered_set.
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<::mongo::executor::TaskExecutor::CallbackHandle> {
-    size_t operator()(const ::mongo::executor::TaskExecutor::CallbackHandle& x) const {
-        return x.hash();
-    }
-};
-MONGO_HASH_NAMESPACE_END

@@ -1,46 +1,49 @@
-// @file time_support.h
-
-/*    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <boost/date_time/gregorian/gregorian_types.hpp>
-#include <boost/date_time/posix_time/posix_time_types.hpp>
+#include <array>
 #include <ctime>
 #include <iosfwd>
+#include <limits>
 #include <string>
 
 #include "mongo/base/status_with.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/chrono.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
+
+class BackgroundThreadClockSource;
 
 template <typename Allocator>
 class StringBuilderImpl;
@@ -61,6 +64,13 @@ public:
      */
     static constexpr Date_t max() {
         return fromMillisSinceEpoch(std::numeric_limits<long long>::max());
+    }
+
+    /**
+     * The minimum representable Date_t.
+     */
+    static constexpr Date_t min() {
+        return fromMillisSinceEpoch(std::numeric_limits<long long>::min());
     }
 
     /**
@@ -168,7 +178,7 @@ public:
 
     template <typename Duration>
     Date_t& operator+=(Duration d) {
-        millis += duration_cast<Milliseconds>(d).count();
+        *this = *this + d;
         return *this;
     }
 
@@ -179,9 +189,7 @@ public:
 
     template <typename Duration>
     Date_t operator+(Duration d) const {
-        Date_t result = *this;
-        result += d;
-        return result;
+        return Date_t::fromDurationSinceEpoch(toDurationSinceEpoch() + d);
     }
 
     template <typename Duration>
@@ -224,14 +232,65 @@ public:
         return out;
     }
 
+    /**
+     * Only exposed for testing.  See lastNow()
+     */
+    static Date_t lastNowForTest() {
+        return lastNow();
+    }
+
 private:
     constexpr explicit Date_t(long long m) : millis(m) {}
 
     long long millis = 0;
+
+    friend class BackgroundThreadClockSource;
+
+    /**
+     * Returns the last time fetched from Date_t::now()
+     *
+     * Note that this is a private semi-implementation detail for BackgroundThreadClockSource.  Use
+     * svc->getFastClockSource()->now() over calling this method.
+     *
+     * If you think you have another use for it, please reconsider, or at least consider very
+     * carefully as correctly using it is complicated.
+     */
+    static Date_t lastNow() {
+        return fromMillisSinceEpoch(lastNowVal.loadRelaxed());
+    }
+
+    // Holds the last value returned from now()
+    static AtomicWord<long long> lastNowVal;
 };
 
-// uses ISO 8601 dates without trailing Z
-// colonsOk should be false when creating filenames
+class DateStringBuffer {
+public:
+    /** Fill with formatted `date`, either in `local` or UTC. */
+    DateStringBuffer& iso8601(Date_t date, bool local);
+
+    /**
+     * Fill with formatted `date`, in modified ctime format.
+     * Like ctime, but newline and year removed, and milliseconds added.
+     */
+    DateStringBuffer& ctime(Date_t date);
+
+    explicit operator StringData() const {
+        return StringData{_data.data(), _size};
+    }
+
+    explicit operator std::string() const {
+        return std::string{StringData{*this}};
+    }
+
+private:
+    std::array<char, 64> _data;
+    size_t _size = 0;
+};
+
+/**
+ * uses ISO 8601 dates without trailing "Z".
+ * `colonsOk` should be false when creating filenames.
+ */
 std::string terseCurrentTime(bool colonsOk = true);
 
 /**
@@ -239,28 +298,25 @@ std::string terseCurrentTime(bool colonsOk = true);
  */
 std::string terseUTCCurrentTime();
 
+/** @{ */
 /**
- * Formats "date" according to the ISO 8601 extended form standard, including date,
- * and time with milliseconds decimal component, in the UTC timezone.
- *
- * Sample format: "2013-07-23T18:42:14.072Z"
+ * Formats "date" in 3 formats to 3 kinds of output.
+ * Function variants are provided to produce ISO local, ISO UTC, or modified ctime formats.
+ * The ISO formats are according to the ISO 8601 extended form standard, including date and
+ * time with a milliseconds decimal component.
+ * Modified ctime format is like `ctime`, but with milliseconds and no year.
+ *     "2013-07-23T18:42:14.072Z"       // *ToISOStringUTC
+ *     "2013-07-23T18:42:14.072-05:00"  // *ToISOStringLocal
+ *     "Wed Oct 31 13:34:47.996"        // *ToCtimeString (modified ctime)
+ * Output can be a std::string, or put to a std::ostream.
  */
 std::string dateToISOStringUTC(Date_t date);
-
-/**
- * Formats "date" according to the ISO 8601 extended form standard, including date,
- * and time with milliseconds decimal component, in the local timezone.
- *
- * Sample format: "2013-07-23T18:42:14.072-05:00"
- */
 std::string dateToISOStringLocal(Date_t date);
-
-/**
- * Formats "date" in fixed width in the local time zone.
- *
- * Sample format: "Wed Oct 31 13:34:47.996"
- */
 std::string dateToCtimeString(Date_t date);
+void outputDateAsISOStringUTC(std::ostream& os, Date_t date);
+void outputDateAsISOStringLocal(std::ostream& os, Date_t date);
+void outputDateAsCtime(std::ostream& os, Date_t date);
+/** @} */
 
 /**
  * Parses a Date_t from an ISO 8601 std::string representation.
@@ -271,26 +327,6 @@ std::string dateToCtimeString(Date_t date);
  * Local times are currently not supported.
  */
 StatusWith<Date_t> dateFromISOString(StringData dateString);
-
-/**
- * Like dateToISOStringUTC, except outputs to a std::ostream.
- */
-void outputDateAsISOStringUTC(std::ostream& os, Date_t date);
-
-/**
- * Like dateToISOStringLocal, except outputs to a std::ostream.
- */
-void outputDateAsISOStringLocal(std::ostream& os, Date_t date);
-
-/**
- * Like dateToCtimeString, except outputs to a std::ostream.
- */
-void outputDateAsCtime(std::ostream& os, Date_t date);
-
-boost::gregorian::date currentDate();
-
-// parses time of day in "hh:mm" format assuming 'hh' is 00-23
-bool toPointInTime(const std::string& str, boost::posix_time::ptime* timeOfDay);
 
 void sleepsecs(int s);
 void sleepmillis(long long ms);
@@ -303,28 +339,29 @@ void sleepFor(DurationType time) {
 
 class Backoff {
 public:
-    Backoff(int maxSleepMillis, int resetAfter)
-        : _maxSleepMillis(maxSleepMillis),
-          _resetAfterMillis(maxSleepMillis + resetAfter),  // Don't reset < the max sleep
+    Backoff(Milliseconds maxSleep, Milliseconds resetAfter)
+        : _maxSleepMillis(durationCount<Milliseconds>(maxSleep)),
+          _resetAfterMillis(
+              durationCount<Milliseconds>(resetAfter)),  // Don't reset < the max sleep
           _lastSleepMillis(0),
           _lastErrorTimeMillis(0) {}
 
-    void nextSleepMillis();
+    Milliseconds nextSleep();
 
     /**
      * testing-only function. used in dbtests/basictests.cpp
      */
-    int getNextSleepMillis(int lastSleepMillis,
+    int getNextSleepMillis(long long lastSleepMillis,
                            unsigned long long currTimeMillis,
                            unsigned long long lastErrorTimeMillis) const;
 
 private:
     // Parameters
-    int _maxSleepMillis;
-    int _resetAfterMillis;
+    long long _maxSleepMillis;
+    long long _resetAfterMillis;
 
     // Last sleep information
-    int _lastSleepMillis;
+    long long _lastSleepMillis;
     unsigned long long _lastErrorTimeMillis;
 };
 
@@ -345,5 +382,8 @@ char* asctime(const struct tm* tm);
 char* ctime(const time_t* timep);
 struct tm* gmtime(const time_t* timep);
 struct tm* localtime(const time_t* timep);
+
+// Find minimum system timer resolution of OS
+Nanoseconds getMinimumTimerResolution();
 
 }  // namespace mongo

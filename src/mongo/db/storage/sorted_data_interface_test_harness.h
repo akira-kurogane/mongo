@@ -1,25 +1,24 @@
-// sorted_data_interface_test_harness.h
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,10 +36,8 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/test_harness_helper.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/unowned_ptr.h"
 
 namespace mongo {
@@ -52,6 +49,11 @@ const BSONObj key3 = BSON("" << 3);
 const BSONObj key4 = BSON("" << 4);
 const BSONObj key5 = BSON("" << 5);
 const BSONObj key6 = BSON("" << 6);
+const BSONObj key7 = BSON(""
+                          << "\x00");
+
+const BSONObj key8 = BSON(""
+                          << "\xff");
 
 const BSONObj compoundKey1a = BSON("" << 1 << ""
                                       << "a");
@@ -87,16 +89,32 @@ class RecoveryUnit;
 
 class SortedDataInterfaceHarnessHelper : public virtual HarnessHelper {
 public:
-    virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) = 0;
+    virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique,
+                                                                        bool partial) = 0;
 
+    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() = 0;
     /**
      * Creates a new SDI with some initial data.
      *
      * For clarity to readers, toInsert must be sorted.
      */
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(
-        bool unique, std::initializer_list<IndexKeyEntry> toInsert);
+        bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert);
 };
+
+void registerSortedDataInterfaceHarnessHelperFactory(
+    std::function<std::unique_ptr<SortedDataInterfaceHarnessHelper>()> factory);
+
+std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper();
+
+KeyString::Value makeKeyString(SortedDataInterface* sorted,
+                               BSONObj bsonKey,
+                               boost::optional<RecordId> rid = boost::none);
+
+KeyString::Value makeKeyStringForSeek(SortedDataInterface* sorted,
+                                      BSONObj bsonKey,
+                                      bool isForward,
+                                      bool inclusive);
 
 /**
  * Inserts all entries in toInsert into index.
@@ -133,7 +151,4 @@ inline void removeFromIndex(unowned_ptr<HarnessHelper> harness,
     removeFromIndex(harness->newOperationContext(client.get()), index, toRemove);
 }
 
-inline std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper() {
-    return dynamic_ptr_cast<SortedDataInterfaceHarnessHelper>(newHarnessHelper());
-}
-}
+}  // namespace mongo

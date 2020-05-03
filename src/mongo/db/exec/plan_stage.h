@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,8 +33,9 @@
 #include <vector>
 
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/invalidation_type.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
@@ -105,9 +107,27 @@ class RecordId;
  */
 class PlanStage {
 public:
-    PlanStage(const char* typeName, OperationContext* opCtx)
-        : _commonStats(typeName), _opCtx(opCtx) {}
+    PlanStage(const char* typeName, ExpressionContext* expCtx)
+        : _commonStats(typeName), _opCtx(expCtx->opCtx), _expCtx(expCtx) {
+        invariant(expCtx);
+        if (expCtx->explain || expCtx->mayDbProfile) {
+            // Populating the field for execution time indicates that this stage should time each
+            // call to work().
+            _commonStats.executionTimeMillis.emplace(0);
+        }
+    }
 
+protected:
+    /**
+     * Obtain a PlanStage given a child stage. Called during the construction of derived
+     * PlanStage types with a single direct descendant.
+     */
+    PlanStage(ExpressionContext* expCtx, std::unique_ptr<PlanStage> child, const char* typeName)
+        : PlanStage(typeName, expCtx) {
+        _children.push_back(std::move(child));
+    }
+
+public:
     virtual ~PlanStage() {}
 
     using Children = std::vector<std::unique_ptr<PlanStage>>;
@@ -151,10 +171,6 @@ public:
         // on the WSM that the held WSID refers to.
         NEED_YIELD,
 
-        // Something went wrong but it's not an internal error.  Perhaps our collection was
-        // dropped or state deleted.
-        DEAD,
-
         // Something has gone unrecoverably wrong.  Stop running this query.
         // If the out parameter does not refer to an invalid working set member,
         // call WorkingSetCommon::getStatusMemberObject() to get details on the failure.
@@ -172,8 +188,6 @@ public:
             return "NEED_TIME";
         } else if (NEED_YIELD == state) {
             return "NEED_YIELD";
-        } else if (DEAD == state) {
-            return "DEAD";
         } else {
             verify(FAILURE == state);
             return "FAILURE";
@@ -186,7 +200,25 @@ public:
      * Stage returns StageState::ADVANCED if *out is set to the next unit of output.  Otherwise,
      * returns another value of StageState to indicate the stage's status.
      */
-    StageState work(WorkingSetID* out);
+    StageState work(WorkingSetID* out) {
+        auto optTimer(getOptTimer());
+
+        ++_commonStats.works;
+
+        StageState workResult = doWork(out);
+
+        if (StageState::ADVANCED == workResult) {
+            ++_commonStats.advanced;
+        } else if (StageState::NEED_TIME == workResult) {
+            ++_commonStats.needTime;
+        } else if (StageState::NEED_YIELD == workResult) {
+            ++_commonStats.needYield;
+        } else if (StageState::FAILURE == workResult) {
+            _commonStats.failed = true;
+        }
+
+        return workResult;
+    }
 
     /**
      * Returns true if no more work can be done on the query / out of results.
@@ -222,6 +254,10 @@ public:
      * Can only be called while the stage in is the "saved" state.
      *
      * Propagates to all children, then calls doRestoreState().
+     *
+     * Throws a UserException on failure to restore due to a conflicting event such as a
+     * collection drop. May throw a WriteConflictException, in which case the caller may choose to
+     * retry.
      */
     void restoreState();
 
@@ -245,21 +281,6 @@ public:
      * Propagates to all children, then calls doReattachToOperationContext().
      */
     void reattachToOperationContext(OperationContext* opCtx);
-
-    /**
-     * Notifies a stage that a RecordId is going to be deleted (or in-place updated) so that the
-     * stage can invalidate or modify any state required to continue processing without this
-     * RecordId.
-     *
-     * Can only be called after a saveState but before a restoreState.
-     *
-     * The provided OperationContext should be used if any work needs to be performed during the
-     * invalidate (as the state of the stage must be saved before any calls to invalidate, the
-     * stage's own OperationContext is inactive during the invalidate and should not be used).
-     *
-     * Propagates to all children, then calls doInvalidate().
-     */
-    void invalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type);
 
     /*
      * Releases any resources held by this stage. It is an error to use a PlanStage in any way after
@@ -341,6 +362,15 @@ public:
      */
     virtual const SpecificStats* getSpecificStats() const = 0;
 
+    /**
+     * Force this stage to collect timing info during its execution. Must not be called after
+     * execution has started.
+     */
+    void markShouldCollectTimingInfo() {
+        invariant(!_commonStats.executionTimeMillis || *_commonStats.executionTimeMillis == 0);
+        _commonStats.executionTimeMillis.emplace(0);
+    }
+
 protected:
     /**
      * Performs one unit of work.  See comment at work() above.
@@ -364,14 +394,14 @@ protected:
     /**
      * Does stage-specific detaching.
      *
-     * Implementations of this method cannot use the pointer returned from getOpCtx().
+     * Implementations of this method cannot use the pointer returned from opCtx().
      */
     virtual void doDetachFromOperationContext() {}
 
     /**
      * Does stage-specific attaching.
      *
-     * If an OperationContext* is needed, use getOpCtx(), which will return a valid
+     * If an OperationContext* is needed, use opCtx(), which will return a valid
      * OperationContext* (the one to which the stage is reattaching).
      */
     virtual void doReattachToOperationContext() {}
@@ -381,15 +411,26 @@ protected:
      */
     virtual void doDispose() {}
 
-    /**
-     * Does the stage-specific invalidation work.
-     */
-    virtual void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {}
-
     ClockSource* getClock() const;
 
-    OperationContext* getOpCtx() const {
+    OperationContext* opCtx() const {
         return _opCtx;
+    }
+
+    ExpressionContext* expCtx() const {
+        return _expCtx;
+    }
+
+    /**
+     * Returns an optional timer which is used to collect time spent executing the current
+     * stage. May return boost::none if it is not necessary to collect timing info.
+     */
+    boost::optional<ScopedTimer> getOptTimer() {
+        if (_commonStats.executionTimeMillis) {
+            return {{getClock(), _commonStats.executionTimeMillis.get_ptr()}};
+        }
+
+        return boost::none;
     }
 
     Children _children;
@@ -397,6 +438,10 @@ protected:
 
 private:
     OperationContext* _opCtx;
+
+    // The PlanExecutor holds a strong reference to this which ensures that this pointer remains
+    // valid for the entire lifetime of the PlanStage.
+    ExpressionContext* _expCtx;
 };
 
 }  // namespace mongo

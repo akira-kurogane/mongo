@@ -1,7 +1,16 @@
 // Tests to see what validity checks are done for 10gen specific object construction
+//
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_commands,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
 // Takes a list of constructors and returns a new list with an extra entry for each constructor with
 // "new" prepended
+(function() {
+"use strict";
+const out = db.map_reduce_constructors_out;
 function addConstructorsWithNew(constructorList) {
     function prependNew(constructor) {
         return "new " + constructor;
@@ -21,7 +30,7 @@ function clientEvalConstructorTest(constructorList) {
         try {
             eval(constructor);
         } catch (e) {
-            throw("valid constructor: " + constructor + " failed in eval context: " + e);
+            throw ("valid constructor: " + constructor + " failed in eval context: " + e);
         }
     });
     constructorList.invalid.forEach(function(constructor) {
@@ -31,27 +40,9 @@ function clientEvalConstructorTest(constructorList) {
     });
 }
 
-function dbEvalConstructorTest(constructorList) {
-    assert.writeOK(db.evalConstructors.insert({}), "db must exist for eval to succeed");
-    assert(db.evalConstructors.drop());
-    constructorList = addConstructorsWithNew(constructorList);
-    constructorList.valid.forEach(function(constructor) {
-        try {
-            db.eval(constructor);
-        } catch (e) {
-            throw("valid constructor: " + constructor + " failed in db.eval context: " + e);
-        }
-    });
-    constructorList.invalid.forEach(function(constructor) {
-        assert.throws(function() {
-            db.eval(constructor);
-        }, [], "invalid constructor did not throw error in db.eval context: " + constructor);
-    });
-}
-
 function mapReduceConstructorTest(constructorList) {
     constructorList = addConstructorsWithNew(constructorList);
-    t = db.mr_constructors;
+    const t = db.mr_constructors;
     t.drop();
 
     t.save({"partner": 1, "visits": 9});
@@ -61,42 +52,46 @@ function mapReduceConstructorTest(constructorList) {
     t.save({"partner": 2, "visits": 41});
     t.save({"partner": 2, "visits": 41});
 
+    let dummy;
     constructorList.valid.forEach(function(constructor) {
         try {
-            m = eval("dummy = function(){ emit( \"test\" , " + constructor + " ) }");
+            const m = eval("dummy = function(){ emit( \"test\" , " + constructor + " ) }");
 
-            r = eval("dummy = function( k , v ){ return { test : " + constructor + " } }");
+            const r = eval("dummy = function( k , v ){ return { test : " + constructor + " } }");
 
-            res = t.mapReduce(m, r, {out: "mr_constructors_out", scope: {xx: 1}});
+            out.drop();
+            assert.commandWorked(
+                t.mapReduce(m, r, {out: {merge: "map_reduce_constructors_out"}, scope: {xx: 1}}));
         } catch (e) {
-            throw("valid constructor: " + constructor + " failed in mapReduce context: " + e);
+            throw ("valid constructor: " + constructor + " failed in mapReduce context: " + e);
         }
     });
     constructorList.invalid.forEach(function(constructor) {
-        m = eval("dummy = function(){ emit( \"test\" , " + constructor + " ) }");
+        const m = eval("dummy = function(){ emit( \"test\" , " + constructor + " ) }");
 
-        r = eval("dummy = function( k , v ){ return { test : " + constructor + " } }");
+        const r = eval("dummy = function( k , v ){ return { test : " + constructor + " } }");
 
         assert.throws(function() {
-            res = t.mapReduce(m, r, {out: "mr_constructors_out", scope: {xx: 1}});
+            out.drop();
+            t.mapReduce(m, r, {out: {merge: "map_reduce_constructors_out"}, scope: {xx: 1}});
         }, [], "invalid constructor did not throw error in mapReduce context: " + constructor);
     });
 
-    db.mr_constructors_out.drop();
+    out.drop();
     t.drop();
 }
 
 function whereConstructorTest(constructorList) {
     constructorList = addConstructorsWithNew(constructorList);
-    t = db.where_constructors;
+    const t = db.where_constructors;
     t.drop();
-    assert.writeOK(t.insert({x: 1}));
+    assert.commandWorked(t.insert({x: 1}));
 
     constructorList.valid.forEach(function(constructor) {
         try {
             t.findOne({$where: constructor});
         } catch (e) {
-            throw("valid constructor: " + constructor + " failed in $where query: " + e);
+            throw ("valid constructor: " + constructor + " failed in $where query: " + e);
         }
     });
     constructorList.invalid.forEach(function(constructor) {
@@ -284,16 +279,6 @@ clientEvalConstructorTest(md5Constructors);
 clientEvalConstructorTest(hexdataConstructors);
 clientEvalConstructorTest(dateConstructors);
 
-dbEvalConstructorTest(dbrefConstructors);
-dbEvalConstructorTest(dbpointerConstructors);
-dbEvalConstructorTest(objectidConstructors);
-dbEvalConstructorTest(timestampConstructors);
-dbEvalConstructorTest(bindataConstructors);
-dbEvalConstructorTest(uuidConstructors);
-dbEvalConstructorTest(md5Constructors);
-dbEvalConstructorTest(hexdataConstructors);
-dbEvalConstructorTest(dateConstructors);
-
 mapReduceConstructorTest(dbrefConstructors);
 mapReduceConstructorTest(dbpointerConstructors);
 mapReduceConstructorTest(objectidConstructors);
@@ -313,3 +298,4 @@ whereConstructorTest(uuidConstructors);
 whereConstructorTest(md5Constructors);
 whereConstructorTest(hexdataConstructors);
 whereConstructorTest(dateConstructors);
+})();

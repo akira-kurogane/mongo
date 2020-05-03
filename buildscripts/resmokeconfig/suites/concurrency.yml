@@ -1,17 +1,18 @@
-test_kind: js_test
+test_kind: fsm_workload_test
 
 selector:
   roots:
-  - jstests/concurrency/*.js
-  exclude_files:
-  # Skip replication and sharding tests because they're run in different suites
-  - jstests/concurrency/fsm_all_replication*.js
-  - jstests/concurrency/fsm_all_sharded*.js
-  # Skip fsm_all_simultaneous.js to avoid triggering the 6-hour timeout in Evergreen when this
-  # suite is run with --repeat=10 on the Linux Repeated Execution variant.
-  - jstests/concurrency/fsm_all_simultaneous.js
+  - jstests/concurrency/fsm_workloads/**/*.js
+  exclude_with_any_tags:
+  - uses_transactions
+  - requires_replication
+  - requires_sharding
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
+    tests: true
   config:
     shell_options:
       readMode: commands
@@ -21,8 +22,7 @@ executor:
       global_vars:
         TestData:
           skipValidationOnNamespaceNotFound: false
-  - class: CleanEveryN
-    n: 20
+  - class: CleanupConcurrencyWorkloads
   fixture:
     class: MongoDFixture
     mongod_options:

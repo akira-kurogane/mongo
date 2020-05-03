@@ -7,19 +7,13 @@
  * underlying collection.
  */
 
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropCollections
-
 var $config = (function() {
-
     // Use the workload name as a prefix for the view names, since the workload name is assumed
     // to be unique.
     const prefix = 'view_catalog_cycle_with_drop_';
 
     var data = {
         viewList: ['viewA', 'viewB', 'viewC'].map(viewName => prefix + viewName),
-        assertCommandWorkedOrFailedWithCode: function(result, codeArr) {
-            assertAlways(result.ok === 1 || codeArr.indexOf(result.code) > -1, tojson(result));
-        },
         getRandomView: function(viewList) {
             return viewList[Random.randInt(viewList.length)];
         },
@@ -35,9 +29,11 @@ var $config = (function() {
         function remapViewToView(db, collName) {
             const fromName = this.getRandomView(this.viewList);
             const toName = this.getRandomView(this.viewList);
-            const res = db.runCommand({collMod: fromName, viewOn: toName, pipeline: []});
-            this.assertCommandWorkedOrFailedWithCode(
-                res, [ErrorCodes.GraphContainsCycle, ErrorCodes.NamespaceNotFound]);
+            const cmd = {collMod: fromName, viewOn: toName, pipeline: []};
+            const res = db.runCommand(cmd);
+            const errorCodes = [ErrorCodes.GraphContainsCycle, ErrorCodes.NamespaceNotFound];
+            assertAlways.commandWorkedOrFailedWithCode(
+                res, errorCodes, () => `cmd: ${tojson(cmd)}`);
         }
 
         /**
@@ -47,10 +43,15 @@ var $config = (function() {
          */
         function recreateViewOnCollection(db, collName) {
             const viewName = this.getRandomView(this.viewList);
-            this.assertCommandWorkedOrFailedWithCode(db.runCommand({drop: viewName}),
-                                                     [ErrorCodes.NamespaceNotFound]);
-            this.assertCommandWorkedOrFailedWithCode(db.createView(viewName, collName, []),
-                                                     [ErrorCodes.NamespaceExists]);
+            const dropCmd = {drop: viewName};
+            let res = db.runCommand(dropCmd);
+            let errorCodes = [ErrorCodes.NamespaceNotFound];
+            assertAlways.commandWorkedOrFailedWithCode(
+                db.runCommand(dropCmd), errorCodes, () => `cmd: ${tojson(dropCmd)}`);
+
+            res = db.createView(viewName, collName, []);
+            errorCodes = [ErrorCodes.NamespaceExists, ErrorCodes.NamespaceNotFound];
+            assertAlways.commandWorkedOrFailedWithCode(res, errorCodes, () => `cmd: createView`);
         }
 
         /**
@@ -61,9 +62,12 @@ var $config = (function() {
          */
         function readFromView(db, collName) {
             const viewName = this.getRandomView(this.viewList);
-            const res = db.runCommand({find: viewName});
+            const cmd = {find: viewName};
+            const res = db.runCommand(cmd);
+            const errorCodes = [ErrorCodes.CommandNotSupportedOnView];
             // TODO SERVER-26037: Replace with the appropriate error code. See ticket for details.
-            this.assertCommandWorkedOrFailedWithCode(res, [ErrorCodes.CommandNotSupportedOnView]);
+            assertAlways.commandWorkedOrFailedWithCode(
+                res, errorCodes, () => `cmd: ${tojson(cmd)}`);
         }
 
         return {
@@ -71,7 +75,6 @@ var $config = (function() {
             recreateViewOnCollection: recreateViewOnCollection,
             readFromView: readFromView
         };
-
     })();
 
     var transitions = {
@@ -84,27 +87,29 @@ var $config = (function() {
 
     function setup(db, collName, cluster) {
         let coll = db[collName];
-        assertAlways.writeOK(coll.insert({x: 1}));
+        assertAlways.commandWorked(coll.insert({x: 1}));
 
         for (let viewName of this.viewList) {
-            assert.commandWorked(db.createView(viewName, collName, []));
+            assertAlways.commandWorked(db.createView(viewName, collName, []));
         }
     }
 
-    function teardown(db, collName, cluster) {
-        const pattern = new RegExp('^' + prefix + '[A-z]*$');
-        dropCollections(db, pattern);
-    }
+    // This test performs createCollection concurrently from many threads, and createCollection on a
+    // sharded cluster takes a distributed lock. Since a distributed lock is acquired by repeatedly
+    // attempting to grab the lock every half second for 20 seconds (a max of 40 attempts), it's
+    // possible that some thread will be starved by the other threads and fail to grab the lock
+    // after 40 attempts. To reduce the likelihood of this, we choose threadCount and iterations so
+    // that threadCount * iterations < 40.
+    // The threadCount and iterations can be increased once PM-697 ("Remove all usages of
+    // distributed lock") is complete.
 
     return {
-        threadCount: 10,
-        iterations: 100,
+        threadCount: 5,
+        iterations: 5,
         data: data,
         states: states,
         startState: 'readFromView',
         transitions: transitions,
         setup: setup,
-        teardown: teardown,
     };
-
 })();

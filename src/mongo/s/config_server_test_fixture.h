@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/catalog_raii.h"
 #include "mongo/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
@@ -89,7 +91,7 @@ public:
     /**
      * Setup the config.shards collection to contain the given shards.
      */
-    Status setupShards(const std::vector<ShardType>& shards);
+    void setupShards(const std::vector<ShardType>& shards);
 
     /**
      * Retrieves the shard document from the config server.
@@ -100,7 +102,7 @@ public:
     /**
      * Setup the config.chunks collection to contain the given chunks.
      */
-    Status setupChunks(const std::vector<ChunkType>& chunks);
+    void setupChunks(const std::vector<ChunkType>& chunks);
 
     /**
      * Retrieves the chunk document from the config server.
@@ -153,6 +155,21 @@ protected:
      * Sets this node up as a mongod with sharding components for ClusterRole::ConfigServer.
      */
     void setUp() override;
+
+    /**
+     * Sets this node up and locks the config db in _setUp() before calling
+     * initializeGlobalShardingStateForMongodForTest(). The RAII object for the database lock is
+     * returned so that the caller can perform other operations on the config db before releasing
+     * the lock.
+     */
+    std::unique_ptr<AutoGetDb> setUpAndLockConfigDb();
+
+    /**
+     * Sets this node up and initialized the collections and indexes in the config db.
+     * Uses setUpAndLockConfigDb() above.
+     */
+    void setUpAndInitializeConfigDb();
+
     void tearDown() override;
 
     std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override;
@@ -163,13 +180,17 @@ protected:
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
         std::unique_ptr<DistLockManager> distLockManager) override;
 
-    std::unique_ptr<CatalogCache> makeCatalogCache() override;
-
     std::unique_ptr<ClusterCursorManager> makeClusterCursorManager() override;
 
     std::unique_ptr<BalancerConfiguration> makeBalancerConfiguration() override;
 
 private:
+    /**
+     * 'onPreInitGlobalStateFn' is invoked near the end of _setUp() before calling
+     * initializeGlobalShardingStateForMongodForTest().
+     */
+    void _setUp(std::function<void()> onPreInitGlobalStateFn);
+
     // Since these are currently private members of the real ShardingCatalogManager, we store a raw
     // pointer to them here.
     executor::NetworkInterfaceMock* _mockNetworkForAddShard;

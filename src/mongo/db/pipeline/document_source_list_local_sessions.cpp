@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,7 +33,7 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/pipeline/document_source_list_local_sessions.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
+#include "mongo/db/pipeline/document_source_list_sessions_gen.h"
 
 namespace mongo {
 
@@ -40,11 +41,7 @@ REGISTER_DOCUMENT_SOURCE(listLocalSessions,
                          DocumentSourceListLocalSessions::LiteParsed::parse,
                          DocumentSourceListLocalSessions::createFromBson);
 
-const char* DocumentSourceListLocalSessions::kStageName = "$listLocalSessions";
-
-DocumentSource::GetNextResult DocumentSourceListLocalSessions::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceListLocalSessions::doGetNext() {
     while (!_ids.empty()) {
         const auto& id = _ids.back();
         _ids.pop_back();
@@ -74,7 +71,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListLocalSessions::createFrom
 
 DocumentSourceListLocalSessions::DocumentSourceListLocalSessions(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx, const ListSessionsSpec& spec)
-    : DocumentSource(pExpCtx), _spec(spec) {
+    : DocumentSource(kStageName, pExpCtx), _spec(spec) {
     const auto& opCtx = pExpCtx->opCtx;
     _cache = LogicalSessionCache::get(opCtx);
     if (_spec.getAllUsers()) {
@@ -154,6 +151,18 @@ mongo::ListSessionsSpec mongo::listSessionsParseSpec(StringData stageName,
             str::stream() << stageName
                           << " may not specify {allUsers:true} and {users:[...]} at the same time",
             !ret.getAllUsers() || !ret.getUsers() || ret.getUsers()->empty());
+
+    // Verify that the correct state is set on the client.
+    uassert(
+        31106,
+        str::stream() << "The " << DocumentSourceListLocalSessions::kStageName
+                      << " stage is not allowed in this context :: missing an AuthorizationManager",
+        AuthorizationManager::get(Client::getCurrent()->getServiceContext()));
+    uassert(
+        31111,
+        str::stream() << "The " << DocumentSourceListLocalSessions::kStageName
+                      << " stage is not allowed in this context :: missing a LogicalSessionCache",
+        LogicalSessionCache::get(Client::getCurrent()->getOperationContext()));
 
     if (!ret.getAllUsers() && (!ret.getUsers() || ret.getUsers()->empty())) {
         // Implicit request for self

@@ -1,22 +1,24 @@
-/*    Copyright (C) 2014 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,7 +35,8 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -59,16 +62,27 @@ constexpr StringData kWElectionIdFieldName = "wElectionId"_sd;
 
 }  // namespace
 
-const int WriteConcernOptions::kNoTimeout(0);
-const int WriteConcernOptions::kNoWaiting(-1);
+constexpr int WriteConcernOptions::kNoTimeout;
+constexpr int WriteConcernOptions::kNoWaiting;
 
-const StringData WriteConcernOptions::kWriteConcernField = "writeConcern"_sd;
+constexpr StringData WriteConcernOptions::kWriteConcernField;
 const char WriteConcernOptions::kMajority[] = "majority";
 
 const BSONObj WriteConcernOptions::Default = BSONObj();
 const BSONObj WriteConcernOptions::Acknowledged(BSON("w" << W_NORMAL));
 const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
 const BSONObj WriteConcernOptions::Majority(BSON("w" << WriteConcernOptions::kMajority));
+
+// The "kImplicitDefault" write concern, used by internal operations, is deliberately empty (no
+// 'w' or 'wtimeout' specified). This allows internal operations to specify a write concern, while
+// still allowing it to be either w:1 or automatically upconverted to w:majority on configsvrs.
+const BSONObj WriteConcernOptions::kImplicitDefault;
+
+constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSystem;
+constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutMigration;
+constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSharding;
+constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutUserCommand;
+
 
 WriteConcernOptions::WriteConcernOptions(int numNodes, SyncMode sync, int timeout)
     : WriteConcernOptions(numNodes, sync, Milliseconds(timeout)) {}
@@ -84,8 +98,7 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
                                          Milliseconds timeout)
     : syncMode(sync), wNumNodes(0), wMode(mode), wTimeout(durationCount<Milliseconds>(timeout)) {}
 
-Status WriteConcernOptions::parse(const BSONObj& obj) {
-    reset();
+StatusWith<WriteConcernOptions> WriteConcernOptions::parse(const BSONObj& obj) {
     if (obj.isEmpty()) {
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
@@ -93,6 +106,9 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
     BSONElement jEl;
     BSONElement fsyncEl;
     BSONElement wEl;
+    int wTimeout = 0;
+
+    WriteConcernOptions writeConcern;
 
     for (auto e : obj) {
         const auto fieldName = e.fieldNameStringData();
@@ -101,22 +117,33 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
             if (!jEl.isNumber() && jEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse, "j must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kFSyncFieldName) {
             fsyncEl = e;
             if (!fsyncEl.isNumber() && fsyncEl.type() != Bool) {
                 return Status(ErrorCodes::FailedToParse,
                               "fsync must be numeric or a boolean value");
             }
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWFieldName) {
             wEl = e;
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWTimeoutFieldName) {
-            wTimeout = e.numberInt();
+            wTimeout = e.safeNumberLong();
+            writeConcern.usedDefault = false;
         } else if (fieldName == kWElectionIdFieldName) {
             // Ignore.
         } else if (fieldName == kWOpTimeFieldName) {
             // Ignore.
         } else if (fieldName.equalCaseInsensitive(kGetLastErrorFieldName)) {
             // Ignore GLE field.
+        } else if (fieldName == ReadWriteConcernProvenance::kSourceFieldName) {
+            try {
+                writeConcern._provenance = ReadWriteConcernProvenance::parse(
+                    IDLParserErrorContext("WriteConcernOptions::parse"), obj);
+            } catch (const DBException&) {
+                return exceptionToStatus();
+            }
         } else {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "unrecognized write concern field: " << fieldName);
@@ -125,38 +152,52 @@ Status WriteConcernOptions::parse(const BSONObj& obj) {
 
     const bool j = jEl.trueValue();
     const bool fsync = fsyncEl.trueValue();
-
-    if (j && fsync)
+    if (j && fsync) {
         return Status(ErrorCodes::FailedToParse, "fsync and j options cannot be used together");
+    }
 
     if (j) {
-        syncMode = SyncMode::JOURNAL;
+        writeConcern.syncMode = SyncMode::JOURNAL;
     } else if (fsync) {
-        syncMode = SyncMode::FSYNC;
+        writeConcern.syncMode = SyncMode::FSYNC;
     } else if (!jEl.eoo()) {
-        syncMode = SyncMode::NONE;
+        writeConcern.syncMode = SyncMode::NONE;
     }
 
     if (wEl.isNumber()) {
-        wNumNodes = wEl.numberInt();
+        auto wNumNodes = wEl.safeNumberLong();
+        if (wNumNodes < 0 ||
+            wNumNodes > static_cast<decltype(wNumNodes)>(repl::ReplSetConfig::kMaxMembers)) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "w has to be a non-negative number and not greater than "
+                                        << repl::ReplSetConfig::kMaxMembers);
+        }
+        writeConcern.wNumNodes = static_cast<decltype(writeConcern.wNumNodes)>(wNumNodes);
+        writeConcern.usedDefaultW = false;
     } else if (wEl.type() == String) {
-        wMode = wEl.valuestrsafe();
+        writeConcern.wNumNodes = 0;
+        writeConcern.wMode = wEl.valuestrsafe();
+        writeConcern.usedDefaultW = false;
     } else if (wEl.eoo() || wEl.type() == jstNULL || wEl.type() == Undefined) {
-        wNumNodes = 1;
+        writeConcern.wNumNodes = 1;
     } else {
         return Status(ErrorCodes::FailedToParse, "w has to be a number or a string");
     }
 
-    return Status::OK();
+    writeConcern.wTimeout = wTimeout;
+
+    return writeConcern;
 }
 
-StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
-    const BSONObj& cmdObj, const std::string& dbName, const WriteConcernOptions& defaultWC) {
-    WriteConcernOptions writeConcern = defaultWC;
-    writeConcern.usedDefault = true;
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
+WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) {
+    if (!obj.isEmpty()) {
+        return uassertStatusOK(parse(obj));
     }
+    return WriteConcernOptions();
+}
+
+StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
+    WriteConcernOptions writeConcern;
 
     // Return the default write concern if no write concern is provided. We check for the existence
     // of the write concern field up front in order to avoid the expense of constructing an error
@@ -178,12 +219,12 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(
         return writeConcern;
     }
 
-    wcStatus = writeConcern.parse(writeConcernObj);
-    writeConcern.usedDefault = false;
-    if (!wcStatus.isOK()) {
-        return wcStatus;
+    auto sw = parse(writeConcernObj);
+    if (!sw.isOK()) {
+        return sw.getStatus();
     }
-
+    writeConcern = sw.getValue();
+    writeConcern.usedDefault = false;
     return writeConcern;
 }
 
@@ -206,11 +247,19 @@ BSONObj WriteConcernOptions::toBSON() const {
 
     builder.append("wtimeout", wTimeout);
 
+    _provenance.serialize(&builder);
+
     return builder.obj();
 }
 
-bool WriteConcernOptions::shouldWaitForOtherNodes() const {
+bool WriteConcernOptions::needToWaitForOtherNodes() const {
     return !wMode.empty() || wNumNodes > 1;
+}
+
+bool WriteConcernOptions::operator==(const WriteConcernOptions& other) const {
+    return syncMode == other.syncMode && wMode == other.wMode && wNumNodes == other.wNumNodes &&
+        wDeadline == other.wDeadline && wTimeout == other.wTimeout &&
+        _provenance == other._provenance;
 }
 
 }  // namespace mongo

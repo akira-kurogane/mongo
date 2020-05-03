@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +33,7 @@
 #include <cstddef>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/base/counter.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/time_support.h"
 
@@ -49,7 +50,8 @@ namespace repl {
  * Implementations are only required to support one pusher and one popper.
  */
 class OplogBuffer {
-    MONGO_DISALLOW_COPYING(OplogBuffer);
+    OplogBuffer(const OplogBuffer&) = delete;
+    OplogBuffer& operator=(const OplogBuffer&) = delete;
 
 public:
     /**
@@ -61,6 +63,11 @@ public:
      * Batch of oplog entries (in BSON format) for bulk read/write operations.
      */
     using Batch = std::vector<Value>;
+
+    /**
+     * Counters for this oplog buffer.
+     */
+    class Counters;
 
     OplogBuffer() = default;
     virtual ~OplogBuffer() = default;
@@ -82,26 +89,11 @@ public:
     virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
-     * Pushes operation into oplog buffer, ignoring any size constraints. Does not block.
-     * If the oplog buffer is already full, this will cause the size of the oplog buffer to exceed
-     * the limit returned by getMaxSize() but should not otherwise adversely affect normal
-     * functionality such as pushing and popping operations from the oplog buffer.
-     */
-    virtual void pushEvenIfFull(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
-     * Pushes operation into oplog buffer.
-     * If there are size constraints on the oplog buffer, this may block until sufficient space
-     * is made available (by popping) to complete this operation.
-     */
-    virtual void push(OperationContext* opCtx, const Value& value) = 0;
-
-    /**
      * Pushes operations in the iterator range [begin, end) into the oplog buffer without blocking.
      */
-    virtual void pushAllNonBlocking(OperationContext* opCtx,
-                                    Batch::const_iterator begin,
-                                    Batch::const_iterator end) = 0;
+    virtual void push(OperationContext* opCtx,
+                      Batch::const_iterator begin,
+                      Batch::const_iterator end) = 0;
 
     /**
      * Returns when enough space is available.
@@ -160,6 +152,57 @@ public:
      * Returns the item most recently added to the oplog buffer or nothing if the buffer is empty.
      */
     virtual boost::optional<Value> lastObjectPushed(OperationContext* opCtx) const = 0;
+
+    /**
+     * Enters "drain mode".  May only be called by the producer.  When the buffer is in drain mode,
+     * "waitForData" will return immediately even if there is data in the queue.  This
+     * is an optimization and subclasses may choose not to implement this function.
+     */
+    virtual void enterDrainMode(){};
+
+    /**
+     * Leaves "drain mode".  May only be called by the producer.
+     */
+    virtual void exitDrainMode(){};
+};
+
+class OplogBuffer::Counters {
+public:
+    /**
+     * Sets maximum size of operations for this OplogBuffer.
+     * This function should only be called by a single thread.
+     */
+    void setMaxSize(std::size_t newMaxSize) {
+        maxSize.increment(newMaxSize - maxSize.get());
+    }
+
+    /**
+     * Clears counters.
+     * This function should only be called by a single thread.
+     */
+    void clear() {
+        count.decrement(count.get());
+        size.decrement(size.get());
+    }
+
+    void increment(const Value& value) {
+        count.increment(1);
+        size.increment(std::size_t(value.objsize()));
+    }
+
+    void decrement(const Value& value) {
+        count.decrement(1);
+        size.decrement(std::size_t(value.objsize()));
+    }
+
+    // Number of operations in this OplogBuffer.
+    Counter64 count;
+
+    // Total size of operations in this OplogBuffer. Measured in bytes.
+    Counter64 size;
+
+    // Maximum size of operations in this OplogBuffer. Measured in bytes.
+    Counter64 maxSize;
 };
 
 }  // namespace repl

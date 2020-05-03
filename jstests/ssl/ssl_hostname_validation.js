@@ -75,6 +75,9 @@ testCombination(SERVER_CERT, true, true, true);
 // BAD_SAN_CERT has SAN=BadSAN.
 testCombination(BAD_SAN_CERT, false, false, false);
 
+// Skip db hash check because replset cannot initiate.
+TestData.skipCheckDBHashes = true;
+
 // 2. Initiate ReplSetTest with invalid certs
 ssl_options = {
     sslMode: "requireSSL",
@@ -84,11 +87,21 @@ ssl_options = {
 };
 
 replTest = new ReplSetTest({nodes: {node0: ssl_options, node1: ssl_options}});
+
+// We don't want to invoke the hang analyzer because we
+// expect this test to fail by timing out
+MongoRunner.runHangAnalyzer.disable();
+
 replTest.startSet();
 assert.throws(function() {
     replTest.initiate();
 });
 replTest.stopSet();
+
+// Re-enable the hang analyzer for the test
+MongoRunner.runHangAnalyzer.enable();
+
+TestData.skipCheckDBHashes = false;
 
 // 3. Initiate ReplSetTest with invalid certs but set allowInvalidHostnames
 ssl_options = {

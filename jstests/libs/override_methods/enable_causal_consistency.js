@@ -2,22 +2,14 @@
  * Enables causal consistency on the connections.
  */
 (function() {
-    "use strict";
+"use strict";
 
-    db.getMongo().setCausalConsistency();
-    db.getMongo().setReadPref("secondary");
+load("jstests/libs/override_methods/override_helpers.js");
+load('jstests/libs/override_methods/set_read_preference_secondary.js');
+load('jstests/libs/override_methods/causally_consistent_index_builds.js');
 
-    var originalStartParallelShell = startParallelShell;
-    startParallelShell = function(jsCode, port, noConnect) {
-        var newCode;
-        var overridesFile = "jstests/libs/override_methods/enable_causal_consistency.js";
-        if (typeof(jsCode) === "function") {
-            // Load the override file and immediately invoke the supplied function.
-            newCode = `load("${overridesFile}"); (${jsCode})();`;
-        } else {
-            newCode = `load("${overridesFile}"); ${jsCode};`;
-        }
+db.getMongo().setCausalConsistency();
 
-        return originalStartParallelShell(newCode, port, noConnect);
-    };
+OverrideHelpers.prependOverrideInParallelShell(
+    "jstests/libs/override_methods/enable_causal_consistency.js");
 })();

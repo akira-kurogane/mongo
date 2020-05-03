@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,7 +33,7 @@
 
 namespace mongo {
 
-class DocumentSourceLimit final : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceLimit final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$limit"_sd;
 
@@ -48,20 +49,19 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    GetNextResult getNext() final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
+    }
+
     const char* getSourceName() const final {
         return kStageName.rawData();
-    }
-
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
-
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
     }
 
     /**
@@ -71,26 +71,20 @@ public:
                                                      Pipeline::SourceContainer* container) final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        return SEE_NEXT;  // This doesn't affect needed fields
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::SEE_NEXT;  // This doesn't affect needed fields
     }
 
     /**
-     * Returns the current DocumentSourceLimit for use in the shards pipeline. Running this stage on
-     * the shards is an optimization, but is not strictly necessary in order to produce correct
-     * pipeline output.
+     * Returns a DistributedPlanLogic with two identical $limit stages; one for the shards pipeline
+     * and one for the merging pipeline.
      */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return this;
-    }
-
-    /**
-     * Returns a new DocumentSourceLimit with the same limit as the current stage, for use in the
-     * merge pipeline. Unlike the shards source, it is necessary for this stage to run on the
-     * merging host in order to produce correct pipeline output.
-     */
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return DocumentSourceLimit::create(pExpCtx, _limit);
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // Running this stage on the shards is an optimization, but is not strictly necessary in
+        // order to produce correct pipeline output.
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{
+            this, DocumentSourceLimit::create(pExpCtx, _limit), boost::none};
     }
 
     long long getLimit() const {
@@ -102,6 +96,7 @@ public:
 
 private:
     DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext>& pExpCtx, long long limit);
+    GetNextResult doGetNext() final;
 
     long long _limit;
     long long _nReturned = 0;

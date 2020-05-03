@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,13 +45,49 @@ REGISTER_DOCUMENT_SOURCE(bucketAuto,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceBucketAuto::createFromBson);
 
-const char* DocumentSourceBucketAuto::getSourceName() const {
-    return "$bucketAuto";
+namespace {
+
+boost::intrusive_ptr<Expression> parseGroupByExpression(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const BSONElement& groupByField,
+    const VariablesParseState& vps) {
+    if (groupByField.type() == BSONType::Object &&
+        groupByField.embeddedObject().firstElementFieldName()[0] == '$') {
+        return Expression::parseObject(expCtx, groupByField.embeddedObject(), vps);
+    } else if (groupByField.type() == BSONType::String &&
+               groupByField.valueStringData()[0] == '$') {
+        return ExpressionFieldPath::parse(expCtx, groupByField.str(), vps);
+    } else {
+        uasserted(
+            40239,
+            str::stream() << "The $bucketAuto 'groupBy' field must be defined as a $-prefixed "
+                             "path or an expression object, but found: "
+                          << groupByField.toString(false, false));
+    }
 }
 
-DocumentSource::GetNextResult DocumentSourceBucketAuto::getNext() {
-    pExpCtx->checkForInterrupt();
+/**
+ * Generates a new file name on each call using a static, atomic and monotonically increasing
+ * number.
+ *
+ * Each user of the Sorter must implement this function to ensure that all temporary files that the
+ * Sorter instances produce are uniquely identified using a unique file name extension with separate
+ * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
+ * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
+ */
+std::string nextFileName() {
+    static AtomicWord<unsigned> documentSourceBucketAutoFileCounter;
+    return "extsort-doc-bucket." +
+        std::to_string(documentSourceBucketAutoFileCounter.fetchAndAdd(1));
+}
 
+}  // namespace
+
+const char* DocumentSourceBucketAuto::getSourceName() const {
+    return kStageName.rawData();
+}
+
+DocumentSource::GetNextResult DocumentSourceBucketAuto::doGetNext() {
     if (!_populated) {
         const auto populationResult = populateSorter();
         if (populationResult.isPaused()) {
@@ -72,26 +109,38 @@ DocumentSource::GetNextResult DocumentSourceBucketAuto::getNext() {
     return makeDocument(*(_bucketsIterator++));
 }
 
-DocumentSource::GetDepsReturn DocumentSourceBucketAuto::getDependencies(DepsTracker* deps) const {
+boost::intrusive_ptr<DocumentSource> DocumentSourceBucketAuto::optimize() {
+    _groupByExpression = _groupByExpression->optimize();
+    for (auto&& accumulatedField : _accumulatedFields) {
+        accumulatedField.expr.argument = accumulatedField.expr.argument->optimize();
+        accumulatedField.expr.initializer = accumulatedField.expr.initializer->optimize();
+    }
+    return this;
+}
+
+DepsTracker::State DocumentSourceBucketAuto::getDependencies(DepsTracker* deps) const {
     // Add the 'groupBy' expression.
     _groupByExpression->addDependencies(deps);
 
     // Add the 'output' fields.
     for (auto&& accumulatedField : _accumulatedFields) {
-        accumulatedField.expression->addDependencies(deps);
+        // Anything the per-doc expression depends on, the whole stage depends on.
+        accumulatedField.expr.argument->addDependencies(deps);
+        // The initializer should be an ExpressionConstant, or something that optimizes to one.
+        // ExpressionConstant doesn't have dependencies.
     }
 
     // We know exactly which fields will be present in the output document. Future stages cannot
     // depend on any further fields. The grouping process will remove any metadata from the
     // documents, so there can be no further dependencies on metadata.
-    return EXHAUSTIVE_ALL;
+    return DepsTracker::State::EXHAUSTIVE_ALL;
 }
 
 DocumentSource::GetNextResult DocumentSourceBucketAuto::populateSorter() {
     if (!_sorter) {
         SortOptions opts;
         opts.maxMemoryUsageBytes = _maxMemoryUsageBytes;
-        if (pExpCtx->extSortAllowed && !pExpCtx->inMongos) {
+        if (pExpCtx->allowDiskUse && !pExpCtx->inMongos) {
             opts.extSortAllowed = true;
             opts.tempDir = pExpCtx->tempDir;
         }
@@ -118,7 +167,7 @@ Value DocumentSourceBucketAuto::extractKey(const Document& doc) {
         return Value(BSONNULL);
     }
 
-    Value key = _groupByExpression->evaluate(doc);
+    Value key = _groupByExpression->evaluate(doc, &pExpCtx->variables);
 
     if (_granularityRounder) {
         uassert(40258,
@@ -151,7 +200,9 @@ void DocumentSourceBucketAuto::addDocumentToBucket(const pair<Value, Document>& 
 
     const size_t numAccumulators = _accumulatedFields.size();
     for (size_t k = 0; k < numAccumulators; k++) {
-        bucket._accums[k]->process(_accumulatedFields[k].expression->evaluate(entry.second), false);
+        bucket._accums[k]->process(
+            _accumulatedFields[k].expr.argument->evaluate(entry.second, &pExpCtx->variables),
+            false);
     }
 }
 
@@ -195,6 +246,16 @@ void DocumentSourceBucketAuto::populateBuckets() {
 
         // Initialize the current bucket.
         Bucket currentBucket(pExpCtx, currentValue.first, currentValue.first, _accumulatedFields);
+
+        // Evaluate each initializer against an empty document. Normally the
+        // initializer can refer to the group key, but in $bucketAuto there is no single
+        // group key per bucket.
+        Document emptyDoc;
+        for (size_t k = 0; k < _accumulatedFields.size(); ++k) {
+            Value initializerValue =
+                _accumulatedFields[k].expr.initializer->evaluate(emptyDoc, &pExpCtx->variables);
+            currentBucket._accums[k]->startNewGroup(initializerValue);
+        }
 
         // Add the first value into the current bucket.
         addDocumentToBucket(currentValue, currentBucket);
@@ -273,7 +334,7 @@ DocumentSourceBucketAuto::Bucket::Bucket(
     : _min(min), _max(max) {
     _accums.reserve(accumulationStatements.size());
     for (auto&& accumulationStatement : accumulationStatements) {
-        _accums.push_back(accumulationStatement.makeAccumulator(expCtx));
+        _accums.push_back(accumulationStatement.makeAccumulator());
     }
 }
 
@@ -344,10 +405,11 @@ Value DocumentSourceBucketAuto::serialize(
 
     MutableDocument outputSpec(_accumulatedFields.size());
     for (auto&& accumulatedField : _accumulatedFields) {
-        intrusive_ptr<Accumulator> accum = accumulatedField.makeAccumulator(pExpCtx);
+        intrusive_ptr<AccumulatorState> accum = accumulatedField.makeAccumulator();
         outputSpec[accumulatedField.fieldName] =
-            Value{Document{{accum->getOpName(),
-                            accumulatedField.expression->serialize(static_cast<bool>(explain))}}};
+            Value(accum->serialize(accumulatedField.expr.initializer,
+                                   accumulatedField.expr.argument,
+                                   static_cast<bool>(explain)));
     }
     insides["output"] = outputSpec.freezeToValue();
 
@@ -367,9 +429,11 @@ intrusive_ptr<DocumentSourceBucketAuto> DocumentSourceBucketAuto::create(
             numBuckets > 0);
     // If there is no output field specified, then add the default one.
     if (accumulationStatements.empty()) {
-        accumulationStatements.emplace_back("count",
-                                            ExpressionConstant::create(pExpCtx, Value(1)),
-                                            AccumulationStatement::getFactory("$sum"));
+        accumulationStatements.emplace_back(
+            "count",
+            AccumulationExpression(ExpressionConstant::create(pExpCtx, Value(BSONNULL)),
+                                   ExpressionConstant::create(pExpCtx, Value(1)),
+                                   [pExpCtx] { return AccumulatorSum::create(pExpCtx); }));
     }
     return new DocumentSourceBucketAuto(pExpCtx,
                                         groupByExpression,
@@ -386,7 +450,7 @@ DocumentSourceBucketAuto::DocumentSourceBucketAuto(
     std::vector<AccumulationStatement> accumulationStatements,
     const boost::intrusive_ptr<GranularityRounder>& granularityRounder,
     uint64_t maxMemoryUsageBytes)
-    : DocumentSource(pExpCtx),
+    : DocumentSource(kStageName, pExpCtx),
       _nBuckets(numBuckets),
       _maxMemoryUsageBytes(maxMemoryUsageBytes),
       _groupByExpression(groupByExpression),
@@ -398,27 +462,13 @@ DocumentSourceBucketAuto::DocumentSourceBucketAuto(
     }
 }
 
-namespace {
-
-boost::intrusive_ptr<Expression> parseGroupByExpression(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const BSONElement& groupByField,
-    const VariablesParseState& vps) {
-    if (groupByField.type() == BSONType::Object &&
-        groupByField.embeddedObject().firstElementFieldName()[0] == '$') {
-        return Expression::parseObject(expCtx, groupByField.embeddedObject(), vps);
-    } else if (groupByField.type() == BSONType::String &&
-               groupByField.valueStringData()[0] == '$') {
-        return ExpressionFieldPath::parse(expCtx, groupByField.str(), vps);
-    } else {
-        uasserted(
-            40239,
-            str::stream() << "The $bucketAuto 'groupBy' field must be defined as a $-prefixed "
-                             "path or an expression object, but found: "
-                          << groupByField.toString(false, false));
-    }
+const boost::intrusive_ptr<Expression> DocumentSourceBucketAuto::getGroupByExpression() const {
+    return _groupByExpression;
 }
-}  // namespace
+
+const std::vector<AccumulationStatement>& DocumentSourceBucketAuto::getAccumulatedFields() const {
+    return _accumulatedFields;
+}
 
 intrusive_ptr<DocumentSource> DocumentSourceBucketAuto::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -462,8 +512,13 @@ intrusive_ptr<DocumentSource> DocumentSourceBucketAuto::createFromBson(
                     argument.type() == BSONType::Object);
 
             for (auto&& outputField : argument.embeddedObject()) {
-                accumulationStatements.push_back(
-                    AccumulationStatement::parseAccumulationStatement(pExpCtx, outputField, vps));
+                auto stmt =
+                    AccumulationStatement::parseAccumulationStatement(pExpCtx, outputField, vps);
+                stmt.expr.initializer = stmt.expr.initializer->optimize();
+                uassert(4544714,
+                        "Can't refer to the group key in $bucketAuto",
+                        ExpressionConstant::isNullOrConstant(stmt.expr.initializer));
+                accumulationStatements.push_back(std::move(stmt));
             }
         } else if ("granularity" == argName) {
             uassert(40261,
@@ -484,6 +539,7 @@ intrusive_ptr<DocumentSource> DocumentSourceBucketAuto::createFromBson(
     return DocumentSourceBucketAuto::create(
         pExpCtx, groupByExpression, numBuckets.get(), accumulationStatements, granularityRounder);
 }
+
 }  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"

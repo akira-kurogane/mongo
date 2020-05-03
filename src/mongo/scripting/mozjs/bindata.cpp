@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -42,7 +43,7 @@
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -86,10 +87,10 @@ void hexToBinData(JSContext* cx,
         int src_index = i * 2;
         if (!std::isxdigit(src[src_index]) || !std::isxdigit(src[src_index + 1]))
             uasserted(ErrorCodes::BadValue, "Invalid hex character in string");
-        data[i] = fromHex(src + src_index);
+        data[i] = uassertStatusOK(fromHex(src + src_index));
     }
 
-    std::string encoded = base64::encode(data.get(), len);
+    std::string encoded = base64::encode(StringData(data.get(), len));
     JS::AutoValueArray<2> args(cx);
 
     args[0].setInt32(type);
@@ -107,7 +108,7 @@ std::string* getEncoded(JSObject* thisv) {
 
 }  // namespace
 
-void BinDataInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void BinDataInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto str = getEncoded(obj);
 
     if (str) {
@@ -134,7 +135,7 @@ void BinDataInfo::Functions::UUID::call(JSContext* cx, JS::CallArgs args) {
         uuid = uassertStatusOK(mongo::UUID::parse(str));
     };
     ConstDataRange cdr = uuid->toCDR();
-    std::string encoded = mongo::base64::encode(cdr.data(), cdr.length());
+    std::string encoded = mongo::base64::encode(StringData(cdr.data(), cdr.length()));
 
     JS::AutoValueArray<2> newArgs(cx);
     newArgs[0].setInt32(newUUID);

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,44 +31,41 @@
 
 #include "mongo/db/exec/fetch.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/storage/record_fetcher.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* FetchStage::kStageType = "FETCH";
 
-FetchStage::FetchStage(OperationContext* opCtx,
+FetchStage::FetchStage(ExpressionContext* expCtx,
                        WorkingSet* ws,
-                       PlanStage* child,
+                       std::unique_ptr<PlanStage> child,
                        const MatchExpression* filter,
                        const Collection* collection)
-    : PlanStage(kStageType, opCtx),
-      _collection(collection),
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _ws(ws),
-      _filter(filter),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _idRetrying(WorkingSet::INVALID_ID) {
-    _children.emplace_back(child);
+    _children.emplace_back(std::move(child));
 }
 
 FetchStage::~FetchStage() {}
 
 bool FetchStage::isEOF() {
     if (WorkingSet::INVALID_ID != _idRetrying) {
-        // We asked the parent for a page-in, but still haven't had a chance to return the
-        // paged in document
+        // We have a working set member that we need to retry.
         return false;
     }
 
@@ -103,20 +101,9 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
 
             try {
                 if (!_cursor)
-                    _cursor = _collection->getCursor(getOpCtx());
+                    _cursor = collection()->getCursor(opCtx());
 
-                if (auto fetcher = _cursor->fetcherForId(member->recordId)) {
-                    // There's something to fetch. Hand the fetcher off to the WSM, and pass up
-                    // a fetch request.
-                    _idRetrying = id;
-                    member->setFetcher(fetcher.release());
-                    *out = id;
-                    return NEED_YIELD;
-                }
-
-                // The doc is already in memory, so go ahead and grab it. Now we have a RecordId
-                // as well as an unowned object
-                if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, _cursor)) {
+                if (!WorkingSetCommon::fetch(opCtx(), _ws, id, _cursor, collection()->ns())) {
                     _ws->free(id);
                     return NEED_TIME;
                 }
@@ -131,17 +118,11 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
         }
 
         return returnIfMatches(member, id, out);
-    } else if (PlanStage::FAILURE == status || PlanStage::DEAD == status) {
+    } else if (PlanStage::FAILURE == status) {
+        // The stage which produces a failure is responsible for allocating a working set member
+        // with error details.
+        invariant(WorkingSet::INVALID_ID != id);
         *out = id;
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case 'id' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            mongoutils::str::stream ss;
-            ss << "fetch stage failed to read in results from child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-        }
         return status;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
@@ -150,14 +131,17 @@ PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
     return status;
 }
 
-void FetchStage::doSaveState() {
-    if (_cursor)
+void FetchStage::doSaveStateRequiresCollection() {
+    if (_cursor) {
         _cursor->saveUnpositioned();
+    }
 }
 
-void FetchStage::doRestoreState() {
-    if (_cursor)
-        _cursor->restore();
+void FetchStage::doRestoreStateRequiresCollection() {
+    if (_cursor) {
+        const bool couldRestore = _cursor->restore();
+        uassert(50982, "could not restore cursor for FETCH stage", couldRestore);
+    }
 }
 
 void FetchStage::doDetachFromOperationContext() {
@@ -167,19 +151,7 @@ void FetchStage::doDetachFromOperationContext() {
 
 void FetchStage::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
-}
-
-void FetchStage::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
-    // It's possible that the recordId getting invalidated is the one we're about to
-    // fetch. In this case we do a "forced fetch" and put the WSM in owned object state.
-    if (WorkingSet::INVALID_ID != _idRetrying) {
-        WorkingSetMember* member = _ws->get(_idRetrying);
-        if (member->hasRecordId() && (member->recordId == dl)) {
-            // Fetch it now and kill the recordId.
-            WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, _collection);
-        }
-    }
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
@@ -214,14 +186,14 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
-    if (NULL != _filter) {
+    if (nullptr != _filter) {
         BSONObjBuilder bob;
         _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
-    ret->specific = make_unique<FetchStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
+    ret->specific = std::make_unique<FetchStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }

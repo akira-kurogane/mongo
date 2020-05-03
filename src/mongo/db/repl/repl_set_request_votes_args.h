@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +32,7 @@
 #include <string>
 
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 
 namespace mongo {
 
@@ -46,18 +48,23 @@ public:
     long long getTerm() const;
     long long getCandidateIndex() const;
     long long getConfigVersion() const;
-    OpTime getLastDurableOpTime() const;
+    long long getConfigTerm() const;
+    ConfigVersionAndTerm getConfigVersionAndTerm() const;
+    OpTime getLastAppliedOpTime() const;
     bool isADryRun() const;
 
     void addToBSON(BSONObjBuilder* builder) const;
+    std::string toString() const;
 
 private:
     std::string _setName;  // Name of the replset.
     long long _term = -1;  // Current known term of the command issuer.
     // replSet config index of the member who sent the replSetRequestVotesCmd.
     long long _candidateIndex = -1;
-    long long _cfgver = -1;     // replSet config version known to the command issuer.
-    OpTime _lastDurableOpTime;  // The last known durable op of the command issuer.
+    long long _cfgVer = -1;  // replSet config version known to the command issuer.
+    // replSet config term known to the command issuer.
+    long long _cfgTerm = OpTime::kUninitializedTerm;
+    OpTime _lastAppliedOpTime;  // The OpTime of the last known applied op of the command issuer.
     bool _dryRun = false;       // Indicates this is a pre-election check when true.
 };
 
@@ -75,6 +82,7 @@ public:
 
     void addToBSON(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
+    std::string toString() const;
 
 private:
     long long _term = -1;

@@ -1,35 +1,38 @@
-/*    Copyright 2013 10gen Inc.
-
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/auth/user.h"
 
 #include <vector>
 
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
@@ -50,19 +53,24 @@ SHA256Block computeDigest(const UserName& name) {
 
 }  // namespace
 
-User::User(const UserName& name)
-    : _name(name), _digest(computeDigest(_name)), _refCount(0), _isValid(1) {}
+User::User(const UserName& name) : _name(name), _digest(computeDigest(_name)) {}
 
-User::~User() {
-    dassert(_refCount == 0);
+template <>
+User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() {
+    return scram_sha1;
+}
+template <>
+const User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() const {
+    return scram_sha1;
 }
 
-const UserName& User::getName() const {
-    return _name;
+template <>
+User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() {
+    return scram_sha256;
 }
-
-const SHA256Block& User::getDigest() const {
-    return _digest;
+template <>
+const User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() const {
+    return scram_sha256;
 }
 
 RoleNameIterator User::getRoles() const {
@@ -81,20 +89,16 @@ const User::CredentialData& User::getCredentials() const {
     return _credentials;
 }
 
-bool User::isValid() const {
-    return _isValid.loadRelaxed() == 1;
-}
-
-uint32_t User::getRefCount() const {
-    return _refCount;
-}
-
 const ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
-    unordered_map<ResourcePattern, Privilege>::const_iterator it = _privileges.find(resource);
+    stdx::unordered_map<ResourcePattern, Privilege>::const_iterator it = _privileges.find(resource);
     if (it == _privileges.end()) {
         return ActionSet();
     }
     return it->second.getActions();
+}
+
+bool User::hasActionsForResource(const ResourcePattern& resource) const {
+    return !getActionsForResource(resource).empty();
 }
 
 void User::setCredentials(const CredentialData& credentials) {
@@ -150,20 +154,8 @@ void User::addPrivileges(const PrivilegeVector& privileges) {
     }
 }
 
-void User::setRestrictions(RestrictionDocuments restrictions)& {
+void User::setRestrictions(RestrictionDocuments restrictions) & {
     _restrictions = std::move(restrictions);
 }
 
-void User::invalidate() {
-    _isValid.store(0);
-}
-
-void User::incrementRefCount() {
-    ++_refCount;
-}
-
-void User::decrementRefCount() {
-    dassert(_refCount > 0);
-    --_refCount;
-}
 }  // namespace mongo

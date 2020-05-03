@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,12 +33,12 @@
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_replace_root.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -48,7 +49,7 @@ using boost::intrusive_ptr;
 class ReplaceRootBasics : public AggregationContextFixture {
 protected:
     intrusive_ptr<DocumentSource> createReplaceRoot(const BSONObj& replaceRoot) {
-        BSONObj spec = BSON("$replaceRoot" << replaceRoot);
+        BSONObj spec = BSON(DocumentSourceReplaceRoot::kStageName << replaceRoot);
         BSONElement specElement = spec.firstElement();
         return DocumentSourceReplaceRoot::createFromBson(specElement, getExpCtx());
     }
@@ -69,7 +70,7 @@ TEST_F(ReplaceRootBasics, FieldPathAsNewRootPromotesSubdocument) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$a"));
     Document subdoc = Document{{"b", 1}, {"c", "hello"_sd}, {"d", Document{{"e", 2}}}};
-    auto mock = DocumentSourceMock::create(Document{{"a", subdoc}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"a", subdoc}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     auto next = replaceRoot->getNext();
@@ -85,7 +86,8 @@ TEST_F(ReplaceRootBasics, DottedFieldPathAsNewRootPromotesSubdocument) {
                                               << "$a.b"));
     // source document: {a: {b: {c: 3}}}
     Document subdoc = Document{{"c", 3}};
-    auto mock = DocumentSourceMock::create(Document{{"a", Document{{"b", subdoc}}}});
+    auto mock =
+        DocumentSourceMock::createForTest(Document{{"a", Document{{"b", subdoc}}}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     auto next = replaceRoot->getNext();
@@ -101,7 +103,8 @@ TEST_F(ReplaceRootBasics, FieldPathAsNewRootPromotesSubdocumentInMultipleDocumen
                                               << "$a"));
     Document subdoc1 = Document{{"b", 1}, {"c", 2}};
     Document subdoc2 = Document{{"b", 3}, {"c", 4}};
-    auto mock = DocumentSourceMock::create({Document{{"a", subdoc1}}, Document{{"a", subdoc2}}});
+    auto mock = DocumentSourceMock::createForTest(
+        {Document{{"a", subdoc1}}, Document{{"a", subdoc2}}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     // Verify that the first document that comes out is the first document we put in.
@@ -120,7 +123,7 @@ TEST_F(ReplaceRootBasics, FieldPathAsNewRootPromotesSubdocumentInMultipleDocumen
 // object.
 TEST_F(ReplaceRootBasics, ExpressionObjectForNewRootReplacesRootWithThatObject) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot" << BSON("b" << 1)));
-    auto mock = DocumentSourceMock::create(Document{{"a", 2}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"a", 2}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     auto next = replaceRoot->getNext();
@@ -130,7 +133,7 @@ TEST_F(ReplaceRootBasics, ExpressionObjectForNewRootReplacesRootWithThatObject) 
 
     BSONObj newObject = BSON("a" << 1 << "b" << 2 << "arr" << BSON_ARRAY(3 << 4 << 5));
     replaceRoot = createReplaceRoot(BSON("newRoot" << newObject));
-    mock = DocumentSourceMock::create(Document{{"c", 2}});
+    mock = DocumentSourceMock::createForTest(Document{{"c", 2}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     next = replaceRoot->getNext();
@@ -139,7 +142,7 @@ TEST_F(ReplaceRootBasics, ExpressionObjectForNewRootReplacesRootWithThatObject) 
     assertExhausted(replaceRoot);
 
     replaceRoot = createReplaceRoot(BSON("newRoot" << BSON("a" << BSON("b" << 1))));
-    mock = DocumentSourceMock::create(Document{{"c", 2}});
+    mock = DocumentSourceMock::createForTest(Document{{"c", 2}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     next = replaceRoot->getNext();
@@ -148,7 +151,7 @@ TEST_F(ReplaceRootBasics, ExpressionObjectForNewRootReplacesRootWithThatObject) 
     assertExhausted(replaceRoot);
 
     replaceRoot = createReplaceRoot(BSON("newRoot" << BSON("a" << 2)));
-    mock = DocumentSourceMock::create(Document{{"b", 2}});
+    mock = DocumentSourceMock::createForTest(Document{{"b", 2}}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     next = replaceRoot->getNext();
@@ -164,7 +167,7 @@ TEST_F(ReplaceRootBasics, SystemVariableForNewRootReplacesRootWithThatObject) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$$CURRENT"));
     Document inputDoc = Document{{"b", 2}};
-    auto mock = DocumentSourceMock::create({inputDoc});
+    auto mock = DocumentSourceMock::createForTest({inputDoc}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     auto next = replaceRoot->getNext();
@@ -174,7 +177,7 @@ TEST_F(ReplaceRootBasics, SystemVariableForNewRootReplacesRootWithThatObject) {
 
     replaceRoot = createReplaceRoot(BSON("newRoot"
                                          << "$$ROOT"));
-    mock = DocumentSourceMock::create({inputDoc});
+    mock = DocumentSourceMock::createForTest({inputDoc}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     next = replaceRoot->getNext();
@@ -186,12 +189,14 @@ TEST_F(ReplaceRootBasics, SystemVariableForNewRootReplacesRootWithThatObject) {
 TEST_F(ReplaceRootBasics, ShouldPropagatePauses) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$$ROOT"));
-    auto mock = DocumentSourceMock::create({Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document(),
-                                            Document(),
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            DocumentSource::GetNextResult::makePauseExecution()});
+    auto mock =
+        DocumentSourceMock::createForTest({Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document(),
+                                           Document(),
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     replaceRoot->setSource(mock.get());
 
     ASSERT_TRUE(replaceRoot->getNext().isAdvanced());
@@ -211,18 +216,18 @@ TEST_F(ReplaceRootBasics, ErrorsWhenNewRootDoesNotEvaluateToAnObject) {
                                               << "$a"));
 
     // A string is not an object.
-    auto mock = DocumentSourceMock::create(Document{{"a", "hello"_sd}});
+    auto mock = DocumentSourceMock::createForTest(Document{{"a", "hello"_sd}}, getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
 
     // An integer is not an object.
-    mock = DocumentSourceMock::create(Document{{"a", 5}});
+    mock = DocumentSourceMock::createForTest(Document{{"a", 5}}, getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
 
     // Literals are not objects.
     replaceRoot = createReplaceRoot(BSON("newRoot" << BSON("$literal" << 1)));
-    mock = DocumentSourceMock::create(Document());
+    mock = DocumentSourceMock::createForTest(Document(), getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
     assertExhausted(replaceRoot);
@@ -230,7 +235,7 @@ TEST_F(ReplaceRootBasics, ErrorsWhenNewRootDoesNotEvaluateToAnObject) {
     // Most operator expressions do not resolve to objects.
     replaceRoot = createReplaceRoot(BSON("newRoot" << BSON("$and"
                                                            << "$a")));
-    mock = DocumentSourceMock::create(Document{{"a", true}});
+    mock = DocumentSourceMock::createForTest(Document{{"a", true}}, getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
     assertExhausted(replaceRoot);
@@ -242,12 +247,13 @@ TEST_F(ReplaceRootBasics, ErrorsIfNewRootFieldPathDoesNotExist) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$a"));
 
-    auto mock = DocumentSourceMock::create(Document());
+    auto mock = DocumentSourceMock::createForTest(Document(), getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
     assertExhausted(replaceRoot);
 
-    mock = DocumentSourceMock::create(Document{{"e", Document{{"b", Document{{"c", 3}}}}}});
+    mock = DocumentSourceMock::createForTest(Document{{"e", Document{{"b", Document{{"c", 3}}}}}},
+                                             getExpCtx());
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
     assertExhausted(replaceRoot);
@@ -258,7 +264,8 @@ TEST_F(ReplaceRootBasics, OnlyDependentFieldIsNewRoot) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$a.b"));
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, replaceRoot->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_FIELDS,
+                  replaceRoot->getDependencies(&dependencies));
 
     // Should only depend on field a.b
     ASSERT_EQUALS(1U, dependencies.fields.size());
@@ -268,7 +275,7 @@ TEST_F(ReplaceRootBasics, OnlyDependentFieldIsNewRoot) {
 
     // Should not need any other fields.
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(ReplaceRootBasics, ReplaceRootModifiesAllFields) {
@@ -283,7 +290,7 @@ TEST_F(ReplaceRootBasics, ReplaceRootWithRemoveSystemVariableThrows) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$$REMOVE"));
     Document inputDoc = Document{{"b", 2}};
-    auto mock = DocumentSourceMock::create({inputDoc});
+    auto mock = DocumentSourceMock::createForTest({inputDoc}, getExpCtx());
     replaceRoot->setSource(mock.get());
 
     ASSERT_THROWS_CODE(replaceRoot->getNext(), AssertionException, 40228);
@@ -298,6 +305,17 @@ public:
         return DocumentSourceReplaceRoot::createFromBson(replaceRootSpec.firstElement(),
                                                          getExpCtx());
     }
+
+    intrusive_ptr<DocumentSource> createReplaceWith(std::string fieldPath) {
+        BSONObj spec = BSON(DocumentSourceReplaceRoot::kAliasNameReplaceWith << fieldPath);
+        return DocumentSourceReplaceRoot::createFromBson(spec.firstElement(), getExpCtx());
+    }
+
+    intrusive_ptr<DocumentSource> createReplaceWith(BSONObj expression) {
+        BSONObj spec = BSON(DocumentSourceReplaceRoot::kAliasNameReplaceWith << expression);
+        return DocumentSourceReplaceRoot::createFromBson(spec.firstElement(), getExpCtx());
+    }
+
 
     BSONObj createSpec(BSONObj spec) {
         return BSON("$replaceRoot" << spec);
@@ -321,25 +339,23 @@ TEST_F(ReplaceRootSpec, CreationRequiresObjectSpecification) {
 TEST_F(ReplaceRootSpec, OnlyValidOptionInObjectSpecIsNewRoot) {
     ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSON("newRoot"
                                                          << "$a"
-                                                         << "root"
-                                                         << 2))),
+                                                         << "root" << 2))),
                        AssertionException,
-                       40230);
+                       40415);
     ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSON("newRoot"
                                                          << "$a"
-                                                         << "path"
-                                                         << 2))),
+                                                         << "path" << 2))),
                        AssertionException,
-                       40230);
+                       40415);
     ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSON("path"
                                                          << "$a"))),
                        AssertionException,
-                       40230);
+                       40415);
 }
 
 // Verify that $replaceRoot requires a valid expression as input to the newRoot option.
 TEST_F(ReplaceRootSpec, RequiresExpressionForNewRootOption) {
-    ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSONObj())), AssertionException, 40231);
+    ASSERT_THROWS_CODE(createReplaceRoot(createSpec(BSONObj())), AssertionException, 40414);
     ASSERT_THROWS(createReplaceRoot(createSpec(BSON("newRoot"
                                                     << "$$$a"))),
                   AssertionException);
@@ -374,6 +390,55 @@ TEST_F(ReplaceRootSpec, NewRootAcceptsAllTypesOfExpressions) {
     // Accumulators
     ASSERT_TRUE(createReplaceRoot(createFullSpec(BSON("$sum"
                                                       << "$a"))));
+}
+
+TEST_F(ReplaceRootSpec, ReplaceWithAcceptsAllTypesOfExpressions) {
+    // Field Path and system variables
+    ASSERT_TRUE(createReplaceWith("$a.b.c.d.e"));
+    ASSERT_TRUE(createReplaceWith("$$CURRENT"));
+
+    // Literals
+    ASSERT_TRUE(createReplaceWith(BSON("$literal" << 1)));
+
+    // Expression Objects
+    ASSERT_TRUE(createReplaceWith(BSON("a" << BSON("b" << 1))));
+
+    // Operator Expressions
+    ASSERT_TRUE(createReplaceWith(BSON("$and"
+                                       << "$a")));
+    ASSERT_TRUE(createReplaceWith(BSON("$gt" << BSON_ARRAY("$a" << 1))));
+    ASSERT_TRUE(createReplaceWith(BSON("$sqrt"
+                                       << "$a")));
+
+    // Accumulators
+    ASSERT_TRUE(createReplaceWith(BSON("$sum"
+                                       << "$a")));
+}
+
+// Verify that $replaceRoot round trips through serialization.
+TEST_F(ReplaceRootSpec, ReplaceRootRoundTrips) {
+    auto replaceRoot = createReplaceRoot(createSpec(BSON("newRoot"
+                                                         << "$a.b.c.d.e")));
+    ASSERT_EQ(replaceRoot->getSourceName(), DocumentSourceReplaceRoot::kStageName);
+    std::vector<Value> serialization;
+    replaceRoot->serializeToArray(serialization);
+    replaceRoot = createReplaceRoot(serialization[0].getDocument().toBson());
+    ASSERT_EQ(replaceRoot->getSourceName(), DocumentSourceReplaceRoot::kStageName);
+}
+
+// Verify that $replaceWith round trips through serialization.
+TEST_F(ReplaceRootSpec, ReplaceWithRoundTrips) {
+    auto replaceWith = createReplaceWith("$newRoot");
+    // We should always create a stage with the name '$replaceRoot' internally, even if the alias is
+    // used.
+    ASSERT_EQ(replaceWith->getSourceName(), DocumentSourceReplaceRoot::kStageName);
+
+    std::vector<Value> serialization;
+    replaceWith->serializeToArray(serialization);
+    replaceWith = createReplaceRoot(serialization[0].getDocument().toBson());
+    // While the stage that has round-tripped through serialization should mean the same thing, it
+    // will have a different name since it always serializes to the full $replaceRoot syntax.
+    ASSERT_EQ(replaceWith->getSourceName(), DocumentSourceReplaceRoot::kStageName);
 }
 
 }  // namespace

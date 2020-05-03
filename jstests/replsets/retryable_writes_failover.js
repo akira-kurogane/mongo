@@ -3,160 +3,161 @@
  * failover.
  */
 (function() {
-    "use strict";
+"use strict";
 
-    function stepDownPrimary(replTest) {
-        let exception = assert.throws(function() {
-            let res = assert.commandWorked(
-                replTest.getPrimary().adminCommand({replSetStepDown: 10, force: true}));
-            print("replSetStepDown did not throw exception but returned: " + tojson(res));
-        });
-        assert(isNetworkError(exception),
-               "replSetStepDown did not disconnect client; failed with " + tojson(exception));
-    }
+load("jstests/libs/retryable_writes_util.js");
 
-    const replTest = new ReplSetTest({nodes: 3});
-    replTest.startSet();
-    replTest.initiate();
+if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+    jsTestLog("Retryable writes are not supported, skipping test");
+    return;
+}
 
-    ////////////////////////////////////////////////////////////////////////
-    // Test insert command
+function stepDownPrimary(replTest) {
+    assert.commandWorked(replTest.getPrimary().adminCommand({replSetStepDown: 10, force: true}));
+}
 
-    let insertCmd = {
-        insert: "foo",
-        documents: [{_id: 10}, {_id: 30}],
-        ordered: false,
-        lsid: {id: UUID()},
-        txnNumber: NumberLong(5)
-    };
+const replTest = new ReplSetTest({nodes: 3});
+replTest.startSet();
+replTest.initiate();
 
-    // Run the command on the primary and wait for replication.
-    let primary = replTest.getPrimary();
-    let testDB = primary.getDB("test");
+////////////////////////////////////////////////////////////////////////
+// Test insert command
 
-    let result = assert.commandWorked(testDB.runCommand(insertCmd));
-    assert.eq(2, testDB.foo.find().itcount());
+let insertCmd = {
+    insert: "foo",
+    documents: [{_id: 10}, {_id: 30}],
+    ordered: false,
+    lsid: {id: UUID()},
+    txnNumber: NumberLong(5)
+};
 
-    replTest.awaitReplication();
+// Run the command on the primary and wait for replication.
+let primary = replTest.getPrimary();
+let testDB = primary.getDB("test");
 
-    // Step down the primary and wait for a new one.
-    stepDownPrimary(replTest);
+let result = assert.commandWorked(testDB.runCommand(insertCmd));
+assert.eq(2, testDB.foo.find().itcount());
 
-    let newPrimary = replTest.getPrimary();
-    testDB = newPrimary.getDB("test");
+replTest.awaitReplication();
 
-    let oplog = newPrimary.getDB("local").oplog.rs;
-    let insertOplogEntries = oplog.find({ns: "test.foo", op: "i"}).itcount();
+// Step down the primary and wait for a new one.
+stepDownPrimary(replTest);
 
-    // Retry the command on the secondary and verify it wasn't repeated.
-    let retryResult = assert.commandWorked(testDB.runCommand(insertCmd));
-    assert.eq(result.ok, retryResult.ok);
-    assert.eq(result.n, retryResult.n);
-    assert.eq(result.writeErrors, retryResult.writeErrors);
-    assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
+let newPrimary = replTest.getPrimary();
+testDB = newPrimary.getDB("test");
 
-    assert.eq(2, testDB.foo.find().itcount());
+let oplog = newPrimary.getDB("local").oplog.rs;
+let insertOplogEntries = oplog.find({ns: "test.foo", op: "i"}).itcount();
 
-    assert.eq(insertOplogEntries, oplog.find({ns: "test.foo", op: "i"}).itcount());
+// Retry the command on the secondary and verify it wasn't repeated.
+let retryResult = assert.commandWorked(testDB.runCommand(insertCmd));
+assert.eq(result.ok, retryResult.ok);
+assert.eq(result.n, retryResult.n);
+assert.eq(result.writeErrors, retryResult.writeErrors);
+assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
 
-    ////////////////////////////////////////////////////////////////////////
-    // Test update command
+assert.eq(2, testDB.foo.find().itcount());
 
-    let updateCmd = {
-        update: "foo",
-        updates: [
-            {q: {_id: 10}, u: {$inc: {x: 1}}},  // in place
-            {q: {_id: 20}, u: {$inc: {y: 1}}, upsert: true},
-            {q: {_id: 30}, u: {z: 1}}  // replacement
-        ],
-        ordered: false,
-        lsid: {id: UUID()},
-        txnNumber: NumberLong(10),
-    };
+assert.eq(insertOplogEntries, oplog.find({ns: "test.foo", op: "i"}).itcount());
 
-    primary = replTest.getPrimary();
-    testDB = primary.getDB("test");
+////////////////////////////////////////////////////////////////////////
+// Test update command
 
-    // Run the command on the primary and wait for replication.
-    result = assert.commandWorked(testDB.runCommand(updateCmd));
-    assert.eq(3, testDB.foo.find().itcount());
+let updateCmd = {
+    update: "foo",
+    updates: [
+        {q: {_id: 10}, u: {$inc: {x: 1}}},  // in place
+        {q: {_id: 20}, u: {$inc: {y: 1}}, upsert: true},
+        {q: {_id: 30}, u: {z: 1}}  // replacement
+    ],
+    ordered: false,
+    lsid: {id: UUID()},
+    txnNumber: NumberLong(10),
+};
 
-    replTest.awaitReplication();
+primary = replTest.getPrimary();
+testDB = primary.getDB("test");
 
-    // Step down the primary and wait for a new one.
-    stepDownPrimary(replTest);
+// Run the command on the primary and wait for replication.
+result = assert.commandWorked(testDB.runCommand(updateCmd));
+assert.eq(3, testDB.foo.find().itcount());
 
-    newPrimary = replTest.getPrimary();
-    testDB = newPrimary.getDB("test");
+replTest.awaitReplication();
 
-    oplog = newPrimary.getDB("local").oplog.rs;
-    let updateOplogEntries = oplog.find({ns: "test.foo", op: "u"}).itcount();
+// Step down the primary and wait for a new one.
+stepDownPrimary(replTest);
 
-    // Upserts are stored as inserts if they match no existing documents.
-    insertOplogEntries = oplog.find({ns: "test.foo", op: "i"}).itcount();
+newPrimary = replTest.getPrimary();
+testDB = newPrimary.getDB("test");
 
-    // Retry the command on the secondary and verify it wasn't repeated.
-    retryResult = assert.commandWorked(testDB.runCommand(updateCmd));
-    assert.eq(result.ok, retryResult.ok);
-    assert.eq(result.n, retryResult.n);
-    assert.eq(result.nModified, retryResult.nModified);
-    assert.eq(result.upserted, retryResult.upserted);
-    assert.eq(result.writeErrors, retryResult.writeErrors);
-    assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
+oplog = newPrimary.getDB("local").oplog.rs;
+let updateOplogEntries = oplog.find({ns: "test.foo", op: "u"}).itcount();
 
-    assert.eq(3, testDB.foo.find().itcount());
+// Upserts are stored as inserts if they match no existing documents.
+insertOplogEntries = oplog.find({ns: "test.foo", op: "i"}).itcount();
 
-    assert.eq({_id: 10, x: 1}, testDB.foo.findOne({_id: 10}));
-    assert.eq({_id: 20, y: 1}, testDB.foo.findOne({_id: 20}));
-    assert.eq({_id: 30, z: 1}, testDB.foo.findOne({_id: 30}));
+// Retry the command on the secondary and verify it wasn't repeated.
+retryResult = assert.commandWorked(testDB.runCommand(updateCmd));
+assert.eq(result.ok, retryResult.ok);
+assert.eq(result.n, retryResult.n);
+assert.eq(result.nModified, retryResult.nModified);
+assert.eq(result.upserted, retryResult.upserted);
+assert.eq(result.writeErrors, retryResult.writeErrors);
+assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
 
-    assert.eq(updateOplogEntries, oplog.find({ns: "test.foo", op: "u"}).itcount());
-    assert.eq(insertOplogEntries, oplog.find({ns: "test.foo", op: "i"}).itcount());
+assert.eq(3, testDB.foo.find().itcount());
 
-    ////////////////////////////////////////////////////////////////////////
-    // Test delete command
+assert.eq({_id: 10, x: 1}, testDB.foo.findOne({_id: 10}));
+assert.eq({_id: 20, y: 1}, testDB.foo.findOne({_id: 20}));
+assert.eq({_id: 30, z: 1}, testDB.foo.findOne({_id: 30}));
 
-    let deleteCmd = {
-        delete: "foo",
-        deletes: [{q: {x: 1}, limit: 1}, {q: {y: 1}, limit: 1}],
-        ordered: false,
-        lsid: {id: UUID()},
-        txnNumber: NumberLong(15),
-    };
+assert.eq(updateOplogEntries, oplog.find({ns: "test.foo", op: "u"}).itcount());
+assert.eq(insertOplogEntries, oplog.find({ns: "test.foo", op: "i"}).itcount());
 
-    primary = replTest.getPrimary();
-    testDB = primary.getDB("test");
+////////////////////////////////////////////////////////////////////////
+// Test delete command
 
-    assert.writeOK(testDB.foo.insert({_id: 40, x: 1}));
-    assert.writeOK(testDB.foo.insert({_id: 50, y: 1}));
+let deleteCmd = {
+    delete: "foo",
+    deletes: [{q: {x: 1}, limit: 1}, {q: {y: 1}, limit: 1}],
+    ordered: false,
+    lsid: {id: UUID()},
+    txnNumber: NumberLong(15),
+};
 
-    // Run the command on the primary and wait for replication.
-    result = assert.commandWorked(testDB.runCommand(deleteCmd));
-    assert.eq(1, testDB.foo.find({x: 1}).itcount());
-    assert.eq(1, testDB.foo.find({y: 1}).itcount());
+primary = replTest.getPrimary();
+testDB = primary.getDB("test");
 
-    replTest.awaitReplication();
+assert.commandWorked(testDB.foo.insert({_id: 40, x: 1}));
+assert.commandWorked(testDB.foo.insert({_id: 50, y: 1}));
 
-    // Step down the primary and wait for a new one.
-    stepDownPrimary(replTest);
+// Run the command on the primary and wait for replication.
+result = assert.commandWorked(testDB.runCommand(deleteCmd));
+assert.eq(1, testDB.foo.find({x: 1}).itcount());
+assert.eq(1, testDB.foo.find({y: 1}).itcount());
 
-    newPrimary = replTest.getPrimary();
-    testDB = newPrimary.getDB("test");
+replTest.awaitReplication();
 
-    oplog = newPrimary.getDB("local").oplog.rs;
-    let deleteOplogEntries = oplog.find({ns: "test.foo", op: "d"}).itcount();
+// Step down the primary and wait for a new one.
+stepDownPrimary(replTest);
 
-    // Retry the command on the secondary and verify it wasn't repeated.
-    retryResult = assert.commandWorked(testDB.runCommand(deleteCmd));
-    assert.eq(result.ok, retryResult.ok);
-    assert.eq(result.n, retryResult.n);
-    assert.eq(result.writeErrors, retryResult.writeErrors);
-    assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
+newPrimary = replTest.getPrimary();
+testDB = newPrimary.getDB("test");
 
-    assert.eq(1, testDB.foo.find({x: 1}).itcount());
-    assert.eq(1, testDB.foo.find({y: 1}).itcount());
+oplog = newPrimary.getDB("local").oplog.rs;
+let deleteOplogEntries = oplog.find({ns: "test.foo", op: "d"}).itcount();
 
-    assert.eq(deleteOplogEntries, oplog.find({ns: "test.foo", op: "d"}).itcount());
+// Retry the command on the secondary and verify it wasn't repeated.
+retryResult = assert.commandWorked(testDB.runCommand(deleteCmd));
+assert.eq(result.ok, retryResult.ok);
+assert.eq(result.n, retryResult.n);
+assert.eq(result.writeErrors, retryResult.writeErrors);
+assert.eq(result.writeConcernErrors, retryResult.writeConcernErrors);
 
-    replTest.stopSet();
+assert.eq(1, testDB.foo.find({x: 1}).itcount());
+assert.eq(1, testDB.foo.find({y: 1}).itcount());
+
+assert.eq(deleteOplogEntries, oplog.find({ns: "test.foo", op: "d"}).itcount());
+
+replTest.stopSet();
 })();

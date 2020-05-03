@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -51,13 +52,14 @@ void _extractAllElementsAlongPath(const BSONObj& obj,
                                   StringData path,
                                   BSONElementColl& elements,
                                   bool expandArrayOnTrailingField,
-                                  size_t depth,
-                                  std::set<size_t>* arrayComponents) {
+                                  BSONDepthIndex depth,
+                                  MultikeyComponents* arrayComponents) {
     BSONElement e = obj.getField(path);
 
     if (e.eoo()) {
         size_t idx = path.find('.');
         if (idx != std::string::npos) {
+            invariant(depth != std::numeric_limits<BSONDepthIndex>::max());
             StringData left = path.substr(0, idx);
             StringData next = path.substr(idx + 1, path.size());
 
@@ -164,8 +166,8 @@ void extractAllElementsAlongPath(const BSONObj& obj,
                                  StringData path,
                                  BSONElementSet& elements,
                                  bool expandArrayOnTrailingField,
-                                 std::set<size_t>* arrayComponents) {
-    const size_t initialDepth = 0;
+                                 MultikeyComponents* arrayComponents) {
+    const BSONDepthIndex initialDepth = 0;
     _extractAllElementsAlongPath(
         obj, path, elements, expandArrayOnTrailingField, initialDepth, arrayComponents);
 }
@@ -174,8 +176,8 @@ void extractAllElementsAlongPath(const BSONObj& obj,
                                  StringData path,
                                  BSONElementMultiSet& elements,
                                  bool expandArrayOnTrailingField,
-                                 std::set<size_t>* arrayComponents) {
-    const size_t initialDepth = 0;
+                                 MultikeyComponents* arrayComponents) {
+    const BSONDepthIndex initialDepth = 0;
     _extractAllElementsAlongPath(
         obj, path, elements, expandArrayOnTrailingField, initialDepth, arrayComponents);
 }

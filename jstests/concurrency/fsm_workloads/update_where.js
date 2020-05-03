@@ -20,12 +20,12 @@ var $config = extendWorkload($config, function($config, $super) {
         var res = db[collName].update(
             // Server-side JS does not support Random.randInt, so use Math.floor/random instead
             {
-              $where: 'this.x === Math.floor(Math.random() * ' + this.randomBound + ') ' +
-                  '&& this.tid === ' + this.tid
+                $where: 'this.x === Math.floor(Math.random() * ' + this.randomBound + ') ' +
+                    '&& this.tid === ' + this.tid
             },
             {$set: {x: Random.randInt(this.randomBound)}},
             {multi: true});
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
 
         if (db.getMongo().writeMode() === 'commands') {
             assertWhenOwnColl.gte(res.nModified, 0);

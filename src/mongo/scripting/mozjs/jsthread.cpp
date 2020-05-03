@@ -1,49 +1,49 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/jsthread.h"
 
-#include "vm/PosixNSPR.h"
 #include <cstdio>
+#include <memory>
+#include <vm/PosixNSPR.h>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -105,25 +105,17 @@ public:
     void start() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread already started", !_started);
 
-        // Despite calling PR_CreateThread, we're actually using our own
-        // implementation of PosixNSPR.cpp in this directory. So these threads
-        // are actually hosted on top of stdx::threads and most of the flags
-        // don't matter.
-        _thread = PR_CreateThread(PR_USER_THREAD,
-                                  JSThread::run,
-                                  &_jsthread,
-                                  PR_PRIORITY_NORMAL,
-                                  PR_LOCAL_THREAD,
-                                  PR_JOINABLE_THREAD,
-                                  0);
+        _thread = stdx::thread(JSThread::run, &_jsthread);
         _started = true;
     }
 
     void join() {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread not running", _started && !_done);
 
-        PR_JoinThread(_thread);
+        _thread.join();
         _done = true;
+
+        uassertStatusOK(_sharedData->getErrorStatus());
     }
 
     /**
@@ -134,7 +126,7 @@ public:
     bool hasFailed() const {
         uassert(ErrorCodes::JSInterpreterFailure, "Thread not started", _started);
 
-        return _sharedData->getErrored();
+        return !_sharedData->getErrorStatus().isOK();
     }
 
     BSONObj returnData() {
@@ -154,16 +146,16 @@ private:
      */
     class SharedData {
     public:
-        SharedData() : _errored(false) {}
+        SharedData() = default;
 
-        void setErrored(bool value) {
-            stdx::lock_guard<stdx::mutex> lck(_erroredMutex);
-            _errored = value;
+        void setErrorStatus(Status status) {
+            stdx::lock_guard<Latch> lck(_statusMutex);
+            _status = std::move(status);
         }
 
-        bool getErrored() {
-            stdx::lock_guard<stdx::mutex> lck(_erroredMutex);
-            return _errored;
+        Status getErrorStatus() {
+            stdx::lock_guard<Latch> lck(_statusMutex);
+            return _status;
         }
 
         /**
@@ -176,8 +168,8 @@ private:
         std::string _stack;
 
     private:
-        stdx::mutex _erroredMutex;
-        bool _errored;
+        Mutex _statusMutex = MONGO_MAKE_LATCH("SharedData::_statusMutex");
+        Status _status = Status::OK();
     };
 
     /**
@@ -191,16 +183,14 @@ private:
             auto thisv = static_cast<JSThread*>(priv);
 
             try {
-                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()));
+                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()),
+                                     boost::none /* Don't override global jsHeapLimitMB */);
 
                 scope.setParentStack(thisv->_sharedData->_stack);
                 thisv->_sharedData->_returnData = scope.callThreadArgs(thisv->_sharedData->_args);
             } catch (...) {
                 auto status = exceptionToStatus();
-
-                log() << "js thread raised js exception: " << redact(status)
-                      << thisv->_sharedData->_stack;
-                thisv->_sharedData->setErrored(true);
+                thisv->_sharedData->setErrorStatus(status);
                 thisv->_sharedData->_returnData = BSON("ret" << BSONUndefined);
             }
         }
@@ -211,7 +201,7 @@ private:
 
     bool _started;
     bool _done;
-    PRThread* _thread = nullptr;
+    stdx::thread _thread;
     std::shared_ptr<SharedData> _sharedData;
     JSThread _jsthread;
 };
@@ -233,7 +223,7 @@ JSThreadConfig* getConfig(JSContext* cx, JS::CallArgs args) {
 
 }  // namespace
 
-void JSThreadInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void JSThreadInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto config = static_cast<JSThreadConfig*>(JS_GetPrivate(obj));
 
     if (!config)

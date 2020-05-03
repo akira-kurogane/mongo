@@ -1,38 +1,40 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ftdc/file_manager.h"
 
 #include <boost/filesystem.hpp>
+#include <memory>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -41,10 +43,9 @@
 #include "mongo/db/ftdc/constants.h"
 #include "mongo/db/ftdc/file_reader.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -75,8 +76,8 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
         boost::filesystem::create_directories(dir, ec);
         if (ec) {
             return {ErrorCodes::NonExistentPath,
-                    str::stream() << "\'" << dir.generic_string() << "\' could not be created: "
-                                  << ec.message()};
+                    str::stream() << "\"" << dir.generic_string()
+                                  << "\" could not be created: " << ec.message()};
         }
     }
 
@@ -101,7 +102,10 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     }
 
     // Rotate as needed after we appended interim data to the archive file
-    mgr->trimDirectory(files);
+    s = mgr->trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
     return {std::move(mgr)};
 }
@@ -116,7 +120,7 @@ std::vector<boost::filesystem::path> FTDCFileManager::scanDirectory() {
 
         std::string str = filename.generic_string();
         if (str.compare(0, strlen(kFTDCArchiveFile), kFTDCArchiveFile) == 0 &&
-            str != kFTDCInterimFile) {
+            str != kFTDCInterimTempFile && str != kFTDCInterimFile) {
             files.emplace_back(_path / filename);
         }
     }
@@ -205,22 +209,41 @@ Status FTDCFileManager::openArchiveFile(
     return Status::OK();
 }
 
-void FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
+Status FTDCFileManager::trimDirectory(std::vector<boost::filesystem::path>& files) {
     std::uint64_t maxSize = _config->maxDirectorySizeBytes;
     std::uint64_t size = 0;
 
     dassert(std::is_sorted(files.begin(), files.end()));
 
     for (auto it = files.rbegin(); it != files.rend(); ++it) {
-        std::uint64_t fileSize = boost::filesystem::file_size(*it);
+        boost::system::error_code ec;
+        std::uint64_t fileSize = boost::filesystem::file_size(*it, ec);
+        if (ec) {
+            return {ErrorCodes::NonExistentPath,
+                    str::stream() << "\"" << (*it).generic_string()
+                                  << "\" file size could not be retrieved during trimming: "
+                                  << ec.message()};
+        }
         size += fileSize;
 
         if (size >= maxSize) {
-            LOG(1) << "Cleaning file over full-time diagnostic data capture quota, file: "
-                   << (*it).generic_string() << " with size " << fileSize;
-            boost::filesystem::remove(*it);
+            LOGV2_DEBUG(20628,
+                        1,
+                        "Cleaning file over full-time diagnostic data capture quota",
+                        "fileName"_attr = (*it).generic_string(),
+                        "fileSize"_attr = fileSize);
+
+            boost::filesystem::remove(*it, ec);
+            if (ec) {
+                return {ErrorCodes::NonExistentPath,
+                        str::stream()
+                            << "\"" << (*it).generic_string()
+                            << "\" could not be removed during trimming: " << ec.message()};
+            }
         }
     }
+
+    return Status::OK();
 }
 
 std::vector<std::tuple<FTDCBSONUtil::FTDCType, BSONObj, Date_t>>
@@ -234,7 +257,15 @@ FTDCFileManager::recoverInterimFile() {
         return docs;
     }
 
-    size_t size = boost::filesystem::file_size(interimFile);
+    boost::system::error_code ec;
+    size_t size = boost::filesystem::file_size(interimFile, ec);
+    if (ec) {
+        LOGV2(20629,
+              "Recover interim file failed as the file size could not be checked",
+              "errorMessage"_attr = ec.message());
+        return docs;
+    }
+
     if (size == 0) {
         return docs;
     }
@@ -242,11 +273,10 @@ FTDCFileManager::recoverInterimFile() {
     FTDCFileReader read;
     auto s = read.open(interimFile);
     if (!s.isOK()) {
-        log() << "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
-                 "but failed "
-                 "to open it, some "
-                 "metrics may have been lost. "
-              << s;
+        LOGV2(20630,
+              "Unclean full-time diagnostic data capture shutdown detected, found interim file,  "
+              "but failed to open it, some metrics may have been lost",
+              "status"_attr = s);
 
         // Note: We ignore any actual errors as reading from the interim files is a best-effort
         return docs;
@@ -261,10 +291,10 @@ FTDCFileManager::recoverInterimFile() {
 
     // Warn if the interim file was corrupt or we had an unclean shutdown
     if (!m.isOK() || !docs.empty()) {
-        log() << "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
-                 "some "
-                 "metrics may have been lost. "
-              << m.getStatus();
+        LOGV2(20631,
+              "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
+              "some metrics may have been lost",
+              "status"_attr = m.getStatus());
     }
 
     // Note: We ignore any actual errors as reading from the interim files is a best-effort
@@ -280,7 +310,10 @@ Status FTDCFileManager::rotate(Client* client) {
     auto files = scanDirectory();
 
     // Rotate as needed
-    trimDirectory(files);
+    s = trimDirectory(files);
+    if (!s.isOK()) {
+        return s;
+    }
 
     auto swFile = generateArchiveFileName(_path, terseUTCCurrentTime());
     if (!swFile.isOK()) {

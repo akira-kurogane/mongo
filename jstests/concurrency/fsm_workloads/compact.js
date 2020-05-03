@@ -6,10 +6,16 @@
  * Bulk inserts 1000 documents and builds indexes. Then alternates between compacting the
  * collection and verifying the number of documents and indexes. Operates on a separate collection
  * for each thread.
+ *
+ * There is a known hang during concurrent FSM workloads with the compact command used
+ * with wiredTiger LSM variants. Bypass this command for the wiredTiger LSM variant
+ * until a fix is available for WT-2523.
+ *
+ * @tags: [does_not_support_wiredtiger_lsm, requires_compact]
  */
 
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');    // for dropCollections
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isEphemeral
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
     var data = {
@@ -25,20 +31,23 @@ var $config = (function() {
                 bulk.insert({a: Random.randInt(10), b: Random.randInt(10), c: Random.randInt(10)});
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.nDocumentsToInsert, res.nInserted);
         }
 
         function createIndexes(db, collName) {
             // The number of indexes created here is also stored in data.nIndexes
             var aResult = db[collName].ensureIndex({a: 1});
-            assertAlways.commandWorked(aResult);
+
+            assertWorkedHandleTxnErrors(aResult, ErrorCodes.IndexBuildAlreadyInProgress);
 
             var bResult = db[collName].ensureIndex({b: 1});
-            assertAlways.commandWorked(bResult);
+
+            assertWorkedHandleTxnErrors(bResult, ErrorCodes.IndexBuildAlreadyInProgress);
 
             var cResult = db[collName].ensureIndex({c: 1});
-            assertAlways.commandWorked(cResult);
+
+            assertWorkedHandleTxnErrors(cResult, ErrorCodes.IndexBuildAlreadyInProgress);
         }
 
         // This method is independent of collectionSetup to allow it to be overridden in
@@ -82,32 +91,11 @@ var $config = (function() {
         query: {compact: 0.5, query: 0.5}
     };
 
-    var teardown = function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '_\\d+$');
-        dropCollections(db, pattern);
-    };
-
-    var skip = function skip(cluster) {
-        if (cluster.isRunningWiredTigerLSM()) {
-            // There is a known hang during concurrent FSM workloads with the compact command used
-            // with wiredTiger LSM variants. Bypass this command for the wiredTiger LSM variant
-            // until a fix is available for WT-2523.
-            return {
-                skip: true,
-                msg: 'WT-2523: compact command can cause hang using WT LSM index during ' +
-                    'concurrent workloads'
-            };
-        }
-        return {skip: false};
-    };
-
     return {
-        threadCount: 15,
+        threadCount: 3,
         iterations: 10,
         states: states,
         transitions: transitions,
-        teardown: teardown,
         data: data,
-        skip: skip
     };
 })();

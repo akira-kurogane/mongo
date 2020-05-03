@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,16 +28,56 @@
  */
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
+/**
+ * The state associated with tailable cursors.
+ */
+struct AwaitDataState {
+    /**
+     * The deadline for how long we wait on the tail of capped collection before returning IS_EOF.
+     */
+    Date_t waitForInsertsDeadline;
+
+    /**
+     * If true, when no results are available from a plan, then instead of returning immediately,
+     * the system should wait up to the length of the operation deadline for data to be inserted
+     * which causes results to become available.
+     */
+    bool shouldWaitForInserts;
+};
+
+extern const OperationContext::Decoration<AwaitDataState> awaitDataState;
+
 class BSONObj;
+class CanonicalQuery;
 class QueryRequest;
 
-// Enabling this fail point will cause the getMore command to busy wait after pinning the cursor,
-// until the fail point is disabled.
-MONGO_FP_FORWARD_DECLARE(keepCursorPinnedDuringGetMore);
+// Failpoint for making find hang.
+extern FailPoint waitInFindBeforeMakingBatch;
+
+// Failpoint for making getMore not wait for an awaitdata cursor. Allows us to avoid waiting during
+// tests.
+extern FailPoint disableAwaitDataForGetMoreCmd;
+
+// Enabling this fail point will cause getMores to busy wait after pinning the cursor
+// but before we have started building the batch, until the fail point is disabled.
+extern FailPoint waitAfterPinningCursorBeforeGetMoreBatch;
+
+// Enabling this fail point will cause getMores to busy wait after setting up the plan executor and
+// before beginning the batch.
+extern FailPoint waitWithPinnedCursorDuringGetMoreBatch;
+
+// Enabling this failpoint will cause getMores to wait just before it unpins its cursor after it
+// has completed building the current batch.
+extern FailPoint waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch;
+
+// Enabling this failpoint will cause a getMore to fail with a specified exception after it has
+// checked out its cursor and the originating command has been made available to CurOp.
+extern FailPoint failGetMoreAfterCursorCheckout;
 
 /**
  * Suite of find/getMore related functions used in both the mongod and mongos query paths.
@@ -80,15 +121,13 @@ public:
     static bool haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int bytesBuffered);
 
     /**
-     * Transforms the raw sort spec into one suitable for use as the ordering specification in
-     * BSONObj::woCompare().
+     * This function wraps waitWhileFailPointEnabled() on waitInFindBeforeMakingBatch.
      *
-     * In particular, eliminates text score meta-sort from 'sortSpec'.
-     *
-     * The input must be validated (each BSON element must be either a number or text score
-     * meta-sort specification).
+     * Since query processing happens in three different places, this function makes it easier to
+     * check the failpoint for a query's namespace and log a helpful diagnostic message when the
+     * failpoint is active.
      */
-    static BSONObj transformSortSpec(const BSONObj& sortSpec);
+    static void waitInFindBeforeMakingBatch(OperationContext* opCtx, const CanonicalQuery& cq);
 };
 
 }  // namespace mongo

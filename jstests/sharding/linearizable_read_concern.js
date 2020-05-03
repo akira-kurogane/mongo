@@ -25,99 +25,104 @@ load("jstests/replsets/rslib.js");
 load("jstests/libs/write_concern_util.js");
 
 (function() {
-    "use strict";
+"use strict";
 
-    var testName = "linearizable_read_concern";
+// Skip db hash check and shard replication since this test leaves a replica set shard
+// partitioned.
+TestData.skipCheckDBHashes = true;
+TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
 
-    var st = new ShardingTest({
-        name: testName,
-        shards: 2,
-        other: {rs0: {nodes: 3}, rs1: {nodes: 3}, useBridge: true},
-        mongos: 1,
-        config: 1,
-        enableBalancer: false
-    });
+var testName = "linearizable_read_concern";
 
-    jsTestLog("Setting up sharded cluster.");
+var st = new ShardingTest({
+    name: testName,
+    shards: 2,
+    other: {rs0: {nodes: 3}, rs1: {nodes: 3}, useBridge: true},
+    mongos: 1,
+    config: 1,
+    enableBalancer: false
+});
 
-    // Set up the sharded cluster.
-    var dbName = testName;
-    var collName = "test";
-    var collNamespace = dbName + "." + collName;
-    var shard0ReplTest = st.rs0;
-    var shard1ReplTest = st.rs1;
-    var testDB = st.s.getDB(dbName);
+jsTestLog("Setting up sharded cluster.");
 
-    // Set high election timeout so that primary doesn't step down during linearizable read test.
-    var cfg = shard0ReplTest.getReplSetConfigFromNode(0);
-    cfg.settings.electionTimeoutMillis = shard0ReplTest.kDefaultTimeoutMS;
-    reconfig(shard0ReplTest, cfg, true);
+// Set up the sharded cluster.
+var dbName = testName;
+var collName = "test";
+var collNamespace = dbName + "." + collName;
+var shard0ReplTest = st.rs0;
+var shard1ReplTest = st.rs1;
+var testDB = st.s.getDB(dbName);
 
-    // Set up sharded collection. Put 5 documents on each shard, with keys {x: 0...9}.
-    var numDocs = 10;
-    shardCollectionWithChunks(st, testDB[collName], numDocs);
+// Set high election timeout so that primary doesn't step down during linearizable read test.
+var cfg = shard0ReplTest.getReplSetConfigFromNode(0);
+cfg.settings.electionTimeoutMillis = shard0ReplTest.kDefaultTimeoutMS;
+reconfig(shard0ReplTest, cfg, true);
 
-    // Make sure the 'shardIdentity' document on each shard is replicated to all secondary nodes
-    // before issuing reads against them.
-    shard0ReplTest.awaitReplication();
-    shard1ReplTest.awaitReplication();
+// Set up sharded collection. Put 5 documents on each shard, with keys {x: 0...9}.
+var numDocs = 10;
+shardCollectionWithChunks(st, testDB[collName], numDocs);
 
-    // Print current sharding stats for debugging.
-    st.printShardingStatus(5);
+// Make sure the 'shardIdentity' document on each shard is replicated to all secondary nodes
+// before issuing reads against them.
+shard0ReplTest.awaitReplication();
+shard1ReplTest.awaitReplication();
 
-    // Filter to target one document in each shard.
-    var shard0DocKey = 2;
-    var shard1DocKey = 7;
-    var dualShardQueryFilter = {$or: [{x: shard0DocKey}, {x: shard1DocKey}]};
+// Print current sharding stats for debugging.
+st.printShardingStatus(5);
 
-    jsTestLog("Testing linearizable read from secondaries");
+// Filter to target one document in each shard.
+var shard0DocKey = 2;
+var shard1DocKey = 7;
+var dualShardQueryFilter = {$or: [{x: shard0DocKey}, {x: shard1DocKey}]};
 
-    // Execute a linearizable read from secondaries (targeting both shards) which should fail.
-    st.s.setReadPref("secondary");
-    var res = assert.commandFailed(testDB.runReadCommand({
-        find: collName,
-        filter: dualShardQueryFilter,
-        readConcern: {level: "linearizable"},
-        maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
-    }));
-    assert.eq(res.code, ErrorCodes.NotMaster);
+jsTestLog("Testing linearizable read from secondaries");
 
-    jsTestLog("Testing linearizable read from primaries.");
+// Execute a linearizable read from secondaries (targeting both shards) which should fail.
+st.s.setReadPref("secondary");
+var res = assert.commandFailed(testDB.runReadCommand({
+    find: collName,
+    filter: dualShardQueryFilter,
+    readConcern: {level: "linearizable"},
+    maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
+}));
+assert.eq(res.code, ErrorCodes.NotMaster);
 
-    // Execute a linearizable read from primaries (targeting both shards) which should succeed.
-    st.s.setReadPref("primary");
-    var res = assert.writeOK(testDB.runReadCommand({
-        find: collName,
-        sort: {x: 1},
-        filter: dualShardQueryFilter,
-        readConcern: {level: "linearizable"},
-        maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
-    }));
+jsTestLog("Testing linearizable read from primaries.");
 
-    // Make sure data was returned from both shards correctly.
-    assert.eq(res.cursor.firstBatch[0].x, shard0DocKey);
-    assert.eq(res.cursor.firstBatch[1].x, shard1DocKey);
+// Execute a linearizable read from primaries (targeting both shards) which should succeed.
+st.s.setReadPref("primary");
+var res = assert.commandWorked(testDB.runReadCommand({
+    find: collName,
+    sort: {x: 1},
+    filter: dualShardQueryFilter,
+    readConcern: {level: "linearizable"},
+    maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
+}));
 
-    jsTestLog("Testing linearizable read targeting partitioned primary.");
+// Make sure data was returned from both shards correctly.
+assert.eq(res.cursor.firstBatch[0].x, shard0DocKey);
+assert.eq(res.cursor.firstBatch[1].x, shard1DocKey);
 
-    var primary = shard0ReplTest.getPrimary();
-    var secondaries = shard0ReplTest.getSecondaries();
+jsTestLog("Testing linearizable read targeting partitioned primary.");
 
-    // Partition the primary in the first shard.
-    secondaries[0].disconnect(primary);
-    secondaries[1].disconnect(primary);
+var primary = shard0ReplTest.getPrimary();
+var secondaries = shard0ReplTest.getSecondaries();
 
-    jsTestLog("Current Replica Set Topology of First Shard: [Secondary-Secondary] [Primary]");
+// Partition the primary in the first shard.
+secondaries[0].disconnect(primary);
+secondaries[1].disconnect(primary);
 
-    // Execute a linearizable read targeting the partitioned primary in first shard, and good
-    // primary in the second shard. This should time out due to partitioned primary.
-    var result = testDB.runReadCommand({
-        find: collName,
-        filter: dualShardQueryFilter,
-        readConcern: {level: "linearizable"},
-        maxTimeMS: 3000
-    });
-    assert.commandFailedWithCode(result, ErrorCodes.ExceededTimeLimit);
+jsTestLog("Current Replica Set Topology of First Shard: [Secondary-Secondary] [Primary]");
 
-    st.stop();
+// Execute a linearizable read targeting the partitioned primary in first shard, and good
+// primary in the second shard. This should time out due to partitioned primary.
+var result = testDB.runReadCommand({
+    find: collName,
+    filter: dualShardQueryFilter,
+    readConcern: {level: "linearizable"},
+    maxTimeMS: 3000
+});
+assert.commandFailedWithCode(result, ErrorCodes.MaxTimeMSExpired);
+
+st.stop();
 })();

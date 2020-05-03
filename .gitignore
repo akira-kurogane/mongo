@@ -3,13 +3,12 @@
 /.jsdbshell
 /.dbshell
 /*.ninja
-/*.ninja.deps
+/*.ninja.*
 /.ninja_deps
 /.ninja_log
 /perf.data
 /perf.data.old
 /massif.out.*
-/smoke-last.json
 
 *~
 *.swp
@@ -21,10 +20,10 @@
 *.tar.gz
 *.suo
 *.ncb
-*.idb 
-*.obj 
-*.opt 
-*.pch 
+*.idb
+*.obj
+*.opt
+*.pch
 *.jsh
 *.jsall
 *.pyc
@@ -61,7 +60,6 @@ settings.py
 log_config.py
 /tags
 TAGS
-failfile.smoke
 
 # temp dirs
 dump
@@ -78,12 +76,19 @@ scratch
 /loadgen
 /mongo
 /mongobridge
+/mongocryptd
 /mongod
+/mongoed
 /mongogrid
+/mongokerberos
+/mongoldap
 /mongoperf
 /mongos
 /mongoshim
 /mongosniff
+/mongotmock
+/mongotrafficreader
+/wt
 
 *.tgz
 *.zip
@@ -94,6 +99,7 @@ scratch
 /libmongotestfiles.*
 /libmongoshellfiles.*
 /sharedclient
+/genny
 
 /emr.jar
 *.class
@@ -112,6 +118,13 @@ scratch
 /perftest
 /clientTest
 /httpClientTest
+/genny_results
+
+# benchrun files
+/benchrun_embedded
+
+# Linters
+.mypy_cache
 
 #debian
 build-stamp
@@ -135,6 +148,8 @@ debian/mongodb
 .cproject
 .project
 .pydevproject
+.externalToolBuilders/
+.settings/
 
 # Idea CLion project artifacts
 .idea
@@ -143,8 +158,10 @@ CMakeLists.txt
 # XCode projects
 .xcworkspace
 
-# VSCode projects
+# Visual Studio and VSCode projects
 .vscode/
+.vs/
+/x64/
 
 # Windows MSI builder artifacts
 *.msi
@@ -152,4 +169,23 @@ CMakeLists.txt
 *.wixpdb
 DriverInclude.wxs
 
+# Gradle
+.gradle
+src/mongo/embedded/java/build/
+src/mongo/embedded/java/aar/build/
+src/mongo/embedded/java/jar/build/
+local.properties
+
 compile_commands.json
+generated_resmoke_config
+selected_tests_config
+
+# Code review tool config
+codereview.rc
+
+# Python venvs and virtualenvs
+python3-venv
+python2-venv
+
+# Generated resmoke configuration file
+resmoke.ini

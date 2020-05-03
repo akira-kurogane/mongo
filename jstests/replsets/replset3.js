@@ -25,19 +25,15 @@ var doTest = function(signal) {
 
     print(phase++);
 
-    // Step down master.  Note: this will close our connection!
-    try {
-        master.getDB("admin").runCommand({replSetStepDown: 0, force: 1});
-    } catch (err) {
-        print("caught: " + err + " on stepdown");
-    }
+    // Step down master.
+    assert.commandWorked(master.getDB("admin").runCommand({replSetStepDown: 0, force: 1}));
 
     print(phase++);
 
     try {
         var new_master = replTest.getPrimary();
     } catch (err) {
-        throw("Could not elect new master before timeout.");
+        throw ("Could not elect new master before timeout.");
     }
 
     print(phase++);
@@ -52,7 +48,7 @@ var doTest = function(signal) {
 
     print(phase++);
 
-    var slaves = replTest.liveNodes.slaves;
+    var slaves = replTest._slaves;
     assert.soon(function() {
         try {
             var res = slaves[0].getDB("admin").runCommand({replSetGetStatus: 1});

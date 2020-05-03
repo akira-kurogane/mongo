@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,20 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/service_entry_point_utils.h"
 
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include <functional>
+#include <memory>
+
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/thread_safety_context.h"
 
-#ifdef __linux__  // TODO: consider making this ifndef _WIN32
+#if !defined(_WIN32)
 #include <sys/resource.h>
 #endif
 
@@ -51,32 +54,30 @@ namespace mongo {
 
 namespace {
 void* runFunc(void* ctx) {
-    std::unique_ptr<stdx::function<void()>> taskPtr(static_cast<stdx::function<void()>*>(ctx));
+    std::unique_ptr<std::function<void()>> taskPtr(static_cast<std::function<void()>*>(ctx));
     (*taskPtr)();
 
     return nullptr;
 }
 }  // namespace
 
-Status launchServiceWorkerThread(stdx::function<void()> task) {
-    auto ctx = stdx::make_unique<stdx::function<void()>>(std::move(task));
+Status launchServiceWorkerThread(std::function<void()> task) {
 
     try {
-#ifndef __linux__  // TODO: consider making this ifdef _WIN32
-        stdx::thread(stdx::bind(runFunc, ctx.get())).detach();
-        ctx.release();
+#if defined(_WIN32)
+        stdx::thread(std::move(task)).detach();
 #else
         pthread_attr_t attrs;
         pthread_attr_init(&attrs);
         pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
 
-        static const size_t STACK_SIZE =
+        static const rlim_t kStackSize =
             1024 * 1024;  // if we change this we need to update the warning
 
         struct rlimit limits;
         invariant(getrlimit(RLIMIT_STACK, &limits) == 0);
-        if (limits.rlim_cur > STACK_SIZE) {
-            size_t stackSizeToSet = STACK_SIZE;
+        if (limits.rlim_cur > kStackSize) {
+            size_t stackSizeToSet = kStackSize;
 #if !__has_feature(address_sanitizer)
             if (kDebugBuild)
                 stackSizeToSet /= 2;
@@ -84,25 +85,38 @@ Status launchServiceWorkerThread(stdx::function<void()> task) {
             int failed = pthread_attr_setstacksize(&attrs, stackSizeToSet);
             if (failed) {
                 const auto ewd = errnoWithDescription(failed);
-                warning() << "pthread_attr_setstacksize failed: " << ewd;
+                LOGV2_WARNING(22949, "pthread_attr_setstacksize failed: {ewd}", "ewd"_attr = ewd);
             }
         } else if (limits.rlim_cur < 1024 * 1024) {
-            warning() << "Stack size set to " << (limits.rlim_cur / 1024) << "KB. We suggest 1MB";
+            LOGV2_WARNING(22950,
+                          "Stack size set to {limits_rlim_cur_1024}KB. We suggest 1MB",
+                          "limits_rlim_cur_1024"_attr = (limits.rlim_cur / 1024));
         }
 
+        // Wrap the user-specified `task` so it runs with an installed `sigaltstack`.
+        task = [sigAltStackController = std::make_shared<stdx::support::SigAltStackController>(),
+                f = std::move(task)] {
+            auto sigAltStackGuard = sigAltStackController->makeInstallGuard();
+            f();
+        };
 
         pthread_t thread;
+        auto ctx = std::make_unique<std::function<void()>>(std::move(task));
+        ThreadSafetyContext::getThreadSafetyContext()->onThreadCreate();
         int failed = pthread_create(&thread, &attrs, runFunc, ctx.get());
 
         pthread_attr_destroy(&attrs);
 
         if (failed) {
-            log() << "pthread_create failed: " << errnoWithDescription(failed);
+            LOGV2(22948,
+                  "pthread_create failed: {errnoWithDescription_failed}",
+                  "errnoWithDescription_failed"_attr = errnoWithDescription(failed));
             throw std::system_error(
                 std::make_error_code(std::errc::resource_unavailable_try_again));
         }
+
         ctx.release();
-#endif  // __linux__
+#endif
 
     } catch (...) {
         return {ErrorCodes::InternalError, "failed to create service entry worker thread"};

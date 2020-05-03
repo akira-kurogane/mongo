@@ -4,6 +4,16 @@
 // so cannot be run on the ephemeralForTest storage engine, as it accepts all journaled writes.
 // @tags: [SERVER-21420]
 
+(function() {
+
+// Skip this test if running with the "wiredTiger" storage engine, since it requires
+// using 'nojournal' in a replica set, which is not supported when using WT.
+if (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger") {
+    // WT is currently the default engine so it is used when 'storageEngine' is not set.
+    jsTest.log("Skipping test because it is not applicable for the wiredTiger storage engine");
+    return;
+}
+
 var request;
 var result;
 
@@ -157,7 +167,7 @@ request = {
     writeConcern: {wtimeout: 1},
     ordered: false
 };
-result = assert.commandWorked(coll.runCommand(request));
+result = assert.commandWorkedIgnoringWriteErrors(coll.runCommand(request));
 assert.eq(1, result.n);
 assert.eq(result.writeErrors.length, 1);
 assert.eq(result.writeErrors[0].index, 1);
@@ -166,3 +176,4 @@ assert.eq(1, coll.find().itcount());
 
 jsTest.log("DONE no journal/repl tests");
 rst.stopSet();
+})();

@@ -1,45 +1,47 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/sharding_mongod_test_fixture.h"
+#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 namespace {
@@ -48,7 +50,8 @@ using executor::RemoteCommandRequest;
 using unittest::assertGet;
 
 const NamespaceString kNss("TestDB", "TestColl");
-const BSONObj kShardKeyPattern{BSON("X" << 1)};
+const std::string kShardKey = "X";
+const BSONObj kShardKeyPattern{BSON(kShardKey << 1)};
 const ConnectionString kConfigConnStr =
     ConnectionString::forReplicaSet("Donor",
                                     {HostAndPort("DonorHost1:1234"),
@@ -65,22 +68,16 @@ const ConnectionString kRecipientConnStr =
                                      HostAndPort("RecipientHost2:1234"),
                                      HostAndPort("RecipientHost3:1234")});
 
-class MigrationChunkClonerSourceLegacyTest : public ShardingMongodTestFixture {
+class MigrationChunkClonerSourceLegacyTest : public ShardServerTestFixture {
 protected:
     void setUp() override {
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        ShardingMongodTestFixture::setUp();
+        ShardServerTestFixture::setUp();
 
         // TODO: SERVER-26919 set the flag on the mock repl coordinator just for the window where it
         // actually needs to bypass the op observer.
         replicationCoordinator()->alwaysAllowWrites(true);
 
-        ASSERT_OK(initializeGlobalShardingStateForMongodForTest(kConfigConnStr));
-
         _client.emplace(operationContext());
-
-        RemoteCommandTargeterMock::get(shardRegistry()->getConfigShard()->getTargeter())
-            ->setConnectionStringReturnValue(kConfigConnStr);
 
         {
             auto donorShard = assertGet(
@@ -99,12 +96,22 @@ protected:
             RemoteCommandTargeterMock::get(recipientShard->getTargeter())
                 ->setFindHostReturnValue(kRecipientConnStr.getServers()[0]);
         }
+
+        auto clockSource = std::make_unique<ClockSourceMock>();
+
+        // Timestamps of "0 seconds" are not allowed, so we must advance our clock mock to the first
+        // real second.
+        clockSource->advance(Seconds(1));
+
+        operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
+
+        _lsid = makeLogicalSessionId(operationContext());
     }
 
     void tearDown() override {
         _client.reset();
 
-        ShardingMongodTestFixture::tearDown();
+        ShardServerTestFixture::tearDown();
     }
 
     /**
@@ -116,16 +123,53 @@ protected:
     }
 
     /**
+     * Inserts the specified docs in 'kNss' and ensures the insert succeeded.
+     */
+    void insertDocsInShardedCollection(const std::vector<BSONObj>& docs) {
+        if (docs.empty())
+            return;
+
+        client()->insert(kNss.ns(), docs);
+        ASSERT_EQ("", client()->getLastError());
+    }
+
+    /**
      * Creates a collection, which contains an index corresponding to kShardKeyPattern and insers
      * the specified initial documents.
      */
-    void createShardedCollection(std::vector<BSONObj> initialDocs) {
+    void createShardedCollection(const std::vector<BSONObj>& initialDocs) {
         ASSERT(_client->createCollection(kNss.ns()));
-        _client->createIndex(kNss.ns(), kShardKeyPattern);
+        const auto uuid = [&] {
+            AutoGetCollection autoColl(operationContext(), kNss, MODE_IX);
+            return autoColl.getCollection()->uuid();
+        }();
 
-        if (!initialDocs.empty()) {
-            _client->insert(kNss.ns(), initialDocs);
-        }
+        [&] {
+            const OID epoch = OID::gen();
+
+            auto rt = RoutingTableHistory::makeNew(
+                kNss,
+                uuid,
+                kShardKeyPattern,
+                nullptr,
+                false,
+                epoch,
+                {ChunkType{kNss,
+                           ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
+                           ChunkVersion(1, 0, epoch),
+                           ShardId("dummyShardId")}});
+
+            std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
+
+            AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
+            Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
+            CollectionShardingRuntime::get(operationContext(), kNss)
+                ->setFilteringMetadata(operationContext(),
+                                       CollectionMetadata(cm, ShardId("dummyShardId")));
+        }();
+
+        _client->createIndex(kNss.ns(), kShardKeyPattern);
+        insertDocsInShardedCollection(initialDocs);
     }
 
     /**
@@ -144,7 +188,8 @@ protected:
             chunkRange,
             1024 * 1024,
             MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kDefault),
-            false);
+            false,
+            MoveChunkRequest::ForceJumbo::kDoNotForce);
 
         return assertGet(MoveChunkRequest::createFromCommand(kNss, cmdBuilder.obj()));
     }
@@ -155,6 +200,10 @@ protected:
     static BSONObj createCollectionDocument(int value) {
         return BSON("_id" << value << "X" << value);
     }
+
+protected:
+    LogicalSessionId _lsid;
+    TxnNumber _txnNumber{0};
 
 private:
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
@@ -178,7 +227,7 @@ private:
             }
         };
 
-        return stdx::make_unique<StaticCatalogClient>();
+        return std::make_unique<StaticCatalogClient>();
     }
 
     boost::optional<DBDirectClient> _client;
@@ -203,8 +252,8 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
             onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
         });
 
-        ASSERT_OK(cloner.startClone(operationContext()));
-        futureStartClone.timed_get(kFutureTimeout);
+        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
+        futureStartClone.default_timed_get();
     }
 
     // Ensure the initial clone documents are available
@@ -231,13 +280,13 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
     }
 
     // Insert some documents in the chunk range to be included for migration
-    client()->insert(kNss.ns(), createCollectionDocument(150));
-    client()->insert(kNss.ns(), createCollectionDocument(151));
+    insertDocsInShardedCollection({createCollectionDocument(150)});
+    insertDocsInShardedCollection({createCollectionDocument(151)});
 
     // Insert some documents which are outside of the chunk range and should not be included for
     // migration
-    client()->insert(kNss.ns(), createCollectionDocument(90));
-    client()->insert(kNss.ns(), createCollectionDocument(210));
+    insertDocsInShardedCollection({createCollectionDocument(90)});
+    insertDocsInShardedCollection({createCollectionDocument(210)});
 
     // Normally the insert above and the onInsert/onDelete callbacks below will happen under the
     // same lock and write unit of work
@@ -246,14 +295,14 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
 
         WriteUnitOfWork wuow(operationContext());
 
-        cloner.onInsertOp(operationContext(), createCollectionDocument(90));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(150));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(151));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(210));
+        cloner.onInsertOp(operationContext(), createCollectionDocument(90), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(150), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(151), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(210), {});
 
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(80));
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(199));
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(220));
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(80), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(199), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(220), {}, {});
 
         wuow.commit();
     }
@@ -291,7 +340,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
     });
 
     ASSERT_OK(cloner.commitClone(operationContext()));
-    futureCommit.timed_get(kFutureTimeout);
+    futureCommit.default_timed_get();
 }
 
 TEST_F(MigrationChunkClonerSourceLegacyTest, CollectionNotFound) {
@@ -301,7 +350,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CollectionNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext()));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
     cloner.cancelClone(operationContext());
 }
 
@@ -314,7 +363,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ShardKeyIndexNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext()));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
     cloner.cancelClone(operationContext());
 }
 
@@ -340,9 +389,10 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
             });
         });
 
-        auto startCloneStatus = cloner.startClone(operationContext());
+        auto startCloneStatus =
+            cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false);
         ASSERT_EQ(ErrorCodes::NetworkTimeout, startCloneStatus.code());
-        futureStartClone.timed_get(kFutureTimeout);
+        futureStartClone.default_timed_get();
     }
 
     // Ensure that if the recipient tries to fetch some documents, the cloner won't crash

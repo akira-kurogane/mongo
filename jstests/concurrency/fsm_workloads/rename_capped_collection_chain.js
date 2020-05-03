@@ -6,11 +6,11 @@
  * Creates a capped collection and then repeatedly executes the renameCollection
  * command against it. The previous "to" namespace is used as the next "from"
  * namespace.
+ *
+ * @tags: [requires_capped]
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropCollections
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as a prefix for the collection name,
         // since the workload name is assumed to be unique.
@@ -18,7 +18,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function uniqueCollectionName(prefix, tid, num) {
             return prefix + tid + '_' + num;
         }
@@ -42,15 +41,9 @@ var $config = (function() {
         }
 
         return {init: init, rename: rename};
-
     })();
 
     var transitions = {init: {rename: 1}, rename: {rename: 1}};
-
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropCollections(db, pattern);
-    }
 
     return {
         threadCount: 10,
@@ -58,7 +51,5 @@ var $config = (function() {
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
-
 })();

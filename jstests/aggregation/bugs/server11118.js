@@ -1,20 +1,20 @@
 // SERVER-11118 Tests for $dateToString
+(function() {
+"use strict";
 
 load('jstests/aggregation/extras/utils.js');
 
-db = db.getSiblingDB("aggdb");
+const coll = db.server11118;
 
 // Used to verify expected output format
 function testFormat(date, formatStr, expectedStr) {
-    db.dates.drop();
-    db.dates.insert({date: date});
+    coll.drop();
+    assert.commandWorked(coll.insert({date: date}));
 
-    var res =
-        db.dates
-            .aggregate([{
-                $project:
-                    {_id: 0, formatted: {$dateToString: {format: formatStr, date: "$date"}}}
-            }])
+    const res =
+        coll.aggregate([
+                {$project: {_id: 0, formatted: {$dateToString: {format: formatStr, date: "$date"}}}}
+            ])
             .toArray();
 
     assert.eq(res[0].formatted, expectedStr);
@@ -22,22 +22,22 @@ function testFormat(date, formatStr, expectedStr) {
 
 // Used to verify that server recognizes bad formats
 function testFormatError(formatObj, errCode) {
-    db.dates.drop();
-    db.dates.insert({tm: ISODate()});
+    coll.drop();
+    assert.commandWorked(coll.insert({date: ISODate()}));
 
-    assertErrorCode(db.dates, {$project: {_id: 0, formatted: {$dateToString: formatObj}}}, errCode);
+    assertErrorCode(coll, {$project: {_id: 0, formatted: {$dateToString: formatObj}}}, errCode);
 }
 
 // Used to verify that only date values are accepted for date parameter
 function testDateValueError(dateVal, errCode) {
-    db.dates.drop();
-    db.dates.insert({date: dateVal});
+    coll.drop();
+    assert.commandWorked(coll.insert({date: dateVal}));
 
     assertErrorCode(
-        db.dates, {$project: {formatted: {$dateToString: {format: "%Y", date: "$date"}}}}, errCode);
+        coll, {$project: {formatted: {$dateToString: {format: "%Y", date: "$date"}}}}, errCode);
 }
 
-var now = ISODate();
+const now = ISODate();
 
 // Use all modifiers we can test with js provided function
 testFormat(now, "%%-%Y-%m-%d-%H-%M-%S-%L", [
@@ -52,7 +52,7 @@ testFormat(now, "%%-%Y-%m-%d-%H-%M-%S-%L", [
 ].join("-"));
 
 // Padding tests
-var padme = ISODate("2001-02-03T04:05:06.007Z");
+const padme = ISODate("2001-02-03T04:05:06.007Z");
 
 testFormat(padme, "%%", "%");
 testFormat(padme, "%Y", padme.getUTCFullYear().zeroPad(4));
@@ -83,9 +83,6 @@ testFormat(ISODate('1999-01-02 03:04:05.006Z'), "%U-%w-%j", "00-7-002");
 // Missing date
 testFormatError({format: "%Y"}, 18628);
 
-// Missing format
-testFormatError({date: "$date"}, 18627);
-
 // Extra field
 testFormatError({format: "%Y", date: "$date", extra: "whyamIhere"}, 18534);
 
@@ -110,17 +107,14 @@ testFormatError({format: {iamalion: "roar"}, date: "$date"}, 18533);
 ///
 
 // Test document
-var date = ISODate("1999-08-29");
+const date = ISODate("1999-08-29");
 
 testFormat(date, "%%d", "%d");
 
 // A very long string of "%"s
-var longstr = Array(1000).join("%%");
-var halfstr = Array(1000).join("%");
+const longstr = Array(1000).join("%%");
+const halfstr = Array(1000).join("%");
 testFormat(date, longstr, halfstr);
-
-// Using subexpressions as format strings (eg "format: '$b'")
-testFormat(date, "$b", "$b");
 
 // Dates as null (should return a null)
 testFormat(null, "%Y", null);
@@ -156,3 +150,4 @@ testFormatError({format: 1, date: "$date"}, 18533);
 
 // Date
 testFormatError({format: ISODate(), date: "$date"}, 18533);
+})();

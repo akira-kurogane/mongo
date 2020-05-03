@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,16 +40,23 @@ namespace repl {
  */
 class TaskExecutorMock : public unittest::TaskExecutorProxy {
 public:
-    using ShouldFailScheduleWorkRequestFn = stdx::function<bool()>;
+    using ShouldFailScheduleWorkRequestFn = std::function<bool()>;
     using ShouldFailScheduleRemoteCommandRequestFn =
-        stdx::function<bool(const executor::RemoteCommandRequest&)>;
+        std::function<bool(const executor::RemoteCommandRequestOnAny&)>;
 
     explicit TaskExecutorMock(executor::TaskExecutor* executor);
 
-    StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work) override;
-    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb) override;
+    StatusWith<CallbackHandle> scheduleWork(CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) override;
+    StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
+        const executor::RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const executor::RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) override;
+    bool hasTasks() override;
 
     // Override to make scheduleWork() fail during testing.
     ShouldFailScheduleWorkRequestFn shouldFailScheduleWorkRequest = []() { return false; };
@@ -65,7 +73,7 @@ public:
 
     // Override to make scheduleRemoteCommand fail during testing.
     ShouldFailScheduleRemoteCommandRequestFn shouldFailScheduleRemoteCommandRequest =
-        [](const executor::RemoteCommandRequest&) { return false; };
+        [](const executor::RemoteCommandRequestOnAny&) { return false; };
 };
 
 }  // namespace repl

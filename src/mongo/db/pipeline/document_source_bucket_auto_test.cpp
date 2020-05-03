@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,23 +38,23 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_bucket_auto.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/value.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
-using std::deque;
-using std::vector;
-using std::string;
 using boost::intrusive_ptr;
+using std::deque;
+using std::string;
+using std::vector;
 
 class BucketAutoTests : public AggregationContextFixture {
 public:
@@ -71,7 +72,7 @@ public:
             mockInputs.emplace_back(std::move(input));
         }
 
-        auto source = DocumentSourceMock::create(std::move(mockInputs));
+        auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
         bucketAutoStage->setSource(source.get());
 
         vector<Document> results;
@@ -316,13 +317,15 @@ TEST_F(BucketAutoTests, RespectsCanonicalTypeOrderingOfValues) {
 TEST_F(BucketAutoTests, ShouldPropagatePauses) {
     auto bucketAutoSpec = fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2}}");
     auto bucketAutoStage = createBucketAuto(bucketAutoSpec);
-    auto source = DocumentSourceMock::create({Document{{"x", 1}},
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document{{"x", 2}},
-                                              Document{{"x", 3}},
-                                              DocumentSource::GetNextResult::makePauseExecution(),
-                                              Document{{"x", 4}},
-                                              DocumentSource::GetNextResult::makePauseExecution()});
+    auto source =
+        DocumentSourceMock::createForTest({Document{{"x", 1}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"x", 2}},
+                                           Document{{"x", 3}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"x", 4}},
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     bucketAutoStage->setSource(source.get());
 
     // The $bucketAuto stage needs to consume all inputs before returning any output, so we should
@@ -350,7 +353,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
     auto expCtx = getExpCtx();
     unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
     expCtx->tempDir = tempDir.path();
-    expCtx->extSortAllowed = true;
+    expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -361,10 +364,11 @@ TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
         expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            Document{{"a", 2}, {"largeStr", largeStr}},
-                                            Document{{"a", 3}, {"largeStr", largeStr}}});
+    auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                                   Document{{"a", 1}, {"largeStr", largeStr}},
+                                                   Document{{"a", 2}, {"largeStr", largeStr}},
+                                                   Document{{"a", 3}, {"largeStr", largeStr}}},
+                                                  expCtx);
     bucketAutoStage->setSource(mock.get());
 
     auto next = bucketAutoStage->getNext();
@@ -386,7 +390,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
     // Allow the $sort stage to spill to disk.
     unittest::TempDir tempDir("DocumentSourceBucketAutoTest");
     expCtx->tempDir = tempDir.path();
-    expCtx->extSortAllowed = true;
+    expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -395,15 +399,17 @@ TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
         expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
-    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), 0, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 2}, {"largeStr", largeStr}},
-                                            Document{{"a", 3}, {"largeStr", largeStr}}});
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 2}, {"largeStr", largeStr}},
+                                           Document{{"a", 3}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // There were 2 pauses, so we should expect 2 paused results before any results can be
@@ -436,7 +442,7 @@ TEST_F(BucketAutoTests, ShouldAddDependenciesOfGroupByFieldAndComputedFields) {
                                   "{$sum : '$a'}, field2 : {$avg : '$b'}}}}"));
 
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
     ASSERT_EQUALS(3U, dependencies.fields.size());
 
     // Dependency from 'groupBy'
@@ -447,19 +453,19 @@ TEST_F(BucketAutoTests, ShouldAddDependenciesOfGroupByFieldAndComputedFields) {
     ASSERT_EQUALS(1U, dependencies.fields.count("b"));
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromGroupByField) {
     auto bucketAuto =
         createBucketAuto(fromjson("{$bucketAuto : {groupBy : {$meta: 'textScore'}, buckets : 2}}"));
 
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
     ASSERT_EQUALS(0U, dependencies.fields.size());
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromOutputField) {
@@ -467,15 +473,15 @@ TEST_F(BucketAutoTests, ShouldNeedTextScoreInDependenciesFromOutputField) {
         createBucketAuto(fromjson("{$bucketAuto : {groupBy : '$x', buckets : 2, output: {avg : "
                                   "{$avg : {$meta : 'textScore'}}}}}"));
 
-    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
+    DepsTracker dependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_ALL, bucketAuto->getDependencies(&dependencies));
     ASSERT_EQUALS(1U, dependencies.fields.size());
 
     // Dependency from 'groupBy'
     ASSERT_EQUALS(1U, dependencies.fields.count("x"));
 
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(BucketAutoTests, SerializesDefaultAccumulatorIfOutputFieldIsNotSpecified) {
@@ -512,7 +518,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToReParseSerializedStage) {
     ASSERT_EQUALS(serialization.size(), 1UL);
     ASSERT_EQUALS(serialization[0].getType(), BSONType::Object);
 
-    ASSERT_EQUALS(serialization[0].getDocument().size(), 1UL);
+    ASSERT_EQUALS(serialization[0].getDocument().computeSize(), 1ULL);
     ASSERT_EQUALS(serialization[0].getDocument()["$bucketAuto"].getType(), BSONType::Object);
 
     auto serializedBson = serialization[0].getDocument().toBson();
@@ -637,32 +643,35 @@ void assertCannotSpillToDisk(const boost::intrusive_ptr<ExpressionContext>& expC
         expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes, 'x');
-    auto mock = DocumentSourceMock::create(
-        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}});
+    auto mock = DocumentSourceMock::createForTest(
+        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}},
+        expCtx);
     bucketAutoStage->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldFailIfBufferingTooManyDocuments) {
     auto expCtx = getExpCtx();
 
-    expCtx->extSortAllowed = false;
+    expCtx->allowDiskUse = false;
     expCtx->inMongos = false;
     assertCannotSpillToDisk(expCtx);
 
-    expCtx->extSortAllowed = true;
+    expCtx->allowDiskUse = true;
     expCtx->inMongos = true;
     assertCannotSpillToDisk(expCtx);
 
-    expCtx->extSortAllowed = false;
+    expCtx->allowDiskUse = false;
     expCtx->inMongos = true;
     assertCannotSpillToDisk(expCtx);
 }
 
 TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
-    expCtx->extSortAllowed = false;
+    expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -673,17 +682,21 @@ TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
         expCtx, groupByExpression, numBuckets, {}, nullptr, maxMemoryUsageBytes);
 
     string largeStr(maxMemoryUsageBytes / 2, 'x');
-    auto mock = DocumentSourceMock::create({Document{{"a", 0}, {"largeStr", largeStr}},
-                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                            Document{{"a", 2}, {"largeStr", largeStr}}});
+    auto mock =
+        DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"a", 1}, {"largeStr", largeStr}},
+                                           Document{{"a", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // The first getNext() should pause.
     ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldRoundUpMaximumBoundariesWithGranularitySpecified) {

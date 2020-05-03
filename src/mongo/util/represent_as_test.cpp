@@ -1,35 +1,38 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include <cmath>
+#include <fmt/format.h>
 #include <limits>
+#include <type_traits>
 
 #include <boost/optional.hpp>
 
@@ -40,6 +43,8 @@
 namespace mongo {
 
 namespace {
+
+using namespace fmt::literals;
 
 // Char values
 const signed char kCharMax = std::numeric_limits<signed char>::max();
@@ -71,7 +76,7 @@ const double kInt32MinAsDouble = kInt32Min;
 const uint32_t kUInt32Zero = 0;
 const uint32_t kUInt32Max = std::numeric_limits<uint32_t>::max();
 const int64_t kUInt32MaxAsInt64 = kUInt32Max;
-const float kUInt32MaxAsFloat = kUInt32Max;
+const float kUInt32MaxAsFloat = static_cast<float>(kUInt32Max);
 const double kUInt32MaxAsDouble = kUInt32Max;
 
 // 64-bit integer values
@@ -79,14 +84,15 @@ const int64_t kInt64Zero = 0;
 const int64_t kInt64Max = std::numeric_limits<int64_t>::max();
 const int64_t kInt64Min = std::numeric_limits<int64_t>::lowest();
 const uint64_t kInt64MaxAsUInt64 = kInt64Max;
-const double kInt64MaxAsDouble = kInt64Max;
+const double kInt64MaxAsDouble = static_cast<double>(kInt64Max);
 const double kInt64MinAsDouble = kInt64Min;
 
 // Unsigned 64-bit integer values
 const uint64_t kUInt64Zero = 0;
 const uint64_t kUInt64Max = std::numeric_limits<uint64_t>::max();
-const float kUInt64MaxAsFloat = kUInt64Max;
-const double kUInt64MaxAsDouble = kUInt64Max;
+const float kUInt64MaxAsFloat = static_cast<float>(kUInt64Max);
+const double kUInt64MaxAsDouble = static_cast<double>(kUInt64Max);
+
 
 // Long long values
 const long long kLongLongMax = std::numeric_limits<long long>::max();
@@ -119,6 +125,11 @@ const uint64_t kUInt64TooPreciseForFloat = kInt32TooPreciseForFloat;
 const uint64_t kUInt64TooPreciseForDouble = kInt64TooPreciseForDouble;
 
 }  // namespace
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4756)  // warning C4756: overflow in constant arithmetic
+#endif
 
 TEST(RepresentAs, Int32ToDouble) {
     ASSERT(*(representAs<double>(kInt32Zero)) == 0);
@@ -239,6 +250,184 @@ TEST(RepresentAs, UnsignedIntToDouble) {
     ASSERT(!(representAs<double>(kUInt64Max)));
 }
 
+template <typename Number>
+void decimal128ToNumber() {
+    const auto floor = std::to_string(std::numeric_limits<Number>::lowest());
+    const auto ceiling = std::to_string(std::numeric_limits<Number>::max());
+
+    ASSERT_EQ(*representAs<Number>(Decimal128(floor)), std::numeric_limits<Number>::lowest());
+    ASSERT_EQ(*representAs<Number>(Decimal128(ceiling)), std::numeric_limits<Number>::max());
+
+    ASSERT_EQ(*representAs<Number>(Decimal128::kNormalizedZero), static_cast<Number>(0));
+    ASSERT_EQ(*representAs<Number>(Decimal128("5")), static_cast<Number>(5));
+
+    ASSERT(!representAs<Number>(Decimal128::kLargestPositive));
+    ASSERT(!representAs<Number>(Decimal128::kLargestNegative));
+}
+
+template <typename Float>
+void decimal128ToFloatingPoint() {
+    decimal128ToNumber<Float>();
+    ASSERT_EQ(*representAs<Float>(Decimal128("-5")), -5);
+    ASSERT_EQ(*representAs<Float>(Decimal128("5.5")), 5.5);
+    ASSERT_EQ(*representAs<Float>(Decimal128("-5.5")), -5.5);
+}
+
+TEST(RepresentAs, Decimal128ToFloat) {
+    decimal128ToFloatingPoint<float>();
+}
+
+TEST(RepresentAs, Decimal128ToDouble) {
+    decimal128ToFloatingPoint<double>();
+}
+
+template <typename Integer>
+void decimal128ToInteger() {
+    decimal128ToNumber<Integer>();
+    ASSERT(!representAs<Integer>(Decimal128("5.5")));
+    ASSERT(!representAs<Integer>(Decimal128("-5.5")));
+
+    ASSERT(!representAs<Integer>(Decimal128::kLargestPositive));
+    ASSERT(!representAs<Integer>(Decimal128::kLargestNegative));
+    ASSERT(!representAs<Integer>(Decimal128::kSmallestPositive));
+    ASSERT(!representAs<Integer>(Decimal128::kSmallestNegative));
+
+    if constexpr (std::is_signed<Integer>()) {
+        ASSERT_EQ(*representAs<Integer>(Decimal128("-5")), -5);
+    } else {
+        ASSERT(!representAs<Integer>(Decimal128("-5")));
+    }
+}
+
+TEST(RepresentAs, Decimal128ToInt8) {
+    decimal128ToInteger<int8_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt8) {
+    decimal128ToInteger<uint8_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt16) {
+    decimal128ToInteger<int16_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt16) {
+    decimal128ToInteger<uint16_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt32) {
+    decimal128ToInteger<int32_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt32) {
+    decimal128ToInteger<uint32_t>();
+}
+
+TEST(RepresentAs, Decimal128ToInt64) {
+    decimal128ToInteger<int64_t>();
+}
+
+TEST(RepresentAs, Decimal128ToUInt64) {
+    decimal128ToInteger<uint64_t>();
+}
+
+TEST(RepresentAs, Decimal128ToDecimal128) {
+    Decimal128 decimals[] = {Decimal128::kNormalizedZero,
+                             Decimal128::kLargestPositive,
+                             Decimal128::kSmallestPositive,
+                             Decimal128::kLargestNegative,
+                             Decimal128::kSmallestNegative,
+                             Decimal128(5),
+                             Decimal128(5.5),
+                             Decimal128(-5),
+                             Decimal128(-5.5)};
+
+    for (const auto& d : decimals) {
+        ASSERT(representAs<Decimal128>(d)->isEqual(d));
+    }
+}
+
+template <typename Integer>
+void integerToDecimal128() {
+    std::vector<Integer> v{
+        Integer{5}, std::numeric_limits<Integer>::lowest(), std::numeric_limits<Integer>::max()};
+
+    if constexpr (std::is_signed_v<Integer>) {
+        v.emplace_back(-5);
+    }
+
+    for (const Integer n : v) {
+        auto d = representAs<Decimal128>(n);
+        ASSERT(d);
+        if (!d->isEqual(Decimal128(std::to_string(n)))) {
+            FAIL(
+                "Failed expectation, representAs<Decimal128>({}) == Decimal128({}),"
+                " but !Decimal128({}).isEqual(Decimal128(std::to_string({}))"_format(
+                    n, d->toString(), d->toString(), n));
+        }
+    }
+}
+
+TEST(RepresentAs, Int8ToDecimal128) {
+    integerToDecimal128<int8_t>();
+}
+
+TEST(RepresentAs, UInt8ToDecimal128) {
+    integerToDecimal128<uint8_t>();
+}
+
+TEST(RepresentAs, Int16ToDecimal128) {
+    integerToDecimal128<int16_t>();
+}
+
+TEST(RepresentAs, UInt16ToDecimal128) {
+    integerToDecimal128<uint16_t>();
+}
+
+TEST(RepresentAs, Int32ToDecimal128) {
+    integerToDecimal128<int32_t>();
+}
+
+TEST(RepresentAs, UInt32ToDecimal128) {
+    integerToDecimal128<uint32_t>();
+}
+
+TEST(RepresentAs, Int64ToDecimal128) {
+    integerToDecimal128<int64_t>();
+}
+
+TEST(RepresentAs, UInt64ToDecimal128) {
+    integerToDecimal128<uint64_t>();
+}
+
+template <typename Float>
+void floatToDecimal128() {
+    Float x = 5.5;
+    ASSERT(representAs<Decimal128>(x)->isEqual(Decimal128(std::to_string(x))));
+    ASSERT(representAs<Decimal128>(-x)->isEqual(Decimal128(std::to_string(-x))));
+
+    // Assert extreme numbers can be represented as Decimal128, and one basic property of each.
+    using limits = std::numeric_limits<Float>;
+    ASSERT(representAs<Decimal128>(limits::lowest())->isLess(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::min())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::denorm_min())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::max())->isGreater(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(limits::quiet_NaN())->isNaN());
+    ASSERT(representAs<Decimal128>(-limits::quiet_NaN())->isNaN());
+    ASSERT(representAs<Decimal128>(limits::infinity())->isInfinite());
+    ASSERT(representAs<Decimal128>(-limits::infinity())->isInfinite());
+    ASSERT(representAs<Decimal128>(Float{0})->isEqual(Decimal128(0)));
+    ASSERT(representAs<Decimal128>(Float{-0})->isEqual(Decimal128(0)));
+}
+
+TEST(RepresentAs, FloatToDecimal128) {
+    floatToDecimal128<float>();
+}
+
+TEST(RepresentAs, DoubleToDecimal128) {
+    floatToDecimal128<double>();
+}
+
 TEST(RepresentAs, PlatformDependent) {
     // signed char
     ASSERT(*(representAs<int>(kCharMax)) == kCharMaxAsInt);
@@ -288,5 +477,9 @@ TEST(RepresentAs, Identity) {
     ASSERT(*(representAs<uint32_t>(kUInt32Max)) == kUInt32Max);
     ASSERT(*(representAs<uint64_t>(kUInt64Max)) == kUInt64Max);
 }
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 }  // namespace mongo

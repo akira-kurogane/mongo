@@ -1,30 +1,33 @@
 /**
- *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +39,8 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/util/net/op_msg.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
 
 using namespace mongo;
 
@@ -46,13 +50,13 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
 
-    NamespaceString ns("test", "doc_seq");
+    NamespaceString nss("test", "doc_seq");
     DBDirectClient db(opCtx);
-    db.dropCollection(ns.ns());
-    ASSERT_EQ(db.count(ns.ns()), 0u);
+    db.dropCollection(nss.ns());
+    ASSERT_EQ(db.count(nss), 0u);
 
     OpMsgRequest request;
-    request.body = BSON("insert" << ns.coll() << "$db" << ns.db());
+    request.body = BSON("insert" << nss.coll() << "$db" << nss.db());
     request.sequences = {{"documents",
                           {
                               BSON("_id" << 1),
@@ -65,7 +69,7 @@ TEST(CommandTests, InputDocumentSequeceWorksEndToEnd) {
     const auto reply = db.runCommand(std::move(request));
     ASSERT_EQ(int(reply->getProtocol()), int(rpc::Protocol::kOpMsg));
     ASSERT_BSONOBJ_EQ(reply->getCommandReply(), BSON("n" << 5 << "ok" << 1.0));
-    ASSERT_EQ(db.count(ns.ns()), 5u);
+    ASSERT_EQ(db.count(nss), 5u);
 }
 
 using std::string;
@@ -76,11 +80,11 @@ using std::string;
 class Base {
 public:
     Base() : db(&_opCtx) {
-        db.dropCollection(ns());
+        db.dropCollection(nss().ns());
     }
 
-    const char* ns() {
-        return "test.testCollection";
+    NamespaceString nss() {
+        return NamespaceString("test.testCollection");
     }
     const char* nsDb() {
         return "test";
@@ -98,12 +102,12 @@ public:
 namespace FileMD5 {
 struct Base {
     Base() : db(&_opCtx) {
-        db.dropCollection(ns());
-        ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), BSON("files_id" << 1 << "n" << 1)));
+        db.dropCollection(nss().ns());
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss().ns(), BSON("files_id" << 1 << "n" << 1)));
     }
 
-    const char* ns() {
-        return "test.fs.chunks";
+    NamespaceString nss() {
+        return NamespaceString("test.fs.chunks");
     }
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
@@ -118,7 +122,7 @@ struct Type0 : Base {
             b.append("files_id", 0);
             b.append("n", 0);
             b.appendBinData("data", 6, BinDataGeneral, "hello ");
-            db.insert(ns(), b.obj());
+            db.insert(nss().ns(), b.obj());
         }
         {
             BSONObjBuilder b;
@@ -126,7 +130,7 @@ struct Type0 : Base {
             b.append("files_id", 0);
             b.append("n", 1);
             b.appendBinData("data", 5, BinDataGeneral, "world");
-            db.insert(ns(), b.obj());
+            db.insert(nss().ns(), b.obj());
         }
 
         BSONObj result;
@@ -142,7 +146,7 @@ struct Type2 : Base {
             b.append("files_id", 0);
             b.append("n", 0);
             b.appendBinDataArrayDeprecated("data", "hello ", 6);
-            db.insert(ns(), b.obj());
+            db.insert(nss().ns(), b.obj());
         }
         {
             BSONObjBuilder b;
@@ -150,7 +154,7 @@ struct Type2 : Base {
             b.append("files_id", 0);
             b.append("n", 1);
             b.appendBinDataArrayDeprecated("data", "world", 5);
-            db.insert(ns(), b.obj());
+            db.insert(nss().ns(), b.obj());
         }
 
         BSONObj result;
@@ -158,7 +162,7 @@ struct Type2 : Base {
         ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result["md5"].valuestr());
     }
 };
-}
+}  // namespace FileMD5
 
 namespace SymbolArgument {
 // SERVER-16260
@@ -169,14 +173,14 @@ namespace SymbolArgument {
 class Drop : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss().ns()));
         {
             BSONObjBuilder cmd;
             cmd.appendSymbol("drop", nsColl());  // Use Symbol for SERVER-16260
 
             BSONObj result;
             bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
+            LOGV2(24181, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
             ASSERT(ok);
         }
     }
@@ -185,7 +189,7 @@ public:
 class DropIndexes : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss().ns()));
 
         BSONObjBuilder cmd;
         cmd.appendSymbol("dropIndexes", nsColl());  // Use Symbol for SERVER-16260
@@ -193,7 +197,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24182, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
     }
 };
@@ -201,7 +205,7 @@ public:
 class CreateIndexWithNoKey : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss().ns()));
 
         BSONObjBuilder indexSpec;
 
@@ -214,7 +218,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24183, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -222,7 +226,7 @@ public:
 class CreateIndexWithDuplicateKey : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss().ns()));
 
         BSONObjBuilder indexSpec;
         indexSpec.append("key", BSON("a" << 1 << "a" << 1 << "b" << 1));
@@ -236,7 +240,32 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24184, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
+        ASSERT(!ok);
+    }
+};
+
+
+class CreateIndexWithEmptyStringAsValue : Base {
+public:
+    void run() {
+        ASSERT(db.createCollection(nss().ns()));
+
+        BSONObjBuilder indexSpec;
+        indexSpec.append("key",
+                         BSON("a"
+                              << ""));
+
+        BSONArrayBuilder indexes;
+        indexes.append(indexSpec.obj());
+
+        BSONObjBuilder cmd;
+        cmd.append("createIndexes", nsColl());
+        cmd.append("indexes", indexes.arr());
+
+        BSONObj result;
+        bool ok = db.runCommand(nsDb(), cmd.obj(), result);
+        LOGV2(24185, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(!ok);
     }
 };
@@ -244,13 +273,13 @@ public:
 class FindAndModify : Base {
 public:
     void run() {
-        ASSERT(db.createCollection(ns()));
+        ASSERT(db.createCollection(nss().ns()));
         {
             BSONObjBuilder b;
             b.genOID();
             b.append("name", "Tom");
             b.append("rating", 0);
-            db.insert(ns(), b.obj());
+            db.insert(nss().ns(), b.obj());
         }
 
         BSONObjBuilder cmd;
@@ -260,7 +289,7 @@ public:
 
         BSONObj result;
         bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-        log() << result.jsonString();
+        LOGV2(24186, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
         ASSERT(ok);
         // TODO(kangas) test that Tom's score is 1
     }
@@ -274,7 +303,8 @@ public:
         int n = 0;
         for (int x = 0; x < 20; x++) {
             for (int y = 0; y < 20; y++) {
-                db.insert(ns(), BSON("_id" << n << "loc" << BSON_ARRAY(x << y) << "z" << n % 5));
+                db.insert(nss().ns(),
+                          BSON("_id" << n << "loc" << BSON_ARRAY(x << y) << "z" << n % 5));
                 n++;
             }
         }
@@ -291,12 +321,10 @@ public:
             cmd.append("indexes",
                        BSON_ARRAY(BSON("key" << BSON("loc"
                                                      << "geoHaystack"
-                                                     << "z"
-                                                     << 1.0)
+                                                     << "z" << 1.0)
                                              << "name"
                                              << "loc_geoHaystack_z_1"
-                                             << "bucketSize"
-                                             << static_cast<double>(0.7))));
+                                             << "bucketSize" << static_cast<double>(0.7))));
 
             BSONObj result;
             ASSERT(db.runCommand(nsDb(), cmd.obj(), result));
@@ -311,30 +339,11 @@ public:
 
             BSONObj result;
             bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
+            LOGV2(24187, "{result_jsonString}", "result_jsonString"_attr = result.jsonString());
             ASSERT(ok);
         }
     }
 };
-
-class Touch : Base {
-public:
-    void run() {
-        ASSERT(db.createCollection(ns()));
-        {
-            BSONObjBuilder cmd;
-            cmd.appendSymbol("touch", nsColl());  // Use Symbol for SERVER-16260
-            cmd.append("data", true);
-            cmd.append("index", true);
-
-            BSONObj result;
-            bool ok = db.runCommand(nsDb(), cmd.obj(), result);
-            log() << result.jsonString();
-            ASSERT(ok || result["code"].Int() == ErrorCodes::CommandNotSupported);
-        }
-    }
-};
-
 }  // namespace SymbolArgument
 
 /**
@@ -347,17 +356,17 @@ public:
         bool ok = db.runCommand(nsDb(), BSON("rolesInfo" << 1), result);
         ASSERT(ok);
 
-        stdx::unordered_set<std::string> observedFields;
+        StringSet observedFields;
         for (const auto& field : result) {
-            ASSERT(observedFields.find(field) == observedFields.end());
+            ASSERT(observedFields.find(field.fieldNameStringData()) == observedFields.end());
             observedFields.insert(field);
         }
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("commands") {}
+    All() : OldStyleSuiteSpecification("commands") {}
 
     void setupTests() {
         add<FileMD5::Type0>();
@@ -365,14 +374,14 @@ public:
         add<FileMD5::Type2>();
         add<SymbolArgument::DropIndexes>();
         add<SymbolArgument::FindAndModify>();
-        add<SymbolArgument::Touch>();
         add<SymbolArgument::Drop>();
         add<SymbolArgument::GeoSearch>();
         add<SymbolArgument::CreateIndexWithNoKey>();
         add<SymbolArgument::CreateIndexWithDuplicateKey>();
+        add<SymbolArgument::CreateIndexWithEmptyStringAsValue>();
         add<RolesInfoShouldNotReturnDuplicateFieldNames>();
     }
 };
 
-SuiteInstance<All> all;
-}
+OldStyleSuiteInitializer<All> all;
+}  // namespace CommandTests

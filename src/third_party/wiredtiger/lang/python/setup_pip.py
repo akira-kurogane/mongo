@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -98,7 +98,7 @@ def check_needed_dependencies(builtins, inc_paths, lib_paths):
 #   Locate an executable in the PATH.
 def find_executable(exename, path):
     p = subprocess.Popen(['which', exename ], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
+                         stderr=subprocess.PIPE, universal_newlines=True)
     out, err = p.communicate('')
     out = str(out)  # needed for Python3
     if out == '':
@@ -146,7 +146,8 @@ def get_sources_curdir():
     DEVNULL = open(os.devnull, 'w')
     gitproc = subprocess.Popen(
         ['git', 'ls-tree', '-r', '--name-only', 'HEAD^{tree}'],
-        stdin=DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdin=DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True)
     sources = [line.rstrip() for line in gitproc.stdout.readlines()]
     err = gitproc.stderr.read()
     gitproc.wait()
@@ -176,6 +177,7 @@ def get_library_dirs():
     dirs.append("/usr/local/lib")
     dirs.append("/usr/local/lib64")
     dirs.append("/lib/x86_64-linux-gnu")
+    dirs.append("/usr/lib/x86_64-linux-gnu")
     dirs.append("/opt/local/lib")
     dirs.append("/usr/lib")
     dirs.append("/usr/lib64")
@@ -186,13 +188,16 @@ def get_library_dirs():
     return dirs
 
 # source_filter
-#   Make any needed changes to the sources list.  Any entry that
-# needs to be moved is returned in a dictionary.
+#   Make any needed changes to the original sources list and return a manifest,
+# a list of source file names relative to the new staging root.  Any entry
+# that needs to be renamed returned in a dictionary where the entry's key
+# is the new name and the value is the old source name.
 def source_filter(sources):
     result = []
     movers = dict()
     py_dir = os.path.join('lang', 'python')
     pywt_dir = os.path.join(py_dir, 'wiredtiger')
+    pywt_build_dir = os.path.join('build_posix', py_dir, 'wiredtiger')
     pywt_prefix = pywt_dir + os.path.sep
     for f in sources:
         if not re.match(source_regex, f):
@@ -202,15 +207,16 @@ def source_filter(sources):
         # move all lang/python files to the top level.
         if dest.startswith(pywt_prefix):
             dest = os.path.basename(dest)
-            if dest == 'pip_init.py':
+            if dest == 'init.py':
                 dest = '__init__.py'
         if dest != src:
             movers[dest] = src
         result.append(dest)
     # Add SWIG generated files
-    result.append('wiredtiger.py')
-    movers['wiredtiger.py'] = os.path.join(pywt_dir, '__init__.py')
     result.append(os.path.join(py_dir, 'wiredtiger_wrap.c'))
+    wiredtiger_py = 'swig_wiredtiger.py'
+    result.append('swig_wiredtiger.py')
+    movers['swig_wiredtiger.py'] = os.path.join(py_dir, 'wiredtiger.py')
     return result, movers
 
 ################################################################
@@ -230,10 +236,6 @@ elif os.path.isfile(os.path.join(this_dir, 'LICENSE')):
     wt_dir = this_dir
 else:
     die('running from an unknown directory')
-
-python3 = (sys.version_info[0] > 2)
-if python3:
-    die('Python3 is not yet supported')
 
 # Ensure that Extensions won't be built for 32 bit,
 # that won't work with WiredTiger.
@@ -272,7 +274,10 @@ builtins = [
       'or via: apt-get install libsnappy-dev' ],
     [ 'zlib', 'z',
       'Need to install zlib\n' + \
-      'It can be installed via: apt-get install zlib1g' ]
+      'It can be installed via: apt-get install zlib1g' ],
+    [ 'zstd', 'zstd',
+      'Need to install zstd\n' + \
+      'It can be installed via: apt-get install zstd' ]
 ]
 builtin_names = [b[0] for b in builtins]
 builtin_libraries = [b[1] for b in builtins]
@@ -304,6 +309,17 @@ cppflags, cflags, ldflags = get_compile_flags(inc_paths, lib_paths)
 # If we are creating a source distribution, create a staging directory
 # with just the right sources. Put the result in the python dist directory.
 if pip_command == 'sdist':
+
+    # Technically, this script can run under Python2, and will do the
+    # right thing. But if we're running with Python2, chances are we built
+    # WiredTiger using Python2, and a distribution built that way will
+    # only run under Python2, not Python3.  If we do the WiredTiger configure,
+    # build and this script all using Python3, we'll end up with a distribution
+    # that installs and runs under either Python2 or Python3.
+    python2 = (sys.version_info[0] <= 2)
+    if python2:
+        die('Python3 should be used to create a source distribution')
+
     sources, movers = source_filter(get_sources_curdir())
     stage_dir = os.path.join(python_rel_dir, 'stage')
     shutil.rmtree(stage_dir, True)

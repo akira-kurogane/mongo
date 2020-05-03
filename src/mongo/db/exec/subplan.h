@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,14 +36,13 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_all_indices_stage.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -67,10 +67,10 @@ class OperationContext;
  *
  *   --Plans for entire rooted $or queries are neither written to nor read from the plan cache.
  */
-class SubplanStage final : public PlanStage {
+class SubplanStage final : public RequiresAllIndicesStage {
 public:
-    SubplanStage(OperationContext* opCtx,
-                 Collection* collection,
+    SubplanStage(ExpressionContext* expCtx,
+                 const Collection* collection,
                  WorkingSet* ws,
                  const QueryPlannerParams& params,
                  CanonicalQuery* cq);
@@ -103,22 +103,9 @@ public:
      *
      * Returns a non-OK status if query planning fails. In particular, this function returns
      * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield, or
-     * ErrorCodes::ExceededTimeLimit if the operation has exceeded its time limit.
+     * ErrorCodes::MaxTimeMSExpired if the operation has exceeded its time limit.
      */
     Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
-
-    /**
-     * Takes a match expression, 'root', which has a single "contained OR". This means that
-     * 'root' is an AND with exactly one OR child.
-     *
-     * Returns a logically equivalent query after rewriting so that the contained OR is at the
-     * root of the expression tree.
-     *
-     * Used internally so that the subplanner can be used for contained OR type queries, but
-     * exposed for testing.
-     */
-    static std::unique_ptr<MatchExpression> rewriteToRootedOr(
-        std::unique_ptr<MatchExpression> root);
 
     //
     // For testing.
@@ -144,7 +131,8 @@ private:
      * a particular $or branch.
      */
     struct BranchPlanningResult {
-        MONGO_DISALLOW_COPYING(BranchPlanningResult);
+        BranchPlanningResult(const BranchPlanningResult&) = delete;
+        BranchPlanningResult& operator=(const BranchPlanningResult&) = delete;
 
     public:
         BranchPlanningResult() {}
@@ -185,9 +173,6 @@ private:
      */
     Status choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy);
 
-    // Not owned here. Must be non-null.
-    Collection* _collection;
-
     // Not owned here.
     WorkingSet* _ws;
 
@@ -209,7 +194,7 @@ private:
     std::vector<std::unique_ptr<BranchPlanningResult>> _branchResults;
 
     // We need this to extract cache-friendly index data from the index assignments.
-    std::map<StringData, size_t> _indexMap;
+    std::map<IndexEntry::Identifier, size_t> _indexMap;
 };
 
 }  // namespace mongo

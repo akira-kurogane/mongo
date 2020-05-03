@@ -1,25 +1,24 @@
-// devnull_kv_engine.h
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +38,9 @@ namespace mongo {
 
 class JournalListener;
 
+/**
+ * The devnull storage engine is intended for unit and performance testing.
+ */
 class DevNullKVEngine : public KVEngine {
 public:
     virtual ~DevNullKVEngine() {}
@@ -59,17 +61,20 @@ public:
                                                         StringData ident,
                                                         const CollectionOptions& options);
 
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) override;
+
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) {
         return Status::OK();
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident) {
+    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
         return Status::OK();
     }
 
@@ -92,6 +97,10 @@ public:
         return true;
     }
 
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
+
+    virtual void setCachePressureForTest(int pressure) override;
+
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 1;
     }
@@ -112,7 +121,39 @@ public:
 
     void setJournalListener(JournalListener* jl) final {}
 
+    virtual Timestamp getAllDurableTimestamp() const override {
+        return Timestamp();
+    }
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
+    }
+
+    virtual Status beginBackup(OperationContext* opCtx) override {
+        return Status::OK();
+    }
+
+    virtual void endBackup(OperationContext* opCtx) {}
+
+    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) override {}
+
+    virtual StatusWith<std::vector<std::string>> extendBackupCursor(
+        OperationContext* opCtx) override;
+
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
 private:
     std::shared_ptr<void> _catalogInfo;
+
+    int _cachePressureForTest;
 };
-}
+}  // namespace mongo

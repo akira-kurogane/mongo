@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,17 +32,16 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 #include <algorithm>  // for max()
 #include <iostream>
 
-// So we can get at the str namespace.
-using namespace mongoutils;
-
 namespace mongo {
 
 using std::stringstream;
+
+static constexpr bool kNativeLittle = (endian::Order::kNative == endian::Order::kLittle);
 
 std::ostream& operator<<(std::ostream& s, const GeoHash& h) {
     return s << h.toString();
@@ -239,12 +239,7 @@ void GeoHash::unhash_fast(unsigned* x, unsigned* y) const {
         // 0x55 in binary is "01010101",
         // it's an odd bitmask that we use to turn off all the even bits
         unsigned t = (unsigned)(c[i]) & 0x55;
-        int leftShift;
-#if MONGO_CONFIG_BYTE_ORDER == MONGO_LITTLE_ENDIAN
-        leftShift = 4 * i;
-#else
-        leftShift = 28 - (4 * i);
-#endif
+        const int leftShift = 4 * (kNativeLittle ? i : (7 - i));
         *y |= geoBitSets.hashedToNormal[t] << leftShift;
 
         t = ((unsigned)(c[i]) >> 1) & 0x55;
@@ -264,11 +259,11 @@ void GeoHash::unhash_slow(unsigned* x, unsigned* y) const {
 }
 
 void GeoHash::unhash(unsigned* x, unsigned* y) const {
-#if MONGO_CONFIG_BYTE_ORDER == MONGO_LITTLE_ENDIAN
-    unhash_fast(x, y);
-#else
-    unhash_slow(x, y);
-#endif
+    if constexpr (kNativeLittle) {
+        unhash_fast(x, y);
+    } else {
+        unhash_slow(x, y);
+    }
 }
 
 /** Is the 'bit'-th most significant bit set?  (NOT the least significant) */
@@ -487,22 +482,42 @@ void GeoHash::clearUnusedBits() {
 
 static void appendHashToBuilder(long long hash, BSONObjBuilder* builder, const char* fieldName) {
     char buf[8];
-#if MONGO_CONFIG_BYTE_ORDER == MONGO_LITTLE_ENDIAN
-    // Reverse the order of bytes when copying between BinData and GeoHash.
-    // GeoHashes are meant to be compared from MSB to LSB, where the first 2 MSB indicate the
-    // quadrant.
-    // In BinData, the GeoHash of a 2D index is compared from LSB to MSB, so the bytes should be
-    // reversed on little-endian systems
-    copyAndReverse(buf, (char*)&hash);
-#else
-    std::memcpy(buf, reinterpret_cast<char*>(&hash), 8);
-#endif
+    if constexpr (kNativeLittle) {
+        // Reverse the order of bytes when copying between BinData and GeoHash.
+        // GeoHashes are meant to be compared from MSB to LSB, where the first 2 MSB indicate the
+        // quadrant.
+        // In BinData, the GeoHash of a 2D index is compared from LSB to MSB, so the bytes should be
+        // reversed on little-endian systems
+        copyAndReverse(buf, (char*)&hash);
+    } else {
+        std::memcpy(buf, reinterpret_cast<char*>(&hash), 8);
+    }
     builder->appendBinData(fieldName, 8, bdtCustom, buf);
+}
+
+static void appendHashToKeyString(long long hash, KeyString::Builder* ks) {
+    char buf[8];
+    if constexpr (kNativeLittle) {
+        // Reverse the order of bytes when copying between BinData and GeoHash.
+        // GeoHashes are meant to be compared from MSB to LSB, where the first 2 MSB indicate the
+        // quadrant.
+        // In BinData, the GeoHash of a 2D index is compared from LSB to MSB, so the bytes should be
+        // reversed on little-endian systems
+        copyAndReverse(buf, (char*)&hash);
+    } else {
+        std::memcpy(buf, reinterpret_cast<char*>(&hash), 8);
+    }
+    ks->appendBinData(BSONBinData(buf, 8, bdtCustom));
 }
 
 void GeoHash::appendHashMin(BSONObjBuilder* builder, const char* fieldName) const {
     // The min bound of a GeoHash region has all the unused suffix bits set to 0
     appendHashToBuilder(_hash, builder, fieldName);
+}
+
+void GeoHash::appendHashMin(KeyString::Builder* ks) const {
+    // The min bound of a GeoHash region has all the unused suffix bits set to 0
+    appendHashToKeyString(_hash, ks);
 }
 
 void GeoHash::appendHashMax(BSONObjBuilder* builder, const char* fieldName) const {
@@ -669,19 +684,13 @@ Status GeoHashConverter::parseParameters(const BSONObj& paramDoc,
     if (params->bits < 1 || params->bits > 32) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream() << "bits for hash must be > 0 and <= 32, "
-                                    << "but "
-                                    << params->bits
-                                    << " bits were specified");
+                                    << "but " << params->bits << " bits were specified");
     }
 
     if (params->min >= params->max) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream() << "region for hash must be valid and have positive area, "
-                                    << "but ["
-                                    << params->min
-                                    << ", "
-                                    << params->max
-                                    << "] "
+                                    << "but [" << params->min << ", " << params->max << "] "
                                     << "was specified");
     }
 
@@ -740,7 +749,7 @@ GeoHash GeoHashConverter::hash(const Point& p) const {
 }
 
 GeoHash GeoHashConverter::hash(const BSONObj& o) const {
-    return hash(o, NULL);
+    return hash(o, nullptr);
 }
 
 // src is printed out as debugging information.  Maybe it is actually somehow the 'source' of o?
@@ -776,8 +785,7 @@ GeoHash GeoHashConverter::hash(const BSONObj& o, const BSONObj* src) const {
 GeoHash GeoHashConverter::hash(double x, double y) const {
     uassert(16433,
             str::stream() << "point not in interval of [ " << _params.min << ", " << _params.max
-                          << " ]"
-                          << causedBy(BSON_ARRAY(x << y).toString()),
+                          << " ]" << causedBy(BSON_ARRAY(x << y).toString()),
             x <= _params.max && x >= _params.min && y <= _params.max && y >= _params.min);
 
     return GeoHash(convertToHashScale(x), convertToHashScale(y), _params.bits);
@@ -847,7 +855,11 @@ double GeoHashConverter::sizeOfDiag(const GeoHash& a) const {
 double GeoHashConverter::sizeEdge(unsigned level) const {
     invariant(level >= 0);
     invariant((int)level <= _params.bits);
+#pragma warning(push)
+// C4146: unary minus operator applied to unsigned type, result still unsigned
+#pragma warning(disable : 4146)
     return ldexp(_params.max - _params.min, -level);
+#pragma warning(pop)
 }
 
 // Convert from a double in [0, (max-min)*scaling] to [min, max]

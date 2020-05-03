@@ -1,24 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,20 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/jsobj.h"
 
 #include <boost/lexical_cast.hpp>
 
 #include "mongo/bson/timestamp.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 using std::string;
 
-void BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
+BSONObjBuilder& BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
     switch (t) {
         // Shared canonical types
         case NumberInt:
@@ -48,70 +48,68 @@ void BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
         case NumberLong:
         case NumberDecimal:
             append(fieldName, std::numeric_limits<double>::quiet_NaN());
-            return;
+            return *this;
         case Symbol:
         case String:
             append(fieldName, "");
-            return;
+            return *this;
         case Date:
-            // min varies with V0 and V1 indexes, so we go one type lower.
-            appendBool(fieldName, true);
-            // appendDate( fieldName , numeric_limits<long long>::min() );
-            return;
+            appendDate(fieldName, Date_t::min());
+            return *this;
         case bsonTimestamp:
             appendTimestamp(fieldName, 0);
-            return;
+            return *this;
         case Undefined:  // shared with EOO
             appendUndefined(fieldName);
-            return;
+            return *this;
 
         // Separate canonical types
         case MinKey:
             appendMinKey(fieldName);
-            return;
+            return *this;
         case MaxKey:
             appendMaxKey(fieldName);
-            return;
+            return *this;
         case jstOID: {
             OID o;
             appendOID(fieldName, &o);
-            return;
+            return *this;
         }
         case Bool:
             appendBool(fieldName, false);
-            return;
+            return *this;
         case jstNULL:
             appendNull(fieldName);
-            return;
+            return *this;
         case Object:
             append(fieldName, BSONObj());
-            return;
+            return *this;
         case Array:
             appendArray(fieldName, BSONObj());
-            return;
+            return *this;
         case BinData:
-            appendBinData(fieldName, 0, BinDataGeneral, (const char*)0);
-            return;
+            appendBinData(fieldName, 0, BinDataGeneral, (const char*)nullptr);
+            return *this;
         case RegEx:
             appendRegex(fieldName, "");
-            return;
+            return *this;
         case DBRef: {
             OID o;
             appendDBRef(fieldName, "", o);
-            return;
+            return *this;
         }
         case Code:
             appendCode(fieldName, "");
-            return;
+            return *this;
         case CodeWScope:
             appendCodeWScope(fieldName, "", BSONObj());
-            return;
+            return *this;
     };
-    log() << "type not supported for appendMinElementForType: " << t;
+    LOGV2(20101, "type not supported for appendMinElementForType: {t}", "t"_attr = t);
     uassert(10061, "type not supported for appendMinElementForType", false);
 }
 
-void BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
+BSONObjBuilder& BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
     switch (t) {
         // Shared canonical types
         case NumberInt:
@@ -119,64 +117,63 @@ void BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
         case NumberLong:
         case NumberDecimal:
             append(fieldName, std::numeric_limits<double>::infinity());
-            return;
+            return *this;
         case Symbol:
         case String:
             appendMinForType(fieldName, Object);
-            return;
+            return *this;
         case Date:
-            appendDate(fieldName,
-                       Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::max()));
-            return;
+            appendDate(fieldName, Date_t::max());
+            return *this;
         case bsonTimestamp:
             append(fieldName, Timestamp::max());
-            return;
+            return *this;
         case Undefined:  // shared with EOO
             appendUndefined(fieldName);
-            return;
+            return *this;
 
         // Separate canonical types
         case MinKey:
             appendMinKey(fieldName);
-            return;
+            return *this;
         case MaxKey:
             appendMaxKey(fieldName);
-            return;
+            return *this;
         case jstOID: {
             OID o = OID::max();
             appendOID(fieldName, &o);
-            return;
+            return *this;
         }
         case Bool:
             appendBool(fieldName, true);
-            return;
+            return *this;
         case jstNULL:
             appendNull(fieldName);
-            return;
+            return *this;
         case Object:
             appendMinForType(fieldName, Array);
-            return;
+            return *this;
         case Array:
             appendMinForType(fieldName, BinData);
-            return;
+            return *this;
         case BinData:
             appendMinForType(fieldName, jstOID);
-            return;
+            return *this;
         case RegEx:
             appendMinForType(fieldName, DBRef);
-            return;
+            return *this;
         case DBRef:
             appendMinForType(fieldName, Code);
-            return;
+            return *this;
         case Code:
             appendMinForType(fieldName, CodeWScope);
-            return;
+            return *this;
         case CodeWScope:
             // This upper bound may change if a new bson type is added.
             appendMinForType(fieldName, MaxKey);
-            return;
+            return *this;
     }
-    log() << "type not supported for appendMaxElementForType: " << t;
+    LOGV2(20102, "type not supported for appendMaxElementForType: {t}", "t"_attr = t);
     uassert(14853, "type not supported for appendMaxElementForType", false);
 }
 
@@ -214,18 +211,6 @@ BSONObjBuilder& BSONObjBuilder::appendElementsUnique(const BSONObj& x) {
     return *this;
 }
 
-void BSONObjBuilder::appendKeys(const BSONObj& keyPattern, const BSONObj& values) {
-    BSONObjIterator i(keyPattern);
-    BSONObjIterator j(values);
-
-    while (i.more() && j.more()) {
-        appendAs(j.next(), i.next().fieldName());
-    }
-
-    verify(!i.more());
-    verify(!j.more());
-}
-
 BSONObjIterator BSONObjBuilder::iterator() const {
     const char* s = _b.buf() + _offset;
     const char* e = _b.buf() + _b.len();
@@ -240,20 +225,17 @@ bool BSONObjBuilder::hasField(StringData name) const {
     return false;
 }
 
-const string BSONObjBuilder::numStrs[] = {
-    "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",  "9",  "10", "11", "12", "13", "14",
-    "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
-    "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44",
-    "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
-    "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74",
-    "75", "76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
-    "90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
-};
+BSONObjBuilder::~BSONObjBuilder() {
+    // If 'done' has not already been called, and we have a reference to an owning
+    // BufBuilder but do not own it ourselves, then we must call _done to write in the
+    // length. Otherwise, we own this memory and its lifetime ends with us, therefore
+    // we can elide the write.
+    if (!_doneCalled && _b.buf() && _buf.getSize() == 0) {
+        _done();
+    }
+}
 
-// This is to ensure that BSONObjBuilder doesn't try to use numStrs before the strings have
-// been constructed I've tested just making numStrs a char[][], but the overhead of
-// constructing the strings each time was too high numStrsReady will be 0 until after
-// numStrs is initialized because it is a static variable
-bool BSONObjBuilder::numStrsReady = (numStrs[0].size() > 0);
+template class StringBuilderImpl<BufBuilder>;
+template class StringBuilderImpl<StackBufBuilderBase<StackSizeDefault>>;
 
 }  // namespace mongo

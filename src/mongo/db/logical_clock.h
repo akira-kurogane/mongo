@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/logical_time.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 class ServiceContext;
@@ -48,11 +49,15 @@ public:
 
     static const uint32_t kMaxSignedInt = ((1U << 31) - 1);
 
-    static constexpr Seconds kMaxAcceptableLogicalClockDriftSecs =
-        Seconds(365 * 24 * 60 * 60);  // 1 year
+    /**
+     * Returns the current cluster time if this is a replica set node, otherwise returns a null
+     * logical time.
+     */
+    static LogicalTime getClusterTimeForReplicaSet(ServiceContext* svcCtx);
+    static LogicalTime getClusterTimeForReplicaSet(OperationContext* opCtx);
 
     /**
-     *  Creates an instance of LogicalClock.
+     * Creates an instance of LogicalClock.
      */
     LogicalClock(ServiceContext*);
 
@@ -82,6 +87,17 @@ public:
      */
     void setClusterTimeFromTrustedSource(LogicalTime newTime);
 
+    /**
+     * Returns true if the clock is enabled and can be used. Defaults to true.
+     */
+    bool isEnabled() const;
+
+    /**
+     * Disables the logical clock. A disabled clock won't process logical times and can't be
+     * re-enabled.
+     */
+    void disable();
+
 private:
     /**
      * Rate limiter for advancing cluster time. Rejects newTime if its seconds value is more than
@@ -91,9 +107,10 @@ private:
 
     ServiceContext* const _service;
 
-    // The mutex protects _clusterTime.
-    stdx::mutex _mutex;
+    // The mutex protects _clusterTime and _isEnabled.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("LogicalClock::_mutex");
     LogicalTime _clusterTime;
+    bool _isEnabled{true};
 };
 
 }  // namespace mongo

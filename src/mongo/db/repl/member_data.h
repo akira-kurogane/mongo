@@ -1,23 +1,24 @@
-/*
- *    Copyright (C) 2014 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +30,7 @@
 #pragma once
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/util/time_support.h"
@@ -63,7 +65,7 @@ public:
         _lastHeartbeatRecv = newHeartbeatRecvTime;
     }
     const std::string& getLastHeartbeatMsg() const {
-        return _lastResponse.getHbMsg();
+        return _lastHeartbeatMessage;
     }
     const HostAndPort& getSyncSource() const {
         return _lastResponse.getSyncingTo();
@@ -75,7 +77,16 @@ public:
         return _lastResponse.hasDurableOpTime() ? _lastResponse.getDurableOpTime() : OpTime();
     }
     int getConfigVersion() const {
-        return _lastResponse.getConfigVersion();
+        return _configVersion;
+    }
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+    /**
+     * Gets the ReplSetConfig (version, term) pair from the last heartbeatResponse.
+     */
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
     }
     bool hasAuthIssue() const {
         return _authIssue;
@@ -87,12 +98,6 @@ public:
 
     long long getTerm() const {
         return _lastResponse.getTerm();
-    }
-
-    // Returns true if the last heartbeat data explicilty stated that the node
-    // is not electable.
-    bool isUnelectable() const {
-        return _lastResponse.hasIsElectable() && !_lastResponse.isElectable();
     }
 
     // Was this member up for the last heartbeat?
@@ -113,6 +118,13 @@ public:
         return _lastDurableOpTime;
     }
 
+    Date_t getLastAppliedWallTime() const {
+        return _lastAppliedWallTime;
+    }
+    Date_t getLastDurableWallTime() const {
+        return _lastDurableWallTime;
+    }
+
     // When was the last time this data was updated via any means?
     Date_t getLastUpdate() const {
         return _lastUpdate;
@@ -127,12 +139,8 @@ public:
         return _configIndex;
     }
 
-    int getMemberId() const {
+    MemberId getMemberId() const {
         return _memberId;
-    }
-
-    OID getRid() const {
-        return _rid;
     }
 
     bool isSelf() const {
@@ -145,7 +153,8 @@ public:
 
     /**
      * Sets values in this object from the results of a successful heartbeat command.
-     * Returns whether or not the optimes advanced as a result of this heartbeat response.
+     * Returns true if the lastApplied/lastDurable values advanced or we've received a newer
+     * config since the last heartbeat response.
      */
     bool setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse);
 
@@ -174,29 +183,34 @@ public:
     }
 
     /**
-     * Sets the last applied op time (not the heartbeat applied op time) and updates the
-     * lastUpdate time.
+     * Performs setLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    void setLastAppliedOpTime(OpTime opTime, Date_t now);
+    void setLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
-     * Sets the last durable op time (not the heartbeat durable op time)
+     * Performs setLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
      */
-    void setLastDurableOpTime(OpTime opTime, Date_t now);
+    void setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last applied op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastAppliedOpTime and also sets the wall clock time corresponding to the last
+     * applied opTime. Should only be used on the current node.
      */
-    bool advanceLastAppliedOpTime(OpTime opTime, Date_t now);
+    bool advanceLastAppliedOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last durable op time (not the heartbeat applied op time) iff the new optime is
      * later than the current optime, and updates the lastUpdate time.  Returns true if the
      * optime was advanced.
+     * Performs advanceLastDurableOpTime and also sets the wall clock time corresponding to the last
+     * durable opTime. Should only be used on the current node.
      */
-    bool advanceLastDurableOpTime(OpTime opTime, Date_t now);
+    bool advanceLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /*
      * Indicates that this data is stale, based on _lastUpdateTime.
@@ -225,15 +239,20 @@ public:
         _hostAndPort = hostAndPort;
     }
 
-    void setMemberId(int memberId) {
+    void setMemberId(MemberId memberId) {
         _memberId = memberId;
     }
 
-    void setRid(OID rid) {
-        _rid = rid;
+    void setConfigVersion(int version) {
+        _configVersion = version;
+    }
+
+    void setConfigTerm(long long term) {
+        _configTerm = term;
     }
 
 private:
+    bool _checkAndSetLastDurableOpTime(OpTime opTime, Date_t now);
     // -1 = not checked yet, 0 = member is down/unreachable, 1 = member is up
     int _health;
 
@@ -243,6 +262,9 @@ private:
     Date_t _lastHeartbeat;
     // This is the last time we got a heartbeat request from a given member.
     Date_t _lastHeartbeatRecv;
+
+    // This is the error message we got last time from contacting a given member.
+    std::string _lastHeartbeatMessage;
 
     // Did the last heartbeat show a failure to authenticate?
     bool _authIssue;
@@ -263,9 +285,17 @@ private:
 
     // Last known OpTime that the replica has applied and journaled to.
     OpTime _lastDurableOpTime;
+    Date_t _lastDurableWallTime = Date_t();
 
     // Last known OpTime that the replica has applied, whether journaled or unjournaled.
     OpTime _lastAppliedOpTime;
+    Date_t _lastAppliedWallTime = Date_t();
+
+    // Last known configVersion.
+    int _configVersion = -1;
+
+    // Last known configTerm.
+    long long _configTerm = OpTime::kUninitializedTerm;
 
     // TODO(russotto): Since memberData is kept in config order, _configIndex
     // and _isSelf may not be necessary.
@@ -275,12 +305,9 @@ private:
     // Is this the data for this member?
     bool _isSelf;
 
-    // This member's RID, used only in master/slave replication.
-    OID _rid;
-
     // This member's member ID.  memberId and hostAndPort duplicate information in the
-    // configuration for replica sets, but are required to be here for master/slave replication.
-    int _memberId = -1;
+    // set's ReplSetConfig.
+    MemberId _memberId;
 
     // Client address of this member.
     HostAndPort _hostAndPort;

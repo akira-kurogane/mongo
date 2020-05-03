@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,42 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/database_holder.h"
 
 namespace mongo {
 
-DatabaseHolder::Impl::~Impl() = default;
-
 namespace {
-stdx::function<DatabaseHolder::factory_function_type> factory;
+
+const auto getDatabaseHolderFromServiceContext =
+    ServiceContext::declareDecoration<std::unique_ptr<DatabaseHolder>>();
+
 }  // namespace
 
-void DatabaseHolder::registerFactory(decltype(factory) newFactory) {
-    factory = std::move(newFactory);
+DatabaseHolder* DatabaseHolder::get(ServiceContext* service) {
+    return getDatabaseHolderFromServiceContext(service).get();
 }
 
-auto DatabaseHolder::makeImpl() -> std::unique_ptr<Impl> {
-    return factory();
+DatabaseHolder* DatabaseHolder::get(ServiceContext& service) {
+    return getDatabaseHolderFromServiceContext(service).get();
 }
 
-void DatabaseHolder::TUHook::hook() noexcept {}
+DatabaseHolder* DatabaseHolder::get(OperationContext* opCtx) {
+    return get(opCtx->getServiceContext());
+}
 
-namespace {
-stdx::function<decltype(dbHolder)> dbHolderImpl;
-}  // namespace
+void DatabaseHolder::set(ServiceContext* service, std::unique_ptr<DatabaseHolder> databaseHolder) {
+    auto& holder = getDatabaseHolderFromServiceContext(service);
+    holder = std::move(databaseHolder);
+}
+
 }  // namespace mongo
-
-// The `mongo::` prefix is necessary to placate MSVC -- it is unable to properly identify anonymous
-// nested namespace members in `decltype` expressions when defining functions using scope-resolution
-// syntax.
-void mongo::registerDbHolderImpl(decltype(mongo::dbHolderImpl) impl) {
-    dbHolderImpl = std::move(impl);
-}
-
-auto mongo::dbHolder() -> DatabaseHolder& {
-    return dbHolderImpl();
-}

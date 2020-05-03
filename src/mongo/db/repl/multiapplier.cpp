@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,26 +42,17 @@ namespace mongo {
 namespace repl {
 
 MultiApplier::MultiApplier(executor::TaskExecutor* executor,
-                           const Operations& operations,
-                           const ApplyOperationFn& applyOperation,
+                           const std::vector<OplogEntry>& operations,
                            const MultiApplyFn& multiApply,
-                           const CallbackFn& onCompletion)
+                           CallbackFn onCompletion)
     : _executor(executor),
       _operations(operations),
-      _applyOperation(applyOperation),
       _multiApply(multiApply),
-      _onCompletion(onCompletion) {
+      _onCompletion(std::move(onCompletion)) {
     uassert(ErrorCodes::BadValue, "null replication executor", executor);
     uassert(ErrorCodes::BadValue, "empty list of operations", !operations.empty());
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "last operation missing 'ts' field: " << operations.back().raw,
-            operations.back().raw.hasField("ts"));
-    uassert(ErrorCodes::TypeMismatch,
-            str::stream() << "'ts' in last operation not a timestamp: " << operations.back().raw,
-            BSONType::bsonTimestamp == operations.back().raw.getField("ts").type());
-    uassert(ErrorCodes::BadValue, "apply operation function cannot be null", applyOperation);
     uassert(ErrorCodes::BadValue, "multi apply function cannot be null", multiApply);
-    uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
+    uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
 }
 
 MultiApplier::~MultiApplier() {
@@ -68,7 +60,7 @@ MultiApplier::~MultiApplier() {
 }
 
 bool MultiApplier::isActive() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _isActive_inlock();
 }
 
@@ -77,7 +69,7 @@ bool MultiApplier::_isActive_inlock() const {
 }
 
 Status MultiApplier::startup() noexcept {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     switch (_state) {
         case State::kPreStart:
@@ -91,8 +83,8 @@ Status MultiApplier::startup() noexcept {
             return Status(ErrorCodes::ShutdownInProgress, "multi applier completed");
     }
 
-    auto scheduleResult =
-        _executor->scheduleWork(stdx::bind(&MultiApplier::_callback, this, stdx::placeholders::_1));
+    auto scheduleResult = _executor->scheduleWork(
+        [=](const executor::TaskExecutor::CallbackArgs& cbd) { return _callback(cbd); });
     if (!scheduleResult.isOK()) {
         _state = State::kComplete;
         return scheduleResult.getStatus();
@@ -104,7 +96,7 @@ Status MultiApplier::startup() noexcept {
 }
 
 void MultiApplier::shutdown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -125,12 +117,12 @@ void MultiApplier::shutdown() {
 }
 
 void MultiApplier::join() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
     _condition.wait(lk, [this]() { return !_isActive_inlock(); });
 }
 
 MultiApplier::State MultiApplier::getState_forTest() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _state;
 }
 
@@ -145,7 +137,7 @@ void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     StatusWith<OpTime> applyStatus(ErrorCodes::InternalError, "not mutated");
     try {
         auto opCtx = cc().makeOperationContext();
-        applyStatus = _multiApply(opCtx.get(), _operations, _applyOperation);
+        applyStatus = _multiApply(opCtx.get(), _operations);
     } catch (...) {
         applyStatus = exceptionToStatus();
     }
@@ -161,14 +153,14 @@ void MultiApplier::_finishCallback(const Status& result) {
     // destroyed outside the lock.
     decltype(_onCompletion) onCompletion;
     {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        stdx::lock_guard<Latch> lock(_mutex);
         invariant(_onCompletion);
         std::swap(_onCompletion, onCompletion);
     }
 
     onCompletion(result);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(State::kComplete != _state);
     _state = State::kComplete;
     _condition.notify_all();

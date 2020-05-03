@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,9 +31,15 @@
 
 #include "mongo/db/matcher/extensions_callback_real.h"
 
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_text.h"
 #include "mongo/db/matcher/expression_where.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_function.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
 
@@ -45,26 +52,42 @@ StatusWithMatchExpression ExtensionsCallbackReal::parseText(BSONElement text) co
         return textParams.getStatus();
     }
 
-    auto exp = stdx::make_unique<TextMatchExpression>();
-    Status status = exp->init(_opCtx, *_nss, std::move(textParams.getValue()));
-    if (!status.isOK()) {
-        return status;
-    }
+    auto exp =
+        std::make_unique<TextMatchExpression>(_opCtx, *_nss, std::move(textParams.getValue()));
+
     return {std::move(exp)};
 }
 
-StatusWithMatchExpression ExtensionsCallbackReal::parseWhere(BSONElement where) const {
+StatusWithMatchExpression ExtensionsCallbackReal::parseWhere(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONElement where) const {
     auto whereParams = extractWhereMatchExpressionParams(where);
     if (!whereParams.isOK()) {
         return whereParams.getStatus();
     }
 
-    auto exp = stdx::make_unique<WhereMatchExpression>(_opCtx, std::move(whereParams.getValue()));
-    Status status = exp->init(_nss->db());
-    if (!status.isOK()) {
-        return status;
+    if (getTestCommandsEnabled() && internalQueryDesugarWhereToFunction.load()) {
+        uassert(ErrorCodes::BadValue, "ns for $where cannot be empty", expCtx->ns.db().size() != 0);
+
+        auto code = whereParams.getValue().code;
+
+        // Desugar $where to $expr. The $where function is invoked through a $function expression by
+        // passing the document as $$CURRENT.
+        auto fnExpression = ExpressionFunction::createForWhere(
+            expCtx,
+            ExpressionArray::create(
+                expCtx,
+                make_vector<boost::intrusive_ptr<Expression>>(
+                    ExpressionFieldPath::parse(expCtx, "$$CURRENT", expCtx->variablesParseState))),
+            code,
+            ExpressionFunction::kJavaScript);
+
+        return {std::make_unique<ExprMatchExpression>(fnExpression, expCtx)};
+    } else {
+        expCtx->hasWhereClause = true;
+        auto exp = std::make_unique<WhereMatchExpression>(
+            _opCtx, std::move(whereParams.getValue()), expCtx->ns.db());
+        return {std::move(exp)};
     }
-    return {std::move(exp)};
 }
 
 }  // namespace mongo

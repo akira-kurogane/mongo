@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,11 +31,11 @@
 
 #include "mongo/db/exec/pipeline_proxy.h"
 
+#include <memory>
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline_d.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -42,17 +43,21 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 const char* PipelineProxyStage::kStageType = "PIPELINE_PROXY";
 
-PipelineProxyStage::PipelineProxyStage(OperationContext* opCtx,
-                                       std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline,
+PipelineProxyStage::PipelineProxyStage(ExpressionContext* expCtx,
+                                       std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
                                        WorkingSet* ws)
-    : PlanStage(kStageType, opCtx),
+    : PipelineProxyStage(expCtx, std::move(pipeline), ws, kStageType) {}
+
+PipelineProxyStage::PipelineProxyStage(ExpressionContext* expCtx,
+                                       std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
+                                       WorkingSet* ws,
+                                       const char* stageTypeName)
+    : PlanStage(stageTypeName, expCtx),
       _pipeline(std::move(pipeline)),
       _includeMetaData(_pipeline->getContext()->needsMerge),  // send metadata to merger
-      _includeSortKey(_includeMetaData && !_pipeline->getContext()->from34Mongos),
       _ws(ws) {
     // We take over responsibility for disposing of the Pipeline, since it is required that
     // doDispose() will be called before destruction of this PipelineProxyStage.
@@ -67,16 +72,22 @@ PlanStage::StageState PipelineProxyStage::doWork(WorkingSetID* out) {
     if (!_stash.empty()) {
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
+        if (_includeMetaData && _stash.back().metadata()) {
+            member->metadata() = _stash.back().metadata();
+        }
+        member->doc = {SnapshotId(), std::move(_stash.back())};
         _stash.pop_back();
         member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
 
-    if (boost::optional<BSONObj> next = getNextBson()) {
+    if (auto next = getNext()) {
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
+        if (_includeMetaData && next->metadata()) {
+            member->metadata() = next->metadata();
+        }
+        member->doc = {SnapshotId(), std::move(*next)};
         member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
@@ -88,8 +99,8 @@ bool PipelineProxyStage::isEOF() {
     if (!_stash.empty())
         return false;
 
-    if (boost::optional<BSONObj> next = getNextBson()) {
-        _stash.push_back(*next);
+    if (auto next = getNext()) {
+        _stash.emplace_back(*next);
         return false;
     }
 
@@ -101,30 +112,22 @@ void PipelineProxyStage::doDetachFromOperationContext() {
 }
 
 void PipelineProxyStage::doReattachToOperationContext() {
-    _pipeline->reattachToOperationContext(getOpCtx());
+    _pipeline->reattachToOperationContext(opCtx());
 }
 
 void PipelineProxyStage::doDispose() {
-    _pipeline->dispose(getOpCtx());
+    _pipeline->dispose(opCtx());
 }
 
 unique_ptr<PlanStageStats> PipelineProxyStage::getStats() {
     unique_ptr<PlanStageStats> ret =
-        make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
-    ret->specific = make_unique<CollectionScanStats>();
+        std::make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_PIPELINE_PROXY);
+    ret->specific = std::make_unique<CollectionScanStats>();
     return ret;
 }
 
-boost::optional<BSONObj> PipelineProxyStage::getNextBson() {
-    if (auto next = _pipeline->getNext()) {
-        if (_includeMetaData) {
-            return next->toBsonWithMetaData(_includeSortKey);
-        } else {
-            return next->toBson();
-        }
-    }
-
-    return boost::none;
+boost::optional<Document> PipelineProxyStage::getNext() {
+    return _pipeline->getNext();
 }
 
 std::string PipelineProxyStage::getPlanSummaryStr() const {
@@ -136,4 +139,9 @@ void PipelineProxyStage::getPlanSummaryStats(PlanSummaryStats* statsOut) const {
     PipelineD::getPlanSummaryStats(_pipeline.get(), statsOut);
     statsOut->nReturned = getCommonStats()->advanced;
 }
+
+vector<Value> PipelineProxyStage::writeExplainOps(ExplainOptions::Verbosity verbosity) const {
+    return _pipeline->writeExplainOps(verbosity);
+}
+
 }  // namespace mongo

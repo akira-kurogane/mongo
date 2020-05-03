@@ -1,23 +1,24 @@
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,15 +43,24 @@ namespace repl {
 const char UpdatePositionArgs::kCommandFieldName[] = "replSetUpdatePosition";
 const char UpdatePositionArgs::kUpdateArrayFieldName[] = "optimes";
 const char UpdatePositionArgs::kAppliedOpTimeFieldName[] = "appliedOpTime";
+const char UpdatePositionArgs::kAppliedWallTimeFieldName[] = "appliedWallTime";
 const char UpdatePositionArgs::kDurableOpTimeFieldName[] = "durableOpTime";
+const char UpdatePositionArgs::kDurableWallTimeFieldName[] = "durableWallTime";
 const char UpdatePositionArgs::kMemberIdFieldName[] = "memberId";
 const char UpdatePositionArgs::kConfigVersionFieldName[] = "cfgver";
 
 UpdatePositionArgs::UpdateInfo::UpdateInfo(const OpTime& applied,
+                                           const Date_t& appliedWall,
                                            const OpTime& durable,
+                                           const Date_t& durableWall,
                                            long long aCfgver,
                                            long long aMemberId)
-    : appliedOpTime(applied), durableOpTime(durable), cfgver(aCfgver), memberId(aMemberId) {}
+    : appliedOpTime(applied),
+      appliedWallTime(appliedWall),
+      durableOpTime(durable),
+      durableWallTime(durableWall),
+      cfgver(aCfgver),
+      memberId(aMemberId) {}
 
 Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
     // grab the array of changes
@@ -66,8 +76,26 @@ Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
 
         OpTime appliedOpTime;
         status = bsonExtractOpTimeField(entry, kAppliedOpTimeFieldName, &appliedOpTime);
-        if (!status.isOK())
+        if (!status.isOK()) {
             return status;
+        }
+        Date_t appliedWallTime = Date_t();
+        BSONElement appliedWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kAppliedWallTimeFieldName, BSONType::Date, &appliedWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        appliedWallTime = appliedWallTimeElement.Date();
+
+        Date_t durableWallTime = Date_t();
+        BSONElement durableWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kDurableWallTimeFieldName, BSONType::Date, &durableWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        durableWallTime = durableWallTimeElement.Date();
 
         OpTime durableOpTime;
         status = bsonExtractOpTimeField(entry, kDurableOpTimeFieldName, &durableOpTime);
@@ -86,7 +114,8 @@ Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
         if (!status.isOK())
             return status;
 
-        _updates.push_back(UpdateInfo(appliedOpTime, durableOpTime, cfgver, memberID));
+        _updates.push_back(UpdateInfo(
+            appliedOpTime, appliedWallTime, durableOpTime, durableWallTime, cfgver, memberID));
     }
 
     return Status::OK();

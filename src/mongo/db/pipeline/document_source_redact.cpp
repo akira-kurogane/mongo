@@ -1,29 +1,30 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,12 +33,12 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
@@ -46,23 +47,21 @@ using std::vector;
 
 DocumentSourceRedact::DocumentSourceRedact(const intrusive_ptr<ExpressionContext>& expCtx,
                                            const intrusive_ptr<Expression>& expression)
-    : DocumentSource(expCtx), _expression(expression) {}
+    : DocumentSource(kStageName, expCtx), _expression(expression) {}
 
 REGISTER_DOCUMENT_SOURCE(redact,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceRedact::createFromBson);
 
 const char* DocumentSourceRedact::getSourceName() const {
-    return "$redact";
+    return kStageName.rawData();
 }
 
 static const Value descendVal = Value("descend"_sd);
 static const Value pruneVal = Value("prune"_sd);
 static const Value keepVal = Value("keep"_sd);
 
-DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
-    pExpCtx->checkForInterrupt();
-
+DocumentSource::GetNextResult DocumentSourceRedact::doGetNext() {
     auto nextInput = pSource->getNext();
     for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
         auto& variables = pExpCtx->variables;
@@ -78,6 +77,10 @@ DocumentSource::GetNextResult DocumentSourceRedact::getNext() {
 Pipeline::SourceContainer::iterator DocumentSourceRedact::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
@@ -130,7 +133,7 @@ Value DocumentSourceRedact::redactValue(const Value& in, const Document& root) {
 
 boost::optional<Document> DocumentSourceRedact::redactObject(const Document& root) {
     auto& variables = pExpCtx->variables;
-    const Value expressionResult = _expression->evaluate(root);
+    const Value expressionResult = _expression->evaluate(root, &variables);
 
     ValueComparator simpleValueCmp;
     if (simpleValueCmp.evaluate(expressionResult == keepVal)) {
@@ -156,8 +159,7 @@ boost::optional<Document> DocumentSourceRedact::redactObject(const Document& roo
         uasserted(17053,
                   str::stream() << "$redact's expression should not return anything "
                                 << "aside from the variables $$KEEP, $$DESCEND, and "
-                                << "$$PRUNE, but returned "
-                                << expressionResult.toString());
+                                << "$$PRUNE, but returned " << expressionResult.toString());
     }
 }
 
@@ -188,7 +190,6 @@ intrusive_ptr<DocumentSource> DocumentSourceRedact::createFromBson(
     variables.setValue(pruneId, pruneVal);
     variables.setValue(keepId, keepVal);
 
-
     return source;
 }
-}
+}  // namespace mongo

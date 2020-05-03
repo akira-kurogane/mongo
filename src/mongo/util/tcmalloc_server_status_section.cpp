@@ -1,31 +1,33 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #ifdef _WIN32
 #define NVALGRIND
@@ -40,66 +42,34 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/service_context.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
-#include "mongo/util/net/listen.h"
-#include "mongo/util/net/thread_idle_callback.h"
+#include "mongo/util/tcmalloc_parameters_gen.h"
 
 namespace mongo {
 
+// TODO: Remove these implementations and the associated IDL definition in 4.3.
+void TCMallocEnableMarkThreadTemporarilyIdle::append(OperationContext*,
+                                                     BSONObjBuilder&,
+                                                     const std::string&) {}
+
+Status TCMallocEnableMarkThreadTemporarilyIdle::setFromString(const std::string&) {
+    return Status(ErrorCodes::BadValue,
+                  "tcmallocEnableMarkThreadTemporarilyIdle has been removed. Setting this "
+                  "parameter has no effect and it will be removed in a future version of "
+                  "MongoDB.");
+}
+
 namespace {
-// If many clients are used, the per-thread caches become smaller and chances of
-// rebalancing of free space during critical sections increases. In such situations,
-// it is better to release memory when it is likely the thread will be blocked for
-// a long time.
-const int kManyClients = 40;
-
-stdx::mutex tcmallocCleanupLock;
-
-/**
- *  Callback to allow TCMalloc to release freed memory to the central list at
- *  favorable times. Ideally would do some milder cleanup or scavenge...
- */
-void threadStateChange() {
-    if (getGlobalServiceContext()->getServiceEntryPoint()->numOpenSessions() <= kManyClients)
-        return;
-
-#if MONGO_HAVE_GPERFTOOLS_GET_THREAD_CACHE_SIZE
-    size_t threadCacheSizeBytes = MallocExtension::instance()->GetThreadCacheSize();
-
-    static const size_t kMaxThreadCacheSizeBytes = 0x10000;
-    if (threadCacheSizeBytes < kMaxThreadCacheSizeBytes) {
-        // This number was chosen a bit magically.
-        // At 1000 threads and the current (64mb) thread local cache size, we're "full".
-        // So we may want this number to scale with the number of current clients.
-        return;
-    }
-
-    LOG(1) << "thread over memory limit, cleaning up, current: " << (threadCacheSizeBytes / 1024)
-           << "k";
-
-    // We synchronize as the tcmalloc central list uses a spinlock, and we can cause a really
-    // terrible runaway if we're not careful.
-    stdx::lock_guard<stdx::mutex> lk(tcmallocCleanupLock);
-#endif
-    MallocExtension::instance()->MarkThreadTemporarilyIdle();
-}
-
-// Register threadStateChange callback
-MONGO_INITIALIZER(TCMallocThreadIdleListener)(InitializerContext*) {
-    if (!RUNNING_ON_VALGRIND)
-        registerThreadIdleCallback(&threadStateChange);
-    return Status::OK();
-}
 
 class TCMallocServerStatusSection : public ServerStatusSection {
 public:
     TCMallocServerStatusSection() : ServerStatusSection("tcmalloc") {}
-    virtual bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         long long verbosity = 1;
         if (configElement) {
             // Relies on the fact that safeNumberLong turns non-numbers into 0.
@@ -155,6 +125,28 @@ public:
             appendNumericPropertyIfAvailable(
                 sub, "aggressive_memory_decommit", "tcmalloc.aggressive_memory_decommit");
 
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_committed_bytes", "tcmalloc.pageheap_committed_bytes");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_scavenge_count", "tcmalloc.pageheap_scavenge_count");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_commit_count", "tcmalloc.pageheap_commit_count");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_total_commit_bytes", "tcmalloc.pageheap_total_commit_bytes");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_decommit_count", "tcmalloc.pageheap_decommit_count");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_total_decommit_bytes", "tcmalloc.pageheap_total_decommit_bytes");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_reserve_count", "tcmalloc.pageheap_reserve_count");
+            appendNumericPropertyIfAvailable(
+                sub, "pageheap_total_reserve_bytes", "tcmalloc.pageheap_total_reserve_bytes");
+            appendNumericPropertyIfAvailable(
+                sub, "spinlock_total_delay_ns", "tcmalloc.spinlock_total_delay_ns");
+
+            auto tcmallocReleaseRate = MallocExtension::instance()->GetMemoryReleaseRate();
+            sub.appendNumber("release_rate", tcmallocReleaseRate);
+
 #if MONGO_HAVE_GPERFTOOLS_SIZE_CLASS_STATS
             if (verbosity >= 2) {
                 // Size class information
@@ -199,5 +191,5 @@ private:
     }
 #endif
 } tcmallocServerStatusSection;
-}
-}
+}  // namespace
+}  // namespace mongo

@@ -1,28 +1,30 @@
-/*    Copyright 2014 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -30,11 +32,15 @@
 #include "mongo/client/native_sasl_client_session.h"
 
 #include "mongo/base/init.h"
+#include "mongo/client/sasl_aws_client_conversation.h"
 #include "mongo/client/sasl_client_conversation.h"
 #include "mongo/client/sasl_plain_client_conversation.h"
-#include "mongo/client/sasl_scramsha1_client_conversation.h"
-#include "mongo/client/scram_sha1_client_cache.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/client/sasl_scram_client_conversation.h"
+#include "mongo/client/scram_client_cache.h"
+#include "mongo/config.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -48,13 +54,14 @@ MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
     return Status::OK();
 }
 
-// Global cache for SCRAM-SHA-1 credentials
-SCRAMSHA1ClientCache* scramsha1ClientCache = new SCRAMSHA1ClientCache;
+// Global cache for SCRAM-SHA-1/256 credentials
+auto* scramsha1ClientCache = new SCRAMClientCache<SHA1Block>;
+auto* scramsha256ClientCache = new SCRAMClientCache<SHA256Block>;
 
 }  // namespace
 
 NativeSaslClientSession::NativeSaslClientSession()
-    : SaslClientSession(), _step(0), _done(false), _saslConversation(nullptr) {}
+    : SaslClientSession(), _step(0), _success(false), _saslConversation(nullptr) {}
 
 NativeSaslClientSession::~NativeSaslClientSession() {}
 
@@ -67,11 +74,19 @@ Status NativeSaslClientSession::initialize() {
     if (mechanism == "PLAIN") {
         _saslConversation.reset(new SaslPLAINClientConversation(this));
     } else if (mechanism == "SCRAM-SHA-1") {
-        _saslConversation.reset(new SaslSCRAMSHA1ClientConversation(this, scramsha1ClientCache));
+        _saslConversation.reset(
+            new SaslSCRAMClientConversationImpl<SHA1Block>(this, scramsha1ClientCache));
+    } else if (mechanism == "SCRAM-SHA-256") {
+        _saslConversation.reset(
+            new SaslSCRAMClientConversationImpl<SHA256Block>(this, scramsha256ClientCache));
+#ifdef MONGO_CONFIG_SSL
+        // AWS depends on kms-message which depends on ssl libraries
+    } else if (mechanism == "MONGODB-AWS") {
+        _saslConversation.reset(new SaslAWSClientConversation(this));
+#endif
     } else {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "SASL mechanism " << mechanism
-                                                << " is not supported");
+                      str::stream() << "SASL mechanism " << mechanism << " is not supported");
     }
 
     return Status::OK();
@@ -80,14 +95,14 @@ Status NativeSaslClientSession::initialize() {
 Status NativeSaslClientSession::step(StringData inputData, std::string* outputData) {
     if (!_saslConversation) {
         return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream()
+                      str::stream()
                           << "The client authentication session has not been properly initialized");
     }
 
     StatusWith<bool> status = _saslConversation->step(inputData, outputData);
     if (status.isOK()) {
-        _done = status.getValue();
+        _success = status.getValue();
     }
     return status.getStatus();
 }
-}  // namespace
+}  // namespace mongo

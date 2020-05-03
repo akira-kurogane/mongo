@@ -15,12 +15,15 @@
  * scenario, none of the members will have any data, and upon restart will each look for a member to
  * initial sync from, so no primary will be elected. This test induces such a scenario, so cannot be
  * run on ephemeral storage engines.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, requires_replication]
  */
+
+// Skip db hash check because replset cannot reach consistent state.
+TestData.skipCheckDBHashes = true;
 
 print("1. make 3-member set w/arb (2)");
 var name = "minvalid";
-var replTest = new ReplSetTest({name: name, nodes: 3, oplogSize: 1});
+var replTest = new ReplSetTest({name: name, nodes: 3, oplogSize: 1, waitForKeys: true});
 var host = getHostName();
 
 var nodes = replTest.startSet();
@@ -32,7 +35,7 @@ replTest.initiate({
         {_id: 2, host: host + ":" + replTest.ports[2], arbiterOnly: true}
     ]
 });
-var slaves = replTest.liveNodes.slaves;
+var slaves = replTest._slaves;
 var master = replTest.getPrimary();
 var masterId = replTest.getNodeId(master);
 var slave = slaves[0];
@@ -51,7 +54,7 @@ print("2: shut down slave");
 replTest.stop(slaveId);
 
 print("3: write to master");
-assert.writeOK(mdb.foo.insert({a: 1001}, {writeConcern: {w: 1}}));
+assert.commandWorked(mdb.foo.insert({a: 1001}, {writeConcern: {w: 1}}));
 
 print("4: modify master's minvalid");
 var local = master.getDB("local");
@@ -62,8 +65,8 @@ printjson(lastOp);
 // crash.
 local.replset.minvalid.update({},
                               {
-                                ts: new Timestamp(lastOp.ts.t, lastOp.ts.i + 1),
-                                t: NumberLong(-1),
+                                  ts: new Timestamp(lastOp.ts.t, lastOp.ts.i + 1),
+                                  t: NumberLong(-1),
                               },
                               {upsert: true});
 printjson(local.replset.minvalid.findOne());

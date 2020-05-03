@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -74,6 +75,20 @@ struct OrderedIntervalList {
 
     bool operator==(const OrderedIntervalList& other) const;
     bool operator!=(const OrderedIntervalList& other) const;
+
+    void reverse();
+
+    /**
+     * Return a clone of this OIL, that is reversed.
+     */
+    OrderedIntervalList reverseClone() const;
+
+    Interval::Direction computeDirection() const;
+
+    /**
+     * Returns true if this OIL represents a single [MinKey, MaxKey] bound.
+     */
+    bool isMinToMax() const;
 };
 
 /**
@@ -126,6 +141,11 @@ struct IndexBounds {
     static BoundInclusion makeBoundInclusionFromBoundBools(bool startKeyInclusive,
                                                            bool endKeyInclusive);
 
+    /**
+     * Reverse the BoundInclusion.
+     */
+    static BoundInclusion reverseBoundInclusion(BoundInclusion b);
+
 
     /**
      * BSON format for explain. The format is an array of strings for each field.
@@ -136,6 +156,18 @@ struct IndexBounds {
      *  {a: ["[1, 1]", "(3, 10)"], b: ["[Infinity, 10)"] }
      */
     BSONObj toBSON() const;
+
+    /**
+     * Return a copy of the index bounds, but with each of the OILs going in the ascending
+     * direction.
+     */
+    IndexBounds forwardize() const;
+
+    /**
+     * Return a copy of the index bounds that has each OIL going in the direction opposite to its
+     * direction in this IndexBounds.
+     */
+    IndexBounds reverse() const;
 
     // TODO: we use this for max/min scan.  Consider migrating that.
     bool isSimpleRange;

@@ -5,16 +5,17 @@
  *
  * Bulk inserts 1000 documents and builds indexes. Then alternates between reindexing and querying
  * against the collection. Operates on a separate collection for each thread.
+ *
+ * @tags: [SERVER-40561]
  */
-
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropCollections
+load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 
 var $config = (function() {
     var data = {
-        nIndexes: 3 + 1,  // 3 created and 1 for _id
+        nIndexes: 4 + 1,  // 4 created and 1 for _id.
         nDocumentsToInsert: 1000,
-        maxInteger: 100,   // Used for document values. Must be a factor of nDocumentsToInsert
-        prefix: 'reindex'  // Use filename for prefix because filename is assumed unique
+        maxInteger: 100,   // Used for document values. Must be a factor of nDocumentsToInsert.
+        prefix: 'reindex'  // Use filename for prefix because filename is assumed unique.
     };
 
     var states = (function() {
@@ -29,20 +30,21 @@ var $config = (function() {
                 });
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.nDocumentsToInsert, res.nInserted);
         }
 
         function createIndexes(db, collName) {
-            // The number of indexes created here is also stored in data.nIndexes
-            var textResult = db[this.threadCollName].ensureIndex({text: 'text'});
-            assertAlways.commandWorked(textResult);
-
-            var geoResult = db[this.threadCollName].ensureIndex({geo: '2dsphere'});
-            assertAlways.commandWorked(geoResult);
-
-            var integerResult = db[this.threadCollName].ensureIndex({integer: 1});
-            assertAlways.commandWorked(integerResult);
+            // The number of indexes created here is also stored in data.nIndexes.
+            const coll = db[this.threadCollName];
+            assertWorkedHandleTxnErrors(coll.createIndex({text: 'text'}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({geo: '2dsphere'}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({integer: 1}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
+            assertWorkedHandleTxnErrors(coll.createIndex({"$**": 1}),
+                                        ErrorCodes.IndexBuildAlreadyInProgress);
         }
 
         function init(db, collName) {
@@ -99,17 +101,5 @@ var $config = (function() {
         query: {reIndex: 0.5, query: 0.5}
     };
 
-    var teardown = function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '_\\d+$');
-        dropCollections(db, pattern);
-    };
-
-    return {
-        threadCount: 15,
-        iterations: 10,
-        states: states,
-        transitions: transitions,
-        teardown: teardown,
-        data: data
-    };
+    return {threadCount: 15, iterations: 10, states: states, transitions: transitions, data: data};
 })();

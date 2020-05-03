@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,8 +31,8 @@
 
 #include "mongo/db/pipeline/granularity_rounder.h"
 
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/util/assert_util.h"
 
@@ -105,13 +106,9 @@ void testRoundingUpInSeries(intrusive_ptr<GranularityRounder> rounder) {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
                 FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding up the value "
-                                   << input.coerceToDouble()
-                                   << " at multiplier level "
-                                   << multiplier
-                                   << ". Expected "
-                                   << expectedValue.coerceToDouble()
-                                   << ", but got "
+                                   << " failed rounding up the value " << input.coerceToDouble()
+                                   << " at multiplier level " << multiplier << ". Expected "
+                                   << expectedValue.coerceToDouble() << ", but got "
                                    << roundedValue.coerceToDouble());
             }
         }
@@ -139,15 +136,12 @@ void testRoundingUpInSeriesDecimal(intrusive_ptr<GranularityRounder> rounder) {
             try {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
-                FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding up the value "
-                                   << input.coerceToDecimal().toString()
-                                   << " at multiplier level "
-                                   << multiplier.toString()
-                                   << ". Expected "
-                                   << expectedValue.coerceToDecimal().toString()
-                                   << ", but got "
-                                   << roundedValue.coerceToDecimal().toString());
+                FAIL(str::stream()
+                     << "The GranularityRounder for " << rounder->getName()
+                     << " failed rounding up the value " << input.coerceToDecimal().toString()
+                     << " at multiplier level " << multiplier.toString() << ". Expected "
+                     << expectedValue.coerceToDecimal().toString() << ", but got "
+                     << roundedValue.coerceToDecimal().toString());
             }
         }
         multiplier = multiplier.multiply(Decimal128(10));
@@ -174,15 +168,11 @@ void testRoundingUpBetweenSeries(intrusive_ptr<GranularityRounder> rounder) {
             try {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
-                FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding up the value "
-                                   << middle
-                                   << " at multiplier level "
-                                   << multiplier
-                                   << ". Expected "
-                                   << expectedValue.coerceToDouble()
-                                   << ", but got "
-                                   << roundedValue.coerceToDouble());
+                FAIL(str::stream()
+                     << "The GranularityRounder for " << rounder->getName()
+                     << " failed rounding up the value " << middle << " at multiplier level "
+                     << multiplier << ". Expected " << expectedValue.coerceToDouble()
+                     << ", but got " << roundedValue.coerceToDouble());
             }
         }
         multiplier *= 10.0;
@@ -211,14 +201,10 @@ void testRoundingUpBetweenSeriesDecimal(intrusive_ptr<GranularityRounder> rounde
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
                 FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding up the value "
-                                   << middle.toString()
-                                   << " at multiplier level "
-                                   << multiplier.toString()
-                                   << ". Expected "
-                                   << expectedValue.coerceToDecimal().toString()
-                                   << ", but got "
-                                   << roundedValue.coerceToDecimal().toString());
+                                   << " failed rounding up the value " << middle.toString()
+                                   << " at multiplier level " << multiplier.toString()
+                                   << ". Expected " << expectedValue.coerceToDecimal().toString()
+                                   << ", but got " << roundedValue.coerceToDecimal().toString());
             }
         }
         multiplier = multiplier.multiply(Decimal128(10));
@@ -243,13 +229,9 @@ void testRoundingDownInSeries(intrusive_ptr<GranularityRounder> rounder) {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
                 FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding down the value "
-                                   << input.coerceToDouble()
-                                   << " at multiplier level "
-                                   << multiplier
-                                   << ". Expected "
-                                   << expectedValue.coerceToDouble()
-                                   << ", but got "
+                                   << " failed rounding down the value " << input.coerceToDouble()
+                                   << " at multiplier level " << multiplier << ". Expected "
+                                   << expectedValue.coerceToDouble() << ", but got "
                                    << roundedValue.coerceToDouble());
             }
         }
@@ -276,15 +258,12 @@ void testRoundingDownInSeriesDecimal(intrusive_ptr<GranularityRounder> rounder) 
             try {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
-                FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding down the value "
-                                   << input.coerceToDecimal().toString()
-                                   << " at multiplier level "
-                                   << multiplier.toString()
-                                   << ". Expected "
-                                   << expectedValue.coerceToDecimal().toString()
-                                   << ", but got "
-                                   << roundedValue.coerceToDecimal().toString());
+                FAIL(str::stream()
+                     << "The GranularityRounder for " << rounder->getName()
+                     << " failed rounding down the value " << input.coerceToDecimal().toString()
+                     << " at multiplier level " << multiplier.toString() << ". Expected "
+                     << expectedValue.coerceToDecimal().toString() << ", but got "
+                     << roundedValue.coerceToDecimal().toString());
             }
         }
         multiplier = multiplier.multiply(Decimal128(10));
@@ -311,15 +290,11 @@ void testRoundingDownBetweenSeries(intrusive_ptr<GranularityRounder> rounder) {
             try {
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
-                FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding down the value "
-                                   << middle
-                                   << " at multiplier level "
-                                   << multiplier
-                                   << ". Expected "
-                                   << expectedValue.coerceToDouble()
-                                   << ", but got "
-                                   << roundedValue.coerceToDouble());
+                FAIL(str::stream()
+                     << "The GranularityRounder for " << rounder->getName()
+                     << " failed rounding down the value " << middle << " at multiplier level "
+                     << multiplier << ". Expected " << expectedValue.coerceToDouble()
+                     << ", but got " << roundedValue.coerceToDouble());
             }
         }
         multiplier *= 10.0;
@@ -348,14 +323,10 @@ void testRoundingDownBetweenSeriesDecimal(intrusive_ptr<GranularityRounder> roun
                 testEquals(roundedValue, expectedValue);
             } catch (...) {
                 FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                                   << " failed rounding down the value "
-                                   << middle.toString()
-                                   << " at multiplier level "
-                                   << multiplier.toString()
-                                   << ". Expected "
-                                   << expectedValue.coerceToDecimal().toString()
-                                   << ", but got "
-                                   << roundedValue.coerceToDecimal().toString());
+                                   << " failed rounding down the value " << middle.toString()
+                                   << " at multiplier level " << multiplier.toString()
+                                   << ". Expected " << expectedValue.coerceToDecimal().toString()
+                                   << ", but got " << roundedValue.coerceToDecimal().toString());
             }
         }
         multiplier = multiplier.multiply(Decimal128(10));
@@ -382,13 +353,9 @@ void testSeriesWrappingAround(intrusive_ptr<GranularityRounder> rounder) {
             testEquals(roundedValue, expectedValue);
         } catch (...) {
             FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                               << " failed rounding up the value "
-                               << input.coerceToDouble()
-                               << " at multiplier level "
-                               << multiplier
-                               << ". Expected "
-                               << expectedValue.coerceToDouble()
-                               << ", but got "
+                               << " failed rounding up the value " << input.coerceToDouble()
+                               << " at multiplier level " << multiplier << ". Expected "
+                               << expectedValue.coerceToDouble() << ", but got "
                                << roundedValue.coerceToDouble());
         }
 
@@ -399,13 +366,9 @@ void testSeriesWrappingAround(intrusive_ptr<GranularityRounder> rounder) {
             testEquals(roundedValue, expectedValue);
         } catch (...) {
             FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
-                               << " failed rounding down the value "
-                               << input.coerceToDouble()
-                               << " at multiplier level "
-                               << multiplier
-                               << ". Expected "
-                               << expectedValue.coerceToDouble()
-                               << ", but got "
+                               << " failed rounding down the value " << input.coerceToDouble()
+                               << " at multiplier level " << multiplier << ". Expected "
+                               << expectedValue.coerceToDouble() << ", but got "
                                << roundedValue.coerceToDouble());
         }
         multiplier *= 10.0;
@@ -429,12 +392,9 @@ void testSeriesWrappingAroundDecimal(intrusive_ptr<GranularityRounder> rounder) 
         } catch (...) {
             FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
                                << " failed rounding up the value "
-                               << input.coerceToDecimal().toString()
-                               << " at multiplier level "
-                               << multiplier.toString()
-                               << ". Expected "
-                               << expectedValue.coerceToDecimal().toString()
-                               << ", but got "
+                               << input.coerceToDecimal().toString() << " at multiplier level "
+                               << multiplier.toString() << ". Expected "
+                               << expectedValue.coerceToDecimal().toString() << ", but got "
                                << roundedValue.coerceToDecimal().toString());
         }
 
@@ -448,12 +408,9 @@ void testSeriesWrappingAroundDecimal(intrusive_ptr<GranularityRounder> rounder) 
         } catch (...) {
             FAIL(str::stream() << "The GranularityRounder for " << rounder->getName()
                                << " failed rounding down the value "
-                               << input.coerceToDecimal().toString()
-                               << " at multiplier level "
-                               << multiplier.toString()
-                               << ". Expected "
-                               << expectedValue.coerceToDecimal().toString()
-                               << ", but got "
+                               << input.coerceToDecimal().toString() << " at multiplier level "
+                               << multiplier.toString() << ". Expected "
+                               << expectedValue.coerceToDecimal().toString() << ", but got "
                                << roundedValue.coerceToDecimal().toString());
         }
         multiplier.multiply(Decimal128(10));
@@ -571,5 +528,19 @@ TEST(GranularityRounderPreferredNumbersTest, ShouldFailOnRoundingNegativeNumber)
         ASSERT_THROWS_CODE(rounder->roundDown(negativeNumber), AssertionException, 40268);
     }
 }
+
+TEST(GranularityRounderPreferredNumbersTest, Infinity) {
+    auto rounder =
+        GranularityRounder::getGranularityRounder(new ExpressionContextForTest(), "E192");
+
+    Value inf = Value(std::numeric_limits<double>::infinity());
+    ASSERT_TRUE(std::isinf(rounder->roundUp(inf).coerceToDouble()));
+    ASSERT_TRUE(std::isinf(rounder->roundDown(inf).coerceToDouble()));
+
+    Value decimalInf = Value(Decimal128::kPositiveInfinity);
+    testEquals(rounder->roundUp(decimalInf), decimalInf);
+    testEquals(rounder->roundDown(decimalInf), decimalInf);
+}
+
 }  // namespace
 }  // namespace mongo

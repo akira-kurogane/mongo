@@ -1,41 +1,49 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class BSONObj;
+class MigrationSessionId;
 class OperationContext;
 class Status;
+class Timestamp;
+class UUID;
+
+namespace repl {
+class OpTime;
+}  // namespace repl
 
 /**
  * This class is responsible for producing chunk documents to be moved from donor to a recipient
@@ -52,7 +60,8 @@ class Status;
  * kicks off the cloning as soon as possible by calling startClone.
  */
 class MigrationChunkClonerSource {
-    MONGO_DISALLOW_COPYING(MigrationChunkClonerSource);
+    MigrationChunkClonerSource(const MigrationChunkClonerSource&) = delete;
+    MigrationChunkClonerSource& operator=(const MigrationChunkClonerSource&) = delete;
 
 public:
     virtual ~MigrationChunkClonerSource();
@@ -65,7 +74,11 @@ public:
      * NOTE: Must be called without any locks and must succeed, before any other methods are called
      * (except for cancelClone and [insert/update/delete]Op).
      */
-    virtual Status startClone(OperationContext* opCtx) = 0;
+    virtual Status startClone(OperationContext* opCtx,
+                              const UUID& migrationId,
+                              const LogicalSessionId& lsid,
+                              TxnNumber txnNumber,
+                              bool resumableRangeDeleterDisabled) = 0;
 
     /**
      * Blocking method, which uses some custom selected logic for deciding whether it is appropriate
@@ -88,9 +101,12 @@ public:
      * This must only be called once and no more methods on the cloner must be used afterwards
      * regardless of whether it succeeds or not.
      *
+     * Returns statistics about the move. These are informational only and should not be
+     * interpreted by the caller for any means other than reporting.
+     *
      * NOTE: Must be called without any locks.
      */
-    virtual Status commitClone(OperationContext* opCtx) = 0;
+    virtual StatusWith<BSONObj> commitClone(OperationContext* opCtx) = 0;
 
     /**
      * Tells the recipient to abort the clone and cleanup any unused data. This method's
@@ -118,7 +134,9 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc) = 0;
+    virtual void onInsertOp(OperationContext* opCtx,
+                            const BSONObj& insertedDoc,
+                            const repl::OpTime& opTime) = 0;
 
     /**
      * Notifies this cloner that an update happened to the collection, which it owns. It is up to
@@ -127,7 +145,11 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onUpdateOp(OperationContext* opCtx, const BSONObj& updatedDoc) = 0;
+    virtual void onUpdateOp(OperationContext* opCtx,
+                            boost::optional<BSONObj> preImageDoc,
+                            const BSONObj& postImageDoc,
+                            const repl::OpTime& opTime,
+                            const repl::OpTime& prePostImageOpTime) = 0;
 
     /**
      * Notifies this cloner that a delede happened to the collection, which it owns. It is up to the
@@ -136,7 +158,16 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onDeleteOp(OperationContext* opCtx, const BSONObj& deletedDocId) = 0;
+    virtual void onDeleteOp(OperationContext* opCtx,
+                            const BSONObj& deletedDocId,
+                            const repl::OpTime& opTime,
+                            const repl::OpTime& preImageOpTime) = 0;
+
+    /**
+     * Returns the migration session id associated with this cloner, so stale sessions can be
+     * disambiguated.
+     */
+    virtual const MigrationSessionId& getSessionId() const = 0;
 
 protected:
     MigrationChunkClonerSource();

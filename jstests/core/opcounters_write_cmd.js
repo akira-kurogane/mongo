@@ -1,4 +1,7 @@
 // Test that opcounters get incremented properly.
+// @tags: [
+//   uses_multiple_connections,
+// ]
 // Legacy write mode test also available at jstests/gle.
 
 var mongo = new Mongo(db.getMongo().host);
@@ -28,13 +31,13 @@ t.drop();
 // Single insert, no error.
 opCounters = newdb.serverStatus().opcounters;
 res = t.insert({_id: 0});
-assert.writeOK(res);
+assert.commandWorked(res);
 assert.eq(opCounters.insert + 1, newdb.serverStatus().opcounters.insert);
 
 // Bulk insert, no error.
 opCounters = newdb.serverStatus().opcounters;
 res = t.insert([{_id: 1}, {_id: 2}]);
-assert.writeOK(res);
+assert.commandWorked(res);
 assert.eq(opCounters.insert + 2, newdb.serverStatus().opcounters.insert);
 
 // Test is not run when in compatibility mode as errors are not counted
@@ -68,7 +71,7 @@ t.insert({_id: 0});
 // Update, no error.
 opCounters = newdb.serverStatus().opcounters;
 res = t.update({_id: 0}, {$set: {a: 1}});
-assert.writeOK(res);
+assert.commandWorked(res);
 assert.eq(opCounters.update + 1, newdb.serverStatus().opcounters.update);
 
 // Update, with error.
@@ -87,7 +90,7 @@ t.insert([{_id: 0}, {_id: 1}]);
 // Delete, no error.
 opCounters = newdb.serverStatus().opcounters;
 res = t.remove({_id: 0});
-assert.writeOK(res);
+assert.commandWorked(res);
 assert.eq(opCounters.delete + 1, newdb.serverStatus().opcounters.delete);
 
 // Delete, with error.
@@ -132,7 +135,12 @@ t.find().batchSize(2).toArray();  // 3 documents, batchSize=2 => 1 query + 1 get
 assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
 assert.eq(opCounters.getmore + 1, newdb.serverStatus().opcounters.getmore);
 
-// Getmore, with error (TODO implement when SERVER-5813 is resolved).
+// Getmore, with error.
+opCounters = newdb.serverStatus().opcounters;
+assert.commandFailedWithCode(
+    t.getDB().runCommand({getMore: NumberLong(123), collection: t.getName()}),
+    ErrorCodes.CursorNotFound);
+assert.eq(opCounters.getmore + 1, newdb.serverStatus().opcounters.getmore);
 
 //
 // 6. Command.
@@ -144,6 +152,10 @@ assert.eq(opCounters.getmore + 1, newdb.serverStatus().opcounters.getmore);
 
 t.drop();
 t.insert({_id: 0});
+
+// Send a command that attaches a databaseVersion to ensure the shard refreshes its cached database
+// version before starting to record opcounters.
+assert.commandWorked(newdb.runCommand({listCollections: 1}));
 
 // Command, recognized, no error.
 serverStatus = newdb.runCommand({serverStatus: 1});

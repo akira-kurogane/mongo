@@ -1,6 +1,9 @@
 // Cannot implicitly shard accessed collections because unsupported use of sharded collection
 // for output collection of aggregation pipeline.
-// @tags: [assumes_unsharded_collection]
+// @tags: [
+//   assumes_superuser_permissions,
+//   assumes_unsharded_collection,
+// ]
 
 // server-3253 Unsharded support for $out
 load('jstests/aggregation/extras/utils.js');
@@ -13,10 +16,6 @@ var cappedOutput = db.server3253_out_capped;
 input.drop();
 inputDoesntExist.drop();  // never created
 output.drop();
-
-function collectionExists(coll) {
-    return Array.contains(coll.getDB().getCollectionNames(), coll.getName());
-}
 
 function getOutputIndexes() {
     return output.getIndexes().sort(function(a, b) {
@@ -34,8 +33,8 @@ function test(input, pipeline, expected) {
 
     var cursor = input.aggregate(pipeline);
 
-    assert.eq(cursor.itcount(), 0);                // empty cursor returned
-    assert.eq(output.find().toArray(), expected);  // correct results
+    assert.eq(cursor.itcount(), 0);                    // empty cursor returned
+    assert(anyEq(output.find().toArray(), expected));  // correct results
     var outputIndexes = getOutputIndexes();
     assert.eq(outputIndexes.length, indexes.length);  // number of indexes maintained
     for (var i = 0; i < outputIndexes.length; i++) {
@@ -47,7 +46,7 @@ function test(input, pipeline, expected) {
 
 function listCollections(name) {
     var collectionInfosCursor = db.runCommand("listCollections", {filter: {name: name}});
-    return new DBCommandCursor(db.getMongo(), collectionInfosCursor).toArray();
+    return new DBCommandCursor(db, collectionInfosCursor).toArray();
 }
 
 input.insert({_id: 1});
@@ -91,18 +90,12 @@ test(input, [{$project: {c: {$concat: ["hello there ", "_id"]}}}], [
     {_id: 3, c: "hello there _id"}
 ]);
 
-// test with capped collection
 cappedOutput.drop();
 db.createCollection(cappedOutput.getName(), {capped: true, size: 2});
 assertErrorCode(input, {$out: cappedOutput.getName()}, 17152);
 
 // ensure everything works even if input doesn't exist.
 test(inputDoesntExist, [], []);
-
-// ensure we cant do dangerous things to system collections
-var outputInSystem = db.system.server3253_out;
-assertErrorCode(input, {$out: outputInSystem.getName()}, 17385);
-assert(!collectionExists(outputInSystem));
 
 // shoudn't leave temp collections laying around
 assert.eq([], listCollections(/tmp\.agg_out/));

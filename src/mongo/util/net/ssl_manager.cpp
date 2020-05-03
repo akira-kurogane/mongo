@@ -1,1631 +1,1250 @@
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_manager.h"
 
 #include <boost/algorithm/string.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <stack>
 #include <string>
 #include <vector>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/debug_util.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/private/ssl_expiration.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/socket_exception.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/icu.h"
 #include "mongo/util/net/ssl_options.h"
-#include "mongo/util/net/ssl_types.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/str.h"
+#include "mongo/util/synchronized_value.h"
 #include "mongo/util/text.h"
-
-#ifdef MONGO_CONFIG_SSL
-#include <openssl/asn1.h>
-#include <openssl/asn1t.h>
-#include <openssl/evp.h>
-#include <openssl/x509_vfy.h>
-#include <openssl/x509v3.h>
-#if defined(_WIN32)
-#include <wincrypt.h>
-#elif defined(__APPLE__)
-#include <Security/Security.h>
-#endif
-#endif
 
 namespace mongo {
 
+SSLManagerInterface* theSSLManager = nullptr;
+
 namespace {
 
-// Because the hostname having a slash is used by `mongo::SockAddr` to determine if a hostname is a
-// Unix Domain Socket endpoint, this function uses the same logic.  (See
-// `mongo::SockAddr::Sockaddr(StringData, int, sa_family_t)`).  A user explicitly specifying a Unix
-// Domain Socket in the present working directory, through a code path which supplies `sa_family_t`
-// as `AF_UNIX` will cause this code to lie.  This will, in turn, cause the
-// `SSLManager::parseAndValidatePeerCertificate` code to believe a socket is a host, which will then
-// cause a connection failure if and only if that domain socket also has a certificate for SSL and
-// the connection is an SSL connection.
-bool isUnixDomainSocket(const std::string& hostname) {
-    return end(hostname) != std::find(begin(hostname), end(hostname), '/');
+// Some of these duplicate the std::isalpha/std::isxdigit because we don't want them to be
+// affected by the current locale.
+inline bool isAlpha(char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
 }
 
-const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
-    transport::Session::declareDecoration<SSLPeerInfo>();
-
-/**
- * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
- * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
- * If true, such log messages will be suppressed.
- */
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
-    disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
-                                            "disableNonSSLConnectionLogging",
-                                            &sslGlobalParams.disableNonSSLConnectionLogging);
-
-ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
-    setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
-                                     "opensslDiffieHellmanParameters",
-                                     &sslGlobalParams.sslPEMTempDHParam);
-}  // namespace
-
-SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
-    return peerInfoForSession(session.get());
+inline bool isDigit(char ch) {
+    return (ch >= '0' && ch <= '9');
 }
 
-SSLParams sslGlobalParams;
-
-const SSLParams& getSSLGlobalParams() {
-    return sslGlobalParams;
+inline bool isHex(char ch) {
+    return isDigit(ch) || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f');
 }
 
-class OpenSSLCipherConfigParameter
-    : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
-public:
-    OpenSSLCipherConfigParameter()
-        : ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "opensslCipherConfig",
-              &sslGlobalParams.sslCipherConfig) {}
-    Status validate(const std::string& potentialNewValue) final {
-        if (!sslGlobalParams.sslCipherConfig.empty()) {
-            return Status(
-                ErrorCodes::BadValue,
-                "opensslCipherConfig setParameter is incompatible with net.ssl.sslCipherConfig");
-        }
-        // Note that there is very little validation that we can do here.
-        // OpenSSL exposes no API to validate a cipher config string. The only way to figure out
-        // what a string maps to is to make an SSL_CTX object, set the string on it, then parse the
-        // resulting STACK_OF object. If provided an invalid entry in the string, it will silently
-        // ignore it. Because an entry in the string may map to multiple ciphers, or remove ciphers
-        // from the final set produced by the full string, we can't tell if any entry failed
-        // to parse.
-        return Status::OK();
+// This function returns true if the character is supposed to be escaped according to the rules
+// in RFC4514. The exception to the RFC the space character ' ' and the '#', because we've not
+// required users to escape spaces or sharps in DNs in the past.
+inline bool isEscaped(char ch) {
+    switch (ch) {
+        case '"':
+        case '+':
+        case ',':
+        case ';':
+        case '<':
+        case '>':
+        case '\\':
+            return true;
+        default:
+            return false;
     }
-} openSSLCipherConfig;
-
-#ifdef MONGO_CONFIG_SSL
-namespace {
-
-// If the underlying SSL supports auto-configuration of ECDH parameters, this function will select
-// it, otherwise this function will do nothing.
-void setECDHModeAuto(SSL_CTX* const ctx) {
-#ifdef MONGO_CONFIG_HAVE_SSL_SET_ECDH_AUTO
-    ::SSL_CTX_set_ecdh_auto(ctx, true);
-#endif
-    std::ignore = ctx;
 }
 
-struct DHFreer {
-    void operator()(DH* const dh) noexcept {
-        if (dh) {
-            ::DH_free(dh);
-        }
+// These characters may appear escaped in a string or not, but must not appear as the first
+// character.
+inline bool isMayBeEscaped(char ch) {
+    switch (ch) {
+        case ' ':
+        case '#':
+        case '=':
+            return true;
+        default:
+            return false;
     }
-};
-using UniqueDHParams = std::unique_ptr<DH, DHFreer>;
-
-struct BIOFree {
-    void operator()(BIO* const p) noexcept {
-        // Assumes that BIO_free succeeds.
-        if (p) {
-            ::BIO_free(p);
-        }
-    }
-};
-using UniqueBIO = std::unique_ptr<BIO, BIOFree>;
-
-UniqueBIO makeUniqueMemBio(std::vector<std::uint8_t>& v) {
-    UniqueBIO rv(::BIO_new_mem_buf(v.data(), v.size()));
-    if (!rv) {
-        class ssl_bad_alloc : public std::bad_alloc {
-        private:
-            std::string message;
-
-        public:
-            explicit ssl_bad_alloc(std::string m) : message(std::move(m)) {}
-
-            const char* what() const noexcept override {
-                return message.c_str();
-            }
-        };
-        throw ssl_bad_alloc(str::stream()
-                            << "Error allocating SSL BIO: "
-                            << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
-    }
-    return rv;
 }
 
-// Old copies of OpenSSL will not have constants to disable protocols they don't support.
-// Define them to values we can OR together safely to generically disable these protocols across
-// all versions of OpenSSL.
-#ifndef SSL_OP_NO_TLSv1_1
-#define SSL_OP_NO_TLSv1_1 0
-#endif
-#ifndef SSL_OP_NO_TLSv1_2
-#define SSL_OP_NO_TLSv1_2 0
-#endif
-
-// clang-format off
-#ifndef MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS
-// Copies of OpenSSL before 1.0.0 do not have ASN1_SEQUENCE_ANY, ASN1_SET_ANY, or the helper
-// functions which let us deserialize these objects. We must polyfill the definitions to interact
-// with ASN1 objects so stored.
-typedef STACK_OF(ASN1_TYPE) ASN1_SEQUENCE_ANY;
-
-ASN1_ITEM_TEMPLATE(ASN1_SEQUENCE_ANY) =
-    ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SEQUENCE_OF, 0, ASN1_SEQUENCE_ANY, ASN1_ANY)
-ASN1_ITEM_TEMPLATE_END(ASN1_SEQUENCE_ANY)
-
-ASN1_ITEM_TEMPLATE(ASN1_SET_ANY) =
-    ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SET_OF, 0, ASN1_SET_ANY, ASN1_ANY)
-ASN1_ITEM_TEMPLATE_END(ASN1_SET_ANY)
-
-IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SEQUENCE_ANY,
-                                            ASN1_SEQUENCE_ANY)
-IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN1_SET_ANY)
-; // clang format needs to see a semicolon or it will start formatting unrelated code
-#endif // MONGO_CONFIG_NEEDS_ASN1_ANY_DEFINITIONS
-// clang-format on
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-// Copies of OpenSSL after 1.1.0 define new functions for interaction with
-// X509 structure. We must polyfill used definitions to interact with older
-// OpenSSL versions.
-const STACK_OF(X509_EXTENSION) * X509_get0_extensions(const X509* peerCert) {
-    return peerCert->cert_info->extensions;
-}
-#endif
-
-/**
- * Multithreaded Support for SSL.
+/*
+ * This class parses out the components of a DN according to RFC4514.
  *
- * In order to allow OpenSSL to work in a multithreaded environment, you
- * may need to provide some callbacks for it to use for locking. The following code
- * sets up a vector of mutexes and provides a thread unique ID number.
- * The so-called SSLThreadInfo class encapsulates most of the logic required for
- * OpenSSL multithreaded support.
- *
- * OpenSSL before version 1.1.0 requires applications provide a callback which emits a thread
- * identifier. This ID is used to store thread specific ERR information. When a thread is
- * terminated, it must call ERR_remove_state or ERR_remove_thread_state. These functions may
- * themselves invoke the application provided callback. These IDs are stored in a hashtable with
- * a questionable hash function. They must be uniformly distributed to prevent collisions.
+ * It takes in a StringData to the DN to be parsed, the buffer containing the StringData
+ * must remain in scope for the duration that it is being parsed.
  */
-class SSLThreadInfo {
+class RFC4514Parser {
 public:
-    static unsigned long getID() {
-        struct CallErrRemoveState {
-            explicit CallErrRemoveState(ThreadIDManager& manager, unsigned long id)
-                : _manager(manager), id(id) {}
+    explicit RFC4514Parser(StringData sd) : _str(sd), _it(_str.begin()) {}
 
-            ~CallErrRemoveState() {
-                ERR_remove_state(0);
-                _manager.releaseID(id);
-            };
+    std::string extractAttributeName();
 
-            ThreadIDManager& _manager;
-            unsigned long id;
-        };
-
-        // NOTE: This logic is fully intentional. Because ERR_remove_state (called within
-        // the destructor of the kRemoveStateFromThread object) re-enters this function,
-        // we must have a two phase protection, otherwise we would access a thread local
-        // during its destruction.
-        static thread_local boost::optional<CallErrRemoveState> threadLocalState;
-        if (!threadLocalState) {
-            threadLocalState.emplace(_idManager, _idManager.reserveID());
-        }
-
-        return threadLocalState->id;
-    }
-
-    static void lockingCallback(int mode, int type, const char* file, int line) {
-        if (mode & CRYPTO_LOCK) {
-            _mutex[type]->lock();
-        } else {
-            _mutex[type]->unlock();
-        }
-    }
-
-    static void init() {
-        CRYPTO_set_id_callback(&SSLThreadInfo::getID);
-        CRYPTO_set_locking_callback(&SSLThreadInfo::lockingCallback);
-
-        while ((int)_mutex.size() < CRYPTO_num_locks()) {
-            _mutex.emplace_back(stdx::make_unique<stdx::recursive_mutex>());
-        }
-    }
-
-private:
-    SSLThreadInfo() = delete;
-
-    // Note: see SERVER-8734 for why we are using a recursive mutex here.
-    // Once the deadlock fix in OpenSSL is incorporated into most distros of
-    // Linux, this can be changed back to a nonrecursive mutex.
-    static std::vector<std::unique_ptr<stdx::recursive_mutex>> _mutex;
-
-    class ThreadIDManager {
-    public:
-        unsigned long reserveID() {
-            stdx::unique_lock<stdx::mutex> lock(_idMutex);
-            if (!_idLast.empty()) {
-                unsigned long ret = _idLast.top();
-                _idLast.pop();
-                return ret;
-            }
-            return ++_idNext;
-        }
-
-        void releaseID(unsigned long id) {
-            stdx::unique_lock<stdx::mutex> lock(_idMutex);
-            _idLast.push(id);
-        }
-
-    private:
-        // Machinery for producing IDs that are unique for the life of a thread.
-        stdx::mutex _idMutex;       // Protects _idNext and _idLast.
-        unsigned long _idNext = 0;  // Stores the next thread ID to use, if none already allocated.
-        std::stack<unsigned long, std::vector<unsigned long>>
-            _idLast;  // Stores old thread IDs, for reuse.
+    enum ValueTerminator {
+        NewRDN,      // The value ended in ','
+        MultiValue,  // The value ended in '+'
+        Done         // The value ended with the end of the string
     };
-    static ThreadIDManager _idManager;
-};
-std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
-SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
-namespace {
-// We only want to free SSL_CTX objects if they have been populated. OpenSSL seems to perform this
-// check before freeing them, but because it does not document this, we should protect ourselves.
-void free_ssl_context(SSL_CTX* ctx) {
-    if (ctx != nullptr) {
-        SSL_CTX_free(ctx);
-    }
-}
-}  // namespace
+    // Returns a decoded string representing one value in an RDN, and the way the value was
+    // terminated.
+    std::pair<std::string, ValueTerminator> extractValue();
 
-////////////////////////////////////////////////////////////////
-
-SimpleMutex sslManagerMtx;
-SSLManagerInterface* theSSLManager = NULL;
-using UniqueSSLContext = std::unique_ptr<SSL_CTX, decltype(&free_ssl_context)>;
-static const int BUFFER_SIZE = 8 * 1024;
-static const int DATE_LEN = 128;
-
-class SSLManager : public SSLManagerInterface {
-public:
-    explicit SSLManager(const SSLParams& params, bool isServer);
-
-    /**
-     * Initializes an OpenSSL context according to the provided settings. Only settings which are
-     * acceptable on non-blocking connections are set.
-     */
-    Status initSSLContext(SSL_CTX* context,
-                          const SSLParams& params,
-                          ConnectionDirection direction) final;
-
-    virtual SSLConnection* connect(Socket* socket);
-
-    virtual SSLConnection* accept(Socket* socket, const char* initialBytes, int len);
-
-    virtual SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
-                                                                  const std::string& remoteHost);
-
-    StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        SSL* conn, const std::string& remoteHost) final;
-
-    virtual const SSLConfiguration& getSSLConfiguration() const {
-        return _sslConfiguration;
+    bool done() const {
+        return _it == _str.end();
     }
 
-    virtual int SSL_read(SSLConnection* conn, void* buf, int num);
-
-    virtual int SSL_write(SSLConnection* conn, const void* buf, int num);
-
-    virtual unsigned long ERR_get_error();
-
-    virtual char* ERR_error_string(unsigned long e, char* buf);
-
-    virtual int SSL_get_error(const SSLConnection* conn, int ret);
-
-    virtual int SSL_shutdown(SSLConnection* conn);
-
-    virtual void SSL_free(SSLConnection* conn);
+    void skipSpaces() {
+        while (!done() && _cur() == ' ') {
+            _advance();
+        }
+    }
 
 private:
-    const int _rolesNid = OBJ_create(mongodbRolesOID.identifier.c_str(),
-                                     mongodbRolesOID.shortDescription.c_str(),
-                                     mongodbRolesOID.longDescription.c_str());
-    UniqueSSLContext _serverContext;  // SSL context for incoming connections
-    UniqueSSLContext _clientContext;  // SSL context for outgoing connections
-    bool _weakValidation;
-    bool _allowInvalidCertificates;
-    bool _allowInvalidHostnames;
-    SSLConfiguration _sslConfiguration;
+    char _cur() const {
+        uassert(51036, "Overflowed string while parsing DN string", !done());
+        return *_it;
+    }
 
-    /**
-     * creates an SSL object to be used for this file descriptor.
-     * caller must SSL_free it.
-     */
-    SSL* _secure(SSL_CTX* context, int fd);
+    char _advance() {
+        invariant(!done());
+        ++_it;
+        return done() ? '\0' : _cur();
+    }
 
-    /**
-     * Given an error code from an SSL-type IO function, logs an
-     * appropriate message and throws a SocketException.
-     */
-    MONGO_COMPILER_NORETURN void _handleSSLError(int code, int ret);
-
-    /*
-     * Init the SSL context using parameters provided in params. This SSL context will
-     * be configured for blocking send/receive.
-     */
-    bool _initSynchronousSSLContext(UniqueSSLContext* context,
-                                    const SSLParams& params,
-                                    ConnectionDirection direction);
-
-    /*
-     * Converts time from OpenSSL return value to unsigned long long
-     * representing the milliseconds since the epoch.
-     */
-    unsigned long long _convertASN1ToMillis(ASN1_TIME* t);
-
-    /*
-     * Parse and store x509 subject name from the PEM keyfile.
-     * For server instances check that PEM certificate is not expired
-     * and extract server certificate notAfter date.
-     * @param keyFile referencing the PEM file to be read.
-     * @param subjectName as a pointer to the subject name variable being set.
-     * @param serverNotAfter a Date_t object pointer that is valued if the
-     * date is to be checked (as for a server certificate) and null otherwise.
-     * @return bool showing if the function was successful.
-     */
-    bool _parseAndValidateCertificate(const std::string& keyFile,
-                                      const std::string& keyPassword,
-                                      std::string* subjectName,
-                                      Date_t* serverNotAfter);
-
-
-    StatusWith<stdx::unordered_set<RoleName>> _parsePeerRoles(X509* peerCert) const;
-
-    /** @return true if was successful, otherwise false */
-    bool _setupPEM(SSL_CTX* context, const std::string& keyFile, const std::string& password);
-
-    /*
-     * Set up an SSL context for certificate validation by loading a CA
-     */
-    Status _setupCA(SSL_CTX* context, const std::string& caFile);
-
-    /*
-     * Set up an SSL context for certificate validation by loading the system's CA store
-     */
-    Status _setupSystemCA(SSL_CTX* context);
-
-    /*
-     * Import a certificate revocation list into an SSL context
-     * for use with validating certificates
-     */
-    bool _setupCRL(SSL_CTX* context, const std::string& crlFile);
-
-    /*
-     * sub function for checking the result of an SSL operation
-     */
-    bool _doneWithSSLOp(SSLConnection* conn, int status);
-
-    /*
-     * Send and receive network data
-     */
-    void _flushNetworkBIO(SSLConnection* conn);
-
-    /*
-     * match a remote host name to an x.509 host name
-     */
-    bool _hostNameMatch(const char* nameToMatch, const char* certHostName);
-
-    /**
-     * Callbacks for SSL functions.
-     */
-    static int password_cb(char* buf, int num, int rwflag, void* userdata);
-    static int verify_cb(int ok, X509_STORE_CTX* ctx);
+    StringData _str;
+    StringData::const_iterator _it;
 };
 
-void setupFIPS() {
-// Turn on FIPS mode if requested, OPENSSL_FIPS must be defined by the OpenSSL headers
-#if defined(MONGO_CONFIG_HAVE_FIPS_MODE_SET)
-    int status = FIPS_mode_set(1);
-    if (!status) {
-        severe() << "can't activate FIPS mode: "
-                 << SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
-        fassertFailedNoTrace(16703);
-    }
-    log() << "FIPS 140-2 mode activated";
-#else
-    severe() << "this version of mongodb was not compiled with FIPS support";
-    fassertFailedNoTrace(17089);
-#endif
-}
+// Parses an attribute name according to the rules for the "descr" type defined in
+// https://tools.ietf.org/html/rfc4512
+std::string RFC4514Parser::extractAttributeName() {
+    StringBuilder sb;
 
-}  // namespace
-
-// Global variable indicating if this is a server or a client instance
-bool isSSLServer = false;
-
-
-MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
-    SSL_library_init();
-    SSL_load_error_strings();
-    ERR_load_crypto_strings();
-
-    if (sslGlobalParams.sslFIPSMode) {
-        setupFIPS();
-    }
-
-    // Add all digests and ciphers to OpenSSL's internal table
-    // so that encryption/decryption is backwards compatible
-    OpenSSL_add_all_algorithms();
-
-    // Setup OpenSSL multithreading callbacks and mutexes
-    SSLThreadInfo::init();
-
-    return Status::OK();
-}
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL"))(InitializerContext*) {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManager = new SSLManager(sslGlobalParams, isSSLServer);
-    }
-    return Status::OK();
-}
-
-std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
-                                                                 bool isServer) {
-    return stdx::make_unique<SSLManager>(params, isServer);
-}
-
-SSLManagerInterface* getSSLManager() {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (theSSLManager)
-        return theSSLManager;
-    return NULL;
-}
-
-std::string getCertificateSubjectName(X509* cert) {
-    std::string result;
-
-    BIO* out = BIO_new(BIO_s_mem());
-    uassert(16884, "unable to allocate BIO memory", NULL != out);
-    ON_BLOCK_EXIT(BIO_free, out);
-
-    if (X509_NAME_print_ex(out, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253) >= 0) {
-        if (BIO_number_written(out) > 0) {
-            result.resize(BIO_number_written(out));
-            BIO_read(out, &result[0], result.size());
-        }
+    auto ch = _cur();
+    std::function<bool(char ch)> characterCheck;
+    // If the first character is a digit, then this is an OID and can only contain
+    // numbers and '.'
+    if (isDigit(ch)) {
+        characterCheck = [](char ch) { return (isDigit(ch) || ch == '.'); };
+        // If the first character is an alpha, then this is a short name and can only
+        // contain alpha/digit/hyphen characters.
+    } else if (isAlpha(ch)) {
+        characterCheck = [](char ch) { return (isAlpha(ch) || isDigit(ch) || ch == '-'); };
+        // Otherwise this is an invalid attribute name
     } else {
-        log() << "failed to convert subject name to RFC2253 format";
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "DN attribute names must begin with either a digit or an alpha"
+                                << " not \'" << ch << "\'");
     }
 
-    return result;
+    for (; ch != '=' && !done(); ch = _advance()) {
+        if (ch == ' ') {
+            continue;
+        }
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "DN attribute name contains an invalid character \'" << ch << "\'",
+                characterCheck(ch));
+        sb << ch;
+    }
+
+    if (!done()) {
+        _advance();
+    }
+
+    return sb.str();
 }
 
-SSLConnection::SSLConnection(SSL_CTX* context, Socket* sock, const char* initialBytes, int len)
-    : socket(sock) {
-    ssl = SSL_new(context);
+std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractValue() {
+    StringBuilder sb;
 
-    std::string sslErr =
-        NULL != getSSLManager() ? getSSLManager()->getSSLErrorMessage(ERR_get_error()) : "";
-    massert(15861, "Error creating new SSL object " + sslErr, ssl);
+    // The RFC states the spaces at the beginning and end of the value must be escaped, which
+    // means we should skip any leading unescaped spaces.
+    skipSpaces();
 
-    BIO_new_bio_pair(&internalBIO, BUFFER_SIZE, &networkBIO, BUFFER_SIZE);
-    SSL_set_bio(ssl, internalBIO, internalBIO);
+    // Every time we see an escaped space ("\ "), we increment this counter. Every time we see
+    // anything non-space character we reset this counter to zero. That way we'll know the number
+    // of consecutive escaped spaces at the end of the string there are.
+    int trailingSpaces = 0;
 
-    if (len > 0) {
-        int toBIO = BIO_write(networkBIO, initialBytes, len);
-        if (toBIO != len) {
-            LOG(3) << "Failed to write initial network data to the SSL BIO layer";
-            throw SocketException(SocketException::RECV_ERROR, socket->remoteString());
+    char ch = _cur();
+    uassert(ErrorCodes::BadValue, "Raw DER sequences are not supported in DN strings", ch != '#');
+    for (; ch != ',' && ch != '+' && !done(); ch = _advance()) {
+        if (ch == '\\') {
+            ch = _advance();
+            if (isEscaped(ch)) {
+                sb << ch;
+                trailingSpaces = 0;
+            } else if (isHex(ch)) {
+                const std::array<char, 2> hexValStr = {ch, _advance()};
+
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << "Escaped hex value contains invalid character \'"
+                                      << hexValStr[1] << "\'",
+                        isHex(hexValStr[1]));
+                const char hexVal = uassertStatusOK(fromHex(StringData(hexValStr.data(), 2)));
+                sb << hexVal;
+                if (hexVal != ' ') {
+                    trailingSpaces = 0;
+                } else {
+                    trailingSpaces++;
+                }
+            } else if (isMayBeEscaped(ch)) {
+                // It is legal to escape whitespace, but we don't count it as an "escaped"
+                // character because we don't require it to be escaped within the value, that is
+                // "C=New York" is legal, and so is "C=New\ York"
+                //
+                // The exception is that leading and trailing whitespace must be escaped or else
+                // it will be trimmed.
+                sb << ch;
+                if (ch == ' ') {
+                    trailingSpaces++;
+                } else {
+                    trailingSpaces = 0;
+                }
+            } else {
+                uasserted(ErrorCodes::BadValue,
+                          str::stream() << "Invalid escaped character \'" << ch << "\'");
+            }
+        } else if (isEscaped(ch)) {
+            uasserted(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Found unescaped character that should be escaped: \'" << ch << "\'");
+        } else {
+            if (ch != ' ') {
+                trailingSpaces = 0;
+            }
+            sb << ch;
         }
     }
+
+    std::string val = sb.str();
+    // It's legal to have trailing spaces as long as they are escaped, so if we have some trailing
+    // escaped spaces, trim the size of the string to the last non-space character + the number of
+    // escaped trailing spaces.
+    if (trailingSpaces > 0) {
+        auto lastNonSpace = val.find_last_not_of(' ');
+        lastNonSpace += trailingSpaces + 1;
+        val.erase(lastNonSpace);
+    }
+
+    // Consume the + or , character
+    if (!done()) {
+        _advance();
+    }
+
+    switch (ch) {
+        case '+':
+            return {std::move(val), MultiValue};
+        case ',':
+            return {std::move(val), NewRDN};
+        default:
+            invariant(done());
+            return {std::move(val), Done};
+    }
 }
 
-SSLConnection::~SSLConnection() {
-    if (ssl) {  // The internalBIO is automatically freed as part of SSL_free
-        SSL_free(ssl);
-    }
-    if (networkBIO) {
-        BIO_free(networkBIO);
-    }
-}
+const auto getTLSVersionCounts = ServiceContext::declareDecoration<TLSVersionCounts>();
 
-namespace {
+
 void canonicalizeClusterDN(std::vector<std::string>* dn) {
     // remove all RDNs we don't care about
     for (size_t i = 0; i < dn->size(); i++) {
         std::string& comp = dn->at(i);
         boost::algorithm::trim(comp);
-        if (!mongoutils::str::startsWith(comp.c_str(), "DC=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "O=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "OU=")) {
+        if (!str::startsWith(comp.c_str(), "DC=") &&  //
+            !str::startsWith(comp.c_str(), "O=") &&   //
+            !str::startsWith(comp.c_str(), "OU=")) {
             dn->erase(dn->begin() + i);
             i--;
         }
     }
     std::stable_sort(dn->begin(), dn->end());
 }
+
+constexpr StringData kOID_DC = "0.9.2342.19200300.100.1.25"_sd;
+constexpr StringData kOID_O = "2.5.4.10"_sd;
+constexpr StringData kOID_OU = "2.5.4.11"_sd;
+
+std::vector<SSLX509Name::Entry> canonicalizeClusterDN(
+    const std::vector<std::vector<SSLX509Name::Entry>>& entries) {
+    std::vector<SSLX509Name::Entry> ret;
+
+    for (const auto& rdn : entries) {
+        for (const auto& entry : rdn) {
+            if ((entry.oid != kOID_DC) && (entry.oid != kOID_O) && (entry.oid != kOID_OU)) {
+                continue;
+            }
+            ret.push_back(entry);
+        }
+    }
+    std::stable_sort(ret.begin(), ret.end());
+    return ret;
+}
+
+struct DNValue {
+    explicit DNValue(SSLX509Name dn)
+        : fullDN(std::move(dn)), canonicalized(canonicalizeClusterDN(fullDN.entries())) {}
+
+    SSLX509Name fullDN;
+    std::vector<SSLX509Name::Entry> canonicalized;
+};
+synchronized_value<boost::optional<DNValue>> clusterMemberOverride;
+boost::optional<std::vector<SSLX509Name::Entry>> getClusterMemberDNOverrideParameter() {
+    auto guarded_value = clusterMemberOverride.synchronize();
+    auto& value = *guarded_value;
+    if (!value) {
+        return boost::none;
+    }
+    return value->canonicalized;
+}
 }  // namespace
 
-bool SSLConfiguration::isClusterMember(StringData subjectName) const {
-    std::vector<std::string> clientRDN = StringSplitter::split(subjectName.toString(), ",");
-    std::vector<std::string> serverRDN = StringSplitter::split(serverSubjectName, ",");
+void ClusterMemberDNOverride::append(OperationContext* opCtx,
+                                     BSONObjBuilder& b,
+                                     const std::string& name) {
+    auto value = clusterMemberOverride.get();
+    if (value) {
+        b.append(name, value->fullDN.toString());
+    }
+}
 
-    canonicalizeClusterDN(&clientRDN);
-    canonicalizeClusterDN(&serverRDN);
+Status ClusterMemberDNOverride::setFromString(const std::string& str) {
+    if (str.empty()) {
+        *clusterMemberOverride = boost::none;
+        return Status::OK();
+    }
 
-    if (clientRDN.size() == 0 || clientRDN.size() != serverRDN.size()) {
+    auto swDN = parseDN(str);
+    if (!swDN.isOK()) {
+        return swDN.getStatus();
+    }
+    auto dn = std::move(swDN.getValue());
+    auto status = dn.normalizeStrings();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    DNValue val(std::move(dn));
+    if (val.canonicalized.empty()) {
+        return {ErrorCodes::BadValue,
+                "Cluster member DN's must contain at least one O, OU, or DC component"};
+    }
+
+    *clusterMemberOverride = {std::move(val)};
+    return Status::OK();
+}
+
+StatusWith<SSLX509Name> parseDN(StringData sd) try {
+    uassert(ErrorCodes::BadValue, "DN strings must be valid UTF-8 strings", isValidUTF8(sd));
+    RFC4514Parser parser(sd);
+
+    std::vector<std::vector<SSLX509Name::Entry>> entries;
+    auto curRDN = entries.emplace(entries.end());
+    while (!parser.done()) {
+        // Allow spaces to separate RDNs for readability, e.g. "CN=foo, OU=bar, DC=bizz"
+        parser.skipSpaces();
+        auto attributeName = parser.extractAttributeName();
+        auto oid = x509ShortNameToOid(attributeName);
+        uassert(ErrorCodes::BadValue, str::stream() << "DN contained an unknown OID " << oid, oid);
+        std::string value;
+        char terminator;
+        std::tie(value, terminator) = parser.extractValue();
+        curRDN->emplace_back(std::move(*oid), kASN1UTF8String, std::move(value));
+        if (terminator == RFC4514Parser::NewRDN) {
+            curRDN = entries.emplace(entries.end());
+        }
+    }
+
+    uassert(ErrorCodes::BadValue,
+            "Cannot parse empty DN",
+            entries.size() > 1 || !entries.front().empty());
+
+    return SSLX509Name(std::move(entries));
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+// OpenSSL has a more complete library of OID to SN mappings.
+std::string x509OidToShortName(StringData name) {
+    const auto nid = OBJ_txt2nid(name.rawData());
+    if (nid == 0) {
+        return name.toString();
+    }
+
+    const auto* sn = OBJ_nid2sn(nid);
+    if (!sn) {
+        return name.toString();
+    }
+
+    return sn;
+}
+
+using UniqueASN1Object =
+    std::unique_ptr<ASN1_OBJECT, OpenSSLDeleter<decltype(ASN1_OBJECT_free), ASN1_OBJECT_free>>;
+
+boost::optional<std::string> x509ShortNameToOid(StringData name) {
+    // Converts the OID to an ASN1_OBJECT
+    UniqueASN1Object obj(OBJ_txt2obj(name.rawData(), 0));
+    if (!obj) {
+        return boost::none;
+    }
+
+    // OBJ_obj2txt doesn't let you pass in a NULL buffer and a negative size to discover how
+    // big the buffer should be, but the man page gives 80 as a good guess for buffer size.
+    constexpr auto kDefaultBufferSize = 80;
+    std::vector<char> buffer(kDefaultBufferSize);
+    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
+
+    // Resize the buffer down or up to the real size.
+    buffer.resize(realSize);
+
+    // If the real size is greater than the default buffer size we picked, then just call
+    // OBJ_obj2txt again now that the buffer is correctly sized.
+    if (realSize > kDefaultBufferSize) {
+        OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
+    }
+
+    return std::string(buffer.data(), buffer.size());
+}
+#else
+// On Apple/Windows we have to provide our own mapping.
+// Generate the 2.5.4.* portions of this list from OpenSSL sources with:
+// grep -E '^X509 ' "$OPENSSL/crypto/objects/objects.txt" | tr -d '\t' |
+//   sed -e 's/^X509 *\([0-9]\+\) *\(: *\)\+\([[:alnum:]]\+\).*/{"2.5.4.\1", "\3"},/g'
+static const std::initializer_list<std::pair<StringData, StringData>> kX509OidToShortNameMappings =
+    {
+        {"0.9.2342.19200300.100.1.1"_sd, "UID"_sd},
+        {"0.9.2342.19200300.100.1.25"_sd, "DC"_sd},
+        {"1.2.840.113549.1.9.1"_sd, "emailAddress"_sd},
+        {"2.5.29.17"_sd, "subjectAltName"_sd},
+
+        // X509 OIDs Generated from objects.txt
+        {"2.5.4.3"_sd, "CN"_sd},
+        {"2.5.4.4"_sd, "SN"_sd},
+        {"2.5.4.5"_sd, "serialNumber"_sd},
+        {"2.5.4.6"_sd, "C"_sd},
+        {"2.5.4.7"_sd, "L"_sd},
+        {"2.5.4.8"_sd, "ST"_sd},
+        {"2.5.4.9"_sd, "street"_sd},
+        {"2.5.4.10"_sd, "O"_sd},
+        {"2.5.4.11"_sd, "OU"_sd},
+        {"2.5.4.12"_sd, "title"_sd},
+        {"2.5.4.13"_sd, "description"_sd},
+        {"2.5.4.14"_sd, "searchGuide"_sd},
+        {"2.5.4.15"_sd, "businessCategory"_sd},
+        {"2.5.4.16"_sd, "postalAddress"_sd},
+        {"2.5.4.17"_sd, "postalCode"_sd},
+        {"2.5.4.18"_sd, "postOfficeBox"_sd},
+        {"2.5.4.19"_sd, "physicalDeliveryOfficeName"_sd},
+        {"2.5.4.20"_sd, "telephoneNumber"_sd},
+        {"2.5.4.21"_sd, "telexNumber"_sd},
+        {"2.5.4.22"_sd, "teletexTerminalIdentifier"_sd},
+        {"2.5.4.23"_sd, "facsimileTelephoneNumber"_sd},
+        {"2.5.4.24"_sd, "x121Address"_sd},
+        {"2.5.4.25"_sd, "internationaliSDNNumber"_sd},
+        {"2.5.4.26"_sd, "registeredAddress"_sd},
+        {"2.5.4.27"_sd, "destinationIndicator"_sd},
+        {"2.5.4.28"_sd, "preferredDeliveryMethod"_sd},
+        {"2.5.4.29"_sd, "presentationAddress"_sd},
+        {"2.5.4.30"_sd, "supportedApplicationContext"_sd},
+        {"2.5.4.31"_sd, "member"_sd},
+        {"2.5.4.32"_sd, "owner"_sd},
+        {"2.5.4.33"_sd, "roleOccupant"_sd},
+        {"2.5.4.34"_sd, "seeAlso"_sd},
+        {"2.5.4.35"_sd, "userPassword"_sd},
+        {"2.5.4.36"_sd, "userCertificate"_sd},
+        {"2.5.4.37"_sd, "cACertificate"_sd},
+        {"2.5.4.38"_sd, "authorityRevocationList"_sd},
+        {"2.5.4.39"_sd, "certificateRevocationList"_sd},
+        {"2.5.4.40"_sd, "crossCertificatePair"_sd},
+        {"2.5.4.41"_sd, "name"_sd},
+        {"2.5.4.42"_sd, "GN"_sd},
+        {"2.5.4.43"_sd, "initials"_sd},
+        {"2.5.4.44"_sd, "generationQualifier"_sd},
+        {"2.5.4.45"_sd, "x500UniqueIdentifier"_sd},
+        {"2.5.4.46"_sd, "dnQualifier"_sd},
+        {"2.5.4.47"_sd, "enhancedSearchGuide"_sd},
+        {"2.5.4.48"_sd, "protocolInformation"_sd},
+        {"2.5.4.49"_sd, "distinguishedName"_sd},
+        {"2.5.4.50"_sd, "uniqueMember"_sd},
+        {"2.5.4.51"_sd, "houseIdentifier"_sd},
+        {"2.5.4.52"_sd, "supportedAlgorithms"_sd},
+        {"2.5.4.53"_sd, "deltaRevocationList"_sd},
+        {"2.5.4.54"_sd, "dmdName"_sd},
+        {"2.5.4.65"_sd, "pseudonym"_sd},
+        {"2.5.4.72"_sd, "role"_sd},
+};
+
+std::string x509OidToShortName(StringData oid) {
+    auto it = std::find_if(
+        kX509OidToShortNameMappings.begin(),
+        kX509OidToShortNameMappings.end(),
+        [&](const std::pair<StringData, StringData>& entry) { return entry.first == oid; });
+
+    if (it == kX509OidToShortNameMappings.end()) {
+        return oid.toString();
+    }
+    return it->second.toString();
+}
+
+boost::optional<std::string> x509ShortNameToOid(StringData name) {
+    auto it = std::find_if(
+        kX509OidToShortNameMappings.begin(),
+        kX509OidToShortNameMappings.end(),
+        [&](const std::pair<StringData, StringData>& entry) { return entry.second == name; });
+
+    if (it == kX509OidToShortNameMappings.end()) {
+        // If the name is a known oid in our mapping list then just return it.
+        if (std::find_if(kX509OidToShortNameMappings.begin(),
+                         kX509OidToShortNameMappings.end(),
+                         [&](const auto& entry) { return entry.first == name; }) !=
+            kX509OidToShortNameMappings.end()) {
+            return name.toString();
+        }
+        return boost::none;
+    }
+    return it->first.toString();
+}
+#endif
+
+TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
+    return getTLSVersionCounts(serviceContext);
+}
+
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
+(InitializerContext*) {
+    if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
+        const auto& config = theSSLManager->getSSLConfiguration();
+        if (!config.clientSubjectName.empty()) {
+            LOGV2_DEBUG(23214,
+                        1,
+                        "Client Certificate Name: {name}",
+                        "Client certificate name",
+                        "name"_attr = config.clientSubjectName);
+        }
+        if (!config.serverSubjectName().empty()) {
+            LOGV2_DEBUG(23215,
+                        1,
+                        "Server Certificate Name: {name}",
+                        "Server certificate name",
+                        "name"_attr = config.serverSubjectName());
+            LOGV2_DEBUG(23216,
+                        1,
+                        "Server Certificate Expiration: {expiration}",
+                        "Server certificate expiration",
+                        "expiration"_attr = config.serverCertificateExpirationDate);
+        }
+    }
+
+    return Status::OK();
+}
+
+Status SSLX509Name::normalizeStrings() {
+    for (auto& rdn : _entries) {
+        for (auto& entry : rdn) {
+            switch (entry.type) {
+                // For each type of valid DirectoryString, do the string prep algorithm.
+                case kASN1UTF8String:
+                case kASN1PrintableString:
+                case kASN1TeletexString:
+                case kASN1UniversalString:
+                case kASN1BMPString:
+                case kASN1IA5String:
+                case kASN1OctetString: {
+                    // Technically https://tools.ietf.org/html/rfc5280#section-4.1.2.4 requires
+                    // that DN component values must be at least 1 code point long, but we've
+                    // supported empty components before (see SERVER-39107) so we special-case
+                    // normalizing empty values to an empty UTF-8 string
+                    if (entry.value.empty()) {
+                        entry.type = kASN1UTF8String;
+                        break;
+                    }
+
+                    auto res = icuX509DNPrep(entry.value);
+                    if (!res.isOK()) {
+                        return res.getStatus();
+                    }
+                    entry.value = std::move(res.getValue());
+                    entry.type = kASN1UTF8String;
+                    break;
+                }
+                default:
+                    LOGV2_DEBUG(23217,
+                                1,
+                                "Certificate subject name contains unknown string type: "
+                                "{entryType} (string value is \"{entryValue}\")",
+                                "Certificate subject name contains unknown string type",
+                                "entryType"_attr = entry.type,
+                                "entryValue"_attr = entry.value);
+                    break;
+            }
+        }
+    }
+
+    return Status::OK();
+}
+
+StatusWith<std::string> SSLX509Name::getOID(StringData oid) const {
+    for (const auto& rdn : _entries) {
+        for (const auto& entry : rdn) {
+            if (entry.oid == oid) {
+                return entry.value;
+            }
+        }
+    }
+    return {ErrorCodes::KeyNotFound, "OID does not exist"};
+}
+
+StringBuilder& operator<<(StringBuilder& os, const SSLX509Name& name) {
+    std::string comma;
+    for (const auto& rdn : name._entries) {
+        std::string plus;
+        os << comma;
+        for (const auto& entry : rdn) {
+            os << plus << x509OidToShortName(entry.oid) << "=" << escapeRfc2253(entry.value);
+            plus = "+";
+        }
+        comma = ",";
+    }
+    return os;
+}
+
+std::string SSLX509Name::toString() const {
+    StringBuilder os;
+    os << *this;
+    return os.str();
+}
+
+Status SSLConfiguration::setServerSubjectName(SSLX509Name name) {
+    auto status = name.normalizeStrings();
+    if (!status.isOK()) {
+        return status;
+    }
+    _serverSubjectName = std::move(name);
+    _canonicalServerSubjectName = canonicalizeClusterDN(_serverSubjectName.entries());
+    return Status::OK();
+}
+
+/**
+ * The behavior of isClusterMember() is subtly different when passed
+ * an SSLX509Name versus a StringData.
+ *
+ * The SSLX509Name version (immediately below) compares distinguished
+ * names in their normalized, unescaped forms and provides a more reliable match.
+ *
+ * The StringData version attempts to canonicalize the stringified subject name
+ * according to RFC4514 and compare that to the normalized/unescaped version of
+ * the server's distinguished name.
+ */
+bool SSLConfiguration::isClusterMember(SSLX509Name subject) const {
+    if (!subject.normalizeStrings().isOK()) {
         return false;
     }
 
-    for (size_t i = 0; i < serverRDN.size(); i++) {
-        if (clientRDN[i] != serverRDN[i]) {
-            return false;
-        }
+    auto client = canonicalizeClusterDN(subject.entries());
+    if (client.empty()) {
+        return false;
     }
-    return true;
+
+    if (client == _canonicalServerSubjectName) {
+        return true;
+    }
+
+    auto altClusterDN = getClusterMemberDNOverrideParameter();
+    return (altClusterDN && (client == *altClusterDN));
 }
 
-BSONObj SSLConfiguration::getServerStatusBSON() const {
-    BSONObjBuilder security;
-    security.append("SSLServerSubjectName", serverSubjectName);
-    security.appendBool("SSLServerHasCertificateAuthority", hasCA);
-    security.appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
-    return security.obj();
+bool SSLConfiguration::isClusterMember(StringData subjectName) const {
+    auto swClient = parseDN(subjectName);
+    if (!swClient.isOK()) {
+        LOGV2_WARNING(23219,
+                      "Unable to parse client subject name: {error}",
+                      "Unable to parse client subject name",
+                      "error"_attr = swClient.getStatus());
+        return false;
+    }
+    auto& client = swClient.getValue();
+    auto status = client.normalizeStrings();
+    if (!status.isOK()) {
+        LOGV2_WARNING(23220,
+                      "Unable to normalize client subject name: {error}",
+                      "Unable to normalize client subject name",
+                      "error"_attr = status);
+        return false;
+    }
+
+    auto canonicalClient = canonicalizeClusterDN(client.entries());
+
+    return !canonicalClient.empty() && (canonicalClient == _canonicalServerSubjectName);
+}
+
+void SSLConfiguration::getServerStatusBSON(BSONObjBuilder* security) const {
+    security->append("SSLServerSubjectName", _serverSubjectName.toString());
+    security->appendBool("SSLServerHasCertificateAuthority", hasCA);
+    security->appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
 }
 
 SSLManagerInterface::~SSLManagerInterface() {}
 
-SSLManager::SSLManager(const SSLParams& params, bool isServer)
-    : _serverContext(nullptr, free_ssl_context),
-      _clientContext(nullptr, free_ssl_context),
-      _weakValidation(params.sslWeakCertificateValidation),
-      _allowInvalidCertificates(params.sslAllowInvalidCertificates),
-      _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
-    if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
-        uasserted(16768, "ssl initialization problem");
-    }
-
-    // pick the certificate for use in outgoing connections,
-    std::string clientPEM, clientPassword;
-    if (!isServer || params.sslClusterFile.empty()) {
-        // We are either a client, or a server without a cluster key,
-        // so use the PEM key file, if specified
-        clientPEM = params.sslPEMKeyFile;
-        clientPassword = params.sslPEMKeyPassword;
-    } else {
-        // We are a server with a cluster key, so use the cluster key file
-        clientPEM = params.sslClusterFile;
-        clientPassword = params.sslClusterPassword;
-    }
-
-    if (!clientPEM.empty()) {
-        if (!_parseAndValidateCertificate(
-                clientPEM, clientPassword, &_sslConfiguration.clientSubjectName, NULL)) {
-            uasserted(16941, "ssl initialization problem");
-        }
-    }
-    // SSL server specific initialization
-    if (isServer) {
-        if (!_initSynchronousSSLContext(&_serverContext, params, ConnectionDirection::kIncoming)) {
-            uasserted(16562, "ssl initialization problem");
-        }
-
-        if (!_parseAndValidateCertificate(params.sslPEMKeyFile,
-                                          params.sslPEMKeyPassword,
-                                          &_sslConfiguration.serverSubjectName,
-                                          &_sslConfiguration.serverCertificateExpirationDate)) {
-            uasserted(16942, "ssl initialization problem");
-        }
-
-        static CertificateExpirationMonitor task =
-            CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
-    }
-}
-
-int SSLManager::password_cb(char* buf, int num, int rwflag, void* userdata) {
-    // Unless OpenSSL misbehaves, num should always be positive
-    fassert(17314, num > 0);
-    invariant(userdata);
-    auto pw = static_cast<const std::string*>(userdata);
-
-    const size_t copied = pw->copy(buf, num - 1);
-    buf[copied] = '\0';
-    return copied;
-}
-
-int SSLManager::verify_cb(int ok, X509_STORE_CTX* ctx) {
-    return 1;  // always succeed; we will catch the error in our get_verify_result() call
-}
-
-int SSLManager::SSL_read(SSLConnection* conn, void* buf, int num) {
-    int status;
-    do {
-        status = ::SSL_read(conn->ssl, buf, num);
-    } while (!_doneWithSSLOp(conn, status));
-
-    if (status <= 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
-    return status;
-}
-
-int SSLManager::SSL_write(SSLConnection* conn, const void* buf, int num) {
-    int status;
-    do {
-        status = ::SSL_write(conn->ssl, buf, num);
-    } while (!_doneWithSSLOp(conn, status));
-
-    if (status <= 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
-    return status;
-}
-
-unsigned long SSLManager::ERR_get_error() {
-    return ::ERR_get_error();
-}
-
-char* SSLManager::ERR_error_string(unsigned long e, char* buf) {
-    return ::ERR_error_string(e, buf);
-}
-
-int SSLManager::SSL_get_error(const SSLConnection* conn, int ret) {
-    return ::SSL_get_error(conn->ssl, ret);
-}
-
-int SSLManager::SSL_shutdown(SSLConnection* conn) {
-    int status;
-    do {
-        status = ::SSL_shutdown(conn->ssl);
-    } while (!_doneWithSSLOp(conn, status));
-
-    if (status < 0)
-        _handleSSLError(SSL_get_error(conn, status), status);
-    return status;
-}
-
-void SSLManager::SSL_free(SSLConnection* conn) {
-    return ::SSL_free(conn->ssl);
-}
-
-Status SSLManager::initSSLContext(SSL_CTX* context,
-                                  const SSLParams& params,
-                                  ConnectionDirection direction) {
-    // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
-    // SSL_OP_NO_SSLv2 - Disable SSL v2 support
-    // SSL_OP_NO_SSLv3 - Disable SSL v3 support
-    long supportedProtocols = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
-
-    // Set the supported TLS protocols. Allow --sslDisabledProtocols to disable selected
-    // ciphers.
-    for (const SSLParams::Protocols& protocol : params.sslDisabledProtocols) {
-        if (protocol == SSLParams::Protocols::TLS1_0) {
-            supportedProtocols |= SSL_OP_NO_TLSv1;
-        } else if (protocol == SSLParams::Protocols::TLS1_1) {
-            supportedProtocols |= SSL_OP_NO_TLSv1_1;
-        } else if (protocol == SSLParams::Protocols::TLS1_2) {
-            supportedProtocols |= SSL_OP_NO_TLSv1_2;
-        }
-    }
-    ::SSL_CTX_set_options(context, supportedProtocols);
-
-    // HIGH - Enable strong ciphers
-    // !EXPORT - Disable export ciphers (40/56 bit)
-    // !aNULL - Disable anonymous auth ciphers
-    // @STRENGTH - Sort ciphers based on strength
-    std::string cipherConfig = "HIGH:!EXPORT:!aNULL@STRENGTH";
-
-    // Allow the cipher configuration string to be overriden by --sslCipherConfig
-    if (!params.sslCipherConfig.empty()) {
-        cipherConfig = params.sslCipherConfig;
-    }
-
-    if (0 == ::SSL_CTX_set_cipher_list(context, cipherConfig.c_str())) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Can not set supported cipher suites: "
-                                    << getSSLErrorMessage(ERR_get_error()));
-    }
-
-    // We use the address of the context as the session id context.
-    if (0 == ::SSL_CTX_set_session_id_context(
-                 context, reinterpret_cast<unsigned char*>(&context), sizeof(context))) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Can not store ssl session id context: "
-                                    << getSSLErrorMessage(ERR_get_error()));
-    }
-
-    if (direction == ConnectionDirection::kOutgoing && !params.sslClusterFile.empty()) {
-        ::EVP_set_pw_prompt("Enter cluster certificate passphrase");
-        if (!_setupPEM(context, params.sslClusterFile, params.sslClusterPassword)) {
-            return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up ssl clusterFile.");
-        }
-    } else if (!params.sslPEMKeyFile.empty()) {
-        // Use the pemfile for everything else
-        ::EVP_set_pw_prompt("Enter PEM passphrase");
-        if (!_setupPEM(context, params.sslPEMKeyFile, params.sslPEMKeyPassword)) {
-            return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up PEM key file.");
-        }
-    }
-
-    const auto status =
-        params.sslCAFile.empty() ? _setupSystemCA(context) : _setupCA(context, params.sslCAFile);
-    if (!status.isOK())
-        return status;
-
-    if (!params.sslCRLFile.empty()) {
-        if (!_setupCRL(context, params.sslCRLFile)) {
-            return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up CRL file.");
-        }
-    }
-
-    if (!params.sslPEMTempDHParam.empty()) {
-        try {
-            std::ifstream dhparamPemFile(params.sslPEMTempDHParam, std::ios_base::binary);
-            if (dhparamPemFile.fail() || dhparamPemFile.bad()) {
-                return Status(ErrorCodes::InvalidSSLConfiguration,
-                              str::stream() << "Cannot open PEM DHParams file.");
-            }
-
-            std::vector<std::uint8_t> paramData{std::istreambuf_iterator<char>(dhparamPemFile),
-                                                std::istreambuf_iterator<char>()};
-            auto bio = makeUniqueMemBio(paramData);
-
-            UniqueDHParams dhparams(::PEM_read_bio_DHparams(bio.get(), nullptr, nullptr, nullptr));
-            if (!dhparams) {
-                return Status(ErrorCodes::InvalidSSLConfiguration,
-                              str::stream() << "Error reading DHParams file."
-                                            << getSSLErrorMessage(ERR_get_error()));
-            }
-
-            if (::SSL_CTX_set_tmp_dh(context, dhparams.get()) != 1) {
-                return Status(ErrorCodes::InvalidSSLConfiguration,
-                              str::stream() << "Failure to set PFS DH parameters: "
-                                            << getSSLErrorMessage(ERR_get_error()));
-            }
-        } catch (const std::exception& ex) {
-            return Status(ErrorCodes::InvalidSSLConfiguration, ex.what());
-        }
-    }
-
-    // We always set ECDH mode anyhow, if available.
-    setECDHModeAuto(context);
-
-    return Status::OK();
-}
-
-bool SSLManager::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
-                                            const SSLParams& params,
-                                            ConnectionDirection direction) {
-    *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()), free_ssl_context);
-
-    uassertStatusOK(initSSLContext(contextPtr->get(), params, direction));
-
-    // If renegotiation is needed, don't return from recv() or send() until it's successful.
-    // Note: this is for blocking sockets only.
-    SSL_CTX_set_mode(contextPtr->get(), SSL_MODE_AUTO_RETRY);
-
-    return true;
-}
-
-unsigned long long SSLManager::_convertASN1ToMillis(ASN1_TIME* asn1time) {
-    BIO* outBIO = BIO_new(BIO_s_mem());
-    int timeError = ASN1_TIME_print(outBIO, asn1time);
-    ON_BLOCK_EXIT(BIO_free, outBIO);
-
-    if (timeError <= 0) {
-        error() << "ASN1_TIME_print failed or wrote no data.";
-        return 0;
-    }
-
-    char dateChar[DATE_LEN];
-    timeError = BIO_gets(outBIO, dateChar, DATE_LEN);
-    if (timeError <= 0) {
-        error() << "BIO_gets call failed to transfer contents to buf";
-        return 0;
-    }
-
-    // Ensure that day format is two digits for parsing.
-    // Jun  8 17:00:03 2014 becomes Jun 08 17:00:03 2014.
-    if (dateChar[4] == ' ') {
-        dateChar[4] = '0';
-    }
-
-    std::istringstream inStringStream((std::string(dateChar, 20)));
-    boost::posix_time::time_input_facet* inputFacet =
-        new boost::posix_time::time_input_facet("%b %d %H:%M:%S %Y");
-
-    inStringStream.imbue(std::locale(std::cout.getloc(), inputFacet));
-    boost::posix_time::ptime posixTime;
-    inStringStream >> posixTime;
-
-    const boost::gregorian::date epoch = boost::gregorian::date(1970, boost::gregorian::Jan, 1);
-
-    return (posixTime - boost::posix_time::ptime(epoch)).total_milliseconds();
-}
-
-bool SSLManager::_parseAndValidateCertificate(const std::string& keyFile,
-                                              const std::string& keyPassword,
-                                              std::string* subjectName,
-                                              Date_t* serverCertificateExpirationDate) {
-    BIO* inBIO = BIO_new(BIO_s_file());
-    if (inBIO == NULL) {
-        error() << "failed to allocate BIO object: " << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    ON_BLOCK_EXIT(BIO_free, inBIO);
-    if (BIO_read_filename(inBIO, keyFile.c_str()) <= 0) {
-        error() << "cannot read key file when setting subject name: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    // Callback will not manipulate the password, so const_cast is safe.
-    X509* x509 = PEM_read_bio_X509(inBIO,
-                                   NULL,
-                                   &SSLManager::password_cb,
-                                   const_cast<void*>(static_cast<const void*>(&keyPassword)));
-    if (x509 == NULL) {
-        error() << "cannot retrieve certificate from keyfile: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-    ON_BLOCK_EXIT(X509_free, x509);
-
-    *subjectName = getCertificateSubjectName(x509);
-    if (serverCertificateExpirationDate != NULL) {
-        unsigned long long notBeforeMillis = _convertASN1ToMillis(X509_get_notBefore(x509));
-        if (notBeforeMillis == 0) {
-            error() << "date conversion failed";
-            return false;
-        }
-
-        unsigned long long notAfterMillis = _convertASN1ToMillis(X509_get_notAfter(x509));
-        if (notAfterMillis == 0) {
-            error() << "date conversion failed";
-            return false;
-        }
-
-        if ((notBeforeMillis > curTimeMillis64()) || (curTimeMillis64() > notAfterMillis)) {
-            severe() << "The provided SSL certificate is expired or not yet valid.";
-            fassertFailedNoTrace(28652);
-        }
-
-        *serverCertificateExpirationDate = Date_t::fromMillisSinceEpoch(notAfterMillis);
-    }
-
-    return true;
-}
-
-bool SSLManager::_setupPEM(SSL_CTX* context,
-                           const std::string& keyFile,
-                           const std::string& password) {
-    if (SSL_CTX_use_certificate_chain_file(context, keyFile.c_str()) != 1) {
-        error() << "cannot read certificate file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    BIO* inBio = BIO_new(BIO_s_file());
-    if (!inBio) {
-        error() << "failed to allocate BIO object: " << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-    const auto bioGuard = MakeGuard([&inBio]() { BIO_free(inBio); });
-
-    if (BIO_read_filename(inBio, keyFile.c_str()) <= 0) {
-        error() << "cannot read PEM key file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    // If password is empty, use default OpenSSL callback, which uses the terminal
-    // to securely request the password interactively from the user.
-    decltype(&SSLManager::password_cb) password_cb = nullptr;
-    void* userdata = nullptr;
-    if (!password.empty()) {
-        password_cb = &SSLManager::password_cb;
-        // SSLManager::password_cb will not manipulate the password, so const_cast is safe.
-        userdata = const_cast<void*>(static_cast<const void*>(&password));
-    }
-    EVP_PKEY* privateKey = PEM_read_bio_PrivateKey(inBio, nullptr, password_cb, userdata);
-    if (!privateKey) {
-        error() << "cannot read PEM key file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-    const auto privateKeyGuard = MakeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
-
-    if (SSL_CTX_use_PrivateKey(context, privateKey) != 1) {
-        error() << "cannot use PEM key file: " << keyFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    // Verify that the certificate and the key go together.
-    if (SSL_CTX_check_private_key(context) != 1) {
-        error() << "SSL certificate validation: " << getSSLErrorMessage(ERR_get_error());
-        return false;
-    }
-
-    return true;
-}
-
-Status SSLManager::_setupCA(SSL_CTX* context, const std::string& caFile) {
-    // Set the list of CAs sent to clients
-    STACK_OF(X509_NAME)* certNames = SSL_load_client_CA_file(caFile.c_str());
-    if (certNames == NULL) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "cannot read certificate authority file: " << caFile << " "
-                                    << getSSLErrorMessage(ERR_get_error()));
-    }
-    SSL_CTX_set_client_CA_list(context, certNames);
-
-    // Load trusted CA
-    if (SSL_CTX_load_verify_locations(context, caFile.c_str(), NULL) != 1) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "cannot read certificate authority file: " << caFile << " "
-                                    << getSSLErrorMessage(ERR_get_error()));
-    }
-
-    // Set SSL to require peer (client) certificate verification
-    // if a certificate is presented
-    SSL_CTX_set_verify(context, SSL_VERIFY_PEER, &SSLManager::verify_cb);
-    _sslConfiguration.hasCA = true;
-    return Status::OK();
-}
-
-inline Status checkX509_STORE_error() {
-    const auto errCode = ERR_peek_last_error();
-    if (ERR_GET_LIB(errCode) != ERR_LIB_X509 ||
-        ERR_GET_REASON(errCode) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "Error adding certificate to X509 store: "
-                              << ERR_reason_error_string(errCode)};
-    }
-    return Status::OK();
-}
-
-#if defined(_WIN32)
-// This imports the certificates in a given Windows certificate store into an X509_STORE for
-// openssl to use during certificate validation.
-Status importCertStoreToX509_STORE(const wchar_t* storeName,
-                                   DWORD storeLocation,
-                                   X509_STORE* verifyStore) {
-    HCERTSTORE systemStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_W,
-                                           0,
-                                           NULL,
-                                           storeLocation | CERT_STORE_READONLY_FLAG,
-                                           const_cast<LPWSTR>(storeName));
-    if (systemStore == NULL) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "error opening system CA store: " << errnoWithDescription()};
-    }
-    auto systemStoreGuard = MakeGuard([systemStore]() { CertCloseStore(systemStore, 0); });
-
-    PCCERT_CONTEXT certCtx = NULL;
-    while ((certCtx = CertEnumCertificatesInStore(systemStore, certCtx)) != NULL) {
-        auto certBytes = static_cast<const unsigned char*>(certCtx->pbCertEncoded);
-        X509* x509Obj = d2i_X509(NULL, &certBytes, certCtx->cbCertEncoded);
-        if (x509Obj == NULL) {
-            return {ErrorCodes::InvalidSSLConfiguration,
-                    str::stream() << "Error parsing X509 object from Windows certificate store"
-                                  << SSLManagerInterface::getSSLErrorMessage(ERR_get_error())};
-        }
-        const auto x509ObjGuard = MakeGuard([&x509Obj]() { X509_free(x509Obj); });
-
-        if (X509_STORE_add_cert(verifyStore, x509Obj) != 1) {
-            auto status = checkX509_STORE_error();
-            if (!status.isOK())
-                return status;
-        }
-    }
-    int lastError = GetLastError();
-    if (lastError != CRYPT_E_NOT_FOUND) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "Error enumerating certificates: "
-                              << errnoWithDescription(lastError)};
-    }
-
-    return Status::OK();
-}
-#elif defined(__APPLE__)
-
-template <typename T>
-class CFTypeRefHolder {
+SSLConnectionInterface::~SSLConnectionInterface() {}
+
+namespace {
+
+/**
+ * Enum of supported Abstract Syntax Notation One (ASN.1) Distinguished Encoding Rules (DER) types.
+ *
+ * This is a subset of all DER types.
+ */
+enum class DERType : char {
+    // Primitive, not supported by the parser
+    // Only exists when BER indefinite form is used which is not valid DER.
+    EndOfContent = 0,
+
+    // Primitive
+    INTEGER = 2,
+
+    // Primitive
+    UTF8String = 12,
+
+    // Sequence or Sequence Of, Constructed
+    SEQUENCE = 16,
+
+    // Set or Set Of, Constructed
+    SET = 17,
+};
+
+/**
+ * Distinguished Encoding Rules (DER) are a strict subset of Basic Encoding Rules (BER).
+ *
+ * For more details, see X.690 from ITU-T.
+ *
+ * It is a Tag + Length + Value format. The tag is generally 1 byte, the length is 1 or more
+ * and then followed by the value.
+ */
+class DERToken {
 public:
-    explicit CFTypeRefHolder(T ptr) : ref(static_cast<CFTypeRef>(ptr)) {}
-    ~CFTypeRefHolder() {
-        CFRelease(ref);
+    DERToken() {}
+    DERToken(DERType type, size_t length, const char* const data)
+        : _type(type), _length(length), _data(data) {}
+
+    /**
+     * Get the ASN.1 type of the current token.
+     */
+    DERType getType() const {
+        return _type;
     }
-    operator T() {
-        return static_cast<T>(ref);
+
+    /**
+     * Get a ConstDataRange for the value of this SET or SET OF.
+     */
+    ConstDataRange getSetRange() {
+        invariant(_type == DERType::SET);
+        return ConstDataRange(_data, _data + _length);
     }
+
+    /**
+     * Get a ConstDataRange for the value of this SEQUENCE or SEQUENCE OF.
+     */
+    ConstDataRange getSequenceRange() {
+        invariant(_type == DERType::SEQUENCE);
+        return ConstDataRange(_data, _data + _length);
+    }
+
+    /**
+     * Get a std::string for the value of this Utf8String.
+     */
+    std::string readUtf8String() {
+        invariant(_type == DERType::UTF8String);
+        return std::string(_data, _length);
+    }
+
+    /**
+     * Get a vector representation for the value of this DER INTEGER
+     */
+    DERInteger readInt() {
+        invariant(_type == DERType::INTEGER);
+        DERInteger out(_length);
+        std::copy(_data, _data + _length, out.begin());
+        return out;
+    }
+
+    /**
+     * Parse a buffer of bytes and return the number of bytes we read for this token.
+     *
+     * Returns a DERToken which consists of the (tag, length, value) tuple.
+     */
+    static StatusWith<DERToken> parse(ConstDataRange cdr, size_t* outLength);
 
 private:
-    CFTypeRef ref = nullptr;
+    DERType _type{DERType::EndOfContent};
+    size_t _length{0};
+    const char* _data{nullptr};
 };
-template <typename T>
-CFTypeRefHolder<T> makeCFTypeRefHolder(T ptr) {
-    return CFTypeRefHolder<T>(ptr);
-}
 
-std::string OSStatusToString(OSStatus status) {
-    auto errMsg = makeCFTypeRefHolder(SecCopyErrorMessageString(status, NULL));
-    return std::string{CFStringGetCStringPtr(errMsg, kCFStringEncodingUTF8)};
-}
+}  // namespace
 
-Status importKeychainToX509_STORE(X509_STORE* verifyStore) {
-    CFArrayRef result;
-    OSStatus status;
+template <>
+struct DataType::Handler<DERToken> {
+    static Status load(DERToken* t,
+                       const char* ptr,
+                       size_t length,
+                       size_t* advanced,
+                       std::ptrdiff_t debug_offset) {
+        size_t outLength;
 
-    // This copies all the certificates trusted by the system (regardless of what keychain they're
-    // attached to) into a CFArray.
-    if ((status = SecTrustCopyAnchorCertificates(&result)) != 0) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "Error enumerating certificates: " << OSStatusToString(status)};
-    }
-    const auto resultGuard = makeCFTypeRefHolder(result);
+        auto swPair = DERToken::parse(ConstDataRange(ptr, length), &outLength);
 
-    for (CFIndex i = 0; i < CFArrayGetCount(result); i++) {
-        SecCertificateRef cert =
-            static_cast<SecCertificateRef>(const_cast<void*>(CFArrayGetValueAtIndex(result, i)));
-
-        auto rawData = makeCFTypeRefHolder(SecCertificateCopyData(cert));
-        if (!rawData) {
-            return {ErrorCodes::InvalidSSLConfiguration,
-                    str::stream() << "Error enumerating certificates: "
-                                  << OSStatusToString(status)};
+        if (!swPair.isOK()) {
+            return swPair.getStatus();
         }
-        const uint8_t* rawDataPtr = CFDataGetBytePtr(rawData);
 
-        // Parse an openssl X509 object from each returned certificate
-        X509* x509Cert = d2i_X509(nullptr, &rawDataPtr, CFDataGetLength(rawData));
-        if (!x509Cert) {
-            return {ErrorCodes::InvalidSSLConfiguration,
-                    str::stream() << "Error parsing X509 certificate from system keychain: "
-                                  << ERR_reason_error_string(ERR_peek_last_error())};
+        if (t) {
+            *t = std::move(swPair.getValue());
         }
-        const auto x509CertGuard = MakeGuard([&x509Cert]() { X509_free(x509Cert); });
 
-        // Add the parsed X509 object to the X509_STORE verification store
-        if (X509_STORE_add_cert(verifyStore, x509Cert) != 1) {
-            auto status = checkX509_STORE_error();
-            if (!status.isOK())
-                return status;
+        if (advanced) {
+            *advanced = outLength;
         }
+
+        return Status::OK();
     }
 
-    return Status::OK();
-}
-#endif
-
-Status SSLManager::_setupSystemCA(SSL_CTX* context) {
-#if !defined(_WIN32) && !defined(__APPLE__)
-    // On non-Windows/non-Apple platforms, the OpenSSL libraries should have been configured
-    // with default locations for CA certificates.
-    if (SSL_CTX_set_default_verify_paths(context) != 1) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "error loading system CA certificates "
-                              << "(default certificate file: "
-                              << X509_get_default_cert_file()
-                              << ", "
-                              << "default certificate path: "
-                              << X509_get_default_cert_dir()
-                              << ")"};
+    static DERToken defaultConstruct() {
+        return DERToken();
     }
-    return Status::OK();
-#else
+};
 
-    X509_STORE* verifyStore = SSL_CTX_get_cert_store(context);
-    if (!verifyStore) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                "no X509 store found for SSL context while loading system certificates"};
+namespace {
+
+StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
+    auto swString = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swString.isOK()) {
+        return swString.getStatus();
     }
-#if defined(_WIN32)
-    auto status = importCertStoreToX509_STORE(L"root", CERT_SYSTEM_STORE_CURRENT_USER, verifyStore);
-    if (!status.isOK())
-        return status;
-    return importCertStoreToX509_STORE(L"CA", CERT_SYSTEM_STORE_CURRENT_USER, verifyStore);
-#elif defined(__APPLE__)
-    return importKeychainToX509_STORE(verifyStore);
-#endif
-#endif
+
+    auto derString = swString.getValue();
+
+    if (derString.getType() != DERType::UTF8String) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream()
+                          << "Unexpected DER Tag, Got " << static_cast<char>(derString.getType())
+                          << ", Expected UTF8String");
+    }
+
+    return derString.readUtf8String();
 }
 
-bool SSLManager::_setupCRL(SSL_CTX* context, const std::string& crlFile) {
-    X509_STORE* store = SSL_CTX_get_cert_store(context);
-    fassert(16583, store);
-
-    X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK);
-    X509_LOOKUP* lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
-    fassert(16584, lookup);
-
-    int status = X509_load_crl_file(lookup, crlFile.c_str(), X509_FILETYPE_PEM);
-    if (status == 0) {
-        error() << "cannot read CRL file: " << crlFile << ' '
-                << getSSLErrorMessage(ERR_get_error());
-        return false;
+StatusWith<DERInteger> readDERInt(ConstDataRangeCursor& cdc) {
+    auto swInt = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swInt.isOK()) {
+        return swInt.getStatus();
     }
-    log() << "ssl imported " << status << " revoked certificate" << ((status == 1) ? "" : "s")
-          << " from the revocation list.";
-    return true;
+
+    auto derInt = swInt.getValue();
+
+    if (derInt.getType() != DERType::INTEGER) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(derInt.getType()) << ", Expected INTEGER");
+    }
+
+    return derInt.readInt();
 }
 
-/*
-* The interface layer between network and BIO-pair. The BIO-pair buffers
-* the data to/from the TLS layer.
-*/
-void SSLManager::_flushNetworkBIO(SSLConnection* conn) {
-    char buffer[BUFFER_SIZE];
-    int wantWrite;
 
-    /*
-    * Write the complete contents of the buffer. Leaving the buffer
-    * unflushed could cause a deadlock.
-    */
-    while ((wantWrite = BIO_ctrl_pending(conn->networkBIO)) > 0) {
-        if (wantWrite > BUFFER_SIZE) {
-            wantWrite = BUFFER_SIZE;
-        }
-        int fromBIO = BIO_read(conn->networkBIO, buffer, wantWrite);
+StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
+    const size_t kTagLength = 1;
+    const size_t kTagLengthAndInitialLengthByteLength = kTagLength + 1;
 
-        int writePos = 0;
-        do {
-            int numWrite = fromBIO - writePos;
-            numWrite = send(conn->socket->rawFD(), buffer + writePos, numWrite, portSendFlags);
-            if (numWrite < 0) {
-                conn->socket->handleSendError(numWrite, "");
+    ConstDataRangeCursor cdrc(cdr);
+
+    auto swTagByte = cdrc.readAndAdvanceNoThrow<char>();
+    if (!swTagByte.getStatus().isOK()) {
+        return swTagByte.getStatus();
+    }
+
+    const char tagByte = swTagByte.getValue();
+
+    // Get the tag number from the first 5 bits
+    const char tag = tagByte & 0x1f;
+
+    // Check the 6th bit
+    const bool constructed = tagByte & 0x20;
+    const bool primitive = !constructed;
+
+    // Check bits 7 and 8 for the tag class, we only want Universal (i.e. 0)
+    const char tagClass = tagByte & 0xC0;
+    if (tagClass != 0) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Unsupported tag class");
+    }
+
+    // Validate the 6th bit is correct, and it is a known type
+    switch (static_cast<DERType>(tag)) {
+        case DERType::UTF8String:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
             }
-            writePos += numWrite;
-        } while (writePos < fromBIO);
-    }
-
-    int wantRead;
-    while ((wantRead = BIO_ctrl_get_read_request(conn->networkBIO)) > 0) {
-        if (wantRead > BUFFER_SIZE) {
-            wantRead = BUFFER_SIZE;
-        }
-
-        int numRead = recv(conn->socket->rawFD(), buffer, wantRead, portRecvFlags);
-        if (numRead <= 0) {
-            conn->socket->handleRecvError(numRead, wantRead);
-            continue;
-        }
-
-        int toBIO = BIO_write(conn->networkBIO, buffer, numRead);
-        if (toBIO != numRead) {
-            LOG(3) << "Failed to write network data to the SSL BIO layer";
-            throw SocketException(SocketException::RECV_ERROR, conn->socket->remoteString());
-        }
-    }
-}
-
-bool SSLManager::_doneWithSSLOp(SSLConnection* conn, int status) {
-    int sslErr = SSL_get_error(conn, status);
-    switch (sslErr) {
-        case SSL_ERROR_NONE:
-            _flushNetworkBIO(conn);  // success, flush network BIO before leaving
-            return true;
-        case SSL_ERROR_WANT_WRITE:
-        case SSL_ERROR_WANT_READ:
-            _flushNetworkBIO(conn);  // not ready, flush network BIO and try again
-            return false;
+            break;
+        case DERType::INTEGER:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        case DERType::SEQUENCE:
+        case DERType::SET:
+            if (!constructed) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
         default:
-            return true;
+            return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+    }
+
+    // Do we have at least 1 byte for the length
+    if (cdrc.length() < kTagLengthAndInitialLengthByteLength) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+    }
+
+    // Read length
+    // Depending on the high bit, either read 1 byte or N bytes
+    auto swInitialLengthByte = cdrc.readAndAdvanceNoThrow<char>();
+    if (!swInitialLengthByte.getStatus().isOK()) {
+        return swInitialLengthByte.getStatus();
+    }
+
+    const char initialLengthByte = swInitialLengthByte.getValue();
+
+
+    uint64_t derLength = 0;
+
+    // How many bytes does it take to encode the length?
+    size_t encodedLengthBytesCount = 1;
+
+    if (initialLengthByte & 0x80) {
+        // Length is > 127 bytes, i.e. Long form of length
+        const size_t lengthBytesCount = 0x7f & initialLengthByte;
+
+        // If length is encoded in more then 8 bytes, we disallow it
+        if (lengthBytesCount > 8) {
+            return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+        }
+
+        // Ensure we have enough data for the length bytes
+        const char* lengthLongFormPtr = cdrc.data();
+
+        Status statusLength = cdrc.advanceNoThrow(lengthBytesCount);
+        if (!statusLength.isOK()) {
+            return statusLength;
+        }
+
+        encodedLengthBytesCount = 1 + lengthBytesCount;
+
+        std::array<char, 8> lengthBuffer;
+        lengthBuffer.fill(0);
+
+        // Copy the length into the end of the buffer
+        memcpy(lengthBuffer.data() + (8 - lengthBytesCount), lengthLongFormPtr, lengthBytesCount);
+
+        // We now have 0x00..NN in the buffer and it can be properly decoded as BigEndian
+        derLength = ConstDataView(lengthBuffer.data()).read<BigEndian<uint64_t>>();
+    } else {
+        // Length is <= 127 bytes, i.e. short form of length
+        derLength = initialLengthByte;
+    }
+
+    // This is the total length of the TLV and all data
+    // This will not overflow since encodedLengthBytesCount <= 9
+    const uint64_t tagAndLengthByteCount = kTagLength + encodedLengthBytesCount;
+
+    // This may overflow since derLength is from user data so check our arithmetic carefully.
+    if (overflow::add(tagAndLengthByteCount, derLength, outLength) || *outLength > cdr.length()) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "Invalid DER length");
+    }
+
+    return DERToken(static_cast<DERType>(tag), derLength, cdr.data() + tagAndLengthByteCount);
+}
+}  // namespace
+
+StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExtension) {
+    stdx::unordered_set<RoleName> roles;
+
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * MongoDBAuthorizationGrants ::= SET OF MongoDBAuthorizationGrant
+     *
+     * MongoDBAuthorizationGrant ::= CHOICE {
+     *  MongoDBRole,
+     *  ...!UTF8String:"Unrecognized entity in MongoDBAuthorizationGrant"
+     * }
+     */
+    auto swSet = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSet.isOK()) {
+        return swSet.getStatus();
+    }
+
+    if (swSet.getValue().getType() != DERType::SET) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream()
+                          << "Unexpected DER Tag, Got "
+                          << static_cast<char>(swSet.getValue().getType()) << ", Expected SET");
+    }
+
+    ConstDataRangeCursor cdcSet(swSet.getValue().getSetRange());
+
+    while (!cdcSet.empty()) {
+        /**
+         * MongoDBRole ::= SEQUENCE {
+         *  role     UTF8String,
+         *  database UTF8String
+         * }
+         */
+        auto swSequence = cdcSet.readAndAdvanceNoThrow<DERToken>();
+        if (!swSequence.isOK()) {
+            return swSequence.getStatus();
+        }
+
+        auto sequenceStart = swSequence.getValue();
+
+        if (sequenceStart.getType() != DERType::SEQUENCE) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream() << "Unexpected DER Tag, Got "
+                                        << static_cast<char>(sequenceStart.getType())
+                                        << ", Expected SEQUENCE");
+        }
+
+        ConstDataRangeCursor cdcSequence(sequenceStart.getSequenceRange());
+
+        auto swRole = readDERString(cdcSequence);
+        if (!swRole.isOK()) {
+            return swRole.getStatus();
+        }
+
+        auto swDatabase = readDERString(cdcSequence);
+        if (!swDatabase.isOK()) {
+            return swDatabase.getStatus();
+        }
+
+        roles.emplace(swRole.getValue(), swDatabase.getValue());
+    }
+
+    return roles;
+}
+
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension) {
+    std::vector<DERInteger> features;
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * FEATURES ::= SEQUENCE OF INTEGER
+     */
+    auto swSeq = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSeq.isOK()) {
+        return swSeq.getStatus();
+    }
+
+    if (swSeq.getValue().getType() != DERType::SEQUENCE) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(swSeq.getValue().getType())
+                                    << ", Expected SEQUENCE");
+    }
+
+    ConstDataRangeCursor cdcSeq(swSeq.getValue().getSequenceRange());
+
+    while (!cdcSeq.empty()) {
+        auto swDERInt = readDERInt(cdcSeq);
+        if (!swDERInt.isOK()) {
+            return swDERInt.getStatus();
+        }
+
+        features.emplace_back(swDERInt.getValue());
+    }
+
+    return std::move(features);
+}
+
+std::string removeFQDNRoot(std::string name) {
+    if (name.back() == '.') {
+        name.pop_back();
+    }
+    return name;
+};
+
+namespace {
+
+// Characters that need to be escaped in RFC 2253
+const std::array<char, 7> rfc2253EscapeChars = {',', '+', '"', '\\', '<', '>', ';'};
+
+}  // namespace
+
+// See section "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
+std::string escapeRfc2253(StringData str) {
+    std::string ret;
+
+    if (str.size() > 0) {
+        size_t pos = 0;
+
+        // a space or "#" character occurring at the beginning of the string
+        if (str[0] == ' ') {
+            ret = "\\ ";
+            pos = 1;
+        } else if (str[0] == '#') {
+            ret = "\\#";
+            pos = 1;
+        }
+
+        while (pos < str.size()) {
+            if (static_cast<signed char>(str[pos]) < 0) {
+                ret += '\\';
+                ret += integerToHex(str[pos]);
+            } else {
+                if (std::find(rfc2253EscapeChars.cbegin(), rfc2253EscapeChars.cend(), str[pos]) !=
+                    rfc2253EscapeChars.cend()) {
+                    ret += '\\';
+                }
+
+                ret += str[pos];
+            }
+            ++pos;
+        }
+
+        // a space character occurring at the end of the string
+        if (ret.size() > 2 && ret[ret.size() - 1] == ' ') {
+            ret[ret.size() - 1] = '\\';
+            ret += ' ';
+        }
+    }
+
+    return ret;
+}
+
+void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
+    StringData versionString;
+    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
+    switch (version) {
+        case TLSVersion::kTLS10:
+            counts.tls10.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_0) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.0"_sd;
+            }
+            break;
+        case TLSVersion::kTLS11:
+            counts.tls11.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_1) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.1"_sd;
+            }
+            break;
+        case TLSVersion::kTLS12:
+            counts.tls12.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_2) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.2"_sd;
+            }
+            break;
+        case TLSVersion::kTLS13:
+            counts.tls13.addAndFetch(1);
+            if (std::find(sslGlobalParams.tlsLogVersions.cbegin(),
+                          sslGlobalParams.tlsLogVersions.cend(),
+                          SSLParams::Protocols::TLS1_3) != sslGlobalParams.tlsLogVersions.cend()) {
+                versionString = "1.3"_sd;
+            }
+            break;
+        default:
+            counts.tlsUnknown.addAndFetch(1);
+            if (!sslGlobalParams.tlsLogVersions.empty()) {
+                versionString = "unknown"_sd;
+            }
+            break;
+    }
+
+    if (!versionString.empty()) {
+        LOGV2(23218,
+              "Accepted connection with TLS Version {tlsVersion} from connection {remoteHost}",
+              "Accepted connection with TLS",
+              "tlsVersion"_attr = versionString,
+              "remoteHost"_attr = hostForLogging);
     }
 }
 
-SSLConnection* SSLManager::connect(Socket* socket) {
-    std::unique_ptr<SSLConnection> sslConn =
-        stdx::make_unique<SSLConnection>(_clientContext.get(), socket, (const char*)NULL, 0);
-
-    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, socket->remoteAddr().hostOrIp().c_str());
-    if (ret != 1)
-        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
-
-    do {
-        ret = ::SSL_connect(sslConn->ssl);
-    } while (!_doneWithSSLOp(sslConn.get(), ret));
-
-    if (ret != 1)
-        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
-
-    return sslConn.release();
-}
-
-SSLConnection* SSLManager::accept(Socket* socket, const char* initialBytes, int len) {
-    std::unique_ptr<SSLConnection> sslConn =
-        stdx::make_unique<SSLConnection>(_serverContext.get(), socket, initialBytes, len);
-
-    int ret;
-    do {
-        ret = ::SSL_accept(sslConn->ssl);
-    } while (!_doneWithSSLOp(sslConn.get(), ret));
-
-    if (ret != 1)
-        _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
-
-    return sslConn.release();
+SSLManagerInterface* getSSLManager() {
+    return theSSLManager;
 }
 
 // TODO SERVER-11601 Use NFC Unicode canonicalization
-bool SSLManager::_hostNameMatch(const char* nameToMatch, const char* certHostName) {
-    if (strlen(certHostName) < 2) {
+bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
+    nameToMatch = removeFQDNRoot(std::move(nameToMatch));
+    certHostName = removeFQDNRoot(std::move(certHostName));
+
+    if (certHostName.size() < 2) {
         return false;
     }
 
     // match wildcard DNS names
     if (certHostName[0] == '*' && certHostName[1] == '.') {
         // allow name.example.com if the cert is *.example.com, '*' does not match '.'
-        const char* subName = strchr(nameToMatch, '.');
-        return subName && !strcasecmp(certHostName + 1, subName);
+        const char* subName = strchr(nameToMatch.c_str(), '.');
+        return subName && !str::caseInsensitiveCompare(certHostName.c_str() + 1, subName);
     } else {
-        return !strcasecmp(nameToMatch, certHostName);
+        return !str::caseInsensitiveCompare(nameToMatch.c_str(), certHostName.c_str());
     }
 }
 
-StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertificate(
-    SSL* conn, const std::string& remoteHost) {
-    if (!_sslConfiguration.hasCA && isSSLServer)
-        return {boost::none};
-
-    X509* peerCert = SSL_get_peer_certificate(conn);
-
-    if (NULL == peerCert) {  // no certificate presented by peer
-        if (_weakValidation) {
-            warning() << "no SSL certificate provided by peer";
-        } else {
-            auto msg = "no SSL certificate provided by peer; connection rejected";
-            error() << msg;
-            return Status(ErrorCodes::SSLHandshakeFailed, msg);
-        }
-        return {boost::none};
-    }
-    ON_BLOCK_EXIT(X509_free, peerCert);
-
-    long result = SSL_get_verify_result(conn);
-
-    if (result != X509_V_OK) {
-        if (_allowInvalidCertificates) {
-            warning() << "SSL peer certificate validation failed: "
-                      << X509_verify_cert_error_string(result);
-        } else {
-            str::stream msg;
-            msg << "SSL peer certificate validation failed: "
-                << X509_verify_cert_error_string(result);
-            error() << msg.ss.str();
-            return Status(ErrorCodes::SSLHandshakeFailed, msg);
-        }
-    }
-
-    // TODO: check optional cipher restriction, using cert.
-    std::string peerSubjectName = getCertificateSubjectName(peerCert);
-    LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
-
-    StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
-    if (!swPeerCertificateRoles.isOK()) {
-        return swPeerCertificateRoles.getStatus();
-    }
-
-    // If this is an SSL client context (on a MongoDB server or client)
-    // perform hostname validation of the remote server
-    if (remoteHost.empty()) {
-        return boost::make_optional(
-            SSLPeerInfo(peerSubjectName, std::move(swPeerCertificateRoles.getValue())));
-    }
-
-    // Try to match using the Subject Alternate Name, if it exists.
-    // RFC-2818 requires the Subject Alternate Name to be used if present.
-    // Otherwise, the most specific Common Name field in the subject field
-    // must be used.
-
-    bool sanMatch = false;
-    bool cnMatch = false;
-    StringBuilder certificateNames;
-
-    STACK_OF(GENERAL_NAME)* sanNames = static_cast<STACK_OF(GENERAL_NAME)*>(
-        X509_get_ext_d2i(peerCert, NID_subject_alt_name, NULL, NULL));
-
-    if (sanNames != NULL) {
-        int sanNamesList = sk_GENERAL_NAME_num(sanNames);
-        certificateNames << "SAN(s): ";
-        for (int i = 0; i < sanNamesList; i++) {
-            const GENERAL_NAME* currentName = sk_GENERAL_NAME_value(sanNames, i);
-            if (currentName && currentName->type == GEN_DNS) {
-                char* dnsName = reinterpret_cast<char*>(ASN1_STRING_data(currentName->d.dNSName));
-                if (_hostNameMatch(remoteHost.c_str(), dnsName)) {
-                    sanMatch = true;
-                    break;
-                }
-                certificateNames << std::string(dnsName) << " ";
-            }
-        }
-        sk_GENERAL_NAME_pop_free(sanNames, GENERAL_NAME_free);
-    } else if (peerSubjectName.find("CN=") != std::string::npos) {
-        // If Subject Alternate Name (SAN) doesn't exist and Common Name (CN) does,
-        // check Common Name.
-        int cnBegin = peerSubjectName.find("CN=") + 3;
-        int cnEnd = peerSubjectName.find(",", cnBegin);
-        std::string commonName = peerSubjectName.substr(cnBegin, cnEnd - cnBegin);
-
-        if (_hostNameMatch(remoteHost.c_str(), commonName.c_str())) {
-            cnMatch = true;
-        }
-        certificateNames << "CN: " << commonName;
-    } else {
-        certificateNames << "No Common Name (CN) or Subject Alternate Names (SAN) found";
-    }
-
-    if (!sanMatch && !cnMatch) {
-        StringBuilder msgBuilder;
-        msgBuilder << "The server certificate does not match the host name. Hostname: "
-                   << remoteHost << " does not match " << certificateNames.str();
-        std::string msg = msgBuilder.str();
-        if (_allowInvalidCertificates || _allowInvalidHostnames || isUnixDomainSocket(remoteHost)) {
-            warning() << msg;
-        } else {
-            error() << msg;
-            return Status(ErrorCodes::SSLHandshakeFailed, msg);
-        }
-    }
-
-    return boost::make_optional(SSLPeerInfo(peerSubjectName, stdx::unordered_set<RoleName>()));
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
+    LOGV2_WARNING(23221,
+                  "Peer certificate '{peerSubjectName}' expires soon",
+                  "Peer certificate expires soon",
+                  "peerSubjectName"_attr = peer);
 }
 
-
-SSLPeerInfo SSLManager::parseAndValidatePeerCertificateDeprecated(const SSLConnection* conn,
-                                                                  const std::string& remoteHost) {
-    auto swPeerSubjectName = parseAndValidatePeerCertificate(conn->ssl, remoteHost);
-    // We can't use uassertStatusOK here because we need to throw a SocketException.
-    if (!swPeerSubjectName.isOK()) {
-        throw SocketException(SocketException::CONNECT_ERROR,
-                              swPeerSubjectName.getStatus().reason());
-    }
-    return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
+void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
+    LOGV2_WARNING(23222,
+                  "Peer certificate '{peerSubjectName}' expires in {days}",
+                  "Peer certificate expiration information",
+                  "peerSubjectName"_attr = peer,
+                  "days"_attr = days);
 }
 
-StatusWith<stdx::unordered_set<RoleName>> SSLManager::_parsePeerRoles(X509* peerCert) const {
-    // exts is owned by the peerCert
-    const STACK_OF(X509_EXTENSION)* exts = X509_get0_extensions(peerCert);
-
-    int extCount = 0;
-    if (exts) {
-        extCount = sk_X509_EXTENSION_num(exts);
-    }
-
-    ASN1_OBJECT* rolesObj = OBJ_nid2obj(_rolesNid);
-
-    // Search all certificate extensions for our own
-    stdx::unordered_set<RoleName> roles;
-    for (int i = 0; i < extCount; i++) {
-        X509_EXTENSION* ex = sk_X509_EXTENSION_value(exts, i);
-        ASN1_OBJECT* obj = X509_EXTENSION_get_object(ex);
-
-        if (!OBJ_cmp(obj, rolesObj)) {
-            // We've found an extension which has our roles OID
-            ASN1_OCTET_STRING* data = X509_EXTENSION_get_data(ex);
-
-            /*
-             * MongoDBAuthorizationGrant ::= CHOICE {
-             *  MongoDBRole,
-             *  ...!UTF8String:"Unrecognized entity in MongoDBAuthorizationGrant"
-             * }
-             * MongoDBAuthorizationGrants ::= SET OF MongoDBAuthorizationGrant
-             */
-            // Extract the set of roles from our extension, and load them into an OpenSSL stack.
-            STACK_OF(ASN1_TYPE)* mongoDBAuthorizationGrants = nullptr;
-
-            // OpenSSL's parsing function will try and manipulate the pointer it's passed. If we
-            // passed it 'data->data' directly, it would modify structures owned by peerCert.
-            const unsigned char* dataBytes = data->data;
-            mongoDBAuthorizationGrants =
-                d2i_ASN1_SET_ANY(&mongoDBAuthorizationGrants, &dataBytes, data->length);
-            if (!mongoDBAuthorizationGrants) {
-                return Status(ErrorCodes::FailedToParse,
-                              "Failed to parse x509 authorization grants");
-            }
-            const auto grantGuard = MakeGuard([&mongoDBAuthorizationGrants]() {
-                sk_ASN1_TYPE_pop_free(mongoDBAuthorizationGrants, ASN1_TYPE_free);
-            });
-
-            /*
-             * MongoDBRole ::= SEQUENCE {
-             *  role     UTF8String,
-             *  database UTF8String
-             * }
-             */
-            // Loop through every role in the stack.
-            ASN1_TYPE* MongoDBRoleWrapped = nullptr;
-            while ((MongoDBRoleWrapped = sk_ASN1_TYPE_pop(mongoDBAuthorizationGrants))) {
-                const auto roleWrappedGuard =
-                    MakeGuard([MongoDBRoleWrapped]() { ASN1_TYPE_free(MongoDBRoleWrapped); });
-
-                if (MongoDBRoleWrapped->type == V_ASN1_SEQUENCE) {
-                    // Unwrap the ASN1Type into a STACK_OF(ASN1_TYPE)
-                    unsigned char* roleBytes = ASN1_STRING_data(MongoDBRoleWrapped->value.sequence);
-                    int roleBytesLength = ASN1_STRING_length(MongoDBRoleWrapped->value.sequence);
-                    ASN1_SEQUENCE_ANY* MongoDBRole = nullptr;
-                    MongoDBRole = d2i_ASN1_SEQUENCE_ANY(
-                        &MongoDBRole, (const unsigned char**)&roleBytes, roleBytesLength);
-                    if (!MongoDBRole) {
-                        return Status(ErrorCodes::FailedToParse,
-                                      "Failed to parse role in x509 authorization grant");
-                    }
-                    const auto roleGuard = MakeGuard(
-                        [&MongoDBRole]() { sk_ASN1_TYPE_pop_free(MongoDBRole, ASN1_TYPE_free); });
-
-                    if (sk_ASN1_TYPE_num(MongoDBRole) != 2) {
-                        return Status(ErrorCodes::FailedToParse,
-                                      "Role entity in MongoDBAuthorizationGrant must have exactly "
-                                      "2 sequence elements");
-                    }
-                    // Extract the subcomponents of the sequence, which are popped off the stack in
-                    // reverse order. Here, parse the role's database.
-                    ASN1_TYPE* roleComponent = sk_ASN1_TYPE_pop(MongoDBRole);
-                    const auto roleDBGuard =
-                        MakeGuard([roleComponent]() { ASN1_TYPE_free(roleComponent); });
-                    if (roleComponent->type != V_ASN1_UTF8STRING) {
-                        return Status(ErrorCodes::FailedToParse,
-                                      "database in MongoDBRole must be a UTF8 string");
-                    }
-                    std::string roleDB(
-                        reinterpret_cast<char*>(ASN1_STRING_data(roleComponent->value.utf8string)));
-
-                    // Parse the role's name.
-                    roleComponent = sk_ASN1_TYPE_pop(MongoDBRole);
-                    const auto roleNameGuard =
-                        MakeGuard([roleComponent]() { ASN1_TYPE_free(roleComponent); });
-                    if (roleComponent->type != V_ASN1_UTF8STRING) {
-                        return Status(ErrorCodes::FailedToParse,
-                                      "role in MongoDBRole must be a UTF8 string");
-                    }
-                    std::string roleName(
-                        reinterpret_cast<char*>(ASN1_STRING_data(roleComponent->value.utf8string)));
-
-                    // Construct a RoleName from the subcomponents
-                    roles.emplace(RoleName(roleName, roleDB));
-
-                } else {
-                    return Status(ErrorCodes::FailedToParse,
-                                  "Unrecognized entity in MongoDBAuthorizationGrant");
-                }
-            }
-            LOG(1) << "MONGODB-X509 authorization parsed the following roles from peer "
-                      "certificate: "
-                   << [&roles]() {
-                          StringBuilder sb;
-                          std::for_each(roles.begin(), roles.end(), [&sb](const RoleName& role) {
-                              sb << role.toString();
-                          });
-                          return sb.str();
-                      }();
-        }
-    }
-
-    return roles;
-}
-
-std::string SSLManagerInterface::getSSLErrorMessage(int code) {
-    // 120 from the SSL documentation for ERR_error_string
-    static const size_t msglen = 120;
-
-    char msg[msglen];
-    ERR_error_string_n(code, msg, msglen);
-    return msg;
-}
-
-void SSLManager::_handleSSLError(int code, int ret) {
-    int err = ERR_get_error();
-
-    switch (code) {
-        case SSL_ERROR_WANT_READ:
-        case SSL_ERROR_WANT_WRITE:
-            // should not happen because we turned on AUTO_RETRY
-            // However, it turns out this CAN happen during a connect, if the other side
-            // accepts the socket connection but fails to do the SSL handshake in a timely
-            // manner.
-            error() << "SSL: " << code << ", possibly timed out during connect";
-            break;
-
-        case SSL_ERROR_ZERO_RETURN:
-            // TODO: Check if we can avoid throwing an exception for this condition
-            LOG(3) << "SSL network connection closed";
-            break;
-        case SSL_ERROR_SYSCALL:
-            // If ERR_get_error returned 0, the error queue is empty
-            // check the return value of the actual SSL operation
-            if (err != 0) {
-                error() << "SSL: " << getSSLErrorMessage(err);
-            } else if (ret == 0) {
-                error() << "Unexpected EOF encountered during SSL communication";
-            } else {
-                error() << "The SSL BIO reported an I/O error " << errnoWithDescription();
-            }
-            break;
-        case SSL_ERROR_SSL: {
-            error() << "SSL: " << getSSLErrorMessage(err);
-            break;
-        }
-
-        default:
-            error() << "unrecognized SSL error";
-            break;
-    }
-    throw SocketException(SocketException::CONNECT_ERROR, "");
-}
-#else
-
-MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
-    // we need a no-op initializer so that we can depend on SSLManager as a prerequisite in
-    // non-SSL builds.
-    return Status::OK();
-}
-
-#endif  // #ifdef MONGO_CONFIG_SSL
 }  // namespace mongo

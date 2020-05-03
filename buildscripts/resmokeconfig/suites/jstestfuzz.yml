@@ -5,6 +5,9 @@ selector:
   - jstestfuzz/out/*.js
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
   config:
     shell_options:
       readMode: commands
@@ -15,12 +18,11 @@ executor:
         TestData:
           skipValidationOnInvalidViewDefinitions: true
           skipValidationOnNamespaceNotFound: false
+          forceValidationWithFeatureCompatibilityVersion: "4.4"
   fixture:
     class: MongoDFixture
     mongod_options:
-      noprealloc: ''
       set_parameters:
+        disableLogicalSessionCacheRefresh: false
         enableTestCommands: 1
-      smallfiles: ''
       verbose: ''
-

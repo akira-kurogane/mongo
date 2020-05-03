@@ -11,13 +11,6 @@ set -e
 # assumption that other factors of the environment will influence the execution
 # time by less than 20%.
 
-
-# need to enable long tests to run test_rwlock 
-export TESTUTIL_ENABLE_LONG_TESTS=1
-
-# We will run only when long tests are enabled.
-test "$TESTUTIL_ENABLE_LONG_TESTS" = "1" || exit 0
-
 EXIT_SUCCESS=0
 EXIT_FAILURE=1
 
@@ -49,10 +42,13 @@ then
     exit $EXIT_FAILURE
 fi
 
+# Locate Wiredtiger home directory.
+RW_LOCK_FILE=$(git rev-parse --show-toplevel)/build_posix/test/csuite/test_rwlock
+
 SEC1=`date +%s`
 if [ "$RUN_OS" = "Darwin" ]
 then
-    ./test_rwlock
+    $RW_LOCK_FILE
 elif [ "$RUN_OS" = "Linux" ]
 then
     if [ -z $2 ]
@@ -61,7 +57,7 @@ then
     else
         CPU_SET=$2
     fi
-    taskset -c $CPU_SET ./test_rwlock
+    taskset -c $CPU_SET $RW_LOCK_FILE
 else
     echo "not able to decide running OS, so exiting"
     exit $EXIT_FAILURE
@@ -75,9 +71,9 @@ if [ "$RUN_OS" = "Darwin" ]
 then
     export DYLD_FORCE_FLAT_NAMESPACE=y
     export DYLD_INSERT_LIBRARIES=$1
-    ./test_rwlock &
+    $RW_LOCK_FILE &
 else
-    LD_PRELOAD=$1 taskset -c $CPU_SET ./test_rwlock &
+    LD_PRELOAD=$1 taskset -c $CPU_SET $RW_LOCK_FILE &
 fi
 
 # get pid of test run in background

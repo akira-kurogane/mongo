@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,8 +29,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/query/async_results_merger.h"
+#include "mongo/s/query/blocking_results_merger.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/router_exec_stage.h"
 #include "mongo/util/net/hostandport.h"
@@ -37,40 +40,53 @@
 namespace mongo {
 
 /**
- * Draws results from the AsyncShardResultsMerger, which is the underlying source of the stream of
- * merged documents manipulated by the MergerPlanStage pipeline. Used to present a stream of
- * documents merged from the shards to the stages later in the pipeline.
+ * Serves as an adapter between the RouterExecStage interface and the BlockingResultsMerger
+ * interface, providing a single stream of results populated from many remote streams.
  */
 class RouterStageMerge final : public RouterExecStage {
 public:
     RouterStageMerge(OperationContext* opCtx,
-                     executor::TaskExecutor* executor,
-                     ClusterClientCursorParams* params);
+                     std::shared_ptr<executor::TaskExecutor> executor,
+                     AsyncResultsMergerParams&& armParams)
+        : RouterExecStage(opCtx),
+          _resultsMerger(opCtx, std::move(armParams), std::move(executor), nullptr) {}
 
-    StatusWith<ClusterQueryResult> next() final;
+    StatusWith<ClusterQueryResult> next(ExecContext execCtx) final {
+        return _resultsMerger.next(getOpCtx(), execCtx);
+    }
 
-    void kill(OperationContext* opCtx) final;
+    void kill(OperationContext* opCtx) final {
+        _resultsMerger.kill(opCtx);
+    }
 
-    bool remotesExhausted() final;
+    bool remotesExhausted() final {
+        return _resultsMerger.remotesExhausted();
+    }
+
+    bool partialResultsReturned() const final {
+        return _resultsMerger.partialResultsReturned();
+    }
+
+    std::size_t getNumRemotes() const final {
+        return _resultsMerger.getNumRemotes();
+    }
 
 protected:
-    Status doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+    Status doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) final {
+        return _resultsMerger.setAwaitDataTimeout(awaitDataTimeout);
+    }
 
-protected:
     void doReattachToOperationContext() override {
-        _arm.reattachToOperationContext(getOpCtx());
+        _resultsMerger.reattachToOperationContext(getOpCtx());
     }
 
     virtual void doDetachFromOperationContext() {
-        _arm.detachFromOperationContext();
+        _resultsMerger.detachFromOperationContext();
     }
 
 private:
-    // Not owned here.
-    executor::TaskExecutor* _executor;
-
     // Schedules remote work and merges results from 'remotes'.
-    AsyncResultsMerger _arm;
+    BlockingResultsMerger _resultsMerger;
 };
 
 }  // namespace mongo

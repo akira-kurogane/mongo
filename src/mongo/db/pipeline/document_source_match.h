@@ -1,59 +1,105 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 #include "mongo/client/connpool.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
 class DocumentSourceMatch : public DocumentSource {
 public:
+    template <typename T, typename... Args, typename>
+    friend boost::intrusive_ptr<T> make_intrusive(Args&&...);
+    virtual boost::intrusive_ptr<DocumentSourceMatch> clone() const {
+        return make_intrusive<std::decay_t<decltype(*this)>>(*this);
+    }
+
+    static constexpr StringData kStageName = "$match"_sd;
+    /**
+     * Convenience method for creating a $match stage.
+     */
+    static boost::intrusive_ptr<DocumentSourceMatch> create(
+        BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Parses a $match stage from 'elem'.
+     */
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+    /**
+     * Returns a new DocumentSourceMatch with a MatchExpression that, if executed on the
+     * sub-document at 'path', is equivalent to 'expression'.
+     *
+     * For example, if the original expression is {$and: [{'a.b': {$gt: 0}}, {'a.d': {$eq: 3}}]},
+     * the new $match will have the expression {$and: [{b: {$gt: 0}}, {d: {$eq: 3}}]} after
+     * descending on the path 'a'.
+     *
+     * Should be called _only_ on a MatchExpression that is a predicate on 'path', or subfields of
+     * 'path'. It is also invalid to call this method on an expression including a $elemMatch on
+     * 'path', for example: {'path': {$elemMatch: {'subfield': 3}}}
+     */
+    static boost::intrusive_ptr<DocumentSourceMatch> descendMatchOnPath(
+        MatchExpression* matchExpr,
+        const std::string& path,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
     virtual ~DocumentSourceMatch() = default;
 
-    GetNextResult getNext() final;
+    /**
+     * Parses 'filter' and resets the member of this source to be consistent with the new
+     * MatchExpression. Takes ownership of 'filter'.
+     */
+    void rebuild(BSONObj filter);
+
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    BSONObjSet getOutputSorts() final {
-        return pSource ? pSource->getOutputSorts()
-                       : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
 
     const char* getSourceName() const override;
 
-    StageConstraints constraints() const override {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed,
+                ChangeStreamRequirement::kWhitelist};
     }
 
     Value serialize(
@@ -66,19 +112,12 @@ public:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
-    /**
-     * Convenience method for creating a $match stage.
-     */
-    static boost::intrusive_ptr<DocumentSourceMatch> create(
-        BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Parses a $match stage from 'elem'.
-     */
-    static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+    GetModPathsReturn getModifiedPaths() const final {
+        // This stage does not modify or rename any paths.
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+    }
 
     /**
      * Access the MatchExpression stored inside the DocumentSourceMatch. Does not release ownership.
@@ -134,32 +173,26 @@ public:
     std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
     splitSourceBy(const std::set<std::string>& fields, const StringMap<std::string>& renames);
 
-    /**
-     * Returns a new DocumentSourceMatch with a MatchExpression that, if executed on the
-     * sub-document at 'path', is equivalent to 'expression'.
-     *
-     * For example, if the original expression is {$and: [{'a.b': {$gt: 0}}, {'a.d': {$eq: 3}}]},
-     * the new $match will have the expression {$and: [{b: {$gt: 0}}, {d: {$eq: 3}}]} after
-     * descending on the path 'a'.
-     *
-     * Should be called _only_ on a MatchExpression that is a predicate on 'path', or subfields of
-     * 'path'. It is also invalid to call this method on an expression including a $elemMatch on
-     * 'path', for example: {'path': {$elemMatch: {'subfield': 3}}}
-     */
-    static boost::intrusive_ptr<DocumentSourceMatch> descendMatchOnPath(
-        MatchExpression* matchExpr,
-        const std::string& path,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        return boost::none;
+    }
 
 protected:
+    DocumentSourceMatch(const DocumentSourceMatch& other)
+        : DocumentSourceMatch(
+              other.serialize().getDocument().toBson().firstElement().embeddedObject(),
+              other.pExpCtx) {}
+
+    GetNextResult doGetNext() override;
     DocumentSourceMatch(const BSONObj& query,
-                        const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    BSONObj _predicate;
 
 private:
     std::unique_ptr<MatchExpression> _expression;
 
-    BSONObj _predicate;
-    const bool _isTextQuery;
+    bool _isTextQuery;
 
     // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
     DepsTracker _dependencies;

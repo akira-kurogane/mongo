@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -35,86 +36,78 @@
 
 
 namespace mongo {
-IndexCatalog::Impl::~Impl() = default;
+using IndexIterator = IndexCatalog::IndexIterator;
+using ReadyIndexesIterator = IndexCatalog::ReadyIndexesIterator;
+using AllIndexesIterator = IndexCatalog::AllIndexesIterator;
 
-namespace {
-IndexCatalog::factory_function_type factory;
-}  // namespace
-
-void IndexCatalog::registerFactory(decltype(factory) newFactory) {
-    factory = std::move(newFactory);
-}
-
-auto IndexCatalog::makeImpl(IndexCatalog* const this_,
-                            Collection* const collection,
-                            const int maxNumIndexesAllowed) -> std::unique_ptr<Impl> {
-    return factory(this_, collection, maxNumIndexesAllowed);
-}
-
-void IndexCatalog::TUHook::hook() noexcept {}
-
-IndexCatalogEntry* IndexCatalog::_setupInMemoryStructures(
-    OperationContext* const opCtx,
-    std::unique_ptr<IndexDescriptor> descriptor,
-    const bool initFromDisk) {
-    return this->_impl()._setupInMemoryStructures(opCtx, std::move(descriptor), initFromDisk);
-}
-
-
-IndexCatalog::IndexIterator::Impl::~Impl() = default;
-
-namespace {
-IndexCatalog::IndexIterator::factory_function_type iteratorFactory;
-}  // namespace
-
-void IndexCatalog::IndexIterator::registerFactory(decltype(iteratorFactory) newFactory) {
-    iteratorFactory = std::move(newFactory);
-}
-
-auto IndexCatalog::IndexIterator::makeImpl(OperationContext* const opCtx,
-                                           const IndexCatalog* const cat,
-                                           const bool includeUnfinishedIndexes)
-    -> std::unique_ptr<Impl> {
-    return iteratorFactory(opCtx, cat, includeUnfinishedIndexes);
-}
-
-void IndexCatalog::IndexIterator::TUHook::hook() noexcept {}
-
-namespace {
-stdx::function<decltype(IndexCatalog::fixIndexKey)> fixIndexKeyImpl;
-}  // namespace
-
-void IndexCatalog::registerFixIndexKeyImpl(decltype(fixIndexKeyImpl) impl) {
-    fixIndexKeyImpl = std::move(impl);
-}
-
-BSONObj IndexCatalog::fixIndexKey(const BSONObj& key) {
-    return fixIndexKeyImpl(key);
-}
-
-namespace {
-stdx::function<decltype(IndexCatalog::prepareInsertDeleteOptions)> prepareInsertDeleteOptionsImpl;
-}  // namespace
-
-std::string::size_type IndexCatalog::getLongestIndexNameLength(OperationContext* opCtx) const {
-    IndexCatalog::IndexIterator it = getIndexIterator(opCtx, true);
-    std::string::size_type longestIndexNameLength = 0;
-    while (it.more()) {
-        auto thisLength = it.next()->indexName().length();
-        if (thisLength > longestIndexNameLength)
-            longestIndexNameLength = thisLength;
+bool IndexIterator::more() {
+    if (_start) {
+        _next = _advance();
+        _start = false;
     }
-    return longestIndexNameLength;
+    return _next != nullptr;
 }
 
-void IndexCatalog::prepareInsertDeleteOptions(OperationContext* const opCtx,
-                                              const IndexDescriptor* const desc,
-                                              InsertDeleteOptions* const options) {
-    return prepareInsertDeleteOptionsImpl(opCtx, desc, options);
+const IndexCatalogEntry* IndexIterator::next() {
+    if (!more())
+        return nullptr;
+    _prev = _next;
+    _next = _advance();
+    return _prev;
 }
 
-void IndexCatalog::registerPrepareInsertDeleteOptionsImpl(
-    stdx::function<decltype(prepareInsertDeleteOptions)> impl) {
-    prepareInsertDeleteOptionsImpl = std::move(impl);
+ReadyIndexesIterator::ReadyIndexesIterator(OperationContext* const opCtx,
+                                           IndexCatalogEntryContainer::const_iterator beginIterator,
+                                           IndexCatalogEntryContainer::const_iterator endIterator)
+    : _opCtx(opCtx), _iterator(beginIterator), _endIterator(endIterator) {}
+
+const IndexCatalogEntry* ReadyIndexesIterator::_advance() {
+    while (_iterator != _endIterator) {
+        IndexCatalogEntry* entry = _iterator->get();
+        ++_iterator;
+
+        if (auto minSnapshot = entry->getMinimumVisibleSnapshot()) {
+            auto mySnapshot = _opCtx->recoveryUnit()->getPointInTimeReadTimestamp().get_value_or(
+                _opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
+
+            if (!mySnapshot.isNull() && mySnapshot < minSnapshot.get()) {
+                // This index isn't finished in my snapshot.
+                continue;
+            }
+        }
+
+        return entry;
+    }
+
+    return nullptr;
+}
+
+AllIndexesIterator::AllIndexesIterator(
+    OperationContext* const opCtx, std::unique_ptr<std::vector<IndexCatalogEntry*>> ownedContainer)
+    : _opCtx(opCtx), _ownedContainer(std::move(ownedContainer)) {
+    // Explicitly order calls onto the ownedContainer with respect to its move.
+    _iterator = _ownedContainer->begin();
+    _endIterator = _ownedContainer->end();
+}
+
+const IndexCatalogEntry* AllIndexesIterator::_advance() {
+    if (_iterator == _endIterator) {
+        return nullptr;
+    }
+
+    IndexCatalogEntry* entry = *_iterator;
+    ++_iterator;
+    return entry;
+}
+
+StringData toString(IndexBuildMethod method) {
+    switch (method) {
+        case IndexBuildMethod::kHybrid:
+            return "Hybrid"_sd;
+        case IndexBuildMethod::kForeground:
+            return "Foreground"_sd;
+    }
+
+    MONGO_UNREACHABLE;
 }
 }  // namespace mongo

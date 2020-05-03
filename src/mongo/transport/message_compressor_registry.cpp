@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,20 +31,20 @@
 
 #include "mongo/transport/message_compressor_registry.h"
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <memory>
+
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/message_compressor_noop.h"
 #include "mongo/transport/message_compressor_snappy.h"
 #include "mongo/transport/message_compressor_zlib.h"
+#include "mongo/transport/message_compressor_zstd.h"
 #include "mongo/util/options_parser/option_section.h"
-
-#include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/split.hpp>
 
 namespace mongo {
 namespace {
-const auto kDisabledConfigValue = "disabled"_sd;
-const auto kDefaultConfigValue = "snappy"_sd;
+constexpr auto kDisabledConfigValue = "disabled"_sd;
 }  // namespace
 
 StringData getMessageCompressorName(MessageCompressor id) {
@@ -54,6 +55,8 @@ StringData getMessageCompressorName(MessageCompressor id) {
             return "snappy"_sd;
         case MessageCompressor::kZlib:
             return "zlib"_sd;
+        case MessageCompressor::kZstd:
+            return "zstd"_sd;
         default:
             fassert(40269, "Invalid message compressor ID");
     }
@@ -111,28 +114,10 @@ void MessageCompressorRegistry::setSupportedCompressors(std::vector<std::string>
     _compressorNames = std::move(names);
 }
 
-Status addMessageCompressionOptions(moe::OptionSection* options, bool forShell) {
-    auto ret =
-        options
-            ->addOptionChaining("net.compression.compressors",
-                                "networkMessageCompressors",
-                                moe::String,
-                                "Comma-separated list of compressors to use for network messages")
-            .setDefault(moe::Value(kDefaultConfigValue.toString()))
-            .setImplicit(moe::Value(kDisabledConfigValue.toString()));
-    if (forShell)
-        ret.hidden();
-
-    return Status::OK();
-}
-
-Status storeMessageCompressionOptions(const moe::Environment& params) {
+Status storeMessageCompressionOptions(const std::string& compressors) {
     std::vector<std::string> restrict;
-    if (params.count("net.compression.compressors")) {
-        auto compressorListStr = params["net.compression.compressors"].as<std::string>();
-        if (compressorListStr != kDisabledConfigValue) {
-            boost::algorithm::split(restrict, compressorListStr, boost::is_any_of(", "));
-        }
+    if (compressors != kDisabledConfigValue) {
+        boost::algorithm::split(restrict, compressors, boost::is_any_of(", "));
     }
 
     auto& compressorFactory = MessageCompressorRegistry::get();
@@ -148,7 +133,7 @@ MONGO_INITIALIZER_GENERAL(NoopMessageCompressorInit,
                           ("AllCompressorsRegistered"))
 (InitializerContext* context) {
     auto& compressorRegistry = MessageCompressorRegistry::get();
-    compressorRegistry.registerImplementation(stdx::make_unique<NoopMessageCompressor>());
+    compressorRegistry.registerImplementation(std::make_unique<NoopMessageCompressor>());
     return Status::OK();
 }
 

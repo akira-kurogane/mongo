@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,14 +33,147 @@
 
 #include <algorithm>
 
+#include "mongo/bson/mutable/document.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/role_graph.h"
-#include "mongo/db/server_options.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/sequence_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
+
+TEST(RoleParsingTest, BuildRoleBSON) {
+    RoleGraph graph;
+    RoleName roleA("roleA", "dbA");
+    RoleName roleB("roleB", "dbB");
+    RoleName roleC("roleC", "dbC");
+    RoleName roleD("roleD", "dbD");
+    ActionSet actions;
+    actions.addAction(ActionType::find);
+    actions.addAction(ActionType::insert);
+    SharedRestrictionDocument restrictions = uassertStatusOK(parseAuthenticationRestriction(
+        BSON_ARRAY(BSON("clientSource" << BSON_ARRAY("127.0.0.1")))));
+
+    ASSERT_OK(graph.createRole(roleA));
+    ASSERT_OK(graph.createRole(roleB));
+    ASSERT_OK(graph.createRole(roleC));
+    ASSERT_OK(graph.createRole(roleD));
+
+    ASSERT_OK(graph.addRoleToRole(roleA, roleC));
+    ASSERT_OK(graph.addRoleToRole(roleA, roleB));
+    ASSERT_OK(graph.addRoleToRole(roleA, roleD));
+    ASSERT_OK(graph.addRoleToRole(roleB, roleC));
+
+    ASSERT_OK(graph.addPrivilegeToRole(
+        roleA, Privilege(ResourcePattern::forAnyNormalResource(), actions)));
+    ASSERT_OK(graph.addPrivilegeToRole(
+        roleB, Privilege(ResourcePattern::forExactNamespace(NamespaceString("dbB.foo")), actions)));
+    ASSERT_OK(
+        graph.addPrivilegeToRole(roleC, Privilege(ResourcePattern::forClusterResource(), actions)));
+    ASSERT_OK(graph.replaceRestrictionsForRole(roleD, restrictions));
+    ASSERT_OK(graph.recomputePrivilegeData());
+
+
+    // Role A
+    mutablebson::Document doc;
+    ASSERT_OK(RoleGraph::getBSONForRole(&graph, roleA, doc.root()));
+    BSONObj roleDoc = doc.getObject();
+
+    ASSERT_EQUALS("dbA.roleA", roleDoc["_id"].String());
+    ASSERT_EQUALS("roleA", roleDoc["role"].String());
+    ASSERT_EQUALS("dbA", roleDoc["db"].String());
+
+    ASSERT_TRUE(roleDoc["authenticationRestrictions"].Array().empty());
+
+    std::vector<BSONElement> privs = roleDoc["privileges"].Array();
+    ASSERT_EQUALS(1U, privs.size());
+    ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["db"].String());
+    ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["collection"].String());
+    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
+    std::vector<BSONElement> actionElements = privs[0].Obj()["actions"].Array();
+    ASSERT_EQUALS(2U, actionElements.size());
+    ASSERT_EQUALS("find", actionElements[0].String());
+    ASSERT_EQUALS("insert", actionElements[1].String());
+
+    std::vector<BSONElement> roles = roleDoc["roles"].Array();
+    ASSERT_EQUALS(3U, roles.size());
+    ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
+    ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
+    ASSERT_EQUALS("roleB", roles[1].Obj()["role"].String());
+    ASSERT_EQUALS("dbB", roles[1].Obj()["db"].String());
+
+    // Role B
+    doc.reset();
+    ASSERT_OK(RoleGraph::getBSONForRole(&graph, roleB, doc.root()));
+    roleDoc = doc.getObject();
+
+    ASSERT_EQUALS("dbB.roleB", roleDoc["_id"].String());
+    ASSERT_EQUALS("roleB", roleDoc["role"].String());
+    ASSERT_EQUALS("dbB", roleDoc["db"].String());
+
+    ASSERT_TRUE(roleDoc["authenticationRestrictions"].Array().empty());
+
+    privs = roleDoc["privileges"].Array();
+    ASSERT_EQUALS(1U, privs.size());
+    ASSERT_EQUALS("dbB", privs[0].Obj()["resource"].Obj()["db"].String());
+    ASSERT_EQUALS("foo", privs[0].Obj()["resource"].Obj()["collection"].String());
+    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
+    actionElements = privs[0].Obj()["actions"].Array();
+    ASSERT_EQUALS(2U, actionElements.size());
+    ASSERT_EQUALS("find", actionElements[0].String());
+    ASSERT_EQUALS("insert", actionElements[1].String());
+
+    roles = roleDoc["roles"].Array();
+    ASSERT_EQUALS(1U, roles.size());
+    ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
+    ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
+
+    // Role C
+    doc.reset();
+    ASSERT_OK(RoleGraph::getBSONForRole(&graph, roleC, doc.root()));
+    roleDoc = doc.getObject();
+
+    ASSERT_EQUALS("dbC.roleC", roleDoc["_id"].String());
+    ASSERT_EQUALS("roleC", roleDoc["role"].String());
+    ASSERT_EQUALS("dbC", roleDoc["db"].String());
+
+    ASSERT_TRUE(roleDoc["authenticationRestrictions"].Array().empty());
+
+    privs = roleDoc["privileges"].Array();
+    ASSERT_EQUALS(1U, privs.size());
+    ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].Bool());
+    ASSERT(privs[0].Obj()["resource"].Obj()["db"].eoo());
+    ASSERT(privs[0].Obj()["resource"].Obj()["collection"].eoo());
+    actionElements = privs[0].Obj()["actions"].Array();
+    ASSERT_EQUALS(2U, actionElements.size());
+    ASSERT_EQUALS("find", actionElements[0].String());
+    ASSERT_EQUALS("insert", actionElements[1].String());
+
+    roles = roleDoc["roles"].Array();
+    ASSERT_EQUALS(0U, roles.size());
+
+    // Role D
+    doc.reset();
+    ASSERT_OK(RoleGraph::getBSONForRole(&graph, roleD, doc.root()));
+    roleDoc = doc.getObject();
+
+    ASSERT_EQUALS("dbD.roleD", roleDoc["_id"].String());
+    ASSERT_EQUALS("roleD", roleDoc["role"].String());
+    ASSERT_EQUALS("dbD", roleDoc["db"].String());
+
+    ASSERT_FALSE(roleDoc["authenticationRestrictions"].Array().empty());
+    auto restrictionObj = BSONArray(roleDoc["authenticationRestrictions"].Obj());
+    SharedRestrictionDocument parsedRestrictions =
+        uassertStatusOK(parseAuthenticationRestriction(restrictionObj));
+    ASSERT_EQ(restrictions->toString(), parsedRestrictions->toString());
+
+    privs = roleDoc["privileges"].Array();
+    ASSERT_TRUE(privs.empty());
+
+    roles = roleDoc["roles"].Array();
+    ASSERT_EQUALS(0U, roles.size());
+}
 
 // Tests adding and removing roles from other roles, the RoleNameIterator, and the
 // getDirectMembers and getDirectSubordinates methods
@@ -96,7 +230,7 @@ TEST(RoleGraphTest, AddRemoveRoles) {
      * |
      * v
      * D
-    */
+     */
 
 
     it = graph.getDirectSubordinates(roleA);  // should be roleB and roleC, order doesn't matter
@@ -106,7 +240,7 @@ TEST(RoleGraphTest, AddRemoveRoles) {
     } else if (cur == roleC) {
         ASSERT_EQUALS(it.next().getFullName(), roleB.getFullName());
     } else {
-        FAIL(mongoutils::str::stream() << "unexpected role returned: " << cur.getFullName());
+        FAIL(str::stream() << "unexpected role returned: " << cur.getFullName());
     }
     ASSERT_FALSE(it.more());
 
@@ -126,7 +260,7 @@ TEST(RoleGraphTest, AddRemoveRoles) {
         } else if (cur == roleD) {
             hasD = true;
         } else {
-            FAIL(mongoutils::str::stream() << "unexpected role returned: " << cur.getFullName());
+            FAIL(str::stream() << "unexpected role returned: " << cur.getFullName());
         }
     }
     ASSERT_EQUALS(3, num);
@@ -141,7 +275,7 @@ TEST(RoleGraphTest, AddRemoveRoles) {
     } else if (cur == roleD) {
         ASSERT_EQUALS(it.next().getFullName(), roleC.getFullName());
     } else {
-        FAIL(mongoutils::str::stream() << "unexpected role returned: " << cur.getFullName());
+        FAIL(str::stream() << "unexpected role returned: " << cur.getFullName());
     }
     ASSERT_FALSE(it.more());
 
@@ -162,7 +296,7 @@ TEST(RoleGraphTest, AddRemoveRoles) {
     } else if (cur == roleB) {
         ASSERT_EQUALS(it.next().getFullName(), roleA.getFullName());
     } else {
-        FAIL(mongoutils::str::stream() << "unexpected role returned: " << cur.getFullName());
+        FAIL(str::stream() << "unexpected role returned: " << cur.getFullName());
     }
     ASSERT_FALSE(it.more());
 
@@ -674,6 +808,7 @@ TEST(RoleGraphTest, getRolesForDatabase) {
 
     // Admin DB
     it = graph.getRolesForDatabase("admin");
+    ASSERT_EQUALS(RoleName("__queryableBackup", "admin"), it.next());
     ASSERT_EQUALS(RoleName("__system", "admin"), it.next());
     ASSERT_EQUALS(RoleName("backup", "admin"), it.next());
     ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), it.next());
@@ -724,26 +859,22 @@ TEST(RoleGraphTest, AddRoleFromDocument) {
                                            << "dbA"
                                            << "collection"
                                            << "collA")
-                                   << "actions"
-                                   << BSON_ARRAY("insert"))),
+                                   << "actions" << BSON_ARRAY("insert"))),
         BSON_ARRAY(BSON("resource" << BSON("db"
                                            << "dbB"
                                            << "collection"
                                            << "collB")
-                                   << "actions"
-                                   << BSON_ARRAY("insert"))
+                                   << "actions" << BSON_ARRAY("insert"))
                    << BSON("resource" << BSON("db"
                                               << "dbC"
                                               << "collection"
                                               << "collC")
-                                      << "actions"
-                                      << BSON_ARRAY("compact"))),
+                                      << "actions" << BSON_ARRAY("compact"))),
         BSON_ARRAY(BSON("resource" << BSON("db"
                                            << ""
                                            << "collection"
                                            << "")
-                                   << "actions"
-                                   << BSON_ARRAY("find"))),
+                                   << "actions" << BSON_ARRAY("find"))),
     };
 
     const BSONArray restrictions[] = {
@@ -772,9 +903,6 @@ TEST(RoleGraphTest, AddRoleFromDocument) {
         }
         return builder.obj();
     };
-
-    serverGlobalParams.featureCompatibility.version.store(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
 
     RoleGraph graph;
 
@@ -824,33 +952,28 @@ TEST(RoleGraphTest, AddRoleFromDocumentWithRestricitonMerge) {
         BSON_ARRAY(BSON("serverAddress" << BSON_ARRAY("127.0.0.1/8")));
 
     RoleGraph graph;
-    ASSERT_OK(graph.addRoleFromDocument(BSON("_id"
-                                             << "dbA.roleA"
-                                             << "role"
-                                             << "roleA"
-                                             << "db"
-                                             << "dbA"
-                                             << "privileges"
-                                             << BSONArray()
-                                             << "roles"
-                                             << BSONArray()
-                                             << "authenticationRestrictions"
-                                             << roleARestrictions)));
-    ASSERT_OK(graph.addRoleFromDocument(BSON("_id"
-                                             << "dbB.roleB"
-                                             << "role"
-                                             << "roleB"
-                                             << "db"
-                                             << "dbB"
-                                             << "privileges"
-                                             << BSONArray()
-                                             << "roles"
-                                             << BSON_ARRAY(BSON("role"
-                                                                << "roleA"
-                                                                << "db"
-                                                                << "dbA"))
-                                             << "authenticationRestrictions"
-                                             << roleBRestrictions)));
+    ASSERT_OK(
+        graph.addRoleFromDocument(BSON("_id"
+                                       << "dbA.roleA"
+                                       << "role"
+                                       << "roleA"
+                                       << "db"
+                                       << "dbA"
+                                       << "privileges" << BSONArray() << "roles" << BSONArray()
+                                       << "authenticationRestrictions" << roleARestrictions)));
+    ASSERT_OK(
+        graph.addRoleFromDocument(BSON("_id"
+                                       << "dbB.roleB"
+                                       << "role"
+                                       << "roleB"
+                                       << "db"
+                                       << "dbB"
+                                       << "privileges" << BSONArray() << "roles"
+                                       << BSON_ARRAY(BSON("role"
+                                                          << "roleA"
+                                                          << "db"
+                                                          << "dbA"))
+                                       << "authenticationRestrictions" << roleBRestrictions)));
     ASSERT_OK(graph.recomputePrivilegeData());
 
     const auto A = graph.getDirectAuthenticationRestrictions(RoleName("roleA", "dbA"));

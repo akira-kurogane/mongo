@@ -1,7 +1,3 @@
-// Cannot implicitly shard accessed collections because of use of $near query instead of geoNear
-// command.
-// @tags: [assumes_unsharded_collection]
-
 t = db.geo_s2index;
 t.drop();
 
@@ -105,24 +101,16 @@ assert.throws(function() {
 t.drop();
 t.ensureIndex({loc: "2dsphere"});
 res = t.insert({
-    loc: {
-        type: 'Point',
-        coordinates: [40, 5],
-        crs: {type: 'name', properties: {name: 'EPSG:2000'}}
-    }
+    loc: {type: 'Point', coordinates: [40, 5], crs: {type: 'name', properties: {name: 'EPSG:2000'}}}
 });
 assert.writeError(res);
 assert.eq(0, t.find().itcount());
 res = t.insert({loc: {type: 'Point', coordinates: [40, 5]}});
-assert.writeOK(res);
+assert.commandWorked(res);
 res = t.insert({
-    loc: {
-        type: 'Point',
-        coordinates: [40, 5],
-        crs: {type: 'name', properties: {name: 'EPSG:4326'}}
-    }
+    loc: {type: 'Point', coordinates: [40, 5], crs: {type: 'name', properties: {name: 'EPSG:4326'}}}
 });
-assert.writeOK(res);
+assert.commandWorked(res);
 res = t.insert({
     loc: {
         type: 'Point',
@@ -130,7 +118,7 @@ res = t.insert({
         crs: {type: 'name', properties: {name: 'urn:ogc:def:crs:OGC:1.3:CRS84'}}
     }
 });
-assert.writeOK(res);
+assert.commandWorked(res);
 
 // We can pass level parameters and we verify that they're valid.
 // 0 <= coarsestIndexedLevel <= finestIndexedLevel <= 30.

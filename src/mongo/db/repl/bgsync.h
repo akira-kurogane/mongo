@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,21 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -60,7 +62,8 @@ class ReplicationProcess;
 class StorageInterface;
 
 class BackgroundSync {
-    MONGO_DISALLOW_COPYING(BackgroundSync);
+    BackgroundSync(const BackgroundSync&) = delete;
+    BackgroundSync& operator=(const BackgroundSync&) = delete;
 
 public:
     /**
@@ -77,9 +80,15 @@ public:
      */
     enum class ProducerState { Starting, Running, Stopped };
 
-    BackgroundSync(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+    /**
+     * Constructs a BackgroundSync to fetch oplog entries from a sync source.
+     * The BackgroundSync does not own any of the components referenced by the constructor
+     * arguments. All these components must outlive the BackgroundSync object.
+     */
+    BackgroundSync(ReplicationCoordinator* replicationCoordinator,
+                   ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
                    ReplicationProcess* replicationProcess,
-                   std::unique_ptr<OplogBuffer> oplogBuffer);
+                   OplogApplier* oplogApplier);
 
     // stop syncing (when this node becomes a primary, e.g.)
     // During stepdown, the last fetched optime is not reset in order to keep track of the lastest
@@ -108,23 +117,20 @@ public:
      */
     bool inShutdown() const;
 
+    /**
+     * Returns true if we have discovered that no sync source's oplog overlaps with ours.
+     */
+    bool tooStale() const;
+
     // starts the sync target notifying thread
     void notifierThread();
 
     HostAndPort getSyncTarget() const;
 
-    // Interface implementation
-
-    bool peek(OperationContext* opCtx, BSONObj* op);
-    void consume(OperationContext* opCtx);
     void clearSyncTarget();
-    void waitForMore();
 
     // For monitoring
     BSONObj getCounters();
-
-    // Clears any fetched and buffered oplog entries.
-    void clearBuffer(OperationContext* opCtx);
 
     /**
      * Returns true if any of the following is true:
@@ -139,9 +145,6 @@ public:
     // Starts the producer if it's stopped. Otherwise, let it keep running.
     void startProducerIfStopped();
 
-    // Adds a fake oplog entry to buffer. Used for testing only.
-    void pushTestOpToBuffer(OperationContext* opCtx, const BSONObj& op);
-
 private:
     bool _inShutdown_inlock() const;
 
@@ -154,7 +157,7 @@ private:
     void _run();
     // Production thread inner loop.
     void _runProducer();
-    void _produce(OperationContext* opCtx);
+    void _produce();
 
     /**
      * Checks current background sync state before pushing operations into blocking queue and
@@ -162,8 +165,8 @@ private:
      *
      * requiredRBID is reset to empty after the first call.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     /**
@@ -186,12 +189,10 @@ private:
                                             OplogInterfaceRemote::GetConnectionFn getConnection);
 
     /**
-     * Executes a rollback via refetch in either rs_rollback.cpp or rs_rollback_no_uuid.cpp
+     * Executes a rollback via refetch in rs_rollback.cpp.
      *
-     * We fall back on the rollback via refetch algorithm when:
-     * 1)  the server parameter "rollbackMethod" is set to "rollbackViaRefetch" or
-     *     "rollbackViaRefetchNoUUID"; or
-     * 2)  the storage engine does not support "rollback to a checkpoint."
+     * We fall back on the rollback via refetch algorithm when the storage engine does not support
+     * "rollback to a checkpoint," or when the forceRollbackViaRefetch parameter is set to true.
      *
      * Must be called from _runRollback() which ensures that all the conditions for entering
      * rollback have been met.
@@ -200,16 +201,20 @@ private:
                                        const HostAndPort& source,
                                        int requiredRBID,
                                        OplogInterface* localOplog,
-                                       bool useUUID,
                                        OplogInterfaceRemote::GetConnectionFn getConnection);
 
     // restart syncing
     void start(OperationContext* opCtx);
 
-    OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* opCtx);
+    // Set the state and notify the condition variable.
+    void setState(WithLock, ProducerState newState);
 
-    // Production thread
-    std::unique_ptr<OplogBuffer> _oplogBuffer;
+    OpTime _readLastAppliedOpTime(OperationContext* opCtx);
+
+    long long _getRetrySleepMS();
+
+    // This OplogApplier applies oplog entries fetched from the sync source.
+    OplogApplier* const _oplogApplier;
 
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;
@@ -221,37 +226,37 @@ private:
     ReplicationProcess* _replicationProcess;
 
     /**
-      * All member variables are labeled with one of the following codes indicating the
-      * synchronization rules for accessing them:
-      *
-      * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
-      *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
-      *      thread.
-      *
-      * (S)  Self-synchronizing; access in any way from any context.
-      *
-      * (M)  Reads and writes guarded by _mutex
-      *
+     * All member variables are labeled with one of the following codes indicating the
+     * synchronization rules for accessing them:
+     *
+     * (PR) Completely private to BackgroundSync. Can be read or written to from within the main
+     *      BackgroundSync thread without synchronization. Shouldn't be accessed outside of this
+     *      thread.
+     *
+     * (S)  Self-synchronizing; access in any way from any context.
+     *
+     * (M)  Reads and writes guarded by _mutex
+     *
      */
 
     // Protects member data of BackgroundSync.
     // Never hold the BackgroundSync mutex when trying to acquire the ReplicationCoordinator mutex.
-    mutable stdx::mutex _mutex;  // (S)
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BackgroundSync::_mutex");  // (S)
 
     OpTime _lastOpTimeFetched;  // (M)
 
-    // lastFetchedHash is used to match ops to determine if we need to rollback, when a secondary.
-    long long _lastFetchedHash = 0LL;  // (M)
-
     // Thread running producerThread().
     std::unique_ptr<stdx::thread> _producerThread;  // (M)
+
+    // Condition variable to notify of _state and _inShutdown changes.
+    stdx::condition_variable _stateCv;  // (S)
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;  // (M)
 
     // Flag that marks whether a node's oplog has no common point with any
     // potential sync sources.
-    bool _tooStale = false;  // (PR)
+    AtomicWord<bool> _tooStale{false};  // (S)
 
     ProducerState _state = ProducerState::Starting;  // (M)
 

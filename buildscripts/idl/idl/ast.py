@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 IDL AST classes.
@@ -20,8 +33,6 @@ Represents the derived IDL specification after type resolution in the binding pa
 This is a lossy translation from the IDL Syntax tree as the IDL AST only contains information about
 the enums and structs that need code generated for them, and just enough information to do that.
 """
-
-from __future__ import absolute_import, print_function, unicode_literals
 
 from typing import List, Union, Any, Optional, Tuple
 
@@ -35,8 +46,8 @@ class IDLBoundSpec(object):
     def __init__(self, spec, error_collection):
         # type: (IDLAST, errors.ParserErrorCollection) -> None
         """Must specify either an IDL document or errors, not both."""
-        assert (spec is None and error_collection is not None) or (spec is not None and
-                                                                   error_collection is None)
+        assert (spec is None and error_collection is not None) or (spec is not None
+                                                                   and error_collection is None)
         self.spec = spec
         self.errors = error_collection
 
@@ -53,6 +64,9 @@ class IDLAST(object):
         self.enums = []  # type: List[Enum]
         self.structs = []  # type: List[Struct]
 
+        self.server_parameters = []  # type: List[ServerParameter]
+        self.configs = []  # type: List[ConfigOption]
+
 
 class Global(common.SourceLocation):
     """
@@ -62,10 +76,12 @@ class Global(common.SourceLocation):
     """
 
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct a Global."""
-        self.cpp_namespace = None  # type: unicode
-        self.cpp_includes = []  # type: List[unicode]
+        self.cpp_namespace = None  # type: str
+        self.cpp_includes = []  # type: List[str]
+        self.configs = None  # type: ConfigGlobal
+
         super(Global, self).__init__(file_name, line, column)
 
 
@@ -76,14 +92,57 @@ class Struct(common.SourceLocation):
     All fields are either required or have a non-None default.
     """
 
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct a struct."""
-        self.name = None  # type: unicode
-        self.description = None  # type: unicode
+        self.name = None  # type: str
+        self.cpp_name = None  # type: str
+        self.description = None  # type: str
         self.strict = True  # type: bool
+        self.immutable = False  # type: bool
+        self.inline_chained_structs = False  # type: bool
+        self.generate_comparison_operators = False  # type: bool
         self.fields = []  # type: List[Field]
         super(Struct, self).__init__(file_name, line, column)
+
+
+class Expression(common.SourceLocation):
+    """Literal of C++ expression representation."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct an Expression."""
+        self.expr = None  # type: str
+        self.validate_constexpr = True  # type: bool
+        self.export = False  # type: bool
+
+        super(Expression, self).__init__(file_name, line, column)
+
+
+class Validator(common.SourceLocation):
+    """
+    An instance of a validator for a field.
+
+    The validator must include at least one of the defined validation predicates.
+    If more than one is included, they must ALL evaluate to true.
+    """
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a Validator."""
+        # Don't lint gt/lt as bad attribute names.
+        # pylint: disable=C0103
+        self.gt = None  # type: Expression
+        self.lt = None  # type: Expression
+        self.gte = None  # type: Expression
+        self.lte = None  # type: Expression
+        self.callback = None  # type: Optional[str]
+
+        super(Validator, self).__init__(file_name, line, column)
 
 
 class Field(common.SourceLocation):
@@ -98,25 +157,27 @@ class Field(common.SourceLocation):
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct a Field."""
-        self.name = None  # type: unicode
-        self.description = None  # type: unicode
-        self.cpp_name = None  # type: unicode
+        self.name = None  # type: str
+        self.description = None  # type: str
+        self.cpp_name = None  # type: str
         self.optional = False  # type: bool
         self.ignore = False  # type: bool
         self.chained = False  # type: bool
+        self.comparison_order = -1  # type: int
+        self.non_const_getter = False  # type: bool
 
         # Properties specific to fields which are types.
-        self.cpp_type = None  # type: unicode
-        self.bson_serialization_type = None  # type: List[unicode]
-        self.serializer = None  # type: unicode
-        self.deserializer = None  # type: unicode
-        self.bindata_subtype = None  # type: unicode
-        self.default = None  # type: unicode
+        self.cpp_type = None  # type: str
+        self.bson_serialization_type = None  # type: List[str]
+        self.serializer = None  # type: str
+        self.deserializer = None  # type: str
+        self.bindata_subtype = None  # type: str
+        self.default = None  # type: str
 
         # Properties specific to fields which are structs.
-        self.struct_type = None  # type: unicode
+        self.struct_type = None  # type: str
 
         # Properties specific to fields which are arrays.
         self.array = False  # type: bool
@@ -125,9 +186,15 @@ class Field(common.SourceLocation):
         # Properties specific to fields which are enums.
         self.enum_type = False  # type: bool
 
+        # Properties specific to fields inlined from chained_structs
+        self.chained_struct_field = None  # type: Field
+
         # Internal fields - not generated by parser
         self.serialize_op_msg_request_only = False  # type: bool
         self.constructed = False  # type: bool
+
+        # Validation rules.
+        self.validator = None  # type: Optional[Validator]
 
         super(Field, self).__init__(file_name, line, column)
 
@@ -140,9 +207,10 @@ class Command(Struct):
     """
 
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct a command."""
-        self.namespace = None  # type: unicode
+        self.namespace = None  # type: str
+        self.command_field = None  # type: Field
         super(Command, self).__init__(file_name, line, column)
 
 
@@ -154,10 +222,10 @@ class EnumValue(common.SourceLocation):
     """
 
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct an Enum."""
-        self.name = None  # type: unicode
-        self.value = None  # type: unicode
+        self.name = None  # type: str
+        self.value = None  # type: str
 
         super(EnumValue, self).__init__(file_name, line, column)
 
@@ -170,11 +238,131 @@ class Enum(common.SourceLocation):
     """
 
     def __init__(self, file_name, line, column):
-        # type: (unicode, int, int) -> None
+        # type: (str, int, int) -> None
         """Construct an Enum."""
-        self.name = None  # type: unicode
-        self.description = None  # type: unicode
-        self.type = None  # type: unicode
+        self.name = None  # type: str
+        self.description = None  # type: str
+        self.cpp_namespace = None  # type: str
+        self.type = None  # type: str
         self.values = []  # type: List[EnumValue]
 
         super(Enum, self).__init__(file_name, line, column)
+
+
+class Condition(common.SourceLocation):
+    """Condition(s) for a ServerParameter or ConfigOption."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a Condition."""
+        self.expr = None  # type: str
+        self.constexpr = None  # type: str
+        self.preprocessor = None  # type: str
+
+        super(Condition, self).__init__(file_name, line, column)
+
+
+class ServerParameterClass(common.SourceLocation):
+    """ServerParameter as C++ class specialization."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a ServerParameterClass."""
+
+        self.name = None  # type: str
+        self.data = None  # type: str
+        self.override_ctor = False  # type: bool
+        self.override_set = False  # type: bool
+
+        super(ServerParameterClass, self).__init__(file_name, line, column)
+
+
+class ServerParameter(common.SourceLocation):
+    """IDL ServerParameter setting."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a ServerParameter."""
+        self.name = None  # type: str
+        self.set_at = None  # type: str
+        self.description = None  # type: str
+        self.cpp_class = None  # type: ServerParameterClass
+        self.cpp_vartype = None  # type: str
+        self.cpp_varname = None  # type: str
+        self.condition = None  # type: Condition
+        self.redact = False  # type: bool
+        self.test_only = False  # type: bool
+        self.deprecated_name = []  # type: List[str]
+        self.default = None  # type: Expression
+
+        # Only valid if cpp_varname is specified.
+        self.validator = None  # type: Validator
+        self.on_update = None  # type: str
+
+        super(ServerParameter, self).__init__(file_name, line, column)
+
+
+class GlobalInitializer(common.SourceLocation):
+    """Initializer details for custom registration/storage."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a GlobalInitializer."""
+
+        self.name = None  # type: str
+        self.register = None  # type: str
+        self.store = None  # type: str
+
+        super(GlobalInitializer, self).__init__(file_name, line, column)
+
+
+class ConfigGlobal(common.SourceLocation):
+    """IDL ConfigOption Globals."""
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a ConfigGlobal."""
+
+        # Other config globals are consumed in bind phase.
+        self.initializer = None  # type: GlobalInitializer
+
+        super(ConfigGlobal, self).__init__(file_name, line, column)
+
+
+class ConfigOption(common.SourceLocation):
+    """IDL ConfigOption setting."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a ConfigOption."""
+        self.name = None  # type: str
+        self.short_name = None  # type: str
+        self.deprecated_name = []  # type: List[str]
+        self.deprecated_short_name = []  # type: List[str]
+
+        self.description = None  # type: Expression
+        self.section = None  # type: str
+        self.arg_vartype = None  # type: str
+        self.cpp_vartype = None  # type: str
+        self.cpp_varname = None  # type: str
+        self.condition = None  # type: Condition
+
+        self.conflicts = []  # type: List[str]
+        self.requires = []  # type: List[str]
+        self.hidden = False  # type: bool
+        self.redact = False  # type: bool
+        self.default = None  # type: Expression
+        self.implicit = None  # type: Expression
+        self.source = None  # type: str
+        self.canonicalize = None  # type: str
+
+        self.duplicates_append = False  # type: bool
+        self.positional_start = None  # type: int
+        self.positional_end = None  # type: int
+        self.validator = None  # type: Validator
+
+        super(ConfigOption, self).__init__(file_name, line, column)

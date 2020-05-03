@@ -1,66 +1,30 @@
-"""
-A thread-safe version of sched.scheduler since the class wasn't made
-thread-safe until Python 3.3.
-"""
-
-from __future__ import absolute_import
+"""Version of sched.scheduler with a fixed cancel() method."""
 
 import heapq
 import sched
-import threading
 
 
 class Scheduler(sched.scheduler):
-    """
-    A thread-safe, general purpose event scheduler.
-    """
-
-    def __init__(self, timefunc, delayfunc):
-        sched.scheduler.__init__(self, timefunc, delayfunc)
-
-        # We use a recursive lock because sched.scheduler.enter() calls sched.scheduler.enterabs().
-        self._queue_lock = threading.RLock()
-
-    def enterabs(self, time, priority, action, argument):
-        with self._queue_lock:
-            return sched.scheduler.enterabs(self, time, priority, action, argument)
-
-    def enter(self, delay, priority, action, argument):
-        with self._queue_lock:
-            return sched.scheduler.enter(self, delay, priority, action, argument)
+    """A thread-safe, general purpose event scheduler."""
 
     def cancel(self, event):
-        with self._queue_lock:
-            return sched.scheduler.cancel(self, event)
+        """Remove an event from the queue.
 
-    def empty(self):
-        with self._queue_lock:
-            return sched.scheduler.empty(self)
+        Raises a ValueError if the event is not in the queue.
+        """
 
-    # The implementation for the run() method was adapted from sched.scheduler.run() in Python 3.6.
-    def run(self):
-        while True:
-            with self._queue_lock:
-                if not self._queue:
-                    break
+        # The changes from https://hg.python.org/cpython/rev/d8802b055474 made it so sched.Event
+        # instances returned by sched.scheduler.enter() and sched.scheduler.enterabs() are treated
+        # as equal if they have the same (time, priority). It is therefore possible to remove the
+        # wrong event from the list when sched.scheduler.cancel() is called. Note that this is still
+        # true even with time.monotonic being the default timefunc, as GetTickCount64() on Windows
+        # only has a resolution of ~15ms. We therefore use the `is` operator to remove the correct
+        # event from the list.
+        with self._lock:
+            for i in range(len(self._queue)):
+                if self._queue[i] is event:
+                    del self._queue[i]
+                    heapq.heapify(self._queue)
+                    return
 
-                now = self.timefunc()
-                event = self._queue[0]
-
-                should_execute = event.time <= now
-                if should_execute:
-                    heapq.heappop(self._queue)
-
-            if should_execute:
-                event.action(*event.argument)
-
-                # sched.scheduler calls delayfunc(0) in order to yield the CPU and let other threads
-                # run, so we do the same here.
-                self.delayfunc(0)
-            else:
-                self.delayfunc(event.time - now)
-
-    @property
-    def queue(self):
-        with self._queue_lock:
-            return sched.scheduler.queue.fget(self)
+            raise ValueError("event not in list")

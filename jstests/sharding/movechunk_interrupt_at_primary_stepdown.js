@@ -9,62 +9,87 @@
 load('./jstests/libs/chunk_manipulation_util.js');
 
 (function() {
-    'use strict';
+'use strict';
 
-    // Intentionally use a config server with 1 node so that the step down and promotion to primary
-    // are guaranteed to happen on the same host
-    var st = new ShardingTest({config: 1, shards: 2});
-    var mongos = st.s0;
+// Intentionally use a config server with 1 node so that the step down and promotion to primary
+// are guaranteed to happen on the same host
+var st = new ShardingTest({config: 1, shards: 2, other: {chunkSize: 1}});
+var mongos = st.s0;
 
-    assert.commandWorked(mongos.adminCommand({enableSharding: 'TestDB'}));
-    st.ensurePrimaryShard('TestDB', st.shard0.shardName);
-    assert.commandWorked(mongos.adminCommand({shardCollection: 'TestDB.TestColl', key: {Key: 1}}));
+assert.commandWorked(mongos.adminCommand({enableSharding: 'TestDB'}));
+st.ensurePrimaryShard('TestDB', st.shard0.shardName);
+assert.commandWorked(mongos.adminCommand({shardCollection: 'TestDB.TestColl', key: {Key: 1}}));
 
-    var coll = mongos.getDB('TestDB').TestColl;
+var coll = mongos.getDB('TestDB').TestColl;
 
-    // We have one chunk initially
-    assert.writeOK(coll.insert({Key: 0, Value: 'Test value'}));
+// For startParallelOps to write its state
+var staticMongod = MongoRunner.runMongod({});
 
-    pauseMigrateAtStep(st.shard1, migrateStepNames.deletedPriorDataInRange);
+function interruptMoveChunkAndRecover(fromShard, toShard, isJumbo) {
+    pauseMigrateAtStep(toShard, migrateStepNames.deletedPriorDataInRange);
 
-    // For startParallelOps to write its state
-    var staticMongod = MongoRunner.runMongod({});
-
-    var joinMoveChunk = moveChunkParallel(
-        staticMongod, mongos.host, {Key: 0}, null, 'TestDB.TestColl', st.shard1.shardName);
-    waitForMigrateStep(st.shard1, migrateStepNames.deletedPriorDataInRange);
+    var joinMoveChunk = moveChunkParallel(staticMongod,
+                                          mongos.host,
+                                          {Key: 0},
+                                          null,
+                                          'TestDB.TestColl',
+                                          toShard.shardName,
+                                          true /* expectSuccess */,
+                                          isJumbo);
+    waitForMigrateStep(toShard, migrateStepNames.deletedPriorDataInRange);
 
     // Stepdown the primary in order to force the balancer to stop. Use a timeout of 5 seconds for
     // both step down operations, because mongos will retry to find the CSRS primary for up to 20
     // seconds and we have two successive ones.
-    assert.throws(function() {
-        assert.commandWorked(
-            st.configRS.getPrimary().adminCommand({replSetStepDown: 5, force: true}));
-    });
+    assert.commandWorked(st.configRS.getPrimary().adminCommand({replSetStepDown: 5, force: true}));
 
     // Ensure a new primary is found promptly
     st.configRS.getPrimary(30000);
 
-    assert.eq(1, mongos.getDB('config').chunks.find({shard: st.shard0.shardName}).itcount());
-    assert.eq(0, mongos.getDB('config').chunks.find({shard: st.shard1.shardName}).itcount());
+    assert.eq(1,
+              mongos.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: fromShard.shardName})
+                  .itcount());
+    assert.eq(0,
+              mongos.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: toShard.shardName})
+                  .itcount());
 
     // At this point, the balancer is in recovery mode. Ensure that stepdown can be done again and
     // the recovery mode interrupted.
-    assert.throws(function() {
-        assert.commandWorked(
-            st.configRS.getPrimary().adminCommand({replSetStepDown: 5, force: true}));
-    });
+    assert.commandWorked(st.configRS.getPrimary().adminCommand({replSetStepDown: 5, force: true}));
 
     // Ensure a new primary is found promptly
     st.configRS.getPrimary(30000);
 
-    unpauseMigrateAtStep(st.shard1, migrateStepNames.deletedPriorDataInRange);
+    unpauseMigrateAtStep(toShard, migrateStepNames.deletedPriorDataInRange);
 
     // Ensure that migration succeeded
     joinMoveChunk();
 
-    assert.eq(0, mongos.getDB('config').chunks.find({shard: st.shard0.shardName}).itcount());
-    assert.eq(1, mongos.getDB('config').chunks.find({shard: st.shard1.shardName}).itcount());
+    assert.eq(0,
+              mongos.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: fromShard.shardName})
+                  .itcount());
+    assert.eq(1,
+              mongos.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: toShard.shardName})
+                  .itcount());
+}
 
-    st.stop();
+// We have one non-jumbo chunk initially
+assert.commandWorked(coll.insert({Key: 0, Value: 'Test value'}));
+interruptMoveChunkAndRecover(st.shard0, st.shard1, false);
+
+// Add a bunch of docs to this chunks so that it becomes jumbo
+const largeString = 'X'.repeat(10000);
+let bulk = coll.initializeUnorderedBulkOp();
+for (let i = 0; i < 2000; i++) {
+    bulk.insert({Key: 0, Value: largeString});
+}
+assert.commandWorked(bulk.execute());
+interruptMoveChunkAndRecover(st.shard1, st.shard0, true);
+
+st.stop();
+MongoRunner.stopMongod(staticMongod);
 })();

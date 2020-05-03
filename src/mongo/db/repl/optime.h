@@ -1,35 +1,37 @@
 /**
-*    Copyright (C) 2015 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
 #include <tuple>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 
 namespace mongo {
@@ -60,7 +62,7 @@ public:
     //
     // This is also the initial term for nodes that were recently started up but have not
     // yet joined the cluster, all in protocol version 1.
-    static const long long kInitialTerm = 0;
+    static const long long kInitialTerm;
 
     /**
      * Returns maximum OpTime value.
@@ -149,11 +151,38 @@ public:
 
     friend std::ostream& operator<<(std::ostream& out, const OpTime& opTime);
 
+    void appendAsQuery(BSONObjBuilder* builder) const;
+    BSONObj asQuery() const;
+
 private:
     Timestamp _timestamp;
     long long _term = kInitialTerm;
 };
 
+class OpTimeAndWallTime {
+public:
+    OpTime opTime = OpTime();
+    Date_t wallTime = Date_t();
+
+    static StatusWith<OpTimeAndWallTime> parseOpTimeAndWallTimeFromOplogEntry(
+        const BSONObj& bsonObject);
+
+    OpTimeAndWallTime() {}
+
+    OpTimeAndWallTime(OpTime optime, Date_t wall) : opTime(optime), wallTime(wall) {}
+
+    inline bool operator==(const OpTimeAndWallTime& rhs) const {
+        return opTime == rhs.opTime && wallTime == rhs.wallTime;
+    }
+    inline bool operator<(const OpTimeAndWallTime& rhs) const {
+        // Wall clock time ordering should not matter for calculations of the commit point.
+        return opTime < rhs.opTime;
+    }
+    std::string toString() const {
+        return opTime.toString() + ", " + wallTime.toString();
+    }
+};
+std::ostream& operator<<(std::ostream& out, const OpTimeAndWallTime& opTime);
 }  // namespace repl
 
 /**

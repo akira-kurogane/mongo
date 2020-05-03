@@ -1,32 +1,31 @@
-// ephemeral_for_test_engine.h
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -34,7 +33,7 @@
 
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -55,13 +54,16 @@ public:
                                                         StringData ident,
                                                         const CollectionOptions& options);
 
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) override;
+
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc);
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status beginBackup(OperationContext* opCtx) {
         return Status::OK();
@@ -69,7 +71,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident);
+    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident);
 
     virtual bool supportsDocLocking() const {
         return false;
@@ -100,23 +102,34 @@ public:
 
     virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
         return _dataMap.find(ident) != _dataMap.end();
-        ;
     }
 
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
     void setJournalListener(JournalListener* jl) final {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        stdx::unique_lock<Latch> lk(_mutex);
         _journalListener = jl;
+    }
+
+    virtual Timestamp getAllDurableTimestamp() const override {
+        return Timestamp();
+    }
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
     }
 
 private:
     typedef StringMap<std::shared_ptr<void>> DataMap;
 
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("EphemeralForTestEngine::_mutex");
     DataMap _dataMap;  // All actual data is owned in here
 
     // Notified when we write as everything is considered "journalled" since repl depends on it.
-    JournalListener* _journalListener = &NoOpJournalListener::instance;
+    JournalListener* _journalListener = nullptr;
 };
-}
+}  // namespace mongo

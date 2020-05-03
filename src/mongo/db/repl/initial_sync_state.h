@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,7 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/databases_cloner.h"
+#include "mongo/db/repl/all_database_cloner.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -47,14 +48,19 @@ namespace repl {
  * Holder of state for initial sync (InitialSyncer).
  */
 struct InitialSyncState {
-    InitialSyncState(std::unique_ptr<DatabasesCloner> cloner) : dbsCloner(std::move(cloner)){};
+    InitialSyncState(std::unique_ptr<AllDatabaseCloner> cloner)
+        : allDatabaseCloner(std::move(cloner)){};
 
-    std::unique_ptr<DatabasesCloner>
-        dbsCloner;             // Cloner for all databases included in initial sync.
-    Timestamp beginTimestamp;  // Timestamp from the latest entry in oplog when started.
-    Timestamp stopTimestamp;   // Referred to as minvalid, or the place we can transition states.
-    Timer timer;               // Timer for timing how long each initial sync attempt takes.
-    size_t fetchedMissingDocs = 0;
+    std::unique_ptr<AllDatabaseCloner>
+        allDatabaseCloner;                 // Cloner for all databases included in initial sync.
+    Future<void> allDatabaseClonerFuture;  // Future for holding result of AllDatabaseCloner
+    Timestamp beginApplyingTimestamp;  // Timestamp from the latest entry in oplog when started. It
+                                       // is also the timestamp after which we will start applying
+                                       // operations during initial sync.
+    Timestamp beginFetchingTimestamp;  // Timestamp from the earliest active transaction that had an
+                                       // oplog entry.
+    Timestamp stopTimestamp;  // Referred to as minvalid, or the place we can transition states.
+    Timer timer;              // Timer for timing how long each initial sync attempt takes.
     size_t appliedOps = 0;
 };
 

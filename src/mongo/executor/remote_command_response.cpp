@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,62 +33,45 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace executor {
 
-RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code, std::string reason)
+RemoteCommandResponseBase::RemoteCommandResponseBase(ErrorCodes::Error code, std::string reason)
     : status(code, reason){};
 
-RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code,
-                                             std::string reason,
-                                             Milliseconds millis)
+RemoteCommandResponseBase::RemoteCommandResponseBase(ErrorCodes::Error code,
+                                                     std::string reason,
+                                                     Milliseconds millis)
     : elapsedMillis(millis), status(code, reason) {}
 
-RemoteCommandResponse::RemoteCommandResponse(Status s) : status(std::move(s)) {
+RemoteCommandResponseBase::RemoteCommandResponseBase(Status s) : status(std::move(s)) {
     invariant(!isOK());
 };
 
-RemoteCommandResponse::RemoteCommandResponse(Status s, Milliseconds millis)
+RemoteCommandResponseBase::RemoteCommandResponseBase(Status s, Milliseconds millis)
     : elapsedMillis(millis), status(std::move(s)) {
     invariant(!isOK());
 };
 
-RemoteCommandResponse::RemoteCommandResponse(BSONObj dataObj,
-                                             BSONObj metadataObj,
-                                             Milliseconds millis)
-    : data(std::move(dataObj)), metadata(std::move(metadataObj)), elapsedMillis(millis) {
+RemoteCommandResponseBase::RemoteCommandResponseBase(BSONObj dataObj,
+                                                     Milliseconds millis,
+                                                     bool moreToCome)
+    : data(std::move(dataObj)), elapsedMillis(millis), moreToCome(moreToCome) {
     // The buffer backing the default empty BSONObj has static duration so it is effectively
     // owned.
     invariant(data.isOwned() || data.objdata() == BSONObj().objdata());
-    invariant(metadata.isOwned() || metadata.objdata() == BSONObj().objdata());
 };
-
-RemoteCommandResponse::RemoteCommandResponse(Message messageArg,
-                                             BSONObj dataObj,
-                                             BSONObj metadataObj,
-                                             Milliseconds millis)
-    : message(std::make_shared<const Message>(std::move(messageArg))),
-      data(std::move(dataObj)),
-      metadata(std::move(metadataObj)),
-      elapsedMillis(millis) {
-    if (!data.isOwned()) {
-        data.shareOwnershipWith(message->sharedBuffer());
-    }
-    if (!metadata.isOwned()) {
-        metadata.shareOwnershipWith(message->sharedBuffer());
-    }
-}
 
 // TODO(amidvidy): we currently discard output docs when we use this constructor. We should
 // have RCR hold those too, but we need more machinery before that is possible.
-RemoteCommandResponse::RemoteCommandResponse(const rpc::ReplyInterface& rpcReply,
-                                             Milliseconds millis)
-    : RemoteCommandResponse(rpcReply.getCommandReply(), rpcReply.getMetadata(), std::move(millis)) {
-}
+RemoteCommandResponseBase::RemoteCommandResponseBase(const rpc::ReplyInterface& rpcReply,
+                                                     Milliseconds millis,
+                                                     bool moreToCome)
+    : RemoteCommandResponseBase(rpcReply.getCommandReply(), std::move(millis), moreToCome) {}
 
-bool RemoteCommandResponse::isOK() const {
+bool RemoteCommandResponseBase::isOK() const {
     return status.isOK();
 }
 
@@ -101,8 +85,7 @@ bool RemoteCommandResponse::operator==(const RemoteCommandResponse& rhs) const {
         return true;
     }
     SimpleBSONObjComparator bsonComparator;
-    return bsonComparator.evaluate(data == rhs.data) &&
-        bsonComparator.evaluate(metadata == rhs.metadata) && elapsedMillis == rhs.elapsedMillis;
+    return bsonComparator.evaluate(data == rhs.data) && elapsedMillis == rhs.elapsedMillis;
 }
 
 bool RemoteCommandResponse::operator!=(const RemoteCommandResponse& rhs) const {
@@ -110,6 +93,65 @@ bool RemoteCommandResponse::operator!=(const RemoteCommandResponse& rhs) const {
 }
 
 std::ostream& operator<<(std::ostream& os, const RemoteCommandResponse& response) {
+    return os << response.toString();
+}
+
+RemoteCommandResponse::RemoteCommandResponse(const RemoteCommandOnAnyResponse& other)
+    : RemoteCommandResponseBase(other) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(boost::optional<HostAndPort> hp,
+                                                       ErrorCodes::Error code,
+                                                       std::string reason)
+    : RemoteCommandResponseBase(code, std::move(reason)), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(boost::optional<HostAndPort> hp,
+                                                       ErrorCodes::Error code,
+                                                       std::string reason,
+                                                       Milliseconds millis)
+    : RemoteCommandResponseBase(code, std::move(reason), millis), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(boost::optional<HostAndPort> hp, Status s)
+    : RemoteCommandResponseBase(std::move(s)), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(boost::optional<HostAndPort> hp,
+                                                       Status s,
+                                                       Milliseconds millis)
+    : RemoteCommandResponseBase(std::move(s), millis), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(HostAndPort hp,
+                                                       BSONObj dataObj,
+                                                       Milliseconds millis)
+    : RemoteCommandResponseBase(std::move(dataObj), millis), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(HostAndPort hp,
+                                                       const rpc::ReplyInterface& rpcReply,
+                                                       Milliseconds millis)
+    : RemoteCommandResponseBase(rpcReply, millis), target(std::move(hp)) {}
+
+RemoteCommandOnAnyResponse::RemoteCommandOnAnyResponse(boost::optional<HostAndPort> hp,
+                                                       const RemoteCommandResponse& other)
+    : RemoteCommandResponseBase(other), target(std::move(hp)) {}
+
+bool RemoteCommandOnAnyResponse::operator==(const RemoteCommandOnAnyResponse& rhs) const {
+    if (this == &rhs) {
+        return true;
+    }
+    SimpleBSONObjComparator bsonComparator;
+    return bsonComparator.evaluate(data == rhs.data) && elapsedMillis == rhs.elapsedMillis &&
+        target == rhs.target;
+}
+
+bool RemoteCommandOnAnyResponse::operator!=(const RemoteCommandOnAnyResponse& rhs) const {
+    return !(*this == rhs);
+}
+
+std::string RemoteCommandOnAnyResponse::toString() const {
+    return str::stream() << "RemoteOnAnyResponse -- "
+                         << " cmd:" << data.toString() << " target: "
+                         << (!target ? StringData("[none]") : StringData(target->toString()));
+}
+
+std::ostream& operator<<(std::ostream& os, const RemoteCommandOnAnyResponse& response) {
     return os << response.toString();
 }
 

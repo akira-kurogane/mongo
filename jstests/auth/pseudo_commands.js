@@ -2,6 +2,7 @@
  * This tests the access control for the pseudo-commands inprog, curop, and killop.  Once
  * SERVER-5466 is resolved this test should be removed and its functionality merged into
  * commands_builtin_roles.js and commands_user_defined_roles.js.
+ * @tags: [requires_sharding]
  */
 
 function runTest(conn) {
@@ -16,6 +17,8 @@ function runTest(conn) {
     admin.createUser({user: 'spencer', pwd: 'pwd', roles: ['myRole']});
 
     var db = conn.getDB('admin');
+    db.auth('admin', 'pwd');
+    var arbitraryShard = db.getSiblingDB("config").shards.findOne();
     db.auth('spencer', 'pwd');
 
     /**
@@ -114,7 +117,7 @@ function runTest(conn) {
             try {
                 var opid;
                 if (isMongos(db)) {  // opid format different between mongos and mongod
-                    opid = "shard0000:1234";
+                    opid = arbitraryShard._id + ":1234";
                 } else {
                     opid = 1234;
                 }

@@ -1,49 +1,55 @@
-// mongo/shell/shell_utils_extended.cpp
-/*
- *    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
-#include <boost/filesystem/convenience.hpp>
-#include <boost/filesystem/fstream.hpp>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include <boost/filesystem.hpp>
 #include <fstream>
 
+#include "mongo/bson/bson_validate.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
+#include "mongo/util/password.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -58,6 +64,7 @@ using std::stringstream;
  * threads.
  */
 namespace shell_utils {
+namespace {
 
 BSONObj listFiles(const BSONObj& _args, void* data) {
     BSONObj cd = BSON("0"
@@ -73,29 +80,27 @@ BSONObj listFiles(const BSONObj& _args, void* data) {
     stringstream ss;
     ss << "listFiles: no such directory: " << rootname;
     string msg = ss.str();
-    uassert(12581, msg.c_str(), boost::filesystem::exists(root));
+    uassert(12581,
+            msg.c_str(),
+            boost::filesystem::exists(root) && boost::filesystem::is_directory(root));
 
-    boost::filesystem::directory_iterator end;
-    boost::filesystem::directory_iterator i(root);
 
-    while (i != end) {
-        boost::filesystem::path p = *i;
-        BSONObjBuilder b;
-        b << "name" << p.generic_string();
-        b << "baseName" << p.filename().generic_string();
-        b.appendBool("isDirectory", is_directory(p));
-        if (!boost::filesystem::is_directory(p)) {
-            try {
+    for (boost::filesystem::directory_iterator i(root), end; i != end; ++i)
+        try {
+            const boost::filesystem::path& p = *i;
+            BSONObjBuilder b;
+            b << "name" << p.generic_string();
+            b << "baseName" << p.filename().generic_string();
+            const bool isDirectory = is_directory(p);
+            b.appendBool("isDirectory", isDirectory);
+            if (!isDirectory) {
                 b.append("size", (double)boost::filesystem::file_size(p));
-            } catch (...) {
-                i++;
-                continue;
             }
-        }
 
-        lst.append(b.obj());
-        i++;
-    }
+            lst.append(b.obj());
+        } catch (const boost::filesystem::filesystem_error&) {
+            continue;  // Filesystem errors cause us to just skip that entry, entirely.
+        }
 
     BSONObjBuilder ret;
     ret.appendArray("", lst.done());
@@ -106,8 +111,8 @@ BSONObj ls(const BSONObj& args, void* data) {
     BSONArrayBuilder ret;
     BSONObj o = listFiles(args, data);
     if (!o.isEmpty()) {
-        for (BSONObj::iterator i = o.firstElement().Obj().begin(); i.more();) {
-            BSONObj f = i.next().Obj();
+        for (auto&& elem : o.firstElement().Obj()) {
+            BSONObj f = elem.Obj();
             string name = f["name"].String();
             if (f["isDirectory"].trueValue()) {
                 name += '/';
@@ -135,7 +140,7 @@ BSONObj cd(const BSONObj& args, void* data) {
         return BSONObj();
     }
 #endif
-    uasserted(16832, mongoutils::str::stream() << "cd command failed: " << errnoWithDescription());
+    uasserted(16832, str::stream() << "cd command failed: " << errnoWithDescription());
     return BSONObj();
 }
 
@@ -151,21 +156,39 @@ BSONObj hostname(const BSONObj&, void* data) {
 const int CANT_OPEN_FILE = 13300;
 
 BSONObj cat(const BSONObj& args, void* data) {
-    BSONElement e = singleArg(args);
+    BSONObjIterator it(args);
+
+    auto filePath = it.next();
+    uassert(51012,
+            "the first argument to cat() must be a string containing the path to the file",
+            filePath.type() == mongo::String);
+
+    std::ios::openmode mode = std::ios::in;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51013,
+                "the second argument to cat(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
     stringstream ss;
-    ifstream f(e.valuestrsafe());
+    ifstream f(filePath.valuestrsafe(), mode);
     uassert(CANT_OPEN_FILE, "couldn't open file", f.is_open());
 
     std::streamsize sz = 0;
     while (1) {
         char ch = 0;
-        // slow...maybe change one day
         f.get(ch);
         if (ch == 0)
             break;
         ss << ch;
         sz += 1;
-        uassert(13301, "cat() : file to big to load as a variable", sz < 1024 * 1024 * 16);
+        uassert(13301, "cat() : file too big to load as a variable", sz < 1024 * 1024 * 16);
     }
     return BSON("" << ss.str());
 }
@@ -175,7 +198,7 @@ BSONObj md5sumFile(const BSONObj& args, void* data) {
     stringstream ss;
     FILE* f = fopen(e.valuestrsafe(), "rb");
     uassert(CANT_OPEN_FILE, "couldn't open file", f);
-    ON_BLOCK_EXIT(fclose, f);
+    ON_BLOCK_EXIT([&] { fclose(f); });
 
     md5digest d;
     md5_state_t st;
@@ -250,8 +273,10 @@ BSONObj copyFile(const BSONObj& args, void* data) {
 BSONObj writeFile(const BSONObj& args, void* data) {
     // Parse the arguments.
 
-    uassert(
-        40340, "writeFile requires 2 arguments: writeFile(filePath, content)", args.nFields() == 2);
+    uassert(40340,
+            "writeFile requires at least 2 arguments: writeFile(filePath, content, "
+            "[useBinaryMode])",
+            args.nFields() >= 2);
 
     BSONObjIterator it(args);
 
@@ -280,7 +305,20 @@ BSONObj writeFile(const BSONObj& args, void* data) {
             "the file name must be compatible with POSIX and Windows",
             boost::filesystem::portable_name(normalizedFilePath.filename().string()));
 
-    boost::filesystem::ofstream ofs{normalizedFilePath};
+    std::ios::openmode mode = std::ios::out;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51014,
+                "the third argument to writeFile(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
+    boost::filesystem::ofstream ofs{normalizedFilePath, mode};
     uassert(40346,
             str::stream() << "failed to open file " << normalizedFilePath.string()
                           << " for writing",
@@ -300,6 +338,127 @@ BSONObj getHostName(const BSONObj& a, void* data) {
     return BSON("" << buf);
 }
 
+BSONObj passwordPrompt(const BSONObj& a, void* data) {
+    uassert(50890, "passwordPrompt accepts no arguments", a.nFields() == 0);
+    return BSON("" << askPassword());
+}
+
+BSONObj changeUmask(const BSONObj& a, void* data) {
+#ifdef _WIN32
+    uasserted(50977, "umask is not supported on windows");
+#else
+    uassert(50976,
+            "umask takes 1 argument, the octal mode of the umask",
+            a.nFields() == 1 && isNumericBSONType(a.firstElementType()));
+    auto val = a.firstElement().Number();
+    return BSON("" << static_cast<int>(umask(static_cast<mode_t>(val))));
+#endif
+}
+
+BSONObj getFileMode(const BSONObj& a, void* data) {
+    uassert(50975,
+            "getFileMode() takes one argument, the absolute path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+    auto pathStr = a.firstElement().checkAndGetStringData();
+    boost::filesystem::path path(pathStr.rawData());
+    boost::system::error_code ec;
+    auto fileStatus = boost::filesystem::status(path, ec);
+    if (ec) {
+        uasserted(50974,
+                  str::stream() << "Unable to get status for file \"" << pathStr
+                                << "\": " << ec.message());
+    }
+
+    return BSON("" << fileStatus.permissions());
+}
+
+// The name of the file to dump is provided as a string in the first
+// field of the 'a' object. Other arguments in the BSONObj are
+// ignored. The void* argument is unused.
+BSONObj readDumpFile(const BSONObj& a, void*) {
+    uassert(31404,
+            "readDumpFile() takes one argument: the path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+
+    // Open the file for reading in binary mode.
+    const auto pathStr = a.firstElement().String();
+    boost::filesystem::ifstream stream(pathStr, std::ios::in | std::ios::binary);
+    uassert(31405,
+            str::stream() << "readDumpFile(): Unable to open file \"" << pathStr
+                          << "\" for reading",
+            stream);
+
+    // Consume the contents of the file into a std::string, or bail out
+    // if there is more data in the file or stream than we can handle.
+    std::string contents;
+    while (stream) {
+        char buffer[4096];
+        stream.read(buffer, sizeof(buffer));
+        contents.append(buffer, stream.gcount());
+
+        // Check that the size of the data can fit into the BSON shape
+        // { "" : [ ... ] }, which has 12 bytes of overhead.
+        uassert(31406,
+                str::stream() << "readDumpFile(): file \"" << pathStr
+                              << "\" too big to load as a variable",
+                contents.size() <= (BSONObj::DefaultSizeTrait::MaxSize - 12));
+    }
+
+    // Construct our return shape
+    BSONObjBuilder builder;
+    BSONArrayBuilder array(builder.subarrayStart(""));
+
+    // Walk the data we read out of the file and interpret it as a series
+    // of contiguous BSON objects. Validate the BSON objects we find and insert
+    // them into the results array.
+    ConstDataRangeCursor cursor(contents.data(), contents.size());
+    while (!cursor.empty()) {
+
+        // Record the amount of valid data ahead of us before
+        // advancing the cursor so we can use it as an argument to
+        // validate below. It would be nice and proper to use
+        // Validated<BSONObj> for all of this instead, but
+        // unfortunately the BSONObj specialization of Validated
+        // depends on a server parameter, so we do it manually.
+        const auto valid = cursor.length();
+
+        const auto swObj = cursor.readAndAdvanceNoThrow<BSONObj>();
+        uassertStatusOK(swObj);
+
+        const auto obj = swObj.getValue();
+        uassertStatusOK(validateBSON(obj.objdata(), valid, BSONVersion::kLatest));
+
+        array.append(obj);
+    }
+
+    array.doneFast();
+    return builder.obj();
+}
+
+BSONObj shellGetEnv(const BSONObj& a, void*) {
+    uassert(46712006,
+            "_getEnv() takes one argument: the name of the environment variable",
+            a.nFields() == 1 && a.firstElementType() == String);
+    const auto envName = a.firstElement().String();
+    std::string result{};
+#ifndef _WIN32
+    auto envPtr = getenv(envName.c_str());
+    if (envPtr) {
+        result = std::string(envPtr);
+    }
+#else
+    auto envPtr = _wgetenv(toNativeString(envName.c_str()).c_str());
+    if (envPtr) {
+        result = toUtf8String(envPtr);
+    }
+#endif
+
+    return BSON("" << result.c_str());
+}
+
+
+}  // namespace
+
 void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("getHostName", getHostName);
     scope.injectNative("removeFile", removeFile);
@@ -313,6 +472,12 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("hostname", hostname);
     scope.injectNative("md5sumFile", md5sumFile);
     scope.injectNative("mkdir", mkdir);
+    scope.injectNative("passwordPrompt", passwordPrompt);
+    scope.injectNative("umask", changeUmask);
+    scope.injectNative("getFileMode", getFileMode);
+    scope.injectNative("_readDumpFile", readDumpFile);
+    scope.injectNative("_getEnv", shellGetEnv);
 }
-}
-}
+
+}  // namespace shell_utils
+}  // namespace mongo

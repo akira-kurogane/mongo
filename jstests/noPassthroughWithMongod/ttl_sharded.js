@@ -1,9 +1,11 @@
-/** Simple test of sharding TTL collections.
+/**
+ * Simple test of sharding TTL collections.
  *  - Creates a new collection with a TTL index
  *  - Shards it, and moves one chunk containing half the docs to another shard.
  *  - Checks that both shards have TTL index, and docs get deleted on both shards.
  *  - Run the collMod command to update the expireAfterSeconds field. Check that more docs get
  *    deleted.
+ *  @tags: [requires_sharding]
  */
 
 // start up a new sharded cluster
@@ -16,7 +18,7 @@ t = s.getDB(dbname).getCollection(coll);
 
 // enable sharding of the collection. Only 1 chunk initially
 s.adminCommand({enablesharding: dbname});
-s.ensurePrimaryShard(dbname, 'shard0001');
+s.ensurePrimaryShard(dbname, s.shard1.shardName);
 s.adminCommand({shardcollection: ns, key: {_id: 1}});
 
 // insert 24 docs, with timestamps at one hour intervals
@@ -26,7 +28,7 @@ for (var i = 0; i < 24; i++) {
     var past = new Date(now - (3600 * 1000 * i));
     bulk.insert({_id: i, x: past});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 assert.eq(t.count(), 24, "initial docs not inserted");
 
 // create the TTL index which delete anything older than ~5.5 hours

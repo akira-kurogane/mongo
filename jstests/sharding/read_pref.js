@@ -1,7 +1,14 @@
 /**
- * Integration test for read preference and tagging. The more comprehensive unit test
- * can be found in dbtests/replica_set_monitor_test.cpp.
+ * Integration test for read preference and tagging. The more comprehensive unit test can be found
+ * in dbtests/scanning_replica_set_monitor_test.cpp.
  */
+
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckOrphans = true;
+
+(function() {
+'use strict';
 
 load("jstests/replsets/rslib.js");
 
@@ -17,6 +24,7 @@ var doTest = function(useDollarQuerySyntax) {
     // The $-prefixed query syntax is only legal for compatibility mode reads, not for the
     // find/getMore commands.
     if (useDollarQuerySyntax && st.s.getDB("test").getMongo().useReadCommands()) {
+        st.stop();
         return;
     }
 
@@ -198,3 +206,4 @@ var doTest = function(useDollarQuerySyntax) {
 
 doTest(false);
 doTest(true);
+})();

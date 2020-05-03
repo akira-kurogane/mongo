@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,44 +29,44 @@
 
 #pragma once
 
-#include <list>
 #include <memory>
+#include <queue>
 
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_all_indices_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
 class PlanYieldPolicy;
 
 /**
- * This stage outputs its mainChild, and possibly its backup child
- * and also updates the cache.
+ * Runs a trial period in order to evaluate the cost of a cached plan. If the cost is unexpectedly
+ * high, the plan cache entry is deactivated and we use multi-planning to select an entirely new
+ * winning plan. This process is called "replanning".
  *
- * Preconditions: Valid RecordId.
- *
+ * This stage requires all indices to stay intact during the trial period so that replanning can
+ * occur with the set of indices in 'params'. As a future improvement, we could instead refresh the
+ * list of indices in 'params' prior to replanning, and thus avoid inheriting from
+ * RequiresAllIndicesStage.
  */
-class CachedPlanStage final : public PlanStage {
+class CachedPlanStage final : public RequiresAllIndicesStage {
 public:
-    CachedPlanStage(OperationContext* opCtx,
+    CachedPlanStage(ExpressionContext* expCtx,
                     Collection* collection,
                     WorkingSet* ws,
                     CanonicalQuery* cq,
                     const QueryPlannerParams& params,
                     size_t decisionWorks,
-                    PlanStage* root);
+                    std::unique_ptr<PlanStage> root);
 
     bool isEOF() final;
 
     StageState doWork(WorkingSetID* out) final;
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_CACHED_PLAN;
@@ -103,21 +104,18 @@ private:
      * We fallback to a new plan if updatePlanCache() tells us that the performance was worse
      * than anticipated during the trial period.
      *
-     * We only write the result of re-planning to the plan cache if 'shouldCache' is true.
+     * We only modify the plan cache if 'shouldCache' is true.
      */
-    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache);
+    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, std::string reason);
 
     /**
      * May yield during the cached plan stage's trial period or replanning phases.
      *
      * Returns a non-OK status if query planning fails. In particular, this function returns
      * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield, or
-     * ErrorCodes::ExceededTimeLimit if the operation exceeded its time limit.
+     * ErrorCodes::MaxTimeMSExpired if the operation exceeded its time limit.
      */
     Status tryYield(PlanYieldPolicy* yieldPolicy);
-
-    // Not owned. Must be non-null.
-    Collection* _collection;
 
     // Not owned.
     WorkingSet* _ws;
@@ -136,13 +134,7 @@ private:
     std::unique_ptr<QuerySolution> _replannedQs;
 
     // Any results produced during trial period execution are kept here.
-    std::list<WorkingSetID> _results;
-
-    // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
-    // to use to pull the record into memory. We take ownership of the RecordFetcher here,
-    // deleting it after we've had a chance to do the fetch. For timing-based yields, we
-    // just pass a NULL fetcher.
-    std::unique_ptr<RecordFetcher> _fetcher;
+    std::queue<WorkingSetID> _results;
 
     // Stats
     CachedPlanStats _specificStats;

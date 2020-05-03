@@ -18,7 +18,7 @@ var admin = mongos.getDB("admin");
 var coll = mongos.getCollection("foo.bar");
 
 printjson(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB().getName(), 'shard0001');
+st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
 printjson(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
 assert.soon(function() {

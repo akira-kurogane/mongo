@@ -1,18 +1,20 @@
 /*
  * Tests that resource pattern matching rules work as expected.
+ * @tags: [requires_replication, requires_sharding]
  */
+
+// This test logs in users on the admin database, but doesn't log them out, which can fail with
+// implicit sessions and ReplSetTest when the fixture attempts to verify data hashes at shutdown by
+// authenticating as the __system user.
+TestData.disableImplicitSessions = true;
 
 function setup_users(granter) {
     var admindb = granter.getSiblingDB("admin");
     admindb.runCommand({
         createUser: "admin",
         pwd: "admin",
-        roles: [
-            "userAdminAnyDatabase",
-            "dbAdminAnyDatabase",
-            "clusterAdmin",
-            "readWriteAnyDatabase"
-        ]
+        roles:
+            ["userAdminAnyDatabase", "dbAdminAnyDatabase", "clusterAdmin", "readWriteAnyDatabase"]
     });
 
     admindb.auth("admin", "admin");
@@ -137,10 +139,10 @@ function run_tests(granter, verifier) {
              verifier,
              [{resource: {db: "a", collection: "a"}, actions: ["find"]}],
              {
-               "a.a": should_find,
-               "a.b": should_fail_find,
-               "b.a": should_fail_find,
-               "b.b": should_fail_find
+                 "a.a": should_find,
+                 "a.b": should_fail_find,
+                 "b.a": should_fail_find,
+                 "b.b": should_fail_find
              });
 
     run_test(
@@ -177,12 +179,12 @@ function run_tests(granter, verifier) {
              verifier,
              [{resource: {db: "$", collection: "cmd"}, actions: ["find"]}],
              {
-               "a.a": function(testdb, testcol) {
-                   var r = testdb.stats();
+                 "a.a": function(testdb, testcol) {
+                     var r = testdb.stats();
 
-                   if (r["ok"])
-                       throw("db.$.cmd shouldn't give a.stats()");
-               }
+                     if (r["ok"])
+                         throw ("db.$.cmd shouldn't give a.stats()");
+                 }
              });
 
     run_test_bad_resource("empty_resource", granter, {});
@@ -196,26 +198,26 @@ function run_tests(granter, verifier) {
              granter,
              verifier,
              [
-               {resource: {db: "a", collection: "a"}, actions: ["find"]},
-               {resource: {db: "", collection: ""}, actions: ["insert"]}
+                 {resource: {db: "a", collection: "a"}, actions: ["find"]},
+                 {resource: {db: "", collection: ""}, actions: ["insert"]}
              ],
              {
-               "a.a": function(testdb, testcol) {
-                   should_insert(testdb, testcol);
-                   should_find(testdb, testcol);
-               },
-               "a.b": function(testdb, testcol) {
-                   should_insert(testdb, testcol);
-                   should_fail_find(testdb, testcol);
-               },
-               "b.a": function(testdb, testcol) {
-                   should_insert(testdb, testcol);
-                   should_fail_find(testdb, testcol);
-               },
-               "b.b": function(testdb, testcol) {
-                   should_insert(testdb, testcol);
-                   should_fail_find(testdb, testcol);
-               },
+                 "a.a": function(testdb, testcol) {
+                     should_insert(testdb, testcol);
+                     should_find(testdb, testcol);
+                 },
+                 "a.b": function(testdb, testcol) {
+                     should_insert(testdb, testcol);
+                     should_fail_find(testdb, testcol);
+                 },
+                 "b.a": function(testdb, testcol) {
+                     should_insert(testdb, testcol);
+                     should_fail_find(testdb, testcol);
+                 },
+                 "b.b": function(testdb, testcol) {
+                     should_insert(testdb, testcol);
+                     should_fail_find(testdb, testcol);
+                 },
              });
 }
 
@@ -245,11 +247,8 @@ var st = new ShardingTest({
     mongos: 2,
     shard: 1,
     keyFile: keyfile,
-    other: {
-        mongosOptions: {'auth': null},
-        configOptions: {'auth': null},
-        shardOptions: {'auth': null}
-    }
+    other:
+        {mongosOptions: {'auth': null}, configOptions: {'auth': null}, shardOptions: {'auth': null}}
 });
 run_tests(st.s0.getDB('admin'), st.s1.getDB('admin'));
 st.stop();

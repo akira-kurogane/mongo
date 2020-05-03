@@ -1,62 +1,58 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/db/s/sharding_statistics.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
-#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/concurrency/notification.h"
-#include "mongo/util/fail_point_service.h"
-#include "mongo/util/log.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 /**
@@ -65,30 +61,42 @@ namespace {
  */
 void uassertStatusOKWithWarning(const Status& status) {
     if (!status.isOK()) {
-        warning() << "Chunk move failed" << causedBy(redact(status));
+        LOGV2_WARNING(23777,
+                      "Chunk move failed with {error}",
+                      "Error while doing moveChunk",
+                      "error"_attr = redact(status));
         uassertStatusOK(status);
     }
 }
 
+const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
+                                                // Note: Even though we're setting UNSET here,
+                                                // kMajority implies JOURNAL if journaling is
+                                                // supported by mongod and
+                                                // writeConcernMajorityJournalDefault is set to true
+                                                // in the ReplSetConfig.
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                WriteConcernOptions::kWriteConcernTimeoutSharding);
+
 // Tests can pause and resume moveChunk's progress at each step by enabling/disabling each failpoint
-MONGO_FP_DECLARE(moveChunkHangAtStep1);
-MONGO_FP_DECLARE(moveChunkHangAtStep2);
-MONGO_FP_DECLARE(moveChunkHangAtStep3);
-MONGO_FP_DECLARE(moveChunkHangAtStep4);
-MONGO_FP_DECLARE(moveChunkHangAtStep5);
-MONGO_FP_DECLARE(moveChunkHangAtStep6);
-MONGO_FP_DECLARE(moveChunkHangAtStep7);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep1);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep2);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep3);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep4);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep5);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep6);
+MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep7);
 
 class MoveChunkCommand : public BasicCommand {
 public:
     MoveChunkCommand() : BasicCommand("moveChunk") {}
 
-    void help(std::stringstream& help) const override {
-        help << "should not be calling this directly";
+    std::string help() const override {
+        return "should not be calling this directly";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -100,8 +108,8 @@ public:
     }
 
     Status checkAuthForCommand(Client* client,
-                               const string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -109,14 +117,14 @@ public:
         return Status::OK();
     }
 
-    string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
+             BSONObjBuilder&) override {
         auto shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
@@ -127,41 +135,54 @@ public:
         // where we might have changed a shard's host by removing/adding a shard with the same name.
         Grid::get(opCtx)->shardRegistry()->reload(opCtx);
 
-        auto scopedRegisterMigration =
-            uassertStatusOK(shardingState->registerDonateChunk(moveChunkRequest));
-
-        Status status = {ErrorCodes::InternalError, "Uninitialized value"};
+        auto scopedMigration = uassertStatusOK(
+            ActiveMigrationsRegistry::get(opCtx).registerDonateChunk(opCtx, moveChunkRequest));
 
         // Check if there is an existing migration running and if so, join it
-        if (scopedRegisterMigration.mustExecute()) {
-            try {
-                _runImpl(opCtx, moveChunkRequest);
-                status = Status::OK();
-            } catch (const DBException& e) {
-                status = e.toStatus();
-            } catch (const std::exception& e) {
-                scopedRegisterMigration.complete(
-                    {ErrorCodes::InternalError,
-                     str::stream() << "Severe error occurred while running moveChunk command: "
-                                   << e.what()});
-                throw;
-            }
+        if (scopedMigration.mustExecute()) {
+            auto moveChunkComplete =
+                ExecutorFuture<void>(_getExecutor())
+                    .then([moveChunkRequest,
+                           scopedMigration = std::move(scopedMigration),
+                           serviceContext = opCtx->getServiceContext()]() mutable {
+                        ThreadClient tc("MoveChunk", serviceContext);
+                        {
+                            stdx::lock_guard<Client> lk(*tc.get());
+                            tc->setSystemOperationKillable(lk);
+                        }
+                        auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
+                        auto opCtx = uniqueOpCtx.get();
+                        // Note: This internal authorization is tied to the lifetime of the client.
+                        AuthorizationSession::get(opCtx->getClient())
+                            ->grantInternalAuthorization(opCtx->getClient());
 
-            scopedRegisterMigration.complete(status);
+                        Status status = {ErrorCodes::InternalError, "Uninitialized value"};
+
+                        try {
+                            _runImpl(opCtx, moveChunkRequest);
+                            status = Status::OK();
+                        } catch (const DBException& e) {
+                            status = e.toStatus();
+                            if (status.code() == ErrorCodes::LockTimeout) {
+                                ShardingStatistics::get(opCtx)
+                                    .countDonorMoveChunkLockTimeout.addAndFetch(1);
+                            }
+                        } catch (const std::exception& e) {
+                            scopedMigration.signalComplete(
+                                {ErrorCodes::InternalError,
+                                 str::stream()
+                                     << "Severe error occurred while running moveChunk command: "
+                                     << e.what()});
+                            throw;
+                        }
+
+                        scopedMigration.signalComplete(status);
+                        uassertStatusOK(status);
+                    });
+            moveChunkComplete.get(opCtx);
         } else {
-            status = scopedRegisterMigration.waitForCompletion(opCtx);
+            uassertStatusOK(scopedMigration.waitForCompletion(opCtx));
         }
-
-        if (status == ErrorCodes::ChunkTooBig) {
-            // This code is for compatibility with pre-3.2 balancer, which does not recognize the
-            // ChunkTooBig error code and instead uses the "chunkTooBig" field in the response,
-            // and the 3.4 shard, which failed to set the ChunkTooBig status code.
-            // TODO: Remove after 3.6 is released.
-            result.appendBool("chunkTooBig", true);
-            return appendCommandStatus(result, status);
-        }
-
-        uassertStatusOK(status);
 
         if (moveChunkRequest.getWaitForDelete()) {
             // Ensure we capture the latest opTime in the system, since range deletion happens
@@ -170,7 +191,20 @@ public:
             // OperationContext.
             // TODO (SERVER-30183): If this moveChunk joined an active moveChunk that did not have
             // waitForDelete=true, the captured opTime may not reflect all the deletes.
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            replClient.setLastOpToSystemLastOpTime(opCtx);
+
+            WriteConcernResult writeConcernResult;
+            writeConcernResult.wTimedOut = false;
+            Status majorityStatus = waitForWriteConcern(
+                opCtx, replClient.getLastOp(), kMajorityWriteConcern, &writeConcernResult);
+
+            if (!majorityStatus.isOK()) {
+                if (!writeConcernResult.wTimedOut) {
+                    uassertStatusOK(majorityStatus);
+                }
+                return false;
+            }
         }
 
         return true;
@@ -192,88 +226,70 @@ private:
             auto recipientShard =
                 uassertStatusOK(shardRegistry->getShard(opCtx, moveChunkRequest.getToShardId()));
 
-            return recipientShard->getTargeter()->findHostNoWait(
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly});
+            return recipientShard->getTargeter()->findHost(
+                opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly});
         }());
 
-        string unusedErrMsg;
+        std::string unusedErrMsg;
         MoveTimingHelper moveTimingHelper(opCtx,
                                           "from",
                                           moveChunkRequest.getNss().ns(),
                                           moveChunkRequest.getMinKey(),
                                           moveChunkRequest.getMaxKey(),
-                                          7,  // Total number of steps
+                                          6,  // Total number of steps
                                           &unusedErrMsg,
                                           moveChunkRequest.getToShardId(),
                                           moveChunkRequest.getFromShardId());
 
         moveTimingHelper.done(1);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep1);
+        moveChunkHangAtStep1.pauseWhileSet();
 
-        BSONObj shardKeyPattern;
+        MigrationSourceManager migrationSourceManager(
+            opCtx, moveChunkRequest, donorConnStr, recipientHost);
 
-        {
-            MigrationSourceManager migrationSourceManager(
-                opCtx, moveChunkRequest, donorConnStr, recipientHost);
+        moveTimingHelper.done(2);
+        moveChunkHangAtStep2.pauseWhileSet();
 
-            shardKeyPattern = migrationSourceManager.getKeyPattern().getOwned();
+        uassertStatusOKWithWarning(migrationSourceManager.startClone());
+        moveTimingHelper.done(3);
+        moveChunkHangAtStep3.pauseWhileSet();
 
-            moveTimingHelper.done(2);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
+        uassertStatusOKWithWarning(migrationSourceManager.awaitToCatchUp());
+        moveTimingHelper.done(4);
+        moveChunkHangAtStep4.pauseWhileSet();
 
-            uassertStatusOKWithWarning(migrationSourceManager.startClone(opCtx));
-            moveTimingHelper.done(3);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
+        uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection());
+        uassertStatusOKWithWarning(migrationSourceManager.commitChunkOnRecipient());
+        moveTimingHelper.done(5);
+        moveChunkHangAtStep5.pauseWhileSet();
 
-            uassertStatusOKWithWarning(migrationSourceManager.awaitToCatchUp(opCtx));
-            moveTimingHelper.done(4);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
-
-            uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection(opCtx));
-            uassertStatusOKWithWarning(migrationSourceManager.commitChunkOnRecipient(opCtx));
-            moveTimingHelper.done(5);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);
-
-            uassertStatusOKWithWarning(migrationSourceManager.commitChunkMetadataOnConfig(opCtx));
-        }
+        uassertStatusOKWithWarning(migrationSourceManager.commitChunkMetadataOnConfig());
         moveTimingHelper.done(6);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep6);
-
-        auto nss = moveChunkRequest.getNss();
-        const auto range = ChunkRange(moveChunkRequest.getMinKey(), moveChunkRequest.getMaxKey());
-
-        // Wait for the metadata update to be persisted in order to avoid orphaned documents from
-        // starting to get deleted before the metadata changes have propagated to the secondaries.
-        auto notification = [&] {
-            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, nss);
-
-            auto const whenToClean = moveChunkRequest.getWaitForDelete()
-                ? CollectionShardingState::kNow
-                : CollectionShardingState::kDelayed;
-
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-            return CollectionShardingState::get(opCtx, nss)->cleanUpRange(range, whenToClean);
-        }();
-
-        // Check for immediate failure on scheduling range deletion.
-        if (notification.ready() && !notification.waitStatus(opCtx).isOK()) {
-            warning() << "Failed to initiate cleanup of " << nss.ns() << " range "
-                      << redact(range.toString())
-                      << " due to: " << redact(notification.waitStatus(opCtx));
-        } else if (moveChunkRequest.getWaitForDelete()) {
-            log() << "Waiting for cleanup of " << nss.ns() << " range " << redact(range.toString());
-            uassertStatusOK(notification.waitStatus(opCtx));
-        } else {
-            log() << "Leaving cleanup of " << nss.ns() << " range " << redact(range.toString())
-                  << " to complete in background";
-            notification.abandon();
-        }
-
-        moveTimingHelper.done(7);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep7);
+        moveChunkHangAtStep6.pauseWhileSet();
     }
 
+private:
+    // Returns a single-threaded executor to be used to run moveChunk commands. The executor is
+    // initialized on the first call to this function. Uses a shared_ptr because a shared_ptr is
+    // required to work with ExecutorFutures.
+    static std::shared_ptr<ThreadPool> _getExecutor() {
+        static Mutex mutex = MONGO_MAKE_LATCH("MoveChunkExecutor::_mutex");
+        static std::shared_ptr<ThreadPool> executor;
+
+        stdx::lock_guard<Latch> lg(mutex);
+        if (!executor) {
+            ThreadPool::Options options;
+            options.poolName = "MoveChunk";
+            options.minThreads = 0;
+            // We limit the size of the thread pool to a single thread because currently there can
+            // only be one moveChunk operation on a shard at a time.
+            options.maxThreads = 1;
+            executor = std::make_shared<ThreadPool>(std::move(options));
+            executor->startup();
+        }
+
+        return executor;
+    }
 } moveChunkCmd;
 
 }  // namespace

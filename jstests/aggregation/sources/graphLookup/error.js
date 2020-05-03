@@ -6,18 +6,17 @@
 load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
 
 (function() {
-    "use strict";
+"use strict";
 
-    var local = db.local;
+var local = db.local;
 
-    local.drop();
-    local.insert({});
+local.drop();
+assert.commandWorked(local.insert({b: 0}));
 
-    var pipeline = {$graphLookup: 4};
-    assertErrorCode(
-        local, pipeline, ErrorCodes.FailedToParse, "$graphLookup spec must be an object");
+var pipeline = {$graphLookup: 4};
+assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "$graphLookup spec must be an object");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -27,9 +26,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             maxDepth: "string"
         }
     };
-    assertErrorCode(local, pipeline, 40100, "maxDepth must be numeric");
+assertErrorCode(local, pipeline, 40100, "maxDepth must be numeric");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -39,9 +38,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             maxDepth: -1
         }
     };
-    assertErrorCode(local, pipeline, 40101, "maxDepth must be nonnegative");
+assertErrorCode(local, pipeline, 40101, "maxDepth must be nonnegative");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -51,9 +50,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             maxDepth: 2.3
         }
     };
-    assertErrorCode(local, pipeline, 40102, "maxDepth must be representable as a long long");
+assertErrorCode(local, pipeline, 40102, "maxDepth must be representable as a long long");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: -1,
             startWith: {$literal: 0},
@@ -62,9 +61,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from must be a string");
+assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from must be a string");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "",
             startWith: {$literal: 0},
@@ -73,9 +72,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, ErrorCodes.InvalidNamespace, "from must be a valid namespace");
+assertErrorCode(local, pipeline, ErrorCodes.InvalidNamespace, "from must be a valid namespace");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -84,9 +83,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: 0
         }
     };
-    assertErrorCode(local, pipeline, 40103, "as must be a string");
+assertErrorCode(local, pipeline, 40103, "as must be a string");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -95,9 +94,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "$output"
         }
     };
-    assertErrorCode(local, pipeline, 16410, "as cannot be a fieldPath");
+assertErrorCode(local, pipeline, 16410, "as cannot be a fieldPath");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -106,9 +105,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40103, "connectFromField must be a string");
+assertErrorCode(local, pipeline, 40103, "connectFromField must be a string");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -117,9 +116,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 16410, "connectFromField cannot be a fieldPath");
+assertErrorCode(local, pipeline, 16410, "connectFromField cannot be a fieldPath");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -128,9 +127,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40103, "connectToField must be a string");
+assertErrorCode(local, pipeline, 40103, "connectToField must be a string");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -139,9 +138,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 16410, "connectToField cannot be a fieldPath");
+assertErrorCode(local, pipeline, 16410, "connectToField cannot be a fieldPath");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -151,9 +150,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             depthField: 0
         }
     };
-    assertErrorCode(local, pipeline, 40103, "depthField must be a string");
+assertErrorCode(local, pipeline, 40103, "depthField must be a string");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -163,9 +162,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             depthField: "$depth"
         }
     };
-    assertErrorCode(local, pipeline, 16410, "depthField cannot be a fieldPath");
+assertErrorCode(local, pipeline, 16410, "depthField cannot be a fieldPath");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -175,9 +174,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             restrictSearchWithMatch: "notamatch"
         }
     };
-    assertErrorCode(local, pipeline, 40185, "restrictSearchWithMatch must be an object");
+assertErrorCode(local, pipeline, 40185, "restrictSearchWithMatch must be an object");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -187,43 +186,37 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             notAField: "foo"
         }
     };
-    assertErrorCode(local, pipeline, 40104, "unknown argument");
+assertErrorCode(local, pipeline, 40104, "unknown argument");
 
-    pipeline = {
-        $graphLookup:
-            {from: "foreign", startWith: {$literal: 0}, connectFromField: "b", as: "output"}
-    };
-    assertErrorCode(local, pipeline, 40105, "connectToField was not specified");
+pipeline = {
+    $graphLookup: {from: "foreign", startWith: {$literal: 0}, connectFromField: "b", as: "output"}
+};
+assertErrorCode(local, pipeline, 40105, "connectToField was not specified");
 
-    pipeline = {
-        $graphLookup:
-            {from: "foreign", startWith: {$literal: 0}, connectToField: "a", as: "output"}
-    };
-    assertErrorCode(local, pipeline, 40105, "connectFromField was not specified");
+pipeline = {
+    $graphLookup: {from: "foreign", startWith: {$literal: 0}, connectToField: "a", as: "output"}
+};
+assertErrorCode(local, pipeline, 40105, "connectFromField was not specified");
 
-    pipeline = {
-        $graphLookup: {from: "foreign", connectToField: "a", connectFromField: "b", as: "output"}
-    };
-    assertErrorCode(local, pipeline, 40105, "startWith was not specified");
+pipeline = {
+    $graphLookup: {from: "foreign", connectToField: "a", connectFromField: "b", as: "output"}
+};
+assertErrorCode(local, pipeline, 40105, "startWith was not specified");
 
-    pipeline = {
-        $graphLookup: {
-            from: "foreign",
-            startWith: {$literal: 0},
-            connectToField: "a",
-            connectFromField: "b"
-        }
-    };
-    assertErrorCode(local, pipeline, 40105, "as was not specified");
+pipeline = {
+    $graphLookup:
+        {from: "foreign", startWith: {$literal: 0}, connectToField: "a", connectFromField: "b"}
+};
+assertErrorCode(local, pipeline, 40105, "as was not specified");
 
-    pipeline = {
-        $graphLookup:
-            {startWith: {$literal: 0}, connectToField: "a", connectFromField: "b", as: "output"}
-    };
-    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from was not specified");
+pipeline = {
+    $graphLookup:
+        {startWith: {$literal: 0}, connectToField: "a", connectFromField: "b", as: "output"}
+};
+assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from was not specified");
 
-    // restrictSearchWithMatch must be a valid match expression.
-    pipeline = {
+// restrictSearchWithMatch must be a valid match expression.
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
@@ -233,10 +226,10 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             restrictSearchWithMatch: {$not: {a: 1}}
         }
     };
-    assertErrorCode(local, pipeline, 40186, "unable to parse match expression");
+assert.throws(() => local.aggregate(pipeline), [], "unable to parse match expression");
 
-    // $where and $text cannot be used inside $graphLookup.
-    pipeline = {
+// $where and $text cannot be used inside $graphLookup.
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
@@ -246,9 +239,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             restrictSearchWithMatch: {$where: "3 > 2"}
         }
     };
-    assertErrorCode(local, pipeline, 40186, "cannot use $where inside $graphLookup");
+assert.throws(() => local.aggregate(pipeline), [], "cannot use $where inside $graphLookup");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
@@ -258,9 +251,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             restrictSearchWithMatch: {$text: {$search: "some text"}}
         }
     };
-    assertErrorCode(local, pipeline, 40186, "cannot use $text inside $graphLookup");
+assert.throws(() => local.aggregate(pipeline), [], "cannot use $text inside $graphLookup");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
@@ -272,9 +265,9 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             }
         }
     };
-    assertErrorCode(local, pipeline, 40186, "cannot use $near inside $graphLookup");
+assert.throws(() => local.aggregate(pipeline), [], "cannot use $near inside $graphLookup");
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
@@ -293,38 +286,56 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             }
         }
     };
-    assertErrorCode(local, pipeline, 40186, "cannot use $near inside $graphLookup at any depth");
+assert.throws(
+    () => local.aggregate(pipeline), [], "cannot use $near inside $graphLookup at any depth");
 
-    pipeline = {
+let foreign = db.foreign;
+foreign.drop();
+assert.commandWorked(foreign.insert({a: 0, x: 0}));
+
+// Test a restrictSearchWithMatch expression that fails to parse.
+pipeline = {
         $graphLookup: {
             from: 'foreign',
             startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
-            restrictSearchWithMatch: {$expr: {$eq: ["$x", 5]}}
+            restrictSearchWithMatch: {$expr: {$eq: ["$x", "$$unbound"]}}
         }
     };
-    assertErrorCode(local, pipeline, 40186, "cannot use $expr inside $graphLookup");
+assert.throws(() => local.aggregate(pipeline), [], "cannot use $expr with unbound variable");
 
-    // $graphLookup can only consume at most 100MB of memory.
-    var foreign = db.foreign;
-    foreign.drop();
+// Test a restrictSearchWithMatchExpression that throws at runtime.
+pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$expr: {$divide: [1, "$x"]}}
+        }
+    };
+assertErrorCode(local, pipeline, 16608, "division by zero in $expr");
 
-    // Here, the visited set exceeds 100MB.
-    var bulk = foreign.initializeUnorderedBulkOp();
+// $graphLookup can only consume at most 100MB of memory.
+foreign.drop();
 
-    var initial = [];
-    for (var i = 0; i < 8; i++) {
-        var obj = {_id: i};
+// Here, the visited set exceeds 100MB.
+var bulk = foreign.initializeUnorderedBulkOp();
 
-        obj['longString'] = new Array(14 * 1024 * 1024).join('x');
-        initial.push(i);
-        bulk.insert(obj);
-    }
-    assert.writeOK(bulk.execute());
+var initial = [];
+for (var i = 0; i < 8; i++) {
+    var obj = {_id: i};
 
-    pipeline = {
+    obj['longString'] = new Array(14 * 1024 * 1024).join('x');
+    initial.push(i);
+    bulk.insert(obj);
+}
+assert.commandWorked(bulk.execute());
+
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: initial},
@@ -333,21 +344,21 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "graph"
         }
     };
-    assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
+assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
 
-    // Here, the visited set should grow to approximately 90 MB, and the frontier should push memory
-    // usage over 100MB.
-    foreign.drop();
+// Here, the visited set should grow to approximately 90 MB, and the frontier should push memory
+// usage over 100MB.
+foreign.drop();
 
-    var bulk = foreign.initializeUnorderedBulkOp();
-    for (var i = 0; i < 14; i++) {
-        var obj = {from: 0, to: 1};
-        obj['s'] = new Array(7 * 1024 * 1024).join(' ');
-        bulk.insert(obj);
-    }
-    assert.writeOK(bulk.execute());
+var bulk = foreign.initializeUnorderedBulkOp();
+for (var i = 0; i < 14; i++) {
+    var obj = {from: 0, to: 1};
+    obj['s'] = new Array(7 * 1024 * 1024).join(' ');
+    bulk.insert(obj);
+}
+assert.commandWorked(bulk.execute());
 
-    pipeline = {
+pipeline = {
         $graphLookup: {
             from: "foreign",
             startWith: {$literal: 0},
@@ -357,20 +368,20 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
         }
     };
 
-    assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
+assertErrorCode(local, pipeline, 40099, "maximum memory usage reached");
 
-    // Here, we test that the cache keeps memory usage under 100MB, and does not cause an error.
-    foreign.drop();
+// Here, we test that the cache keeps memory usage under 100MB, and does not cause an error.
+foreign.drop();
 
-    var bulk = foreign.initializeUnorderedBulkOp();
-    for (var i = 0; i < 13; i++) {
-        var obj = {from: 0, to: 1};
-        obj['s'] = new Array(7 * 1024 * 1024).join(' ');
-        bulk.insert(obj);
-    }
-    assert.writeOK(bulk.execute());
+var bulk = foreign.initializeUnorderedBulkOp();
+for (var i = 0; i < 13; i++) {
+    var obj = {from: 0, to: 1};
+    obj['s'] = new Array(7 * 1024 * 1024).join(' ');
+    bulk.insert(obj);
+}
+assert.commandWorked(bulk.execute());
 
-    var res = local
+var res = local
                   .aggregate({
                       $graphLookup: {
                           from: "foreign",
@@ -383,5 +394,5 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
                              {$unwind: {path: "$out"}})
                   .toArray();
 
-    assert.eq(res.length, 13);
+assert.eq(res.length, 13);
 }());

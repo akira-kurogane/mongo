@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,14 +31,16 @@
 
 #include "mongo/rpc/metadata.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/server_options.h"
-#include "mongo/rpc/metadata/audit_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -50,20 +53,19 @@ BSONObj makeEmptyMetadata() {
     return BSONObj();
 }
 
-void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
+void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bool requiresAuth) {
     BSONElement readPreferenceElem;
-    BSONElement auditElem;
     BSONElement configSvrElem;
     BSONElement trackingElem;
     BSONElement clientElem;
     BSONElement logicalTimeElem;
+    BSONElement impersonationElem;
+    BSONElement clientOperationKeyElem;
 
     for (const auto& metadataElem : metadataObj) {
         auto fieldName = metadataElem.fieldNameStringData();
         if (fieldName == "$readPreference") {
             readPreferenceElem = metadataElem;
-        } else if (fieldName == AuditMetadata::fieldName()) {
-            auditElem = metadataElem;
         } else if (fieldName == ConfigServerMetadata::fieldName()) {
             configSvrElem = metadataElem;
         } else if (fieldName == ClientMetadata::fieldName()) {
@@ -72,7 +74,21 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             trackingElem = metadataElem;
         } else if (fieldName == LogicalTimeMetadata::fieldName()) {
             logicalTimeElem = metadataElem;
+        } else if (fieldName == kImpersonationMetadataSectionName) {
+            impersonationElem = metadataElem;
+        } else if (fieldName == "clientOperationKey"_sd) {
+            clientOperationKeyElem = metadataElem;
         }
+    }
+
+    AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+    if (clientOperationKeyElem &&
+        (getTestCommandsEnabled() ||
+         authSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                       ActionType::internal))) {
+        auto opKey = uassertStatusOK(UUID::parse(clientOperationKeyElem));
+        opCtx->setOperationKey(std::move(opKey));
     }
 
     if (readPreferenceElem) {
@@ -80,7 +96,7 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPreferenceElem));
     }
 
-    AuditMetadata::get(opCtx) = uassertStatusOK(AuditMetadata::readFromMetadata(auditElem));
+    readImpersonatedUserMetadata(impersonationElem, opCtx);
 
     uassertStatusOK(ClientMetadataIsMasterState::readFromMetadata(opCtx, clientElem));
 
@@ -91,31 +107,38 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
         uassertStatusOK(TrackingMetadata::readFromMetadata(trackingElem));
 
     auto logicalClock = LogicalClock::get(opCtx);
-    if (logicalClock) {
+    if (logicalClock && logicalClock->isEnabled()) {
         auto logicalTimeMetadata =
             uassertStatusOK(rpc::LogicalTimeMetadata::readFromMetadata(logicalTimeElem));
 
         auto& signedTime = logicalTimeMetadata.getSignedTime();
+
+        if (!requiresAuth &&
+            AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
+            (!signedTime.getProof() || *signedTime.getProof() == TimeProofService::TimeProof())) {
+
+            // The client is not authenticated and is not using localhost auth bypass.
+            if (authSession && !authSession->isAuthenticated() &&
+                !authSession->isUsingLocalhostBypass()) {
+                return;
+            }
+        }
+
         // LogicalTimeMetadata is default constructed if no cluster time metadata was sent, so a
         // default constructed SignedLogicalTime should be ignored.
         if (signedTime.getTime() != LogicalTime::kUninitialized) {
-            // Cluster times are only sent by sharding aware mongod servers, so this point is only
-            // reached in sharded clusters.
-            if (serverGlobalParams.featureCompatibility.version.load() !=
-                ServerGlobalParams::FeatureCompatibility::Version::k34) {
-                auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
-                if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                    if (!logicalTimeValidator) {
-                        uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
-                                  "Cannot accept logicalTime: " + signedTime.getTime().toString() +
-                                      ". May not be a part of a sharded cluster");
-                    } else {
-                        uassertStatusOK(logicalTimeValidator->validate(opCtx, signedTime));
-                    }
+            auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
+            if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+                if (!logicalTimeValidator) {
+                    uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
+                              "Cannot accept logicalTime: " + signedTime.getTime().toString() +
+                                  ". May not be a part of a sharded cluster");
+                } else {
+                    uassertStatusOK(logicalTimeValidator->validate(opCtx, signedTime));
                 }
-
-                uassertStatusOK(logicalClock->advanceClusterTime(signedTime.getTime()));
             }
+
+            uassertStatusOK(logicalClock->advanceClusterTime(signedTime.getTime()));
         }
     }
 }
@@ -138,7 +161,7 @@ bool isArrayOfObjects(BSONElement array) {
 
     return true;
 }
-}
+}  // namespace
 
 OpMsgRequest upconvertRequest(StringData db, BSONObj cmdObj, int queryFlags) {
     cmdObj = cmdObj.getOwned();  // Usually this is a no-op since it is already owned.

@@ -1,13 +1,15 @@
 # -*- mode: python -*-
 
+Import("endian")
 Import("env")
 Import("get_option")
 Import("has_option")
+Import("use_libunwind")
 Import("use_system_version_of_library")
 
 env = env.Clone()
 
-env.InjectThirdPartyIncludePaths('asio')
+env.InjectThirdParty('asio')
 
 env.SConscript(
     dirs=[
@@ -38,12 +40,34 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        ]
-    )
+    ]
+)
+
+env.Library(
+    target='log_and_backoff',
+    source= [
+        'log_and_backoff.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
+    target='regex_util',
+    source= [
+        'regex_util.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
 
 debuggerEnv = env.Clone()
 if has_option("gdbserver"):
     debuggerEnv.Append(CPPDEFINES=["USE_GDBSERVER"])
+elif has_option("lldb-server"):
+    debuggerEnv.Append(CPPDEFINES=["USE_LLDB_SERVER"])
 
 debuggerEnv.Library(
     target='debugger',
@@ -59,86 +83,12 @@ debuggerEnv.Library(
 )
 
 env.Library(
-    target='decorable',
-    source=[
-        'decoration_container.cpp',
-        'decoration_registry.cpp',
-    ],
-    LIBDEPS=[]
-    )
-
-env.CppUnitTest(
-    target='decorable_test',
-    source=[
-        'decorable_test.cpp'
-        ],
-    LIBDEPS=[
-        'decorable',
-        ]
-    )
-
-env.CppUnitTest(
-    target='represent_as_test',
-    source=[
-        'represent_as_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/third_party/shim_boost',
-    ],
-)
-
-env.CppUnitTest(
-    target='lru_cache_test',
-    source=[
-        'lru_cache_test.cpp',
-    ],
-    LIBDEPS=[
-    ],
-)
-
-env.Library(
-    target='uuid',
-    source=[
-        'uuid.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/decorable',
-        '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
-    ],
-)
-
-env.CppUnitTest(
-    target='uuid_test',
-    source=[
-        'uuid_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'uuid',
-    ],
-)
-
-env.Library(
     target='summation',
     source=[
         'summation.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target='summation_test',
-    source=[
-        'summation_test.cpp',
-    ],
-    LIBDEPS=[
-        'summation',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/third_party/shim_boost',
     ],
 )
 
@@ -153,16 +103,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='progress_meter_test',
-    source=[
-        'progress_meter_test.cpp',
-    ],
-    LIBDEPS=[
-        'progress_meter',
-    ],
-)
-
 env.Library(
     target='md5',
     source=[
@@ -171,65 +111,25 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target="md5_test",
+env.Library(
+    target='clock_source_mock',
     source=[
-        "md5_test.cpp",
-        "md5main.cpp",
+        'clock_source_mock.cpp'
     ],
     LIBDEPS=[
-        "md5",
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
 env.Library(
-    target='clock_source_mock',
+    target='alarm',
     source=[
-        'clock_source_mock.cpp',
-        'tick_source_mock.cpp',
+        'alarm.cpp',
+        'alarm_runner_background_thread.cpp',
     ],
     LIBDEPS=[
+        'clock_sources',
         '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target='clock_source_mock_test',
-    source=[
-        'clock_source_mock_test.cpp',
-    ],
-    LIBDEPS=[
-        'clock_source_mock',
-    ],
-)
-
-env.CppUnitTest(
-    target='text_test',
-    source=[
-        'text_test.cpp'
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target='time_support_test',
-    source=[
-        'time_support_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.CppUnitTest(
-    target="stringutils_test",
-    source=[
-        "stringutils_test.cpp",
-    ],
-    LIBDEPS=[
-        "$BUILD_DIR/mongo/base",
     ],
 )
 
@@ -244,38 +144,16 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target="processinfo_test",
-    source=[
-        "processinfo_test.cpp",
-    ],
-    LIBDEPS=[
-        "processinfo",
-    ],
-)
-
 env.Library(
     target="fail_point",
     source=[
         "fail_point.cpp",
-        "fail_point_registry.cpp",
-        "fail_point_server_parameter.cpp",
-        "fail_point_service.cpp",
+        env.Idlc('fail_point_server_parameter.idl')[0],
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/bson/util/bson_extract",
-        "$BUILD_DIR/mongo/db/server_parameters",
-    ],
-)
-
-env.CppUnitTest(
-    target="fail_point_test",
-    source=[
-        "fail_point_test.cpp",
-    ],
-    LIBDEPS=[
-        "fail_point",
+        "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
 
@@ -285,32 +163,19 @@ env.Library(
         "periodic_runner.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
     ],
 )
 
 env.Library(
-    target="periodic_runner_asio",
+    target="periodic_runner_impl",
     source=[
-        "periodic_runner_asio.cpp",
+        "periodic_runner_impl.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/service_context",
-        "$BUILD_DIR/third_party/shim_asio",
-        "$BUILD_DIR/mongo/executor/async_timer_asio",
         "periodic_runner",
-    ],
-)
-
-env.CppUnitTest(
-    target="periodic_runner_asio_test",
-    source=[
-        "periodic_runner_asio_test.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
-        "$BUILD_DIR/mongo/executor/async_timer_mock",
-        "periodic_runner_asio",
     ],
 )
 
@@ -320,8 +185,9 @@ env.Library(
         'periodic_runner_factory.cpp',
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/service_context",
         'periodic_runner',
-        'periodic_runner_asio',
+        'periodic_runner_impl',
     ],
 )
 
@@ -336,23 +202,34 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target="background_job_test",
+env.Library(
+    target='caching',
     source=[
-        "background_job_test.cpp",
+        'read_through_cache.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ]
+)
+
+env.CppUnitTest(
+    target='thread_safety_context_test',
+    source=[
+        'thread_safety_context_test.cpp',
     ],
     LIBDEPS=[
-        "background_job",
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
-if env['MONGO_ALLOCATOR'] == 'tcmalloc':
+if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
     tcmspEnv = env.Clone()
 
     if not use_system_version_of_library('tcmalloc'):
 
         # Add in the include path for our vendored tcmalloc.
-        tcmspEnv.InjectThirdPartyIncludePaths('gperftools')
+        tcmspEnv.InjectThirdParty('gperftools')
 
         # If our changes to tcmalloc are ever upstreamed, this should become set based on a top
         # level configure check, though its effects should still be scoped just to these files.
@@ -365,19 +242,23 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
 
     if not use_system_version_of_library('valgrind'):
         # Include valgrind since tcmalloc disables itself while running under valgrind
-        tcmspEnv.InjectThirdPartyIncludePaths('valgrind')
+        tcmspEnv.InjectThirdParty('valgrind')
 
     tcmspEnv.Library(
         target='tcmalloc_set_parameter',
         source=[
             'tcmalloc_server_status_section.cpp',
             'tcmalloc_set_parameter.cpp',
+            env.Idlc('tcmalloc_parameters.idl')[0],
             'heap_profiler.cpp',
         ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/transport/service_executor',
+        ],
+        LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/db/commands/server_status',
-            '$BUILD_DIR/mongo/db/server_parameters',
-            '$BUILD_DIR/mongo/util/net/network',
+            '$BUILD_DIR/mongo/idl/server_parameter',
+            'processinfo',
         ],
         PROGDEPS_DEPENDENTS=[
             '$BUILD_DIR/mongo/mongod',
@@ -415,31 +296,43 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='background_thread_clock_source_test',
-    source=[
-        'background_thread_clock_source_test.cpp',
-    ],
-    LIBDEPS=[
-        'clock_source_mock',
-        'clock_sources',
-    ],
-)
-
-if env.TargetOSIs('windows'):
-    env.CppUnitTest(
-        target='ntservice_test',
-        source=[
-            'ntservice_test.cpp',
+if get_option('use-diagnostic-latches') == 'on':
+    env.Library(
+        target='diagnostic_info',
+        source= [
+            'diagnostic_info.cpp',
         ],
         LIBDEPS=[
-            'ntservice',
-        ],
-        LIBS=[
-            'shell32',
-            env['LIBS']
+            '$BUILD_DIR/mongo/base',
+            "$BUILD_DIR/mongo/db/service_context",
         ],
     )
+
+    env.Library(
+        target='latch_analyzer',
+        source= [
+            'latch_analyzer.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+            '$BUILD_DIR/mongo/db/service_context',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/commands/server_status',
+        ],
+    )
+
+env.Benchmark(
+    target='clock_source_bm',
+    source=[
+        'clock_source_bm.cpp',
+    ],
+    LIBDEPS=[
+        'clock_sources',
+        'processinfo',
+    ],
+)
 
 env.Library(
     target='elapsed_tracker',
@@ -459,18 +352,6 @@ if has_option('gcov'):
             'MONGO_GCOV',
         ],
     )
-
-if has_option('use-cpu-profiler'):
-    quick_exit_env.Append(
-        CPPDEFINES=[
-            'MONGO_CPU_PROFILER',
-        ],
-    )
-
-    if not use_system_version_of_library('tcmalloc'):
-        quick_exit_env.InjectThirdPartyIncludePaths(
-            'gperftools'
-        )
 
 quick_exit_env.Library(
     target='quick_exit',
@@ -494,6 +375,16 @@ env.Library(
 )
 
 env.Library(
+    target='dns_query',
+    source=[
+        'dns_query.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/base",
+    ],
+)
+
+env.Library(
     target="secure_zero_memory",
     source=[
         'secure_zero_memory.cpp',
@@ -503,26 +394,12 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='secure_zero_memory_test',
-    source=['secure_zero_memory_test.cpp'],
-    LIBDEPS=[
-        'secure_zero_memory'
-    ],
-)
+signalEnv = env.Clone()
 
-if not env.TargetOSIs('windows'):
-    env.CppUnitTest(
-        target='signal_handlers_synchronous_test',
-        source=[
-            'signal_handlers_synchronous_test.cpp',
-        ],
-        LIBDEPS=[
-            '$BUILD_DIR/mongo/base',
-        ],
-    )
+if use_libunwind:
+    signalEnv.InjectThirdParty('unwind')
 
-env.Library(
+signalEnv.Library(
     target="signal_handlers",
     source=[
         "signal_handlers.cpp",
@@ -536,16 +413,6 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target="unowned_ptr_test",
-    source=[
-        "unowned_ptr_test.cpp",
-    ],
-    LIBDEPS=[
-        # None since unowned_ptr is header-only.
-    ],
-)
-
 env.Library(
     target='safe_num',
     source=[
@@ -556,73 +423,52 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='safe_num_test',
-    source=[
-        'safe_num_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'safe_num',
-    ],
-)
-
-env.CppUnitTest(
-    target='string_map_test',
-    source=[
-        'string_map_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
 env.Library(
     target='password',
     source=[
         'password.cpp',
+        env.Idlc('password_params.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ],
-)
-
-env.CppUnitTest(
-    target='itoa_test',
-    source=[
-        'itoa_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
 
-env.CppUnitTest(
-    target='duration_test',
-    source=[
-        'duration_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ])
 
-env.CppUnitTest(
-    target='assert_util_test',
+env.Benchmark(
+    target='decimal_counter_bm',
     source=[
-        'assert_util_test.cpp',
+        'decimal_counter_bm.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ]
+    ],
 )
 
-env.CppUnitTest(
-    target='base64_test',
+env.Benchmark(
+    target='itoa_bm',
     source=[
-        'base64_test.cpp',
+        'itoa_bm.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Benchmark(
+    target='future_bm',
+    source=[
+        'future_bm.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Benchmark(
+    target='hash_table_bm',
+    source='hash_table_bm.cpp',
+    LIBDEPS=[
     ],
 )
 
@@ -637,15 +483,6 @@ if env.TargetOSIs('linux'):
         ],
     )
 
-    env.CppUnitTest(
-        target='procparser_test',
-        source=[
-            'procparser_test.cpp',
-        ],
-        LIBDEPS=[
-            'procparser',
-        ])
-
 if env.TargetOSIs('windows'):
     env.Library(
         target='perfctr_collect',
@@ -657,11 +494,199 @@ if env.TargetOSIs('windows'):
         ],
     )
 
-    env.CppUnitTest(
-        target='perfctr_collect_test',
+icuEnv = env.Clone()
+
+if not use_system_version_of_library("icu"):
+    generateICUInit = icuEnv.Command(
+        target="icu_init.cpp",
         source=[
+            "generate_icu_init_cpp.py",
+            ("$BUILD_DIR/third_party/icu4c-57.1/source/mongo_sources/icudt57l.dat"
+                if endian == "little"
+                else "$BUILD_DIR/third_party/icu4c-57.1/source/mongo_sources/icudt57b.dat"),
+        ],
+        action="$PYTHON ${SOURCES[0]} -o $TARGET -i ${SOURCES[1]}",
+    )
+    icuEnv.Alias("generated-sources", generateICUInit)
+
+    icuEnv.InjectThirdParty("icu")
+    # Since we are injecting the third-party ICU headers, we must also copy the same defines that we
+    # use to configure ICU when building ICU sources. See comment in
+    # src/third_party/icu4c-57.1/source/SConscript.
+    icuEnv.Append(
+        CPPDEFINES=[
+            ('UCONFIG_NO_BREAK_ITERATION', 1),
+            ('UCONFIG_NO_FORMATTING', 1),
+            ('UCONFIG_NO_TRANSLITERATION', 1),
+            ('UCONFIG_NO_REGULAR_EXPRESSIONS', 1),
+            ("U_CHARSET_IS_UTF8", 1),
+            ("U_DISABLE_RENAMING", 1),
+            ("U_STATIC_IMPLEMENTATION", 1),
+            ("U_USING_ICU_NAMESPACE", 0),
+        ],
+    )
+
+# When using ICU from third_party, icu_init.cpp will load a subset of
+# ICU's data files using udata_setCommonData() in an initializer.
+# When using the system ICU, we rely on those files being in the install path.
+icuEnv.Library(
+    target='icu_init',
+    source=[
+        'icu_init.cpp' if not use_system_version_of_library('icu') else 'icu_init_stub.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/third_party/shim_icu',
+    ],
+)
+
+icuEnv.Library(
+    target='icu',
+    source=[
+        'icu.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'icu_init',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/third_party/shim_icu',
+    ],
+)
+
+icuEnv.CppUnitTest(
+    target='util_test',
+    source=[
+        'alarm_test.cpp',
+        'assert_util_test.cpp',
+        'background_job_test.cpp',
+        'background_thread_clock_source_test.cpp',
+        'base64_test.cpp',
+        'clock_source_mock_test.cpp',
+        'concepts_test.cpp',
+        'container_size_helper_test.cpp',
+        'decimal_counter_test.cpp',
+        'decorable_test.cpp',
+        'diagnostic_info_test.cpp' if get_option('use-diagnostic-latches') == 'on' else [],
+        'dns_name_test.cpp',
+        'dns_query_test.cpp',
+        'duration_test.cpp',
+        'errno_util_test.cpp',
+        'fail_point_test.cpp',
+        'future_test_edge_cases.cpp',
+        'future_test_executor_future.cpp',
+        'future_test_future_int.cpp',
+        'future_test_future_move_only.cpp',
+        'future_test_future_void.cpp',
+        'future_test_promise_int.cpp',
+        'future_test_promise_void.cpp',
+        'future_test_shared_future.cpp',
+        'future_util_test.cpp',
+        'hierarchical_acquisition_test.cpp',
+        'icu_test.cpp',
+        'invalidating_lru_cache_test.cpp',
+        'interruptible_test.cpp',
+        'itoa_test.cpp',
+        'latch_analyzer_test.cpp' if get_option('use-diagnostic-latches') == 'on' else [],
+        'lockable_adapter_test.cpp',
+        'log_with_sampling_test.cpp',
+        'lru_cache_test.cpp',
+        'md5_test.cpp',
+        'md5main.cpp',
+        'out_of_line_executor_test.cpp',
+        'periodic_runner_impl_test.cpp',
+        'processinfo_test.cpp',
+        'procparser_test.cpp' if env.TargetOSIs('linux') else [],
+        'producer_consumer_queue_test.cpp',
+        'progress_meter_test.cpp',
+        'read_through_cache_test.cpp',
+        'registry_list_test.cpp',
+        'represent_as_test.cpp',
+        'safe_num_test.cpp',
+        'secure_zero_memory_test.cpp',
+        'signal_handlers_synchronous_test.cpp' if not env.TargetOSIs('windows') else [],
+        'str_test.cpp',
+        'string_map_test.cpp',
+        'strong_weak_finish_line_test.cpp',
+        'summation_test.cpp',
+        'text_test.cpp',
+        'tick_source_test.cpp',
+        'time_support_test.cpp',
+        'unique_function_test.cpp',
+        'unowned_ptr_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        'alarm',
+        'background_job',
+        'caching',
+        'clock_source_mock',
+        'clock_sources',
+        'concurrency/thread_pool',
+        'diagnostic_info' if get_option('use-diagnostic-latches') == 'on' else [],
+        'dns_query',
+        'fail_point',
+        'icu',
+        'latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
+        'md5',
+        'periodic_runner_impl',
+        'processinfo',
+        'procparser' if env.TargetOSIs('linux') else [],
+        'progress_meter',
+        'safe_num',
+        'secure_zero_memory',
+        'summation',
+    ],
+)
+
+if env.TargetOSIs('windows'):
+    env.CppUnitTest(
+        target='util_windows_test',
+        source=[
+            'ntservice_test.cpp',
             'perfctr_collect_test.cpp',
         ],
         LIBDEPS=[
+            'ntservice',
             'perfctr_collect',
-        ])
+        ],
+        LIBS=[
+            'shell32',
+            env['LIBS']
+        ],
+    )
+
+env.Benchmark(
+    target='base64_bm',
+    source='base64_bm.cpp',
+)
+
+stacktraceEnv = env.Clone()
+if use_libunwind:
+    stacktraceEnv.InjectThirdParty(libraries=['unwind'])
+
+stacktraceEnv.CppUnitTest(
+    target='stacktrace_test',
+    source='stacktrace_test.cpp',
+)
+
+stacktraceEnv.Benchmark(
+    target='stacktrace_bm',
+    source='stacktrace_bm.cpp',
+)
+
+if use_libunwind:
+    unwindTestEnv = env.Clone()
+    unwindTestEnv.InjectThirdParty(libraries=['unwind'])
+    unwindTestEnv.CppUnitTest(
+        target=[
+            'stacktrace_libunwind_test',
+        ],
+        source=[
+            'stacktrace_libunwind_test_functions.cpp',
+            'stacktrace_libunwind_test.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/third_party/shim_unwind',
+        ],
+    )

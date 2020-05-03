@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,25 +26,27 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import wiredtiger, wttest, exceptions
+import wiredtiger, wttest
 from wtdataset import SimpleDataSet, ComplexDataSet, ComplexLSMDataSet
-from wtscenario import make_scenarios
+from wtscenario import filter_scenarios, make_scenarios
 
 # Test cursor comparisons.
 class test_cursor_comparison(wttest.WiredTigerTestCase):
     name = 'test_compare'
 
     types = [
-        ('file', dict(type='file:', dataset=SimpleDataSet)),
-        ('lsm', dict(type='table:', dataset=ComplexLSMDataSet)),
-        ('table', dict(type='table:', dataset=ComplexDataSet))
+        ('file', dict(type='file:', lsm=False, dataset=SimpleDataSet)),
+        ('lsm', dict(type='table:', lsm=True, dataset=ComplexLSMDataSet)),
+        ('table', dict(type='table:', lsm=False, dataset=ComplexDataSet))
     ]
     keyfmt = [
         ('integer', dict(keyfmt='i')),
         ('recno', dict(keyfmt='r')),
         ('string', dict(keyfmt='S'))
     ]
-    scenarios = make_scenarios(types, keyfmt)
+    # Skip record number keys with LSM.
+    scenarios = filter_scenarios(make_scenarios(types, keyfmt),
+        lambda name, d: not (d['lsm'] and d['keyfmt'] == 'r'))
 
     def test_cursor_comparison(self):
         uri = self.type + 'compare'
@@ -97,7 +99,7 @@ class test_cursor_comparison(wttest.WiredTigerTestCase):
             wiredtiger.WiredTigerError, lambda: cX.compare(c1), msg)
         msg = '/wt_cursor.* is None/'
         self.assertRaisesHavingMessage(
-            exceptions.RuntimeError,  lambda: cX.compare(None), msg)
+            RuntimeError,  lambda: cX.compare(None), msg)
         if ix0_0 != None:
             self.assertEqual(ix0_0.compare(ix0_1), 0)
             ix0_1.reset()
@@ -186,7 +188,7 @@ class test_cursor_comparison(wttest.WiredTigerTestCase):
             wiredtiger.WiredTigerError, lambda: cX.equals(c1), msg)
         msg = '/wt_cursor.* is None/'
         self.assertRaisesHavingMessage(
-            exceptions.RuntimeError,  lambda: cX.equals(None), msg)
+            RuntimeError,  lambda: cX.equals(None), msg)
         if ix0_0 != None:
             self.assertTrue(ix0_0.equals(ix0_1))
             ix0_1.reset()

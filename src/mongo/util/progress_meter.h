@@ -1,30 +1,30 @@
-// progress_meter.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -36,7 +36,8 @@
 namespace mongo {
 
 class ProgressMeter {
-    MONGO_DISALLOW_COPYING(ProgressMeter);
+    ProgressMeter(const ProgressMeter&) = delete;
+    ProgressMeter& operator=(const ProgressMeter&) = delete;
 
 public:
     ProgressMeter(unsigned long long total,
@@ -76,8 +77,8 @@ public:
         return _units;
     }
 
-    void setName(std::string name) {
-        _name = name.c_str();
+    void setName(StringData name) {
+        _name = name;
     }
     std::string getName() const {
         return _name.toString();
@@ -125,41 +126,46 @@ private:
     ThreadSafeString _name;
 };
 
-// e.g.:
-// CurOp * op = CurOp::get(opCtx);
-// ProgressMeterHolder pm(op->setMessage("index: (1/3) external sort",
-// "Index: External Sort Progress", d->stats.nrecords, 10)); loop { pm.hit(); }
+/*
+ * Wraps a ProgressMeter and calls finished() when destructed. This may only exist as long as the
+ * underlying ProgressMeter, which is owned by CurOp.
+ */
 class ProgressMeterHolder {
-    MONGO_DISALLOW_COPYING(ProgressMeterHolder);
+    ProgressMeterHolder(const ProgressMeterHolder&) = delete;
+    ProgressMeterHolder& operator=(const ProgressMeterHolder&) = delete;
 
 public:
-    ProgressMeterHolder(ProgressMeter& pm) : _pm(pm) {}
+    ProgressMeterHolder() : _pm(nullptr) {}
+
+    ProgressMeterHolder(ProgressMeter& pm) : _pm(&pm) {}
 
     ~ProgressMeterHolder() {
-        _pm.finished();
+        if (_pm) {
+            _pm->finished();
+        }
+    }
+
+    void set(ProgressMeter& pm) {
+        _pm = &pm;
     }
 
     ProgressMeter* operator->() {
-        return &_pm;
+        return _pm;
     }
 
     ProgressMeter* get() {
-        return &_pm;
+        return _pm;
     }
 
     bool hit(int n = 1) {
-        return _pm.hit(n);
+        return _pm->hit(n);
     }
 
     void finished() {
-        _pm.finished();
-    }
-
-    bool operator==(const ProgressMeter& other) {
-        return _pm == other;
+        _pm->finished();
     }
 
 private:
-    ProgressMeter& _pm;
+    ProgressMeter* _pm;
 };
-}
+}  // namespace mongo

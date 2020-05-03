@@ -1,24 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,8 +33,8 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -49,6 +49,10 @@ public:
         int64_t records;      // Approximate number of records in a chunk of the oplog.
         int64_t bytes;        // Approximate size of records in a chunk of the oplog.
         RecordId lastRecord;  // RecordId of the last record in a chunk of the oplog.
+        Date_t wallTime;      // Walltime of when this chunk of the oplog was created.
+
+        Stone(int64_t records, int64_t bytes, RecordId lastRecord, Date_t wallTime)
+            : records(records), bytes(bytes), lastRecord(lastRecord), wallTime(wallTime) {}
     };
 
     OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs);
@@ -57,27 +61,27 @@ public:
 
     void kill();
 
-    bool hasExcessStones_inlock() const {
-        int64_t total_bytes = 0;
-        for (std::deque<OplogStones::Stone>::const_iterator it = _stones.begin();
-             it != _stones.end();
-             ++it) {
-            total_bytes += it->bytes;
-        }
-        return total_bytes > _rs->cappedMaxSize();
-    }
+    bool hasExcessStones_inlock() const;
 
     void awaitHasExcessStonesOrDead();
+
+    void getOplogStonesStats(BSONObjBuilder& builder) const {
+        builder.append("totalTimeProcessingMicros", _totalTimeProcessing.load());
+        builder.append("processingMethod", _processBySampling.load() ? "sampling" : "scanning");
+        if (auto oplogMinRetentionHours = storageGlobalParams.oplogMinRetentionHours.load()) {
+            builder.append("oplogMinRetentionHours", oplogMinRetentionHours);
+        }
+    }
 
     boost::optional<OplogStones::Stone> peekOldestStoneIfNeeded() const;
 
     void popOldestStone();
 
-    void createNewStoneIfNeeded(RecordId lastRecord);
+    void createNewStoneIfNeeded(OperationContext* opCtx, RecordId lastRecord, Date_t wallTime);
 
     void updateCurrentStoneAfterInsertOnCommit(OperationContext* opCtx,
                                                int64_t bytesInserted,
-                                               RecordId highestInserted,
+                                               const Record& highestInsertedRecord,
                                                int64_t countInserted);
 
     void clearStonesOnCommit(OperationContext* opCtx);
@@ -99,7 +103,7 @@ public:
     //
 
     size_t numStones() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         return _stones.size();
     }
 
@@ -129,7 +133,7 @@ private:
 
     WiredTigerRecordStore* _rs;
 
-    stdx::mutex _oplogReclaimMutex;
+    Mutex _oplogReclaimMutex;
     stdx::condition_variable _oplogReclaimCv;
 
     // True if '_rs' has been destroyed, e.g. due to repairDatabase being called on the "local"
@@ -140,10 +144,14 @@ private:
     // deque of oplog stones.
     int64_t _minBytesPerStone;
 
-    AtomicInt64 _currentRecords;  // Number of records in the stone being filled.
-    AtomicInt64 _currentBytes;    // Number of bytes in the stone being filled.
+    AtomicWord<long long> _currentRecords;     // Number of records in the stone being filled.
+    AtomicWord<long long> _currentBytes;       // Number of bytes in the stone being filled.
+    AtomicWord<int64_t> _totalTimeProcessing;  // Amount of time spent scanning and/or sampling the
+                                               // oplog during start up, if any.
+    AtomicWord<bool> _processBySampling;       // Whether the oplog was sampled or scanned.
 
-    mutable stdx::mutex _mutex;  // Protects against concurrent access to the deque of oplog stones.
+    // Protects against concurrent access to the deque of oplog stones.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogStones::_mutex");
     std::deque<OplogStones::Stone> _stones;  // front = oldest, back = newest.
 };
 

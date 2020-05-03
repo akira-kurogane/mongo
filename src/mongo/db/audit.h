@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,20 +37,37 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/util/net/op_msg.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/rpc/op_msg.h"
 
 namespace mongo {
 
 class AuthorizationSession;
 class BSONObj;
 class Client;
-class CommandInterface;
 class NamespaceString;
 class OperationContext;
 class StringData;
 class UserName;
 
+namespace mutablebson {
+class Document;
+}  // namespace mutablebson
+
 namespace audit {
+
+/**
+ * Narrow API for the parts of mongo::Command used by the audit library.
+ */
+class CommandInterface {
+public:
+    virtual ~CommandInterface() = default;
+    virtual StringData sensitiveFieldName() const = 0;
+    virtual void snipForLogging(mutablebson::Document* cmdObj) const = 0;
+    virtual StringData getName() const = 0;
+    virtual NamespaceString ns() const = 0;
+    virtual bool redactArgs() const = 0;
+};
 
 /**
  * Logs the result of an authentication attempt.
@@ -71,7 +89,7 @@ void logAuthentication(Client* client,
  */
 void logCommandAuthzCheck(Client* client,
                           const OpMsgRequest& cmdObj,
-                          CommandInterface* command,
+                          const CommandInterface& command,
                           ErrorCodes::Error result);
 
 /**
@@ -120,7 +138,7 @@ void logQueryAuthzCheck(Client* client,
 void logUpdateAuthzCheck(Client* client,
                          const NamespaceString& ns,
                          const BSONObj& query,
-                         const BSONObj& updateObj,
+                         const write_ops::UpdateModification& update,
                          bool isUpsert,
                          bool isMulti,
                          ErrorCodes::Error result);
@@ -297,13 +315,10 @@ void logRemoveShard(Client* client, StringData shardname);
  */
 void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern, bool unique);
 
-
-/*
- * Appends an array of user/db pairs and an array of role/db pairs
- * to the provided metadata builder. The users and roles are extracted from the current client.
- * They are to be the impersonated users and roles for a Command run by an internal user.
+/**
+ * Logs the result of a refineCollectionShardKey event.
  */
-void writeImpersonatedUsersToMetadata(OperationContext* opCtx, BSONObjBuilder* metadataBob);
+void logRefineCollectionShardKey(Client* client, StringData ns, const BSONObj& keyPattern);
 
 }  // namespace audit
 }  // namespace mongo

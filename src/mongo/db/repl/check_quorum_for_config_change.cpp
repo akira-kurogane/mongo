@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,31 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
 
 using executor::RemoteCommandRequest;
 
-QuorumChecker::QuorumChecker(const ReplSetConfig* rsConfig, int myIndex)
+QuorumChecker::QuorumChecker(const ReplSetConfig* rsConfig, int myIndex, long long term)
     : _rsConfig(rsConfig),
       _myIndex(myIndex),
+      _term(term),
       _numResponses(1),  // We "responded" to ourself already.
       _numElectable(0),
       _vetoStatus(Status::OK()),
@@ -81,14 +83,20 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
         return requests;
     }
 
-    ReplSetHeartbeatArgs hbArgs;
+    BSONObj hbRequest;
+    invariant(_term != OpTime::kUninitializedTerm);
+    ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName(_rsConfig->getReplSetName());
-    hbArgs.setProtocolVersion(1);
     hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
-    hbArgs.setCheckEmpty(isInitialConfig);
+    hbArgs.setConfigTerm(_rsConfig->getConfigTerm());
+    hbArgs.setHeartbeatVersion(1);
+    if (isInitialConfig) {
+        hbArgs.setCheckEmpty();
+    }
     hbArgs.setSenderHost(myConfig.getHostAndPort());
-    hbArgs.setSenderId(myConfig.getId());
-    const BSONObj hbRequest = hbArgs.toBSON();
+    hbArgs.setSenderId(myConfig.getId().getData());
+    hbArgs.setTerm(_term);
+    hbRequest = hbArgs.toBSON();
 
     // Send a bunch of heartbeat requests.
     // Schedule an operation when a "sufficient" number of them have completed, and use that
@@ -180,8 +188,11 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
                                                const executor::RemoteCommandResponse& response) {
     ++_numResponses;
     if (!response.isOK()) {
-        warning() << "Failed to complete heartbeat request to " << request.target << "; "
-                  << response.status;
+        LOGV2_WARNING(23722,
+                      "Failed to complete heartbeat request to {requestTarget}; {responseStatus}",
+                      "Failed to complete heartbeat request to target",
+                      "requestTarget"_attr = request.target,
+                      "responseStatus"_attr = response.status);
         _badResponses.push_back(std::make_pair(request.target, response.status));
         return;
     }
@@ -191,53 +202,71 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
     if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
-        std::string message = str::stream() << "Our set name did not match that of "
-                                            << request.target.toString();
-        _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-        warning() << message;
+        static constexpr char message[] = "Our set name did not match that of the request target";
+        _vetoStatus =
+            Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                   str::stream() << message << ", requestTarget:" << request.target.toString());
+        LOGV2_WARNING(23723,
+                      "Our set name did not match that of {requestTarget}",
+                      message,
+                      "requestTarget"_attr = request.target.toString());
         return;
     }
 
     if (!hbStatus.isOK() && hbStatus != ErrorCodes::InvalidReplicaSetConfig) {
-        warning() << "Got error (" << hbStatus << ") response on heartbeat request to "
-                  << request.target << "; " << hbResp;
+        LOGV2_WARNING(
+            23724,
+            "Got error ({hbStatus}) response on heartbeat request to {requestTarget}; {hbResp}",
+            "Got error response on heartbeat request",
+            "hbStatus"_attr = hbStatus,
+            "requestTarget"_attr = request.target,
+            "hbResp"_attr = hbResp);
         _badResponses.push_back(std::make_pair(request.target, hbStatus));
         return;
     }
 
     if (!hbResp.getReplicaSetName().empty()) {
         if (hbResp.getConfigVersion() >= _rsConfig->getConfigVersion()) {
-            std::string message = str::stream()
-                << "Our config version of " << _rsConfig->getConfigVersion()
-                << " is no larger than the version on " << request.target.toString()
-                << ", which is " << hbResp.getConfigVersion();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
+            static constexpr char message[] =
+                "Our config version is no larger than the version of the request target";
+            _vetoStatus = Status(
+                ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                str::stream() << message << ", rsConfigVersion: " << _rsConfig->getConfigVersion()
+                              << ", requestTarget: " << request.target.toString()
+                              << ", requestTargetConfigVersion: " << hbResp.getConfigVersion());
+            LOGV2_WARNING(23725,
+                          "Our config version of {rsConfigVersion} is no larger than the version "
+                          "on {requestTarget}, which is {requestTargetConfigVersion}",
+                          message,
+                          "rsConfigVersion"_attr = _rsConfig->getConfigVersion(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetConfigVersion"_attr = hbResp.getConfigVersion());
             return;
         }
     }
 
     if (_rsConfig->hasReplicaSetId()) {
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(response.metadata);
+            rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            std::string message = str::stream()
-                << "Our replica set ID of " << _rsConfig->getReplicaSetId()
-                << " did not match that of " << request.target.toString() << ", which is "
-                << replMetadata.getValue().getReplicaSetId();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
+            static constexpr char message[] =
+                "Our replica set ID did not match that of our request target";
+            _vetoStatus =
+                Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                       str::stream() << message << ", replSetId: " << _rsConfig->getReplicaSetId()
+                                     << ", requestTarget: " << request.target.toString()
+                                     << ", requestTargetReplSetId: "
+                                     << replMetadata.getValue().getReplicaSetId());
+            LOGV2_WARNING(23726,
+                          "Our replica set ID of {replSetId} did not match that of "
+                          "{requestTarget}, which is {requestTargetId}",
+                          message,
+                          "replSetId"_attr = _rsConfig->getReplicaSetId(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetReplSetId"_attr =
+                              replMetadata.getValue().getReplicaSetId());
         }
-    }
-
-    const bool isInitialConfig = _rsConfig->getConfigVersion() == 1;
-    if (isInitialConfig && hbResp.hasData()) {
-        std::string message = str::stream() << "'" << request.target.toString()
-                                            << "' has data already, cannot initiate set.";
-        _vetoStatus = Status(ErrorCodes::CannotInitializeNodeWithData, message);
-        warning() << message;
-        return;
     }
 
     for (int i = 0; i < _rsConfig->getNumMembers(); ++i) {
@@ -253,7 +282,7 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
         }
         return;
     }
-    invariant(false);
+    MONGO_UNREACHABLE;
 }
 
 bool QuorumChecker::hasReceivedSufficientResponses() const {
@@ -281,9 +310,11 @@ bool QuorumChecker::hasReceivedSufficientResponses() const {
 
 Status checkQuorumGeneral(executor::TaskExecutor* executor,
                           const ReplSetConfig& rsConfig,
-                          const int myIndex) {
-    auto checker = std::make_shared<QuorumChecker>(&rsConfig, myIndex);
-    ScatterGatherRunner runner(checker, executor);
+                          const int myIndex,
+                          long long term,
+                          std::string logMessage) {
+    auto checker = std::make_shared<QuorumChecker>(&rsConfig, myIndex, term);
+    ScatterGatherRunner runner(checker, executor, std::move(logMessage));
     Status status = runner.run();
     if (!status.isOK()) {
         return status;
@@ -294,16 +325,18 @@ Status checkQuorumGeneral(executor::TaskExecutor* executor,
 
 Status checkQuorumForInitiate(executor::TaskExecutor* executor,
                               const ReplSetConfig& rsConfig,
-                              const int myIndex) {
+                              const int myIndex,
+                              long long term) {
     invariant(rsConfig.getConfigVersion() == 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "initiate quorum check");
 }
 
 Status checkQuorumForReconfig(executor::TaskExecutor* executor,
                               const ReplSetConfig& rsConfig,
-                              const int myIndex) {
+                              const int myIndex,
+                              long long term) {
     invariant(rsConfig.getConfigVersion() > 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "reconfig quorum check");
 }
 
 }  // namespace repl

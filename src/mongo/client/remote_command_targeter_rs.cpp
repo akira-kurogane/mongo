@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +38,10 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -51,41 +52,45 @@ RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
     std::set<HostAndPort> seedServers(seedHosts.begin(), seedHosts.end());
     _rsMonitor = ReplicaSetMonitor::createIfNeeded(rsName, seedServers);
 
-    LOG(1) << "Started targeter for "
-           << ConnectionString::forReplicaSet(
-                  rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end()));
+    LOGV2_DEBUG(
+        20157,
+        1,
+        "Started targeter for "
+        "{ConnectionString_forReplicaSet_rsName_std_vector_HostAndPort_seedServers_begin_"
+        "seedServers_end}",
+        "ConnectionString_forReplicaSet_rsName_std_vector_HostAndPort_seedServers_begin_seedServers_end"_attr =
+            ConnectionString::forReplicaSet(
+                rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end())));
 }
 
 ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-StatusWith<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
+SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
     return _rsMonitor->getHostOrRefresh(readPref, maxWait);
 }
 
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHostsWithMaxWait(
+    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
+    return _rsMonitor->getHostsOrRefresh(readPref, maxWait);
+}
+
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
                                                           const ReadPreferenceSetting& readPref) {
-    auto clock = opCtx->getServiceContext()->getFastClockSource();
-    auto startDate = clock->now();
-    while (true) {
-        const auto interruptStatus = opCtx->checkForInterruptNoAssert();
-        if (!interruptStatus.isOK()) {
-            return interruptStatus;
-        }
-        const auto host = _rsMonitor->getHostOrRefresh(readPref, Milliseconds::zero());
-        if (host.getStatus() != ErrorCodes::FailedToSatisfyReadPreference) {
-            return host;
-        }
-        // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
-        // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
-        // See comment in remote_command_targeter.h for details.
-        if (clock->now() - startDate > Seconds{20}) {
-            return host;
-        }
-        sleepFor(Milliseconds{500});
+    const auto interruptStatus = opCtx->checkForInterruptNoAssert();
+    if (!interruptStatus.isOK()) {
+        return interruptStatus;
     }
+
+    // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
+    // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
+    // See comment in remote_command_targeter.h for details.
+    return _rsMonitor
+        ->getHostOrRefresh(readPref,
+                           std::min<Milliseconds>(opCtx->getRemainingMaxTimeMillis(), Seconds(20)))
+        .getNoThrow(opCtx);
 }
 
 void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host, const Status& status) {

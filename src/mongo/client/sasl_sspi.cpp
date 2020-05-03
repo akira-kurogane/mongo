@@ -1,49 +1,47 @@
-/*
- * Copyright (C) 2013 10gen, Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #ifdef _WIN32
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
-#define SECURITY_WIN32 1  // Required for SSPI support.
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
-#include <sspi.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/client/sasl_sspi_options.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 extern "C" int plain_client_plug_init(const sasl_utils_t* utils,
@@ -51,12 +49,6 @@ extern "C" int plain_client_plug_init(const sasl_utils_t* utils,
                                       int* out_version,
                                       sasl_client_plug_t** pluglist,
                                       int* plugcount);
-
-extern "C" int crammd5_client_plug_init(const sasl_utils_t* utils,
-                                        int maxversion,
-                                        int* out_version,
-                                        sasl_client_plug_t** pluglist,
-                                        int* plugcount);
 
 namespace mongo {
 namespace {
@@ -66,6 +58,10 @@ namespace {
 
 // The SSPI plugin implements the GSSAPI interface.
 char sspiPluginName[] = "GSSAPI";
+
+void saslSetError(const sasl_utils_t* utils, const std::string& msg) {
+    utils->seterror(utils->conn, 0, "%s", msg.c_str());
+}
 
 // This structure is passed through each callback to us by the sasl glue code.
 struct SspiConnContext {
@@ -93,17 +89,17 @@ void HandleLastError(const sasl_utils_t* utils, DWORD errCode, const char* msg) 
     char* err;
     if (!FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                             FORMAT_MESSAGE_IGNORE_INSERTS,
-                        NULL,
+                        nullptr,
                         errCode,
                         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                         (LPSTR)&err,
                         0,
-                        NULL)) {
+                        nullptr)) {
         return;
     }
 
-    std::string buffer(mongoutils::str::stream() << "SSPI: " << msg << ": " << err);
-    utils->seterror(utils->conn, 0, "%s", buffer.c_str());
+    std::string buffer(str::stream() << "SSPI: " << msg << ": " << err);
+    saslSetError(utils, buffer);
     LocalFree(err);
 }
 
@@ -120,7 +116,7 @@ int sspiClientMechNew(void* glob_context,
     int ret = cparams->utils->getcallback(
         cparams->utils->conn, SASL_CB_USER, (sasl_callback_ft*)&user_cb, &user_context);
     if (ret != SASL_OK) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "getcallback user failed");
+        saslSetError(cparams->utils, "getcallback user failed");
         return ret;
     }
     const char* rawUserPlusRealm;
@@ -128,7 +124,7 @@ int sspiClientMechNew(void* glob_context,
 
     ret = user_cb(user_context, SASL_CB_USER, &rawUserPlusRealm, &rawUserPlusRealmLength);
     if (ret != SASL_OK) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "user callback failed");
+        saslSetError(cparams->utils, "user callback failed");
         return ret;
     }
     std::string userPlusRealm(rawUserPlusRealm, rawUserPlusRealmLength);
@@ -136,7 +132,7 @@ int sspiClientMechNew(void* glob_context,
     // Parse out the username and realm.
     size_t atSign = userPlusRealm.find('@');
     if (atSign == std::string::npos) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "no @REALM found in username");
+        saslSetError(cparams->utils, "no @REALM found in username");
         return SASL_BADPARAM;
     }
     std::string utf8Username(userPlusRealm, 0, atSign);
@@ -154,10 +150,10 @@ int sspiClientMechNew(void* glob_context,
 
     // Fetch password, if available.
     authIdentity.PasswordLength = 0;
-    authIdentity.Password = NULL;
+    authIdentity.Password = nullptr;
     std::wstring utf16Password;
 
-    sasl_secret_t* password = NULL;
+    sasl_secret_t* password = nullptr;
     sasl_getsecret_t* pass_cb;
     void* pass_context;
     ret = cparams->utils->getcallback(
@@ -178,15 +174,16 @@ int sspiClientMechNew(void* glob_context,
     std::unique_ptr<SspiConnContext> pcctx(new SspiConnContext());
     pcctx->userPlusRealm = userPlusRealm;
     TimeStamp ignored;
-    SECURITY_STATUS status = AcquireCredentialsHandleW(NULL,  // principal
-                                                       const_cast<LPWSTR>(L"kerberos"),
-                                                       SECPKG_CRED_OUTBOUND,
-                                                       NULL,           // LOGON id
-                                                       &authIdentity,  // auth data
-                                                       NULL,           // get key fn
-                                                       NULL,           // get key arg
-                                                       &pcctx->cred,
-                                                       &ignored);
+    SECURITY_STATUS status =
+        AcquireCredentialsHandleW(nullptr,  // principal
+                                  const_cast<LPWSTR>(L"kerberos"),
+                                  SECPKG_CRED_OUTBOUND,
+                                  nullptr,                                          // LOGON id
+                                  authIdentity.Password ? &authIdentity : nullptr,  // auth data
+                                  nullptr,                                          // get key fn
+                                  nullptr,                                          // get key arg
+                                  &pcctx->cred,
+                                  &ignored);
     if (status != SEC_E_OK) {
         HandleLastError(cparams->utils, status, "AcquireCredentialsHandle");
         return SASL_FAIL;
@@ -195,8 +192,8 @@ int sspiClientMechNew(void* glob_context,
     pcctx->haveCred = true;
 
     // Compose target name token. First, verify that a hostname has been provided.
-    if (cparams->serverFQDN == NULL || strlen(cparams->serverFQDN) == 0) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "SSPI: no serverFQDN");
+    if (cparams->serverFQDN == nullptr || strlen(cparams->serverFQDN) == 0) {
+        saslSetError(cparams->utils, "SSPI: no serverFQDN");
         return SASL_FAIL;
     }
 
@@ -207,18 +204,14 @@ int sspiClientMechNew(void* glob_context,
         // PTR records should point to the canonical name. If there's more than one, warn and
         // arbitrarily use the last entry.
         if (fqdns.size() > 1) {
-            std::stringstream ss;
-            ss << "Found multiple PTR records while performing reverse DNS: [ ";
-            for (const std::string& fqdn : fqdns) {
-                ss << fqdn << " ";
-            }
-            ss << "]";
-            warning() << ss.str();
+            LOGV2_WARNING(23933,
+                          "Found multiple PTR records while performing reverse DNS",
+                          "records"_attr = fqdns);
         }
         canonName = std::move(fqdns.back());
         fqdns.pop_back();
     } else if (saslSSPIGlobalParams.canonicalization != HostnameCanonicalizationMode::kNone) {
-        warning() << "Was unable to acquire an FQDN";
+        LOGV2_WARNING(23934, "Was unable to acquire an FQDN");
     }
 
     pcctx->nameToken = toWideString(cparams->service) + L'/' + toWideString(canonName.c_str());
@@ -250,9 +243,9 @@ int sspiValidateServerSecurityLayerOffering(SspiConnContext* pcctx,
 
     wrapBufs[1].cbBuffer = 0;
     wrapBufs[1].BufferType = SECBUFFER_DATA;
-    wrapBufs[1].pvBuffer = NULL;
+    wrapBufs[1].pvBuffer = nullptr;
 
-    SECURITY_STATUS status = DecryptMessage(&pcctx->ctx, &wrapBufDesc, 0, NULL);
+    SECURITY_STATUS status = DecryptMessage(&pcctx->ctx, &wrapBufDesc, 0, nullptr);
     if (status != SEC_E_OK) {
         HandleLastError(cparams->utils, status, "DecryptMessage");
         return SASL_FAIL;
@@ -261,15 +254,14 @@ int sspiValidateServerSecurityLayerOffering(SspiConnContext* pcctx,
     // Validate the server's plaintext message.
     // Length (as per RFC 4752)
     if (wrapBufs[1].cbBuffer < 4) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "SSPI: server message is too short");
+        saslSetError(cparams->utils, "SSPI: server message is too short");
         return SASL_FAIL;
     }
     // First bit of first byte set, indicating that the client may elect to use no
     // security layer. As a client we are uninterested in any of the other features the
     // server offers and thus we ignore the other bits.
     if (!(static_cast<char*>(wrapBufs[1].pvBuffer)[0] & 1)) {
-        cparams->utils->seterror(
-            cparams->utils->conn, 0, "SSPI: server does not support the required security layer");
+        saslSetError(cparams->utils, "SSPI: server does not support the required security layer");
         return SASL_BADAUTH;
     }
     return SASL_OK;
@@ -364,7 +356,7 @@ int sspiClientMechStep(void* conn_context,
                        unsigned* clientoutlen,
                        sasl_out_params_t* oparams) throw() {
     SspiConnContext* pcctx = static_cast<SspiConnContext*>(conn_context);
-    *clientout = NULL;
+    *clientout = nullptr;
     *clientoutlen = 0;
 
     if (pcctx->authComplete) {
@@ -391,36 +383,36 @@ int sspiClientMechStep(void* conn_context,
     outbuf.ulVersion = SECBUFFER_VERSION;
     outbuf.cBuffers = 1;
     outbuf.pBuffers = outBufs;
-    outBufs[0].pvBuffer = NULL;
+    outBufs[0].pvBuffer = nullptr;
     outBufs[0].cbBuffer = 0;
     outBufs[0].BufferType = SECBUFFER_TOKEN;
 
     ULONG contextAttr = 0;
     SECURITY_STATUS status =
         InitializeSecurityContextW(&pcctx->cred,
-                                   pcctx->haveCtxt ? &pcctx->ctx : NULL,
+                                   pcctx->haveCtxt ? &pcctx->ctx : nullptr,
                                    const_cast<wchar_t*>(pcctx->nameToken.c_str()),
                                    ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_MUTUAL_AUTH,
                                    0,
                                    SECURITY_NETWORK_DREP,
-                                   (pcctx->haveCtxt ? &inbuf : NULL),
+                                   (pcctx->haveCtxt ? &inbuf : nullptr),
                                    0,
                                    &pcctx->ctx,
                                    &outbuf,
                                    &contextAttr,
-                                   NULL);
+                                   nullptr);
 
     if (status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED) {
         HandleLastError(cparams->utils, status, "InitializeSecurityContext");
         return SASL_FAIL;
     }
 
-    ON_BLOCK_EXIT(FreeContextBuffer, outbuf.pBuffers[0].pvBuffer);
+    ON_BLOCK_EXIT([&] { FreeContextBuffer(outbuf.pBuffers[0].pvBuffer); });
     pcctx->haveCtxt = true;
 
     if (status == SEC_E_OK) {
         // Send back nothing and wait for the server to reply with the security capabilities
-        *clientout = NULL;
+        *clientout = nullptr;
         *clientoutlen = 0;
         pcctx->authComplete = true;
         return SASL_CONTINUE;
@@ -444,19 +436,18 @@ sasl_client_plug_t sspiClientPlugin[] = {
     {sspiPluginName, /* mechanism name */
      112, /* TODO: (taken from gssapi) best mech additional security layer strength factor */
      SASL_SEC_NOPLAINTEXT /* eam: copied from gssapi */
-         |
-         SASL_SEC_NOACTIVE | SASL_SEC_NOANONYMOUS | SASL_SEC_MUTUAL_AUTH |
+         | SASL_SEC_NOACTIVE | SASL_SEC_NOANONYMOUS | SASL_SEC_MUTUAL_AUTH |
          SASL_SEC_PASS_CREDENTIALS, /* security_flags */
      SASL_FEAT_NEEDSERVERFQDN | SASL_FEAT_WANT_CLIENT_FIRST | SASL_FEAT_ALLOWS_PROXY,
-     NULL, /* required prompt ids, NULL = user/pass only */
-     NULL, /* global state for mechanism */
+     nullptr, /* required prompt ids, nullptr = user/pass only */
+     nullptr, /* global state for mechanism */
      sspiClientMechNew,
      sspiClientMechStep,
      sspiClientMechDispose,
      sspiClientMechFree,
-     NULL,
-     NULL,
-     NULL}};
+     nullptr,
+     nullptr,
+     nullptr}};
 
 int sspiClientPluginInit(const sasl_utils_t* utils,
                          int max_version,
@@ -464,7 +455,7 @@ int sspiClientPluginInit(const sasl_utils_t* utils,
                          sasl_client_plug_t** pluglist,
                          int* plugcount) {
     if (max_version < SASL_CLIENT_PLUG_VERSION) {
-        utils->seterror(utils->conn, 0, "Wrong SSPI version");
+        saslSetError(utils, "Wrong SSPI version");
         return SASL_BADVERS;
     }
 
@@ -486,24 +477,8 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SaslSspiClientPlugin,
     int ret = sasl_client_add_plugin(sspiPluginName, sspiClientPluginInit);
     if (SASL_OK != ret) {
         return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "could not add SASL Client SSPI plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
-    }
-
-    return Status::OK();
-}
-MONGO_INITIALIZER_WITH_PREREQUISITES(SaslCramClientPlugin,
-                                     ("CyrusSaslAllocatorsAndMutexes", "CyrusSaslClientContext"))
-(InitializerContext*) {
-    int ret = sasl_client_add_plugin("CRAMMD5", crammd5_client_plug_init);
-    if (SASL_OK != ret) {
-        return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "Could not add SASL Client CRAM-MD5 plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
+                      str::stream() << "could not add SASL Client SSPI plugin " << sspiPluginName
+                                    << ": " << sasl_errstring(ret, nullptr, nullptr));
     }
 
     return Status::OK();
@@ -515,10 +490,8 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SaslPlainClientPlugin,
     int ret = sasl_client_add_plugin("PLAIN", plain_client_plug_init);
     if (SASL_OK != ret) {
         return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "Could not add SASL Client PLAIN plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
+                      str::stream() << "Could not add SASL Client PLAIN plugin " << sspiPluginName
+                                    << ": " << sasl_errstring(ret, nullptr, nullptr));
     }
 
     return Status::OK();

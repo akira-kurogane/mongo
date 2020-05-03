@@ -1,22 +1,34 @@
-#!/usr/bin/env python2
-# Copyright (C) 2017 MongoDB Inc.
+#!/usr/bin/env python3
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# Copyright (C) 2018-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 # pylint: disable=too-many-lines
 """Test cases for IDL binder."""
-
-from __future__ import absolute_import, print_function, unicode_literals
 
 import textwrap
 import unittest
@@ -37,7 +49,7 @@ INDENT_SPACE_COUNT = 4
 
 
 def fill_spaces(count):
-    # type: (int) -> unicode
+    # type: (int) -> str
     """Fill a string full of spaces."""
     fill = ''
     for _ in range(count * INDENT_SPACE_COUNT):
@@ -47,7 +59,7 @@ def fill_spaces(count):
 
 
 def indent_text(count, unindented_text):
-    # type: (int, unicode) -> unicode
+    # type: (int, str) -> str
     """Indent each line of a multi-line string."""
     lines = unindented_text.splitlines()
     fill = fill_spaces(count)
@@ -56,6 +68,8 @@ def indent_text(count, unindented_text):
 
 class TestBinder(testcase.IDLTestcase):
     """Test cases for the IDL binder."""
+
+    # pylint: disable=too-many-public-methods
 
     def test_empty(self):
         # type: () -> None
@@ -72,7 +86,7 @@ class TestBinder(testcase.IDLTestcase):
             cpp_includes:
                 - 'bar'
                 - 'foo'"""))
-        self.assertEquals(spec.globals.cpp_namespace, "something")
+        self.assertEqual(spec.globals.cpp_namespace, "something")
         self.assertListEqual(spec.globals.cpp_includes, ['bar', 'foo'])
 
     def test_type_positive(self):
@@ -550,7 +564,8 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Test array as name
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 array<foo>:
                     description: foo
@@ -659,7 +674,8 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Test field of a struct type with a default
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -676,7 +692,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_STRUCT)
 
         # Test array as field name
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -686,7 +703,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_ARRAY_NOT_VALID_TYPE)
 
         # Test recursive array as field type
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -696,7 +714,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_BAD_ARRAY_TYPE_NAME)
 
         # Test inherited default with array
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -727,7 +746,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_ARRAY_NO_DEFAULT)
 
         # Test bindata with default
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -739,7 +759,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_BAD_BINDATA_DEFAULT)
 
         # Test default and optional for the same field
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -750,6 +771,36 @@ class TestBinder(testcase.IDLTestcase):
                             default: 42
                             optional: true
             """), idl.errors.ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL)
+
+        # Test duplicate comparison order
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                strict: false
+                generate_comparison_operators: true
+                fields:
+                    foo:
+                        type: string
+                        comparison_order: 1
+                    bar:
+                        type: string
+                        comparison_order: 1
+            """), idl.errors.ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER)
+
+        # Test field marked with non_const_getter in immutable struct
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+            structs:
+                foo:
+                    description: foo
+                    immutable: true
+                    fields:
+                        foo:
+                            type: string
+                            non_const_getter: true
+            """), idl.errors.ERROR_ID_NON_CONST_GETTER_IN_IMMUTABLE_STRUCT)
 
     def test_ignored_field_negative(self):
         # type: () -> None
@@ -829,7 +880,8 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Chaining with strict struct
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -839,7 +891,8 @@ class TestBinder(testcase.IDLTestcase):
         """), idl.errors.ERROR_ID_CHAINED_NO_TYPE_STRICT)
 
         # Non-'any' type as chained type
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -849,7 +902,8 @@ class TestBinder(testcase.IDLTestcase):
         """), idl.errors.ERROR_ID_CHAINED_TYPE_WRONG_BSON_TYPE)
 
         # Chaining and fields only with same name
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -861,7 +915,8 @@ class TestBinder(testcase.IDLTestcase):
         """), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
 
         # Non-existent chained type
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -873,7 +928,8 @@ class TestBinder(testcase.IDLTestcase):
         """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
         # A regular field as a chained type
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -884,7 +940,8 @@ class TestBinder(testcase.IDLTestcase):
         """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
         # Array of chained types
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             bar1:
                 description: foo
@@ -931,8 +988,9 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # A struct with only chaining
-        self.assert_bind(test_preamble + indent_text(1,
-                                                     textwrap.dedent("""
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
             bar1:
                 description: foo
                 strict: true
@@ -941,8 +999,9 @@ class TestBinder(testcase.IDLTestcase):
         """)))
 
         # Chaining struct's fields and explicit fields
-        self.assert_bind(test_preamble + indent_text(1,
-                                                     textwrap.dedent("""
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
             bar1:
                 description: foo
                 strict: true
@@ -953,8 +1012,9 @@ class TestBinder(testcase.IDLTestcase):
         """)))
 
         # Chained types and structs
-        self.assert_bind(test_preamble + indent_text(1,
-                                                     textwrap.dedent("""
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -967,8 +1027,9 @@ class TestBinder(testcase.IDLTestcase):
         """)))
 
         # Non-strict chained struct
-        self.assert_bind(test_preamble + indent_text(1,
-                                                     textwrap.dedent("""
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -976,6 +1037,46 @@ class TestBinder(testcase.IDLTestcase):
                     chained2: alias
                 fields:
                     foo1: string
+        """)))
+
+        # Inline Chained struct with strict true
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
+            bar1:
+                description: foo
+                strict: true
+                fields:
+                    field1: string
+
+            foobar:
+                description: foo
+                strict: false
+                inline_chained_structs: true
+                chained_structs:
+                    bar1: alias
+                fields:
+                    f1: string
+
+        """)))
+
+        # Inline Chained struct with strict true and inline_chained_structs defaulted
+        self.assert_bind(test_preamble + indent_text(
+            1,
+            textwrap.dedent("""
+            bar1:
+                description: foo
+                strict: true
+                fields:
+                    field1: string
+
+            foobar:
+                description: foo
+                strict: false
+                chained_structs:
+                    bar1: alias
+                fields:
+                    f1: string
         """)))
 
     def test_chained_struct_negative(self):
@@ -1016,8 +1117,10 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Non-existing chained struct
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: true
@@ -1026,8 +1129,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
         # Type as chained struct
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: true
@@ -1036,8 +1141,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_STRUCT_NOT_FOUND)
 
         # Struct as chained type
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -1046,8 +1153,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_TYPE_NOT_FOUND)
 
         # Duplicated field names across chained struct's fields and fields
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -1058,8 +1167,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
 
         # Duplicated field names across chained structs
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -1069,8 +1180,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
 
         # Chained struct with strict true
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: true
@@ -1080,6 +1193,7 @@ class TestBinder(testcase.IDLTestcase):
             foobar:
                 description: foo
                 strict: false
+                inline_chained_structs: false
                 chained_structs:
                     bar1: alias
                 fields:
@@ -1088,8 +1202,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_NO_NESTED_STRUCT_STRICT)
 
         # Chained struct with nested chained struct
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -1107,8 +1223,10 @@ class TestBinder(testcase.IDLTestcase):
         """)), idl.errors.ERROR_ID_CHAINED_NO_NESTED_CHAINED)
 
         # Chained struct with nested chained type
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + indent_text(
+                1,
+                textwrap.dedent("""
             bar1:
                 description: foo
                 strict: false
@@ -1233,24 +1351,14 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Test array of enums
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
         structs:
             foo1:
                 description: foo
                 fields:
                     foo1: array<foo>
             """), idl.errors.ERROR_ID_NO_ARRAY_ENUM)
-
-        # Test default
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
-        structs:
-            foo1:
-                description: foo
-                fields:
-                    foo1:
-                        type: foo
-                        default: 1
-            """), idl.errors.ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_ENUM)
 
     def test_command_positive(self):
         # type: () -> None
@@ -1295,7 +1403,8 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # Commands cannot be fields in other commands
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1311,7 +1420,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_FIELD_NO_COMMAND)
 
         # Commands cannot be fields in structs
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1327,7 +1437,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_FIELD_NO_COMMAND)
 
         # Commands cannot have a field as the same name
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1428,7 +1539,8 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         # A struct
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             structs:
                 foo:
                     description: foo
@@ -1439,7 +1551,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_STRUCT_NO_DOC_SEQUENCE)
 
         # A non-array type
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1451,7 +1564,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_ARRAY)
 
         # An array of a scalar
-        self.assert_bind_fail(test_preamble2 + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble2 + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1463,7 +1577,8 @@ class TestBinder(testcase.IDLTestcase):
             """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT)
 
         # An array of 'any'
-        self.assert_bind_fail(test_preamble2 + textwrap.dedent("""
+        self.assert_bind_fail(
+            test_preamble2 + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
@@ -1473,6 +1588,402 @@ class TestBinder(testcase.IDLTestcase):
                             type: array<string>
                             supports_doc_sequence: true
             """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT)
+
+    def test_command_type_positive(self):
+        # type: () -> None
+        """Positive command custom type test cases."""
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+        """)
+
+        # string
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                strict: true
+                namespace: type
+                type: string
+                fields:
+                    field1: string
+            """))
+
+        # array of string
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                strict: true
+                namespace: type
+                type: array<string>
+                fields:
+                    field1: string
+            """))
+
+    def test_command_type_negative(self):
+        # type: () -> None
+        """Negative command type test cases."""
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+        """)
+
+        # supports_doc_sequence must be a bool
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                namespace: type
+                type: int
+                fields:
+                    field1: string
+            """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+    def test_server_parameter_positive(self):
+        # type: () -> None
+        """Positive server parameter test cases."""
+
+        # server parameter with storage.
+        # Also try valid set_at values.
+        for set_at in ["startup", "runtime", "[ startup, runtime ]"]:
+            self.assert_bind(
+                textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: %s
+                    description: bar
+                    cpp_varname: baz
+                """ % (set_at)))
+
+        # server parameter with storage and optional fields.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_varname: baz
+                default: 42
+                on_update: buzz
+                validator:
+                    gt: 0
+                    gte: 1
+                    lte: 999
+                    lt: 1000
+                    callback: qux
+            """))
+
+        # Bound setting with arbitrary expression default and validators.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_varname: baz
+                default:
+                    expr: 'kDefaultValue'
+                validator:
+                    gte:
+                        expr: 'kMinimumValue'
+                        is_constexpr: true
+                    lte:
+                        expr: 'kMaximumValue'
+                        is_constexpr: false
+                    gt: 0
+                    lt: 255
+            """))
+
+        # Specialized SCPs.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_class: baz
+        """))
+
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_class:
+                    name: baz
+        """))
+
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_class:
+                    name: baz
+                    data: bling
+                    override_set: true
+                    override_ctor: false
+        """))
+
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_class: baz
+                condition: { expr: "true" }
+                redact: true
+                test_only: true
+                deprecated_name: bling
+        """))
+
+        # Default without data.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_class: baz
+                default: blong
+            """))
+
+    def test_server_parameter_negative(self):
+        # type: () -> None
+        """Negative server parameter test cases."""
+
+        # Invalid set_at values.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: shutdown
+                    description: bar
+                    cpp_varname: baz
+            """), idl.errors.ERROR_ID_BAD_SETAT_SPECIFIER)
+
+        # Mix of specialized with bound storage.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: startup
+                    description: bar
+                    cpp_class: baz
+                    cpp_varname: bling
+            """), idl.errors.ERROR_ID_SERVER_PARAMETER_INVALID_ATTR)
+
+    def test_config_option_positive(self):
+        # type: () -> None
+        """Posative config option test cases."""
+
+        # Every field.
+        self.assert_bind(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    short_name: bar
+                    deprecated_name: baz
+                    deprecated_short_name: qux
+                    description: comment
+                    section: here
+                    arg_vartype: String
+                    cpp_varname: gStringVal
+                    conflicts: bling
+                    requires: blong
+                    hidden: false
+                    default: one
+                    implicit: two
+                    duplicate_behavior: append
+                    source: yaml
+                    positional: 1-2
+                    validator:
+                        gt: 0
+                        lt: 100
+                        gte: 1
+                        lte: 99
+                        callback: doSomething
+            """))
+
+        # Required fields only.
+        self.assert_bind(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: comment
+                    arg_vartype: Switch
+                    source: yaml
+            """))
+
+        # List and enum variants.
+        self.assert_bind(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    deprecated_name: [ baz, baz ]
+                    deprecated_short_name: [ bling, blong ]
+                    description: comment
+                    arg_vartype: StringVector
+                    source: [ cli, ini, yaml ]
+                    conflicts: [ a, b, c ]
+                    requires: [ d, e, f ]
+                    hidden: true
+                    duplicate_behavior: overwrite
+            """))
+
+        # Positional variants.
+        for positional in ['1', '1-', '-2', '1-2']:
+            self.assert_bind(
+                textwrap.dedent("""
+                configs:
+                    foo:
+                        short_name: foo
+                        description: comment
+                        arg_vartype: Bool
+                        source: cli
+                        positional: %s
+                """ % (positional)))
+            # With implicit short name.
+            self.assert_bind(
+                textwrap.dedent("""
+                configs:
+                    foo:
+                        description: comment
+                        arg_vartype: Bool
+                        source: cli
+                        positional: %s
+                """ % (positional)))
+
+        # Expressions in default, implicit, and validators.
+        self.assert_bind(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: bar
+                    arg_vartype: String
+                    source: cli
+                    default: { expr: kDefault, is_constexpr: true }
+                    implicit: { expr: kImplicit, is_constexpr: false }
+                    validator:
+                        gte: { expr: kMinimum }
+                        lte: { expr: kMaximum }
+            """))
+
+    def test_config_option_negative(self):
+        # type: () -> None
+        """Negative config option test cases."""
+
+        # Invalid source.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: comment
+                    arg_vartype: Long
+                    source: json
+            """), idl.errors.ERROR_ID_BAD_SOURCE_SPECIFIER)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: comment
+                    arg_vartype: StringMap
+                    source: [ cli, yaml ]
+                    duplicate_behavior: guess
+            """), idl.errors.ERROR_ID_BAD_DUPLICATE_BEHAVIOR_SPECIFIER)
+
+        for positional in ["x", "1-2-3", "-2-", "1--3"]:
+            self.assert_bind_fail(
+                textwrap.dedent("""
+                configs:
+                    foo:
+                        description: comment
+                        arg_vartype: String
+                        source: cli
+                        positional: %s
+                """ % (positional)), idl.errors.ERROR_ID_BAD_NUMERIC_RANGE)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: comment
+                    short_name: "bar.baz"
+                    arg_vartype: Bool
+                    source: cli
+            """), idl.errors.ERROR_ID_INVALID_SHORT_NAME)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    description: comment
+                    short_name: bar
+                    deprecated_short_name: "baz.qux"
+                    arg_vartype: Long
+                    source: cli
+            """), idl.errors.ERROR_ID_INVALID_SHORT_NAME)
+
+        # dottedName is not valid as a shortName.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                "foo.bar":
+                    description: comment
+                    arg_vartype: String
+                    source: cli
+                    positional: 1
+            """), idl.errors.ERROR_ID_MISSING_SHORTNAME_FOR_POSITIONAL)
+
+        # Invalid shortname using boost::po format directly.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                foo:
+                    short_name: "foo,f"
+                    arg_vartype: Switch
+                    description: comment
+                    source: cli
+            """), idl.errors.ERROR_ID_INVALID_SHORT_NAME)
+
+        # Invalid single names, must be single alpha char.
+        for name in ["foo", "1", ".", ""]:
+            self.assert_bind_fail(
+                textwrap.dedent("""
+                configs:
+                    foo:
+                        single_name: "%s"
+                        arg_vartype: Switch
+                        description: comment
+                        source: cli
+            """ % (name)), idl.errors.ERROR_ID_INVALID_SINGLE_NAME)
+
+        # Single names require a valid short name.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            configs:
+                "foo.bar":
+                    single_name: f
+                    arg_vartype: Switch
+                    description: comment
+                    source: cli
+            """), idl.errors.ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME)
 
 
 if __name__ == '__main__':

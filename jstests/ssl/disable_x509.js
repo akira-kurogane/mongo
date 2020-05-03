@@ -3,7 +3,6 @@
 var CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=client";
 
 var conn = MongoRunner.runMongod({
-    smallfiles: "",
     auth: "",
     sslMode: "requireSSL",
     sslPEMKeyFile: "jstests/libs/server.pem",
@@ -43,4 +42,7 @@ if (cmdOut.ok) {
 
     assert(!external.auth({user: CLIENT_USER, mechanism: 'MONGODB-X509'}),
            "authentication with disabled auth mechanism succeeded");
+    MongoRunner.stopMongod(conn);
+} else {
+    MongoRunner.stopMongod(conn);
 }

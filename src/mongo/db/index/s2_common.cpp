@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -105,5 +106,51 @@ BSONObj S2CellIdToIndexKey(const S2CellId& cellId, S2IndexVersion indexVersion) 
     b.append("", cellId.ToString());
     // Return a copy so its buffer size fits the object size.
     return b.obj().copy();
+}
+
+void S2CellIdToIndexKeyStringAppend(const S2CellId& cellId,
+                                    S2IndexVersion indexVersion,
+                                    const std::vector<KeyString::HeapBuilder>& keysToAdd,
+                                    std::vector<KeyString::HeapBuilder>* out,
+                                    KeyString::Version keyStringVersion,
+                                    Ordering ordering) {
+    // The range of an unsigned long long is
+    // |-----------------|------------------|
+    // 0                2^32               2^64 - 1
+    // 000...           100...             111...
+    // The range of a signed long long is
+    // |-----------------|------------------|
+    // -2^63             0                 2^63 - 1
+    // 100...           000...             011...
+    // S2 gives us an unsigned long long, and we need
+    // to use signed long longs for the index.
+    //
+    // The relative ordering may be changed with unsigned
+    // numbers around 2^32 being converted to signed
+    //
+    // However, because a single cell cannot span over
+    // more than once face, individual intervals will
+    // never cross that threshold. Thus, scans will still
+    // produce the same results.
+    if (indexVersion >= S2_INDEX_VERSION_3) {
+        if (keysToAdd.empty()) {
+            out->emplace_back(keyStringVersion, ordering);
+            out->back().appendNumberLong(cellId.id());
+        }
+        for (const auto& ks : keysToAdd) {
+            out->emplace_back(ks);
+            out->back().appendNumberLong(cellId.id());
+        }
+        return;
+    }
+
+    if (keysToAdd.empty()) {
+        out->emplace_back(keyStringVersion, ordering);
+        out->back().appendString(cellId.ToString());
+    }
+    for (const auto& ks : keysToAdd) {
+        out->emplace_back(ks);
+        out->back().appendString(cellId.ToString());
+    }
 }
 }  // namespace mongo

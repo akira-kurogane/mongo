@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -28,134 +28,135 @@
 #include "test_util.h"
 
 /*
- * JIRA ticket reference: WT-2535
- * Test case description: This is a test case that looks for lost updates to
- * a single record. That is multiple threads each do the same number of read
- * modify write operations on a single record. At the end verify that the
- * data contains the expected value.
+ * JIRA ticket reference: WT-2535 Test case description: This is a test case that looks for lost
+ * updates to a single record. That is multiple threads each do the same number of read modify write
+ * operations on a single record. At the end verify that the data contains the expected value.
  * Failure mode: Check that the data is correct at the end of the run.
  */
 
 void *thread_insert_race(void *);
 
+static uint64_t ready_counter;
+
 int
 main(int argc, char *argv[])
 {
-	TEST_OPTS *opts, _opts;
-	WT_CURSOR *c;
-	WT_SESSION *session;
-	clock_t ce, cs;
-	pthread_t id[100];
-	uint64_t current_value;
-	int i;
+    TEST_OPTS *opts, _opts;
+    WT_CURSOR *c;
+    WT_SESSION *session;
+    clock_t ce, cs;
+    pthread_t id[100];
+    uint64_t current_value;
+    int i;
 
-	/* Ignore unless requested */
-	if (!testutil_is_flag_set("TESTUTIL_ENABLE_LONG_TESTS"))
-		return (EXIT_SUCCESS);
+    /* Bypass this test for valgrind */
+    if (testutil_is_flag_set("TESTUTIL_BYPASS_VALGRIND"))
+        return (EXIT_SUCCESS);
 
-	opts = &_opts;
-	memset(opts, 0, sizeof(*opts));
-	opts->nthreads = 10;
-	opts->nrecords = 1000;
-	opts->table_type = TABLE_ROW;
-	testutil_check(testutil_parse_opts(argc, argv, opts));
-	testutil_make_work_dir(opts->home);
+    opts = &_opts;
+    memset(opts, 0, sizeof(*opts));
+    opts->nthreads = 20;
+    opts->nrecords = 100000;
+    opts->table_type = TABLE_ROW;
+    testutil_check(testutil_parse_opts(argc, argv, opts));
+    testutil_make_work_dir(opts->home);
 
-	testutil_check(wiredtiger_open(opts->home, NULL,
-	    "create,"
-	    "cache_size=2G,"
-	    "eviction=(threads_max=5),"
-	    "statistics=(fast)", &opts->conn));
-	testutil_check(
-	    opts->conn->open_session(opts->conn, NULL, NULL, &session));
-	testutil_check(session->create(session, opts->uri,
-	    "key_format=Q,value_format=Q,"
-	    "leaf_page_max=32k,"));
+    testutil_check(wiredtiger_open(opts->home, NULL,
+      "create,"
+      "cache_size=2G,"
+      "eviction=(threads_max=5),"
+      "statistics=(fast)",
+      &opts->conn));
+    testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
+    testutil_check(session->create(session, opts->uri,
+      "key_format=Q,value_format=Q,"
+      "leaf_page_max=32k,"));
 
-	/* Create the single record. */
-	testutil_check(
-	    session->open_cursor(session, opts->uri, NULL, NULL, &c));
-	c->set_key(c, 1);
-	c->set_value(c, 0);
-	testutil_check(c->insert(c));
-	testutil_check(c->close(c));
-	cs = clock();
-	for (i = 0; i < (int)opts->nthreads; ++i) {
-		testutil_check(
-		    pthread_create(&id[i], NULL, thread_insert_race, opts));
-	}
-	while (--i >= 0)
-		testutil_check(pthread_join(id[i], NULL));
-	testutil_check(
-	    session->open_cursor(session, opts->uri, NULL, NULL, &c));
-	c->set_key(c, 1);
-	testutil_check(c->search(c));
-	testutil_check(c->get_value(c, &current_value));
-	if (current_value != opts->nthreads * opts->nrecords) {
-		fprintf(stderr,
-		    "ERROR: didn't get expected number of changes\n");
-		fprintf(stderr, "got: %" PRIu64 ", expected: %" PRIu64 "\n",
-		    current_value, opts->nthreads * opts->nrecords);
-		return (EXIT_FAILURE);
-	}
-	testutil_check(session->close(session, NULL));
-	ce = clock();
-	printf("%" PRIu64 ": %.2lf\n",
-	    opts->nrecords, (ce - cs) / (double)CLOCKS_PER_SEC);
+    /* Create the single record. */
+    testutil_check(session->open_cursor(session, opts->uri, NULL, NULL, &c));
+    c->set_key(c, 1);
+    c->set_value(c, 0);
+    testutil_check(c->insert(c));
+    testutil_check(c->close(c));
+    cs = clock();
+    for (i = 0; i < (int)opts->nthreads; ++i) {
+        testutil_check(pthread_create(&id[i], NULL, thread_insert_race, opts));
+    }
+    while (--i >= 0)
+        testutil_check(pthread_join(id[i], NULL));
+    testutil_check(session->open_cursor(session, opts->uri, NULL, NULL, &c));
+    c->set_key(c, 1);
+    testutil_check(c->search(c));
+    testutil_check(c->get_value(c, &current_value));
+    if (current_value != opts->nthreads * opts->nrecords) {
+        fprintf(stderr, "ERROR: didn't get expected number of changes\n");
+        fprintf(stderr, "got: %" PRIu64 ", expected: %" PRIu64 "\n", current_value,
+          opts->nthreads * opts->nrecords);
+        return (EXIT_FAILURE);
+    }
+    testutil_check(session->close(session, NULL));
+    ce = clock();
+    printf("%" PRIu64 ": %.2lf\n", opts->nrecords, (ce - cs) / (double)CLOCKS_PER_SEC);
 
-	testutil_cleanup(opts);
-	return (EXIT_SUCCESS);
+    testutil_cleanup(opts);
+    return (EXIT_SUCCESS);
 }
 
 /*
- * Append to a table in a "racy" fashion - that is attempt to insert the
- * same record another thread is likely to also be inserting.
+ * Append to a table in a "racy" fashion - that is attempt to insert the same record another thread
+ * is likely to also be inserting.
  */
 void *
 thread_insert_race(void *arg)
 {
-	TEST_OPTS *opts;
-	WT_CONNECTION *conn;
-	WT_CURSOR *cursor;
-	WT_SESSION *session;
-	uint64_t i, value;
-	int ret;
+    TEST_OPTS *opts;
+    WT_CONNECTION *conn;
+    WT_CURSOR *cursor;
+    WT_DECL_RET;
+    WT_SESSION *session;
+    uint64_t i, value, ready_counter_local;
 
-	opts = (TEST_OPTS *)arg;
-	conn = opts->conn;
+    opts = (TEST_OPTS *)arg;
+    conn = opts->conn;
 
-	testutil_check(conn->open_session(conn, NULL, NULL, &session));
-	testutil_check(session->open_cursor(
-	    session, opts->uri, NULL, NULL, &cursor));
+    printf("Running insert thread\n");
 
-	printf("Running insert thread\n");
-	for (i = 0; i < opts->nrecords; ++i) {
-		testutil_check(
-		    session->begin_transaction(session, "isolation=snapshot"));
-		cursor->set_key(cursor, 1);
-		testutil_check(cursor->search(cursor));
-		testutil_check(cursor->get_value(cursor, &value));
-		cursor->set_key(cursor, 1);
-		cursor->set_value(cursor, value + 1);
-		if ((ret = cursor->update(cursor)) != 0) {
-			if (ret == WT_ROLLBACK) {
-				testutil_check(session->rollback_transaction(
-				    session, NULL));
-				i--;
-				continue;
-			}
-			printf("Error in update: %d\n", ret);
-		}
-		testutil_check(session->commit_transaction(session, NULL));
-		if (i % 10000 == 0) {
-			printf("insert: %" PRIu64 "\r", i);
-			fflush(stdout);
-		}
-	}
-	if (i > 10000)
-		printf("\n");
+    testutil_check(conn->open_session(conn, NULL, NULL, &session));
+    testutil_check(session->open_cursor(session, opts->uri, NULL, NULL, &cursor));
 
-	opts->running = false;
+    /* Wait until all the threads are ready to go. */
+    (void)__wt_atomic_add64(&ready_counter, 1);
+    for (;; __wt_yield()) {
+        WT_ORDERED_READ(ready_counter_local, ready_counter);
+        if (ready_counter_local >= opts->nthreads)
+            break;
+    }
 
-	return (NULL);
+    for (i = 0; i < opts->nrecords; ++i) {
+        testutil_check(session->begin_transaction(session, "isolation=snapshot"));
+        cursor->set_key(cursor, 1);
+        testutil_check(cursor->search(cursor));
+        testutil_check(cursor->get_value(cursor, &value));
+        cursor->set_key(cursor, 1);
+        cursor->set_value(cursor, value + 1);
+        if ((ret = cursor->update(cursor)) != 0) {
+            if (ret == WT_ROLLBACK) {
+                testutil_check(session->rollback_transaction(session, NULL));
+                i--;
+                continue;
+            }
+            printf("Error in update: %d\n", ret);
+        }
+        testutil_check(session->commit_transaction(session, NULL));
+        if (i % 10000 == 0) {
+            printf("insert: %" PRIu64 "\r", i);
+            fflush(stdout);
+        }
+    }
+    if (i > 10000)
+        printf("\n");
+
+    opts->running = false;
+
+    return (NULL);
 }

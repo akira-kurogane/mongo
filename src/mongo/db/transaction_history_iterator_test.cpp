@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,67 +46,87 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 using SessionHistoryIteratorTest = MockReplCoordServerFixture;
 
+namespace {
+
+/**
+ * Creates an OplogEntry with defaults specific to this test suite.
+ */
+repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
+                                BSONObj docToInsert,
+                                boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
+    return repl::OplogEntry(
+        opTime,                           // optime
+        0,                                // hash
+        repl::OpTypeEnum::kInsert,        // opType
+        NamespaceString("a.b"),           // namespace
+        boost::none,                      // uuid
+        boost::none,                      // fromMigrate
+        repl::OplogEntry::kOplogVersion,  // version
+        docToInsert,                      // o
+        boost::none,                      // o2
+        {},                               // sessionInfo
+        boost::none,                      // upsert
+        Date_t(),                         // wall clock time
+        boost::none,                      // statement id
+        prevWriteOpTimeInTransaction,     // optime of previous write within same transaction
+        boost::none,                      // pre-image optime
+        boost::none);                     // post-image optime
+}
+
+}  // namespace
+
 TEST_F(SessionHistoryIteratorTest, NormalHistory) {
-    repl::OplogEntry entry1(repl::OpTime(Timestamp(52, 345), 2),
-                            0,
-                            repl::OpTypeEnum::kInsert,
-                            NamespaceString("a.b"),
-                            BSON("x" << 30));
-    entry1.setPrevWriteTsInTransaction(Timestamp(0, 0));
+    auto entry1 = makeOplogEntry(repl::OpTime(Timestamp(52, 345), 2),  // optime
+                                 BSON("x" << 30),                      // o
+                                 repl::OpTime());  //  optime of previous write in transaction
+
     insertOplogEntry(entry1);
 
-    repl::OplogEntry entry2(repl::OpTime(Timestamp(67, 54801), 2),
-                            0,
-                            repl::OpTypeEnum::kInsert,
-                            NamespaceString("a.b"),
-                            BSON("y" << 50));
-    entry2.setPrevWriteTsInTransaction(Timestamp(52, 345));
+    auto entry2 = makeOplogEntry(
+        repl::OpTime(Timestamp(67, 54801), 2),  // optime
+        BSON("y" << 50),                        // o
+        repl::OpTime(Timestamp(52, 345), 2));   // optime of previous write in transaction
     insertOplogEntry(entry2);
 
     // Insert an unrelated entry in between
-    repl::OplogEntry entry3(repl::OpTime(Timestamp(83, 2), 2),
-                            0,
-                            repl::OpTypeEnum::kInsert,
-                            NamespaceString("a.b"),
-                            BSON("z" << 40));
-    entry3.setPrevWriteTsInTransaction(Timestamp(22, 67));
+    auto entry3 = makeOplogEntry(
+        repl::OpTime(Timestamp(83, 2), 2),    // optime
+        BSON("z" << 40),                      // o
+        repl::OpTime(Timestamp(22, 67), 2));  // optime of previous write in transaction
     insertOplogEntry(entry3);
 
-    repl::OplogEntry entry4(repl::OpTime(Timestamp(97, 2472), 2),
-                            0,
-                            repl::OpTypeEnum::kInsert,
-                            NamespaceString("a.b"),
-                            BSON("a" << 3));
-    entry4.setPrevWriteTsInTransaction(Timestamp(67, 54801));
+    auto entry4 = makeOplogEntry(
+        repl::OpTime(Timestamp(97, 2472), 2),    // optime
+        BSON("a" << 3),                          // o
+        repl::OpTime(Timestamp(67, 54801), 2));  // optime of previous write in transaction
     insertOplogEntry(entry4);
 
-    TransactionHistoryIterator iter(Timestamp(97, 2472));
+    TransactionHistoryIterator iter(repl::OpTime(Timestamp(97, 2472), 2));
 
     {
         ASSERT_TRUE(iter.hasNext());
         auto nextEntry = iter.next(opCtx());
-        ASSERT_EQ(Timestamp(97, 2472), nextEntry.getTimestamp());
+        ASSERT_EQ(repl::OpTime(Timestamp(97, 2472), 2), nextEntry.getOpTime());
         ASSERT_BSONOBJ_EQ(BSON("a" << 3), nextEntry.getObject());
     }
 
     {
         ASSERT_TRUE(iter.hasNext());
         auto nextEntry = iter.next(opCtx());
-        ASSERT_EQ(Timestamp(67, 54801), nextEntry.getTimestamp());
+        ASSERT_EQ(repl::OpTime(Timestamp(67, 54801), 2), nextEntry.getOpTime());
         ASSERT_BSONOBJ_EQ(BSON("y" << 50), nextEntry.getObject());
     }
 
     {
         ASSERT_TRUE(iter.hasNext());
         auto nextEntry = iter.next(opCtx());
-        ASSERT_EQ(Timestamp(52, 345), nextEntry.getTimestamp());
+        ASSERT_EQ(repl::OpTime(Timestamp(52, 345), 2), nextEntry.getOpTime());
         ASSERT_BSONOBJ_EQ(BSON("x" << 30), nextEntry.getObject());
     }
 
@@ -113,32 +134,29 @@ TEST_F(SessionHistoryIteratorTest, NormalHistory) {
 }
 
 TEST_F(SessionHistoryIteratorTest, StartAtZeroTSShouldNotBeAbleToIterate) {
-    repl::OplogEntry entry(repl::OpTime(Timestamp(67, 54801), 2),
-                           0,
-                           repl::OpTypeEnum::kInsert,
-                           NamespaceString("a.b"),
-                           BSON("y" << 50));
-    entry.setPrevWriteTsInTransaction(Timestamp(52, 345));
+    auto entry = makeOplogEntry(
+        repl::OpTime(Timestamp(67, 54801), 2),  // optime
+        BSON("y" << 50),                        // o
+        repl::OpTime(Timestamp(52, 345), 1));   // optime of previous write in transaction
     insertOplogEntry(entry);
 
-    TransactionHistoryIterator iter(Timestamp(0, 0));
+    TransactionHistoryIterator iter({});
     ASSERT_FALSE(iter.hasNext());
 }
 
 TEST_F(SessionHistoryIteratorTest, NextShouldAssertIfHistoryIsTruncated) {
-    repl::OplogEntry entry(repl::OpTime(Timestamp(67, 54801), 2),
-                           0,
-                           repl::OpTypeEnum::kInsert,
-                           NamespaceString("a.b"),
-                           BSON("y" << 50));
-    entry.setPrevWriteTsInTransaction(Timestamp(52, 345));
+    auto entry = makeOplogEntry(
+        repl::OpTime(Timestamp(67, 54801), 2),  // optime
+        BSON("y" << 50),                        // o
+        repl::OpTime(Timestamp(52, 345), 1));   // optime of previous write in transaction
     insertOplogEntry(entry);
 
-    TransactionHistoryIterator iter(Timestamp(67, 54801));
+    repl::OpTime opTime(Timestamp(67, 54801), 2);
+    TransactionHistoryIterator iter(opTime);
     ASSERT_TRUE(iter.hasNext());
 
     auto nextEntry = iter.next(opCtx());
-    ASSERT_EQ(Timestamp(67, 54801), nextEntry.getTimestamp());
+    ASSERT_EQ(opTime, nextEntry.getOpTime());
     ASSERT_BSONOBJ_EQ(BSON("y" << 50), nextEntry.getObject());
 
     ASSERT_TRUE(iter.hasNext());
@@ -147,14 +165,12 @@ TEST_F(SessionHistoryIteratorTest, NextShouldAssertIfHistoryIsTruncated) {
 }
 
 TEST_F(SessionHistoryIteratorTest, OplogInWriteHistoryChainWithMissingPrevTSShouldAssert) {
-    repl::OplogEntry entry(repl::OpTime(Timestamp(67, 54801), 2),
-                           0,
-                           repl::OpTypeEnum::kInsert,
-                           NamespaceString("a.b"),
-                           BSON("y" << 50));
+    auto entry = makeOplogEntry(repl::OpTime(Timestamp(67, 54801), 2),  // optime
+                                BSON("y" << 50),                        // o
+                                boost::none);  // optime of previous write in transaction
     insertOplogEntry(entry);
 
-    TransactionHistoryIterator iter(Timestamp(67, 54801));
+    TransactionHistoryIterator iter(repl::OpTime(Timestamp(67, 54801), 2));
     ASSERT_TRUE(iter.hasNext());
     ASSERT_THROWS_CODE(iter.next(opCtx()), AssertionException, ErrorCodes::FailedToParse);
 }

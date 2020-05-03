@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,13 +29,11 @@
 
 #pragma once
 
-#include <boost/container/flat_set.hpp>
 #include <initializer_list>
 #include <map>
 #include <set>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
@@ -50,11 +49,45 @@ class BSONObj;
  */
 template <typename T>
 class BSONComparatorInterfaceBase {
-    MONGO_DISALLOW_COPYING(BSONComparatorInterfaceBase);
+    BSONComparatorInterfaceBase(const BSONComparatorInterfaceBase&) = delete;
+    BSONComparatorInterfaceBase& operator=(const BSONComparatorInterfaceBase&) = delete;
 
 public:
     BSONComparatorInterfaceBase(BSONComparatorInterfaceBase&& other) = default;
     BSONComparatorInterfaceBase& operator=(BSONComparatorInterfaceBase&& other) = default;
+
+    /**
+     * Set of rules used in the comparison of BSON Objects and Elements.
+     */
+    enum ComparisonRules {
+        // Set this bit to consider the field name in element comparisons.
+        // if (kConsiderFieldName = 0) --> 'a: 1' == 'b: 1'
+        // if (kConsiderFieldName = 1) --> 'a: 1' != 'b: 1'
+        kConsiderFieldName = 1 << 0,
+
+        // Set this bit to ignore the element order in BSON Object comparisons. This field will
+        // remain set/unset for nested objects.
+        //
+        // e.g. if kIgnoreFieldOrder == 1, then the following objects are considered equal:
+        //
+        // obj1: {
+        //     a: {
+        //         b: 1,
+        //         c: 1
+        //     },
+        //     d: 1
+        // }
+        //
+        // obj2: {
+        //     d: 1,
+        //     a: {
+        //         c: 1,
+        //         b: 1,
+        //     },
+        // }
+        kIgnoreFieldOrder = 1 << 1,
+    };
+    using ComparisonRulesSet = uint32_t;
 
     /**
      * A deferred comparison between two objects of type T, which can be converted into a boolean
@@ -127,8 +160,6 @@ public:
 
     using Set = std::set<T, LessThan>;
 
-    using FlatSet = boost::container::flat_set<T, LessThan>;
-
     using UnorderedSet = stdx::unordered_set<T, Hasher, EqualTo>;
 
     template <typename ValueType>
@@ -195,43 +226,55 @@ public:
      * Returns a function object which computes whether one BSONObj is less than another under this
      * comparator. This comparator must outlive the returned function object.
      */
-    LessThan makeLessThan() const {
+    LessThan makeLessThan() const& {
         return LessThan(this);
     }
+
+    LessThan makeLessThan() const&& = delete;
 
     /**
      * Returns a function object which computes whether one BSONObj is equal to another under this
      * comparator. This comparator must outlive the returned function object.
      */
-    EqualTo makeEqualTo() const {
+    EqualTo makeEqualTo() const& {
         return EqualTo(this);
     }
+
+    EqualTo makeEqualTo() const&& = delete;
 
 protected:
     constexpr BSONComparatorInterfaceBase() = default;
 
-    Set makeSet(std::initializer_list<T> init = {}) const {
+    Set makeSet(std::initializer_list<T> init = {}) const& {
         return Set(init, LessThan(this));
     }
 
-    FlatSet makeFlatSet(const std::vector<T>& elements) const {
-        return FlatSet(elements.begin(), elements.end(), LessThan(this));
-    }
+    Set makeSet(std::initializer_list<T> init = {}) const&& = delete;
 
-    UnorderedSet makeUnorderedSet(std::initializer_list<T> init = {}) const {
+    UnorderedSet makeUnorderedSet(std::initializer_list<T> init = {}) const& {
         return UnorderedSet(init, 0, Hasher(this), EqualTo(this));
     }
 
+    UnorderedSet makeUnorderedSet(std::initializer_list<T> init = {}) const&& = delete;
+
     template <typename ValueType>
-    Map<ValueType> makeMap(std::initializer_list<std::pair<const T, ValueType>> init = {}) const {
+    Map<ValueType> makeMap(std::initializer_list<std::pair<const T, ValueType>> init = {}) const& {
         return Map<ValueType>(init, LessThan(this));
     }
 
     template <typename ValueType>
+    Map<ValueType> makeMap(std::initializer_list<std::pair<const T, ValueType>> init = {}) const&& =
+        delete;
+
+    template <typename ValueType>
     UnorderedMap<ValueType> makeUnorderedMap(
-        std::initializer_list<std::pair<const T, ValueType>> init = {}) const {
+        std::initializer_list<std::pair<const T, ValueType>> init = {}) const& {
         return UnorderedMap<ValueType>(init, 0, Hasher(this), EqualTo(this));
     }
+
+    template <typename ValueType>
+    UnorderedMap<ValueType> makeUnorderedMap(
+        std::initializer_list<std::pair<const T, ValueType>> init = {}) const&& = delete;
 
     /**
      * Hashes 'objToHash', respecting the equivalence classes given by 'stringComparator'.
@@ -240,7 +283,7 @@ protected:
      */
     static void hashCombineBSONObj(size_t& seed,
                                    const BSONObj& objToHash,
-                                   bool considerFieldName,
+                                   ComparisonRulesSet rules,
                                    const StringData::ComparatorInterface* stringComparator);
 
     /**
@@ -250,7 +293,7 @@ protected:
      */
     static void hashCombineBSONElement(size_t& seed,
                                        BSONElement elemToHash,
-                                       bool considerFieldName,
+                                       ComparisonRulesSet rules,
                                        const StringData::ComparatorInterface* stringComparator);
 };
 

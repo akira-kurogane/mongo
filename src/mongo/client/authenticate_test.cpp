@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,10 +44,6 @@
 namespace {
 
 using namespace mongo;
-using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
-
-using auth::RunCommandResultHandler;
 
 /**
  * Utility class to support tests in this file.  Allows caller to load
@@ -63,9 +60,8 @@ public:
           _nonce("7ca422a24f326f2a"),
           _requests(),
           _responses() {
-        _runCommandCallback = [this](RemoteCommandRequest request,
-                                     RunCommandResultHandler handler) {
-            runCommand(std::move(request), handler);
+        _runCommandCallback = [this](OpMsgRequest request) {
+            return runCommand(std::move(request));
         };
 
         // create our digest
@@ -82,18 +78,19 @@ public:
     }
 
     // protected:
-    void runCommand(RemoteCommandRequest request, RunCommandResultHandler handler) {
+    Future<BSONObj> runCommand(OpMsgRequest request) {
         // Validate the received request
         ASSERT(!_requests.empty());
-        RemoteCommandRequest expected = _requests.front();
-        ASSERT(expected.dbname == request.dbname);
-        ASSERT_BSONOBJ_EQ(expected.cmdObj, request.cmdObj);
+        auto& expected = _requests.front();
+        ASSERT_EQ(expected.getDatabase(), request.getDatabase());
+        ASSERT_BSONOBJ_EQ(expected.body, request.body);
         _requests.pop();
 
         // Then pop a response and call the handler
         ASSERT(!_responses.empty());
-        handler(_responses.front());
+        auto ret = _responses.front();
         _responses.pop();
+        return ret;
     }
 
     void reset() {
@@ -103,11 +100,11 @@ public:
     }
 
     void pushResponse(const BSONObj& cmd) {
-        _responses.emplace(cmd, BSONObj(), _millis);
+        _responses.emplace(cmd);
     }
 
     void pushRequest(StringData dbname, const BSONObj& cmd) {
-        _requests.emplace(_mockHost, dbname.toString(), cmd, nullptr);
+        _requests.emplace(OpMsgRequest::fromDBAndBody(dbname, cmd));
     }
 
     BSONObj loadMongoCRConversation() {
@@ -130,11 +127,7 @@ public:
                     << "MONGODB-CR"
                     << "db"
                     << "admin"
-                    << "user"
-                    << _username
-                    << "pwd"
-                    << _password
-                    << "digest"
+                    << "user" << _username << "pwd" << _password << "digest"
                     << "true");
     }
 
@@ -144,8 +137,7 @@ public:
         pushRequest("$external",
                     BSON("authenticate" << 1 << "mechanism"
                                         << "MONGODB-X509"
-                                        << "user"
-                                        << _username));
+                                        << "user" << _username));
 
         // 2. Client receives 'ok'
         pushResponse(BSON("ok" << 1));
@@ -155,8 +147,7 @@ public:
                     << "MONGODB-X509"
                     << "db"
                     << "$external"
-                    << "user"
-                    << _username);
+                    << "user" << _username);
     }
 
 
@@ -173,37 +164,41 @@ public:
     std::string _digest;
     std::string _nonce;
 
-    std::queue<RemoteCommandRequest> _requests;
-    std::queue<RemoteCommandResponse> _responses;
+    std::queue<OpMsgRequest> _requests;
+    std::queue<BSONObj> _responses;
 };
 
 TEST_F(AuthClientTest, MongoCR) {
+    // This test excludes the MONGODB-CR support found in mongo/shell/mongodbcr.cpp
+    // so it should fail to auth.
+    // jstests exist to ensure MONGODB-CR continues to work from the client.
     auto params = loadMongoCRConversation();
-    auth::authenticateClient(std::move(params), HostAndPort(), "", _runCommandCallback);
+    ASSERT_THROWS(
+        auth::authenticateClient(std::move(params), HostAndPort(), "", _runCommandCallback).get(),
+        DBException);
 }
 
 TEST_F(AuthClientTest, asyncMongoCR) {
+    // As with the sync version above, we expect authentication to fail
+    // since this test was built without MONGODB-CR support.
     auto params = loadMongoCRConversation();
-    auth::authenticateClient(std::move(params),
-                             HostAndPort(),
-                             "",
-                             _runCommandCallback,
-                             [this](auth::AuthResponse response) { ASSERT(response.isOK()); });
+    ASSERT_NOT_OK(
+        auth::authenticateClient(std::move(params), HostAndPort(), "", _runCommandCallback)
+            .getNoThrow());
 }
 
 #ifdef MONGO_CONFIG_SSL
 TEST_F(AuthClientTest, X509) {
     auto params = loadX509Conversation();
-    auth::authenticateClient(std::move(params), HostAndPort(), _username, _runCommandCallback);
+    auth::authenticateClient(std::move(params), HostAndPort(), _username, _runCommandCallback)
+        .get();
 }
 
 TEST_F(AuthClientTest, asyncX509) {
     auto params = loadX509Conversation();
-    auth::authenticateClient(std::move(params),
-                             HostAndPort(),
-                             _username,
-                             _runCommandCallback,
-                             [this](auth::AuthResponse response) { ASSERT(response.isOK()); });
+    ASSERT_OK(
+        auth::authenticateClient(std::move(params), HostAndPort(), _username, _runCommandCallback)
+            .getNoThrow());
 }
 #endif
 

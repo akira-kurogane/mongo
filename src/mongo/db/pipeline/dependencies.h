@@ -1,29 +1,30 @@
 /**
- * Copyright (c) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,93 +33,156 @@
 #include <set>
 #include <string>
 
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/variables.h"
 
 namespace mongo {
-class ParsedDeps;
 
 /**
  * This struct allows components in an agg pipeline to report what they need from their input.
  */
 struct DepsTracker {
     /**
-     * Represents what metadata is available on documents that are input to the pipeline.
+     * Used by aggregation stages to report whether or not dependency resolution is complete, or
+     * must continue to the next stage.
      */
-    enum MetadataAvailable { kNoMetadata = 0, kTextScore = 1 };
+    enum State {
+        // The full object and all metadata may be required.
+        NOT_SUPPORTED = 0x0,
 
-    DepsTracker(MetadataAvailable metadataAvailable = kNoMetadata)
-        : _metadataAvailable(metadataAvailable) {}
+        // Later stages could need either fields or metadata. For example, a $limit stage will pass
+        // through all fields, and they may or may not be needed by future stages.
+        SEE_NEXT = 0x1,
+
+        // Later stages won't need more fields from input. For example, an inclusion projection like
+        // {_id: 1, a: 1} will only output two fields, so future stages cannot possibly depend on
+        // any other fields.
+        EXHAUSTIVE_FIELDS = 0x2,
+
+        // Later stages won't need more metadata from input. For example, a $group stage will group
+        // documents together, discarding their text score and sort keys.
+        EXHAUSTIVE_META = 0x4,
+
+        // Later stages won't need either fields or metadata.
+        EXHAUSTIVE_ALL = EXHAUSTIVE_FIELDS | EXHAUSTIVE_META,
+    };
 
     /**
-     * Returns a projection object covering the dependencies tracked by this class.
+     * Represents a state where all geo metadata is available.
      */
-    BSONObj toProjection() const;
+    static constexpr auto kAllGeoNearData = QueryMetadataBitSet(
+        (1 << DocumentMetadataFields::kGeoNearDist) | (1 << DocumentMetadataFields::kGeoNearPoint));
 
-    boost::optional<ParsedDeps> toParsedDeps() const;
+    /**
+     * Represents a state where all metadata is available.
+     */
+    static constexpr auto kAllMetadata =
+        QueryMetadataBitSet(~(1 << DocumentMetadataFields::kNumFields));
+
+    /**
+     * Represents a state where only text score metadata is available.
+     */
+    static constexpr auto kOnlyTextScore =
+        QueryMetadataBitSet(1 << DocumentMetadataFields::kTextScore);
+
+    /**
+     * By default, certain metadata is unavailable to the pipeline, unless explicitly specified
+     * that it is available. This state represents all metadata which is not available by default.
+     */
+    static constexpr auto kDefaultUnavailableMetadata = QueryMetadataBitSet(
+        (1 << DocumentMetadataFields::kTextScore) | (1 << DocumentMetadataFields::kGeoNearDist) |
+        (1 << DocumentMetadataFields::kGeoNearPoint));
+
+    /**
+     * Represents a state where no metadata is available.
+     */
+    static constexpr auto kNoMetadata = QueryMetadataBitSet();
+
+    DepsTracker(const QueryMetadataBitSet& unavailableMetadata = kNoMetadata)
+        : _unavailableMetadata{unavailableMetadata} {}
+
+    /**
+     * Returns a projection object covering the non-metadata dependencies tracked by this class, or
+     * empty BSONObj if the entire document is required.
+     */
+    BSONObj toProjectionWithoutMetadata() const;
 
     bool hasNoRequirements() const {
-        return fields.empty() && !needWholeDocument && !_needTextScore;
+        return fields.empty() && !needWholeDocument && !_metadataDeps.any();
     }
 
-    MetadataAvailable getMetadataAvailable() const {
-        return _metadataAvailable;
-    }
-
-    bool isTextScoreAvailable() const {
-        return _metadataAvailable & MetadataAvailable::kTextScore;
-    }
-
-    bool getNeedTextScore() const {
-        return _needTextScore;
-    }
-
-    void setNeedTextScore(bool needTextScore) {
-        if (needTextScore && !isTextScoreAvailable()) {
-            uasserted(
-                40218,
-                "pipeline requires text score metadata, but there is no text score available");
-        }
-        _needTextScore = needTextScore;
-    }
-
-    bool getNeedSortKey() const {
-        return _needSortKey;
-    }
-
-    void setNeedSortKey(bool needSortKey) {
-        // We don't expect to ever unset '_needSortKey'.
-        invariant(!_needSortKey || needSortKey);
-        _needSortKey = needSortKey;
-    }
-
-    std::set<std::string> fields;    // The names of needed fields in dotted notation.
-    bool needWholeDocument = false;  // If true, ignore 'fields' and assume the whole document is
-                                     // needed.
-private:
     /**
-     * Appends the meta projections for the sort key and/or text score to 'bb' if necessary. Returns
-     * true if either type of metadata was needed, and false otherwise.
+     * Returns 'true' if any of the DepsTracker's variables appear in the passed 'ids' set.
      */
-    bool _appendMetaProjections(BSONObjBuilder* bb) const;
+    bool hasVariableReferenceTo(const std::set<Variables::Id>& ids) const {
+        std::vector<Variables::Id> match;
+        std::set_intersection(
+            vars.begin(), vars.end(), ids.begin(), ids.end(), std::back_inserter(match));
+        return !match.empty();
+    }
 
-    MetadataAvailable _metadataAvailable;
-    bool _needTextScore = false;  // if true, add a {$meta: "textScore"} to the projection.
-    bool _needSortKey = false;    // if true, add a {$meta: "sortKey"} to the projection.
-};
+    /**
+     * Returns a value with bits set indicating the types of metadata not available to the
+     * pipeline.
+     */
+    QueryMetadataBitSet getUnavailableMetadata() const {
+        return _unavailableMetadata;
+    }
 
-/**
- * This class is designed to quickly extract the needed fields from a BSONObj into a Document.
- * It should only be created by a call to DepsTracker::ParsedDeps
- */
-class ParsedDeps {
-public:
-    Document extractFields(const BSONObj& input) const;
+    /**
+     * Sets whether or not metadata 'type' is required. Throws if 'required' is true but that
+     * metadata is not available to the pipeline.
+     *
+     * Except for MetadataType::SORT_KEY, once 'type' is required, it cannot be unset.
+     */
+    void setNeedsMetadata(DocumentMetadataFields::MetaType type, bool required);
+
+    /**
+     * Returns true if the DepsTracker requires that metadata of type 'type' is present.
+     */
+    bool getNeedsMetadata(DocumentMetadataFields::MetaType type) const {
+        return _metadataDeps[type];
+    }
+
+    /**
+     * Returns true if there exists a type of metadata required by the DepsTracker.
+     */
+    bool getNeedsAnyMetadata() const {
+        return _metadataDeps.any();
+    }
+
+    /**
+     * Return all of the metadata dependencies.
+     */
+    QueryMetadataBitSet& metadataDeps() {
+        return _metadataDeps;
+    }
+    const QueryMetadataBitSet& metadataDeps() const {
+        return _metadataDeps;
+    }
+
+    /**
+     * Request that all metadata in the given QueryMetadataBitSet be added as dependencies. Throws a
+     * UserException if any of the requested metadata fields have been marked as unavailable.
+     */
+    void requestMetadata(const QueryMetadataBitSet& metadata) {
+        for (size_t i = 1; i < DocumentMetadataFields::kNumFields; ++i) {
+            if (metadata[i]) {
+                setNeedsMetadata(static_cast<DocumentMetadataFields::MetaType>(i), true);
+            }
+        }
+    }
+
+    std::set<std::string> fields;    // Names of needed fields in dotted notation.
+    std::set<Variables::Id> vars;    // IDs of referenced variables.
+    bool needWholeDocument = false;  // If true, ignore 'fields'; the whole document is needed.
 
 private:
-    friend struct DepsTracker;  // so it can call constructor
-    explicit ParsedDeps(Document&& fields) : _fields(std::move(fields)), _nFields(_fields.size()) {}
+    // Represents all metadata not available to the pipeline.
+    QueryMetadataBitSet _unavailableMetadata;
 
-    Document _fields;
-    int _nFields;  // Cache the number of top-level fields needed.
+    // Represents which metadata is used by the pipeline. This is populated while performing
+    // dependency analysis.
+    QueryMetadataBitSet _metadataDeps;
 };
-}
+}  // namespace mongo

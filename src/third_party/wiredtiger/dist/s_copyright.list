@@ -1,5 +1,3 @@
-skip	api/leveldb/leveldb_wt_config.h
-skip	api/leveldb/leveldb_wt_config.in
 skip	bench/workgen/workgen/workgen.py
 skip	bench/workgen/workgen_wrap.cxx
 skip	build_win/wiredtiger_config.h
@@ -9,10 +7,14 @@ skip	dist/api_err.py
 skip	dist/db.py
 skip	dist/dist.py
 skip	dist/flags.py
+skip	dist/function.py
 skip	dist/java_doc.py
 skip	dist/log.py
 skip	dist/log_data.py
+skip	dist/prototypes.py
+skip	dist/s_comment.py
 skip	dist/s_function_loop.py
+skip	dist/s_goto.py
 skip	dist/stat.py
 skip	dist/stat_data.py
 skip	dist/style.py
@@ -28,6 +30,7 @@ skip	lang/java/src/com/wiredtiger/db/wiredtiger.java
 skip	lang/java/src/com/wiredtiger/db/wiredtigerConstants.java
 skip	lang/java/src/com/wiredtiger/db/wiredtigerJNI.java
 skip	lang/java/wiredtiger_wrap.c
+skip	lang/python/wiredtiger.py
 skip	lang/python/wiredtiger/__init__.py
 skip	lang/python/wiredtiger_wrap.c
 skip	src/config/config_def.c
@@ -40,10 +43,10 @@ skip	src/include/flags.h
 skip	src/include/queue.h
 skip	src/log/log_auto.c
 skip	src/support/stat.c
+skip	test/evergreen/evg_cfg.py
 skip	test/packing/intpack-test.c
 skip	test/packing/intpack-test2.c
 skip	test/packing/packing-test.c
 skip	tools/wtperf_stats/wt_nvd3_util.py
 skip	tools/wtperf_stats/wtperf_stats.py
-skip	tools/wtstats/stat_data.py
 skip	wiredtiger_config.h

@@ -1,4 +1,4 @@
-from __future__ import absolute_import
+"""Resmokelib core module."""
 
 from . import process
 from . import programs

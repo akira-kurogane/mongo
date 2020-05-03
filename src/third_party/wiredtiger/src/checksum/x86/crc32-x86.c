@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -26,135 +26,128 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "wt_internal.h"
+#include <wiredtiger_config.h>
+#if defined(_M_AMD64)
+#include <intrin.h>
+#endif
+#include <inttypes.h>
+#include <stddef.h>
 
-#if defined(HAVE_CRC32_HARDWARE)
+#if !defined(HAVE_NO_CRC32_HARDWARE)
 #if (defined(__amd64) || defined(__x86_64))
 /*
  * __wt_checksum_hw --
- *	Return a checksum for a chunk of memory, computed in hardware
- *	using 8 byte steps.
+ *     Return a checksum for a chunk of memory, computed in hardware using 8 byte steps.
  */
 static uint32_t
 __wt_checksum_hw(const void *chunk, size_t len)
 {
-	uint32_t crc;
-	size_t nqwords;
-	const uint8_t *p;
-	const uint64_t *p64;
+    uint32_t crc;
+    size_t nqwords;
+    const uint8_t *p;
+    const uint64_t *p64;
 
-	crc = 0xffffffff;
+    crc = 0xffffffff;
 
-	/* Checksum one byte at a time to the first 4B boundary. */
-	for (p = chunk;
-	    ((uintptr_t)p & (sizeof(uint32_t) - 1)) != 0 &&
-	    len > 0; ++p, --len) {
-		__asm__ __volatile__(
-				     ".byte 0xF2, 0x0F, 0x38, 0xF0, 0xF1"
-				     : "=S" (crc)
-				     : "0" (crc), "c" (*p));
-	}
+    /* Checksum one byte at a time to the first 4B boundary. */
+    for (p = chunk; ((uintptr_t)p & (sizeof(uint32_t) - 1)) != 0 && len > 0; ++p, --len) {
+        __asm__ __volatile__(".byte 0xF2, 0x0F, 0x38, 0xF0, 0xF1" : "=S"(crc) : "0"(crc), "c"(*p));
+    }
 
-	p64 = (const uint64_t *)p;
-	/* Checksum in 8B chunks. */
-	for (nqwords = len / sizeof(uint64_t); nqwords; nqwords--) {
-		__asm__ __volatile__ (
-				      ".byte 0xF2, 0x48, 0x0F, 0x38, 0xF1, 0xF1"
-				      : "=S"(crc)
-				      : "0"(crc), "c" (*p64));
-		p64++;
-	}
+    p64 = (const uint64_t *)p;
+    /* Checksum in 8B chunks. */
+    for (nqwords = len / sizeof(uint64_t); nqwords; nqwords--) {
+        __asm__ __volatile__(".byte 0xF2, 0x48, 0x0F, 0x38, 0xF1, 0xF1"
+                             : "=S"(crc)
+                             : "0"(crc), "c"(*p64));
+        p64++;
+    }
 
-	/* Checksum trailing bytes one byte at a time. */
-	p = (const uint8_t *)p64;
-	for (len &= 0x7; len > 0; ++p, len--) {
-		__asm__ __volatile__(
-				     ".byte 0xF2, 0x0F, 0x38, 0xF0, 0xF1"
-				     : "=S" (crc)
-				     : "0" (crc), "c" (*p));
-	}
-	return (~crc);
+    /* Checksum trailing bytes one byte at a time. */
+    p = (const uint8_t *)p64;
+    for (len &= 0x7; len > 0; ++p, len--) {
+        __asm__ __volatile__(".byte 0xF2, 0x0F, 0x38, 0xF0, 0xF1" : "=S"(crc) : "0"(crc), "c"(*p));
+    }
+    return (~crc);
 }
 #endif
 
 #if defined(_M_AMD64)
 /*
  * __wt_checksum_hw --
- *	Return a checksum for a chunk of memory, computed in hardware
- *	using 8 byte steps.
+ *     Return a checksum for a chunk of memory, computed in hardware using 8 byte steps.
  */
 static uint32_t
 __wt_checksum_hw(const void *chunk, size_t len)
 {
-	uint32_t crc;
-	size_t nqwords;
-	const uint8_t *p;
-	const uint64_t *p64;
+    uint32_t crc;
+    size_t nqwords;
+    const uint8_t *p;
+    const uint64_t *p64;
 
-	crc = 0xffffffff;
+    crc = 0xffffffff;
 
-	/* Checksum one byte at a time to the first 4B boundary. */
-	for (p = chunk;
-	    ((uintptr_t)p & (sizeof(uint32_t) - 1)) != 0 &&
-	    len > 0; ++p, --len) {
-		crc = _mm_crc32_u8(crc, *p);
-	}
+    /* Checksum one byte at a time to the first 4B boundary. */
+    for (p = chunk; ((uintptr_t)p & (sizeof(uint32_t) - 1)) != 0 && len > 0; ++p, --len) {
+        crc = _mm_crc32_u8(crc, *p);
+    }
 
-	p64 = (const uint64_t *)p;
-	/* Checksum in 8B chunks. */
-	for (nqwords = len / sizeof(uint64_t); nqwords; nqwords--) {
-		crc = (uint32_t)_mm_crc32_u64(crc, *p64);
-		p64++;
-	}
+    p64 = (const uint64_t *)p;
+    /* Checksum in 8B chunks. */
+    for (nqwords = len / sizeof(uint64_t); nqwords; nqwords--) {
+        crc = (uint32_t)_mm_crc32_u64(crc, *p64);
+        p64++;
+    }
 
-	/* Checksum trailing bytes one byte at a time. */
-	p = (const uint8_t *)p64;
-	for (len &= 0x7; len > 0; ++p, len--) {
-		crc = _mm_crc32_u8(crc, *p);
-	}
+    /* Checksum trailing bytes one byte at a time. */
+    p = (const uint8_t *)p64;
+    for (len &= 0x7; len > 0; ++p, len--) {
+        crc = _mm_crc32_u8(crc, *p);
+    }
 
-	return (~crc);
+    return (~crc);
 }
 #endif
-#endif /* HAVE_CRC32_HARDWARE */
-
-/*
- * __wt_checksum_init --
- *	WiredTiger: detect CRC hardware and set the checksum function.
- */
-void
-__wt_checksum_init(void)
-{
-#if defined(HAVE_CRC32_HARDWARE)
-#if (defined(__amd64) || defined(__x86_64))
-	unsigned int eax, ebx, ecx, edx;
-
-	__asm__ __volatile__ (
-			      "cpuid"
-			      : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
-			      : "a" (1));
-
-#define	CPUID_ECX_HAS_SSE42	(1 << 20)
-	if (ecx & CPUID_ECX_HAS_SSE42)
-		__wt_process.checksum = __wt_checksum_hw;
-	else
-		__wt_process.checksum = __wt_checksum_sw;
-
-#elif defined(_M_AMD64)
-	int cpuInfo[4];
-
-	__cpuid(cpuInfo, 1);
-
-#define	CPUID_ECX_HAS_SSE42	(1 << 20)
-	if (cpuInfo[2] & CPUID_ECX_HAS_SSE42)
-		__wt_process.checksum = __wt_checksum_hw;
-	else
-		__wt_process.checksum = __wt_checksum_sw;
-#else
-	__wt_process.checksum = __wt_checksum_sw;
 #endif
 
-#else /* !HAVE_CRC32_HARDWARE */
-	__wt_process.checksum = __wt_checksum_sw;
-#endif /* HAVE_CRC32_HARDWARE */
+extern uint32_t __wt_checksum_sw(const void *chunk, size_t len);
+#if defined(__GNUC__)
+extern uint32_t (*wiredtiger_crc32c_func(void))(const void *, size_t)
+  __attribute__((visibility("default")));
+#else
+extern uint32_t (*wiredtiger_crc32c_func(void))(const void *, size_t);
+#endif
+
+/*
+ * wiredtiger_crc32c_func --
+ *     WiredTiger: detect CRC hardware and return the checksum function.
+ */
+uint32_t (*wiredtiger_crc32c_func(void))(const void *, size_t)
+{
+#if !defined(HAVE_NO_CRC32_HARDWARE)
+#if (defined(__amd64) || defined(__x86_64))
+    unsigned int eax, ebx, ecx, edx;
+
+    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+
+#define CPUID_ECX_HAS_SSE42 (1 << 20)
+    if (ecx & CPUID_ECX_HAS_SSE42)
+        return (__wt_checksum_hw);
+    return (__wt_checksum_sw);
+
+#elif defined(_M_AMD64)
+    int cpuInfo[4];
+
+    __cpuid(cpuInfo, 1);
+
+#define CPUID_ECX_HAS_SSE42 (1 << 20)
+    if (cpuInfo[2] & CPUID_ECX_HAS_SSE42)
+        return (__wt_checksum_hw);
+    return (__wt_checksum_sw);
+#else
+    return (__wt_checksum_sw);
+#endif
+#else
+    return (__wt_checksum_sw);
+#endif
 }

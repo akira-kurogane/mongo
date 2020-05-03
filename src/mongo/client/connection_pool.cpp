@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,10 +31,9 @@
 
 #include "mongo/client/connection_pool.h"
 
+#include "mongo/client/authenticate.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
@@ -68,7 +68,7 @@ ConnectionPool::~ConnectionPool() {
 }
 
 void ConnectionPool::cleanUpOlderThan(Date_t now) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
 
     HostConnectionMap::iterator hostConns = _connections.begin();
     while (hostConns != _connections.end()) {
@@ -92,20 +92,20 @@ void ConnectionPool::_cleanUpOlderThan_inlock(Date_t now, ConnectionList* hostCo
     }
 }
 
-bool ConnectionPool::_shouldKeepConnection(Date_t now, const ConnectionInfo& connInfo) const {
+bool ConnectionPool::_shouldKeepConnection(Date_t now, const ConnectionInfo& connInfo) {
     const Date_t expirationDate = connInfo.creationDate + kMaxConnectionAge;
     if (expirationDate <= now) {
         return false;
     }
 
-    return true;
+    return !connInfo.conn->isFailed();
 }
 
 void ConnectionPool::closeAllInUseConnections() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     for (ConnectionList::iterator iter = _inUseConnections.begin(); iter != _inUseConnections.end();
          ++iter) {
-        iter->conn->port().shutdown();
+        iter->conn->shutdownAndDisallowReconnect();
     }
 }
 
@@ -127,7 +127,7 @@ void ConnectionPool::_cleanUpStaleHosts_inlock(Date_t now) {
 
 ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     const HostAndPort& target, Date_t now, Milliseconds timeout) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<Latch> lk(_mutex);
 
     // Clean up connections on stale/unused hosts
     _cleanUpStaleHosts_inlock(now);
@@ -177,7 +177,7 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
             0,      // socket timeout
             {},     // MongoURI
             [this, target](const executor::RemoteCommandResponse& isMasterReply) {
-                return _hook->validateHost(target, isMasterReply);
+                return _hook->validateHost(target, BSONObj(), isMasterReply);
             }));
     } else {
         conn.reset(new DBClientConnection());
@@ -189,10 +189,10 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
 
     uassertStatusOK(conn->connect(target, StringData()));
-    conn->port().setTag(conn->port().getTag() | _messagingPortTags);
+    conn->setTags(_messagingPortTags);
 
-    if (isInternalAuthSet()) {
-        conn->auth(getInternalUserAuthParams());
+    if (auth::isInternalAuthSet()) {
+        uassertStatusOK(conn->authenticateInternalUser());
     }
 
     if (_hook) {
@@ -207,7 +207,6 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
                                                              postConnectRequest->metadata));
 
             auto rcr = executor::RemoteCommandResponse(reply->getCommandReply().getOwned(),
-                                                       reply->getMetadata().getOwned(),
                                                        Date_t::now() - start);
 
             uassertStatusOK(_hook->handleReply(target, std::move(rcr)));
@@ -219,7 +218,7 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
 }
 
 void ConnectionPool::releaseConnection(ConnectionList::iterator iter, const Date_t now) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (!_shouldKeepConnection(now, *iter)) {
         _destroyConnection_inlock(&_inUseConnections, iter);
         return;
@@ -233,7 +232,7 @@ void ConnectionPool::releaseConnection(ConnectionList::iterator iter, const Date
 }
 
 void ConnectionPool::destroyConnection(ConnectionList::iterator iter) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _destroyConnection_inlock(&_inUseConnections, iter);
 }
 
@@ -274,7 +273,7 @@ ConnectionPool::ConnectionPtr& ConnectionPool::ConnectionPtr::operator=(Connecti
 
 void ConnectionPool::ConnectionPtr::done(Date_t now) {
     _pool->releaseConnection(_connInfo, now);
-    _pool = NULL;
+    _pool = nullptr;
 }
 
 }  // namespace mongo

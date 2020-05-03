@@ -10,9 +10,9 @@ var password = "bar";
 
 load("jstests/libs/host_ipaddr.js");
 
-var createUser = function(mongo) {
+var createUser = function(db) {
     print("============ adding a user.");
-    mongo.getDB("admin").createUser({user: username, pwd: password, roles: jsTest.adminUserRoles});
+    db.createUser({user: username, pwd: password, roles: jsTest.adminUserRoles});
 };
 
 var createRole = function(mongo) {
@@ -54,11 +54,8 @@ var assertCannotRunCommands = function(mongo) {
     assert.throws(function() {
         mongo.getDB("test").createUser({user: username, pwd: password, roles: ['readWrite']});
     });
-    // DB operations
-    var authorizeErrorCode = 13;
-    assert.commandFailedWithCode(
-        mongo.getDB("test").copyDatabase("admin", "admin2"), authorizeErrorCode, "copyDatabase");
     // Create collection
+    var authorizeErrorCode = 13;
     assert.commandFailedWithCode(
         mongo.getDB("test").createCollection("log", {capped: true, size: 5242880, max: 5000}),
         authorizeErrorCode,
@@ -99,9 +96,9 @@ var assertCanRunCommands = function(mongo) {
     // will throw on failure
     test.system.users.findOne();
 
-    assert.writeOK(test.foo.save({_id: 0}));
-    assert.writeOK(test.foo.update({_id: 0}, {$set: {x: 20}}));
-    assert.writeOK(test.foo.remove({_id: 0}));
+    assert.commandWorked(test.foo.save({_id: 0}));
+    assert.commandWorked(test.foo.update({_id: 0}, {$set: {x: 20}}));
+    assert.commandWorked(test.foo.remove({_id: 0}));
 
     test.foo.mapReduce(
         function() {
@@ -123,7 +120,7 @@ var shutdown = function(conn) {
     MongoRunner.stopMongod(conn, /*signal*/ false, {auth: {user: username, pwd: password}});
 };
 
-var runTest = function(useHostName) {
+var runTest = function(useHostName, useSession) {
     print("==========================");
     print("starting mongod: useHostName=" + useHostName);
     print("==========================");
@@ -133,7 +130,13 @@ var runTest = function(useHostName) {
 
     assertCannotRunCommands(mongo);
 
-    createUser(mongo);
+    if (useSession) {
+        var session = mongo.startSession();
+        createUser(session.getDatabase("admin"));
+        session.endSession();
+    } else {
+        createUser(mongo.getDB("admin"));
+    }
 
     assertCannotRunCommands(mongo);
 
@@ -187,10 +190,13 @@ var runRoleTest = function() {
     conn = MongoRunner.runMongod({auth: '', dbpath: dbpath, restart: true, cleanData: false});
     mongo = new Mongo("localhost:" + conn.port);
     assertCannotRunCommands(mongo);
+    MongoRunner.stopMongod(conn);
 };
 
-runTest(false);
-runTest(true);
+runTest(false, false);
+runTest(false, true);
+runTest(true, false);
+runTest(true, true);
 
 runNonlocalTest(get_ipaddr());
 

@@ -1,10 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
 
 from gen_helper import getCopyrightNotice, openNamespaces, closeNamespaces, \
     include
+
 
 def generate(unicode_casefold_file, target):
     """Generates a C++ source file that contains a Unicode case folding
@@ -13,7 +14,7 @@ def generate(unicode_casefold_file, target):
     The case folding function contains a switch statement with cases for every
     Unicode codepoint that has a case folding mapping.
     """
-    out = open(target, "w")
+    out = open(target, "w", encoding='utf-8')
 
     out.write(getCopyrightNotice())
     out.write(include("mongo/db/fts/unicode/codepoints.h"))
@@ -22,7 +23,7 @@ def generate(unicode_casefold_file, target):
 
     case_mappings = {}
 
-    cf_file = open(unicode_casefold_file, 'rU')
+    cf_file = open(unicode_casefold_file, 'r', encoding='utf-8')
 
     for line in cf_file:
         # Filter out blank lines and lines that start with #
@@ -36,8 +37,8 @@ def generate(unicode_casefold_file, target):
 
         status = values[1]
         if status == 'C' or status == 'S':
-            # We only include the "Common" and "Simple" mappings. "Full" case 
-            # folding mappings expand certain letters to multiple codepoints, 
+            # We only include the "Common" and "Simple" mappings. "Full" case
+            # folding mappings expand certain letters to multiple codepoints,
             # which we currently do not support.
             original_codepoint = int(values[0], 16)
             codepoint_mapping  = int(values[2], 16)
@@ -76,18 +77,19 @@ def generate(unicode_casefold_file, target):
 
     for mapping in sorted_mappings:
         if mapping[0] <= 0x7f:
-            continue # ascii is special cased above.
+            continue  # ascii is special cased above.
 
         if mapping[0] in turkishMapping:
-            out.write("case 0x%x: return mode == CaseFoldMode::kTurkish ? 0x%x : 0x%x;\n"
-                      % (mapping[0], turkishMapping[mapping[0]], mapping[1]))
+            out.write("case 0x%x: return mode == CaseFoldMode::kTurkish ? 0x%x : 0x%x;\n" %
+                      (mapping[0], turkishMapping[mapping[0]], mapping[1]))
         else:
-            out.write("case 0x%x: return 0x%x;\n"%mapping)
+            out.write("case 0x%x: return 0x%x;\n" % mapping)
 
     out.write("\
     default: return codepoint;\n    }\n}")
 
     out.write(closeNamespaces())
+
 
 if __name__ == "__main__":
     generate(sys.argv[1], sys.argv[2])

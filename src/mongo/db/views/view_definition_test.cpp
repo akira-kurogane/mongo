@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +38,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/views/view.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -57,7 +57,7 @@ TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStrings) 
 
 TEST(ViewDefinitionTest, CopyConstructorProperlyClonesAllFields) {
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     ViewDefinition originalView(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, std::move(collator));
     ViewDefinition copiedView(originalView);
@@ -74,7 +74,7 @@ TEST(ViewDefinitionTest, CopyConstructorProperlyClonesAllFields) {
 
 TEST(ViewDefinitionTest, CopyAssignmentOperatorProperlyClonesAllFields) {
     auto collator =
-        stdx::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     ViewDefinition originalView(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, std::move(collator));
     ViewDefinition copiedView = originalView;
@@ -89,9 +89,9 @@ TEST(ViewDefinitionTest, CopyAssignmentOperatorProperlyClonesAllFields) {
                                              copiedView.defaultCollator()));
 }
 
-DEATH_TEST(ViewDefinitionTest,
-           SetViewOnFailsIfNewViewOnNotInSameDatabaseAsView,
-           "Invariant failure _viewNss.db() == viewOnNss.db()") {
+DEATH_TEST_REGEX(ViewDefinitionTest,
+                 SetViewOnFailsIfNewViewOnNotInSameDatabaseAsView,
+                 R"#(Invariant failure.*_viewNss.db\(\) == viewOnNss.db\(\))#") {
     ViewDefinition viewDef(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
     NamespaceString badViewOn("someOtherDb.someOtherCollection");
@@ -108,9 +108,9 @@ TEST(ViewDefinitionTest, SetViewOnSucceedsIfNewViewOnIsInSameDatabaseAsView) {
     ASSERT_EQ(newViewOn, viewDef.viewOn());
 }
 
-DEATH_TEST(ViewDefinitionTest,
-           SetPiplineFailsIfPipelineTypeIsNotArray,
-           "Invariant failure pipeline.type() == Array") {
+DEATH_TEST_REGEX(ViewDefinitionTest,
+                 SetPiplineFailsIfPipelineTypeIsNotArray,
+                 R"#(Invariant failure.*pipeline.type\(\) == Array)#") {
     ViewDefinition viewDef(
         viewNss.db(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
 

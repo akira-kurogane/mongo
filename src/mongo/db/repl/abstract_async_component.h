@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,12 +34,11 @@
 #include <string>
 #include <type_traits>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace repl {
@@ -52,7 +52,8 @@ namespace repl {
  * _getMutex()).
  */
 class AbstractAsyncComponent {
-    MONGO_DISALLOW_COPYING(AbstractAsyncComponent);
+    AbstractAsyncComponent(const AbstractAsyncComponent&) = delete;
+    AbstractAsyncComponent& operator=(const AbstractAsyncComponent&) = delete;
 
 public:
     AbstractAsyncComponent(executor::TaskExecutor* executor, const std::string& componentName);
@@ -146,11 +147,11 @@ protected:
      * Saves handle if work was successfully scheduled.
      * Returns scheduleWork status (without the handle).
      */
-    Status _scheduleWorkAndSaveHandle_inlock(const executor::TaskExecutor::CallbackFn& work,
+    Status _scheduleWorkAndSaveHandle_inlock(executor::TaskExecutor::CallbackFn work,
                                              executor::TaskExecutor::CallbackHandle* handle,
                                              const std::string& name);
     Status _scheduleWorkAtAndSaveHandle_inlock(Date_t when,
-                                               const executor::TaskExecutor::CallbackFn& work,
+                                               executor::TaskExecutor::CallbackFn work,
                                                executor::TaskExecutor::CallbackHandle* handle,
                                                const std::string& name);
 
@@ -206,7 +207,7 @@ private:
     /**
      * Returns mutex to guard this component's state variable.
      */
-    virtual stdx::mutex* _getMutex() noexcept = 0;
+    virtual Mutex* _getMutex() noexcept = 0;
 
 private:
     // All member variables are labeled with one of the following codes indicating the
@@ -246,8 +247,7 @@ Status AbstractAsyncComponent::_startupComponent_inlock(std::unique_ptr<T>& comp
         component.reset();
         return Status(ErrorCodes::CallbackCanceled,
                       str::stream() << "failed to start up " << componentToStartUp << ": "
-                                    << _componentName
-                                    << " is shutting down");
+                                    << _componentName << " is shutting down");
     }
 
     auto status = component->startup();
@@ -259,7 +259,7 @@ Status AbstractAsyncComponent::_startupComponent_inlock(std::unique_ptr<T>& comp
 
 template <typename T>
 Status AbstractAsyncComponent::_startupComponent(std::unique_ptr<T>& component) {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     return _startupComponent_inlock(component);
 }
 
@@ -275,7 +275,7 @@ void AbstractAsyncComponent::_shutdownComponent_inlock(const std::unique_ptr<T>&
 
 template <typename T>
 void AbstractAsyncComponent::_shutdownComponent(const std::unique_ptr<T>& component) {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     _shutdownComponent_inlock(component);
 }
 

@@ -1,63 +1,64 @@
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kBridge
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kBridge
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
 #include <cstdint>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/rpc/command_request.h"
 #include "mongo/rpc/factory.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/tools/bridge_commands.h"
 #include "mongo/tools/mongobridge_options.h"
+#include "mongo/transport/message_compressor_manager.h"
+#include "mongo/transport/service_entry_point_impl.h"
+#include "mongo/transport/service_executor_synchronous.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/abstract_message_port.h"
-#include "mongo/util/net/listen.h"
-#include "mongo/util/net/message.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -82,235 +83,20 @@ boost::optional<HostAndPort> extractHostInfo(const OpMsgRequest& request) {
     return boost::none;
 }
 
-class Forwarder {
+}  // namespace
+
+class BridgeContext {
 public:
-    Forwarder(AbstractMessagingPort* mp,
-              stdx::mutex* settingsMutex,
-              HostSettingsMap* settings,
-              int64_t seed)
-        : _mp(mp), _settingsMutex(settingsMutex), _settings(settings), _prng(seed) {}
-
-    void operator()() {
-        DBClientConnection dest;
-
-        {
-            HostAndPort destAddr{mongoBridgeGlobalParams.destUri};
-            const Seconds kConnectTimeout(30);
-            Timer connectTimer;
-            while (true) {
-                // DBClientConnection::connectSocketOnly() is used instead of
-                // DBClientConnection::connect() to avoid sending an isMaster command when the
-                // connection is established. We'd otherwise trigger a socket timeout when
-                // forwarding an _isSelf command because dest's replication subsystem hasn't been
-                // initialized yet and so it cannot respond to the isMaster command.
-                auto status = dest.connectSocketOnly(destAddr);
-                if (status.isOK()) {
-                    break;
-                }
-                Seconds elapsed{connectTimer.seconds()};
-                if (elapsed >= kConnectTimeout) {
-                    warning() << "Unable to establish connection to "
-                              << mongoBridgeGlobalParams.destUri << " after " << elapsed
-                              << " seconds: " << status;
-                    log() << "end connection " << _mp->remote().toString();
-                    _mp->shutdown();
-                    return;
-                }
-                sleepmillis(500);
-            }
-        }
-
-        bool receivingFirstMessage = true;
-        boost::optional<HostAndPort> host;
-
-        Message request;
-        Message response;
-        MessageCompressorManager compressorManager;
-
-        while (true) {
-            try {
-                request.reset();
-                if (!_mp->recv(request)) {
-                    log() << "end connection " << _mp->remote().toString();
-                    _mp->shutdown();
-                    break;
-                }
-
-                uassert(ErrorCodes::IllegalOperation,
-                        str::stream() << "Unsupported network op " << request.operation(),
-                        isSupportedRequestNetworkOp(request.operation()));
-
-                if (request.operation() == dbCompressed) {
-                    auto swm = compressorManager.decompressMessage(request);
-                    if (!swm.isOK()) {
-                        error() << "Error decompressing message: " << swm.getStatus();
-                        _mp->shutdown();
-                        return;
-                    }
-                    request = std::move(swm.getValue());
-                }
-
-                const bool isFireAndForgetCommand = OpMsg::isFlagSet(request, OpMsg::kMoreToCome);
-
-                boost::optional<OpMsgRequest> cmdRequest;
-                if ((request.operation() == dbQuery &&
-                     NamespaceString(DbMessage(request).getns()).isCommand()) ||
-                    request.operation() == dbCommand || request.operation() == dbMsg) {
-                    cmdRequest = rpc::opMsgRequestFromAnyProtocol(request);
-                    if (receivingFirstMessage) {
-                        host = extractHostInfo(*cmdRequest);
-                    }
-
-                    std::string hostName = host ? (host->toString()) : "<unknown>";
-                    LOG(1) << "Received \"" << cmdRequest->getCommandName()
-                           << "\" command with arguments " << cmdRequest->body << " from "
-                           << hostName;
-                }
-                receivingFirstMessage = false;
-
-                // Handle a message intended to configure the mongobridge and return a response.
-                // The 'request' is consumed by the mongobridge and does not get forwarded to
-                // 'dest'.
-                if (auto status = maybeProcessBridgeCommand(cmdRequest)) {
-                    invariant(!isFireAndForgetCommand);
-
-                    auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(request));
-                    BSONObj metadata;
-                    BSONObj reply;
-                    StatusWith<BSONObj> commandReply(reply);
-                    if (!status->isOK()) {
-                        commandReply = StatusWith<BSONObj>(*status);
-                    }
-                    auto cmdResponse = replyBuilder->setCommandReply(std::move(commandReply))
-                                           .setMetadata(metadata)
-                                           .done();
-                    cmdResponse.header().setId(nextMessageId());
-                    cmdResponse.header().setResponseToMsgId(request.header().getId());
-                    _mp->say(cmdResponse);
-                    continue;
-                }
-
-                // Get the message handling settings for 'host' if the source of _mp's connection is
-                // known. By default, messages are forwarded to 'dest' without any additional delay.
-                HostSettings hostSettings = getHostSettings(host);
-
-                switch (hostSettings.state) {
-                    // Forward the message to 'dest' after waiting for 'hostSettings.delay'
-                    // milliseconds.
-                    case HostSettings::State::kForward:
-                        sleepmillis(durationCount<Milliseconds>(hostSettings.delay));
-                        break;
-                    // Close the connection to 'dest'.
-                    case HostSettings::State::kHangUp:
-                        log() << "Rejecting connection from " << host->toString()
-                              << ", end connection " << _mp->remote().toString();
-                        _mp->shutdown();
-                        return;
-                    // Forward the message to 'dest' with probability '1 - hostSettings.loss'.
-                    case HostSettings::State::kDiscard:
-                        if (_prng.nextCanonicalDouble() < hostSettings.loss) {
-                            std::string hostName = host ? (host->toString()) : "<unknown>";
-                            if (cmdRequest) {
-                                log() << "Discarding \"" << cmdRequest->getCommandName()
-                                      << "\" command with arguments " << cmdRequest->body
-                                      << " from " << hostName;
-                            } else {
-                                log() << "Discarding " << networkOpToString(request.operation())
-                                      << " from " << hostName;
-                            }
-                            continue;
-                        }
-                        break;
-                }
-
-                // Send the message we received from '_mp' to 'dest'. 'dest' returns a response for
-                // OP_QUERY, OP_GET_MORE, and OP_COMMAND messages that we respond back to
-                // '_mp' with.
-                if (!isFireAndForgetCommand &&
-                    (request.operation() == dbQuery || request.operation() == dbGetMore ||
-                     request.operation() == dbCommand || request.operation() == dbMsg)) {
-                    // TODO dbMsg moreToCome
-                    // Forward the message to 'dest' and receive its reply in 'response'.
-                    response.reset();
-                    dest.port().call(request, response);
-
-                    // If there's nothing to respond back to '_mp' with, then close the connection.
-                    if (response.empty()) {
-                        log() << "Received an empty response, end connection "
-                              << _mp->remote().toString();
-                        _mp->shutdown();
-                        break;
-                    }
-
-                    // Reload the message handling settings for 'host' in case they were changed
-                    // while waiting for a response from 'dest'.
-                    hostSettings = getHostSettings(host);
-
-                    // It's possible that sending 'request' blocked until 'dest' had something to
-                    // reply with. If the message handling settings were since changed to close
-                    // connections from 'host', then do so now.
-                    if (hostSettings.state == HostSettings::State::kHangUp) {
-                        log() << "Closing connection from " << host->toString()
-                              << ", end connection " << _mp->remote().toString();
-                        _mp->shutdown();
-                        break;
-                    }
-
-                    _mp->say(response);
-
-                    // If 'exhaust' is true, then instead of trying to receive another message from
-                    // '_mp', receive messages from 'dest' until it returns a cursor id of zero.
-                    bool exhaust = false;
-                    if (request.operation() == dbQuery) {
-                        DbMessage d(request);
-                        QueryMessage q(d);
-                        exhaust = q.queryOptions & QueryOption_Exhaust;
-                    }
-                    while (exhaust) {
-                        if (response.operation() == dbCompressed) {
-                            auto swm = compressorManager.decompressMessage(response);
-                            if (!swm.isOK()) {
-                                error() << "Error decompressing message: " << swm.getStatus();
-                                _mp->shutdown();
-                                return;
-                            }
-                            response = std::move(swm.getValue());
-                        }
-
-                        MsgData::View header = response.header();
-                        QueryResult::View qr = header.view2ptr();
-                        if (qr.getCursorId()) {
-                            response.reset();
-                            dest.port().recv(response);
-                            _mp->say(response);
-                        } else {
-                            exhaust = false;
-                        }
-                    }
-                } else {
-                    dest.port().say(request);
-                }
-            } catch (const DBException& ex) {
-                error() << "Caught DBException in Forwarder: " << ex << ", end connection "
-                        << _mp->remote().toString();
-                _mp->shutdown();
-                break;
-            } catch (...) {
-                severe() << exceptionToStatus() << ", terminating";
-                quickExit(EXIT_UNCAUGHT);
-            }
-        }
-    }
-
-private:
     Status runBridgeCommand(StringData cmdName, BSONObj cmdObj) {
         auto status = BridgeCommand::findCommand(cmdName);
         if (!status.isOK()) {
             return status.getStatus();
         }
 
+        LOGV2(22916, "Processing bridge command", "cmdName"_attr = cmdName, "cmdObj"_attr = cmdObj);
+
         BridgeCommand* command = status.getValue();
-        return command->run(cmdObj, _settingsMutex, _settings);
+        return command->run(cmdObj, &_settingsMutex, &_settings);
     }
 
     boost::optional<Status> maybeProcessBridgeCommand(boost::optional<OpMsgRequest> cmdRequest) {
@@ -330,70 +116,342 @@ private:
 
     HostSettings getHostSettings(boost::optional<HostAndPort> host) {
         if (host) {
-            stdx::lock_guard<stdx::mutex> lk(*_settingsMutex);
-            return (*_settings)[*host];
+            stdx::lock_guard<Latch> lk(_settingsMutex);
+            return (_settings)[*host];
         }
         return {};
     }
 
-    AbstractMessagingPort* _mp;
-
-    stdx::mutex* _settingsMutex;
-    HostSettingsMap* _settings;
-
-    PseudoRandom _prng;
-};
-
-class BridgeListener final : public Listener {
-public:
-    BridgeListener()
-        : Listener(
-              "bridge", "0.0.0.0", mongoBridgeGlobalParams.port, getGlobalServiceContext(), false),
-          _seedSource(mongoBridgeGlobalParams.seed) {
-        log() << "Setting random seed: " << mongoBridgeGlobalParams.seed;
+    PseudoRandom makeSeededPRNG() {
+        static PseudoRandom globalPRNG(mongoBridgeGlobalParams.seed);
+        return PseudoRandom(globalPRNG.nextInt64());
     }
 
-    void accepted(std::unique_ptr<AbstractMessagingPort> mp) override final {
-        {
-            stdx::lock_guard<stdx::mutex> lk(_portsMutex);
-            if (_inShutdown.load()) {
-                mp->shutdown();
-                return;
-            }
-            _ports.insert(mp.get());
-        }
-
-        Forwarder f(mp.release(), &_settingsMutex, &_settings, _seedSource.nextInt64());
-        stdx::thread t(f);
-        t.detach();
-    }
-
-    void shutdownAll() {
-        stdx::lock_guard<stdx::mutex> lk(_portsMutex);
-        for (auto mp : _ports) {
-            mp->shutdown();
-        }
-    }
+    static BridgeContext* get();
 
 private:
-    stdx::mutex _portsMutex;
-    std::set<AbstractMessagingPort*> _ports;
-    AtomicWord<bool> _inShutdown{false};
+    static const ServiceContext::Decoration<BridgeContext> _get;
 
-    stdx::mutex _settingsMutex;
+    Mutex _settingsMutex = MONGO_MAKE_LATCH("BridgeContext::_settingsMutex");
     HostSettingsMap _settings;
-
-    PseudoRandom _seedSource;
 };
 
-std::unique_ptr<mongo::BridgeListener> listener;
+const ServiceContext::Decoration<BridgeContext> BridgeContext::_get =
+    ServiceContext::declareDecoration<BridgeContext>();
 
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
-    return Status::OK();
+BridgeContext* BridgeContext::get() {
+    return &_get(getGlobalServiceContext());
 }
 
-}  // namespace
+class ServiceEntryPointBridge;
+class ProxiedConnection {
+public:
+    ProxiedConnection() : _dest(nullptr), _prng(BridgeContext::get()->makeSeededPRNG()) {}
+
+    transport::Session* operator->() {
+        return _dest.get();
+    }
+
+    transport::SessionHandle& getSession() {
+        return _dest;
+    }
+
+    void setSession(transport::SessionHandle session) {
+        _dest = std::move(session);
+    }
+
+    const boost::optional<HostAndPort>& host() const {
+        return _host;
+    }
+
+    std::string toString() const {
+        if (_host) {
+            return _host->toString();
+        }
+        return "<unknown>";
+    }
+
+    void extractHostInfo(OpMsgRequest request) {
+        if (_seenFirstMessage)
+            return;
+        _seenFirstMessage = true;
+
+        // The initial isMaster request made by mongod and mongos processes should contain a
+        // hostInfo field that identifies the process by its host:port.
+        StringData cmdName = request.getCommandName();
+        if (cmdName != "isMaster" && cmdName != "ismaster") {
+            return;
+        }
+
+        if (auto hostInfoElem = request.body["hostInfo"]) {
+            if (hostInfoElem.type() == String) {
+                _host = HostAndPort{hostInfoElem.valueStringData()};
+            }
+        }
+    }
+
+    double nextCanonicalDouble() {
+        return _prng.nextCanonicalDouble();
+    }
+
+    void setInExhaust(bool inExhaust) {
+        _inExhaust = inExhaust;
+    }
+
+    bool inExhaust() const {
+        return _inExhaust;
+    }
+
+    // Handle response for request with kExhaustSupported flag or response from the exhaust stream.
+    // This sets up the internal states for the ProxiedConnection and returns whether there is
+    // "moreToCome" from the exhaust stream.
+    bool handleExhaustResponse(Message& response) {
+        // Only support OP_MSG exhaust cursors.
+        invariant(response.operation() == dbMsg);
+        uassert(4622300,
+                "Response ID did not match the sent message ID.",
+                !_lastExhaustRequestId ||
+                    response.header().getResponseToMsgId() == _lastExhaustRequestId);
+        if (response.operation() == dbCompressed) {
+            MessageCompressorManager compressorManager;
+            response = uassertStatusOK(compressorManager.decompressMessage(response));
+        }
+        _inExhaust = OpMsg::isFlagSet(response, OpMsg::kMoreToCome);
+        if (_inExhaust) {
+            _lastExhaustRequestId = response.header().getId();
+        }
+        return _inExhaust;
+    }
+
+    static ProxiedConnection& get(const transport::SessionHandle& session);
+
+private:
+    friend class ServiceEntryPointBridge;
+
+    static const transport::Session::Decoration<ProxiedConnection> _get;
+    transport::SessionHandle _dest;
+    PseudoRandom _prng;
+    boost::optional<HostAndPort> _host;
+    bool _seenFirstMessage = false;
+    bool _inExhaust = false;
+    int _lastExhaustRequestId = 0;
+};
+
+const transport::Session::Decoration<ProxiedConnection> ProxiedConnection::_get =
+    transport::Session::declareDecoration<ProxiedConnection>();
+
+ProxiedConnection& ProxiedConnection::get(const transport::SessionHandle& session) {
+    return _get(*session);
+}
+
+class ServiceEntryPointBridge final : public ServiceEntryPointImpl {
+public:
+    explicit ServiceEntryPointBridge(ServiceContext* svcCtx) : ServiceEntryPointImpl(svcCtx) {}
+
+    DbResponse handleRequest(OperationContext* opCtx, const Message& request) final;
+};
+
+DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const Message& request) {
+    if (request.operation() == dbQuery) {
+        DbMessage d(request);
+        QueryMessage q(d);
+        if (q.queryOptions & QueryOption_Exhaust) {
+            uasserted(51755, "Mongobridge does not support OP_QUERY exhaust");
+        }
+    }
+
+    const auto& source = opCtx->getClient()->session();
+    auto& dest = ProxiedConnection::get(source);
+    auto brCtx = BridgeContext::get();
+
+    // If the bridge decides to return something else other than a response from an active exhaust
+    // stream, make sure we close the exhaust stream properly.
+    auto earlyExhaustExitGuard = makeGuard([&] {
+        if (dest.inExhaust()) {
+            LOGV2(4622301, "mongobridge shutting down exhaust stream", "remote"_attr = dest);
+            dest.setInExhaust(false);
+            // Active exhaust stream should have a session.
+            invariant(dest.getSession());
+            // Close the connection to the dest server to end the exhaust stream.
+            dest->end();
+            dest.setSession(nullptr);
+        }
+    });
+
+    if (!dest.getSession()) {
+        dest.setSession([]() -> transport::SessionHandle {
+            HostAndPort destAddr{mongoBridgeGlobalParams.destUri};
+            const Seconds kConnectTimeout(30);
+            auto now = getGlobalServiceContext()->getFastClockSource()->now();
+            const auto connectExpiration = now + kConnectTimeout;
+            while (now < connectExpiration) {
+                auto tl = getGlobalServiceContext()->getTransportLayer();
+                auto sws =
+                    tl->connect(destAddr, transport::kGlobalSSLMode, connectExpiration - now);
+                auto status = sws.getStatus();
+                if (!status.isOK()) {
+                    LOGV2_WARNING(22924,
+                                  "Unable to establish connection to {remoteAddress}: {error}",
+                                  "Unable to establish connection",
+                                  "remoteAddress"_attr = destAddr,
+                                  "error"_attr = status);
+                    now = getGlobalServiceContext()->getFastClockSource()->now();
+                } else {
+                    return std::move(sws.getValue());
+                }
+
+                sleepmillis(500);
+            }
+
+            return nullptr;
+        }());
+
+        if (!dest.getSession()) {
+            source->end();
+            uasserted(50861, str::stream() << "Unable to connect to " << source->remote());
+        }
+    }
+
+    const bool isFireAndForgetCommand = OpMsg::isFlagSet(request, OpMsg::kMoreToCome);
+
+    boost::optional<OpMsgRequest> cmdRequest;
+    if ((request.operation() == dbQuery &&
+         NamespaceString(DbMessage(request).getns()).isCommand()) ||
+        request.operation() == dbMsg) {
+        cmdRequest = rpc::opMsgRequestFromAnyProtocol(request);
+
+        dest.extractHostInfo(*cmdRequest);
+
+        LOGV2_DEBUG(22917,
+                    1,
+                    "Received \"{commandName}\" command with arguments "
+                    "{arguments} from {remote}",
+                    "Received command",
+                    "commandName"_attr = cmdRequest->getCommandName(),
+                    "arguments"_attr = cmdRequest->body,
+                    "remote"_attr = dest);
+    }
+
+    // Handle a message intended to configure the mongobridge and return a response.
+    // The 'request' is consumed by the mongobridge and does not get forwarded to
+    // 'dest'.
+    if (auto status = brCtx->maybeProcessBridgeCommand(cmdRequest)) {
+        invariant(!isFireAndForgetCommand);
+
+        auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(request));
+        BSONObj reply;
+        StatusWith<BSONObj> commandReply(reply);
+        if (!status->isOK()) {
+            commandReply = StatusWith<BSONObj>(*status);
+        }
+        return {replyBuilder->setCommandReply(std::move(commandReply)).done()};
+    }
+
+
+    // Get the message handling settings for 'host' if the source of the connection is
+    // known. By default, messages are forwarded to 'dest' without any additional delay.
+    HostSettings hostSettings = brCtx->getHostSettings(dest.host());
+
+    switch (hostSettings.state) {
+        // Close the connection to 'dest'.
+        case HostSettings::State::kHangUp:
+            LOGV2(22918,
+                  "Rejecting connection from {remote}, end connection {source}",
+                  "Rejecting connection",
+                  "remote"_attr = dest,
+                  "source"_attr = source->remote().toString());
+            source->end();
+            return {Message()};
+        // Forward the message to 'dest' with probability '1 - hostSettings.loss'.
+        case HostSettings::State::kDiscard:
+            if (dest.nextCanonicalDouble() < hostSettings.loss) {
+                std::string hostName = dest.toString();
+                if (cmdRequest) {
+                    LOGV2(22919,
+                          "Discarding \"{commandName}\" command with arguments "
+                          "{arguments} from {hostName}",
+                          "Discarding command from host",
+                          "commandName"_attr = cmdRequest->getCommandName(),
+                          "arguments"_attr = cmdRequest->body,
+                          "hostName"_attr = hostName);
+                } else {
+                    LOGV2(22920,
+                          "Discarding {operation} from {hostName}",
+                          "Discarding operation from host",
+                          "operation"_attr = networkOpToString(request.operation()),
+                          "hostName"_attr = hostName);
+                }
+                return {Message()};
+            }
+        // Forward the message to 'dest' after waiting for 'hostSettings.delay'
+        // milliseconds.
+        case HostSettings::State::kForward:
+            sleepmillis(durationCount<Milliseconds>(hostSettings.delay));
+            break;
+    }
+
+    // If we get another type of request (e.g. exhaust cleanup killCursor request from the service
+    // state machine), unset the exhaust mode.
+    if (dest.inExhaust() &&
+        (request.operation() != dbMsg || !OpMsg::isFlagSet(request, OpMsg::kExhaustSupported))) {
+        dest.setInExhaust(false);
+    }
+
+    // Skip sending request in exhaust mode.
+    if (!dest.inExhaust()) {
+        uassertStatusOK(dest->sinkMessage(request));
+    }
+
+    // Send the message we received from 'source' to 'dest'. 'dest' returns a response for
+    // OP_QUERY, OP_GET_MORE, and OP_MSG messages that we respond with.
+    if (!isFireAndForgetCommand &&
+        (request.operation() == dbQuery || request.operation() == dbGetMore ||
+         request.operation() == dbMsg)) {
+        auto response = uassertStatusOK(dest->sourceMessage());
+
+        if (!dest.inExhaust()) {
+            uassert(50765,
+                    "Response ID did not match the sent message ID.",
+                    response.header().getResponseToMsgId() == request.header().getId());
+        }
+
+        // Reload the message handling settings for 'host' in case they were changed
+        // while waiting for a response from 'dest'.
+        hostSettings = brCtx->getHostSettings(dest.host());
+
+        // It's possible that sending 'request' blocked until 'dest' had something to
+        // reply with. If the message handling settings were since changed to close
+        // connections from 'host', then do so now.
+        if (hostSettings.state == HostSettings::State::kHangUp) {
+            LOGV2(22921,
+                  "Closing connection from {remote}, end connection {source}",
+                  "Closing connection",
+                  "remote"_attr = dest,
+                  "source"_attr = source->remote());
+            source->end();
+            return {Message()};
+        }
+
+        // Only support OP_MSG exhaust cursors.
+        bool isExhaust = false;
+        if (request.operation() == dbMsg && OpMsg::isFlagSet(request, OpMsg::kExhaustSupported)) {
+            isExhaust = dest.handleExhaustResponse(response);
+            earlyExhaustExitGuard.dismiss();
+        }
+
+        // The original checksum won't be valid once the network layer replaces requestId. Remove it
+        // because the network layer re-checksums the response.
+        OpMsg::removeChecksum(&response);
+
+        // Return a DbResponse with shouldRunAgainForExhaust being set to isExhaust to indicate
+        // whether this should be run again to receive more responses from the exhaust stream.
+        // We do not need to set 'nextInvocation' in the DbResponse because mongobridge
+        // only receives responses but ignores the next request if it is in exhaust mode.
+        return {std::move(response), isExhaust};
+    } else {
+        return {Message()};
+    }
+}
 
 int bridgeMain(int argc, char** argv, char** envp) {
 
@@ -401,19 +459,49 @@ int bridgeMain(int argc, char** argv, char** envp) {
         // NOTE: This function may be called at any time. It must not
         // depend on the prior execution of mongo initializers or the
         // existence of threads.
-        ListeningSockets::get()->closeAll();
-        listener->shutdownAll();
+        if (hasGlobalServiceContext()) {
+            auto sc = getGlobalServiceContext();
+            if (sc->getTransportLayer())
+                sc->getTransportLayer()->shutdown();
+
+            if (sc->getServiceEntryPoint()) {
+                sc->getServiceEntryPoint()->endAllSessions(transport::Session::kEmptyTagMask);
+                sc->getServiceEntryPoint()->shutdown(Seconds{10});
+            }
+        }
     });
 
     setupSignalHandlers();
     runGlobalInitializersOrDie(argc, argv, envp);
     startSignalProcessingThread(LogFileStatus::kNoLogFileToRotate);
 
-    listener = stdx::make_unique<BridgeListener>();
-    listener->setupSockets();
-    listener->initAndListen();
+    setGlobalServiceContext(ServiceContext::make());
+    auto serviceContext = getGlobalServiceContext();
+    serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointBridge>(serviceContext));
+    serviceContext->setServiceExecutor(
+        std::make_unique<transport::ServiceExecutorSynchronous>(serviceContext));
 
-    return EXIT_CLEAN;
+    fassert(50766, serviceContext->getServiceExecutor()->start());
+
+    transport::TransportLayerASIO::Options opts;
+    opts.ipList.emplace_back("0.0.0.0");
+    opts.port = mongoBridgeGlobalParams.port;
+
+    serviceContext->setTransportLayer(std::make_unique<mongo::transport::TransportLayerASIO>(
+        opts, serviceContext->getServiceEntryPoint()));
+    auto tl = serviceContext->getTransportLayer();
+    if (!tl->setup().isOK()) {
+        LOGV2(22922, "Error setting up transport layer");
+        return EXIT_NET_ERROR;
+    }
+
+    if (!tl->start().isOK()) {
+        LOGV2(22923, "Error starting transport layer");
+        return EXIT_NET_ERROR;
+    }
+
+    serviceContext->notifyStartupComplete();
+    return waitForShutdown();
 }
 
 }  // namespace mongo

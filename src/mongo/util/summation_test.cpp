@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -40,36 +41,41 @@ namespace mongo {
 
 namespace {
 using limits = std::numeric_limits<long long>;
-std::vector<long long> longValues = {
-    limits::min(),
-    limits::min() + 1,
-    limits::min() / 2,
-    -(1LL << 53),
-    -(1LL << 52),
-    -(1LL << 32),
-    -0x100,
-    -0xff,
-    -0xaa,
-    -0x55,
-    -1,
-    0,
-    1,
-    2,
-    0x55,
-    0x80,
-    0xaa,
-    0x100,
-    512,
-    1024,
-    2048,
-    1LL << 31,
-    1LL << 32,
-    1LL << 52,
-    1LL << 53,
-    limits::max() / 2,
-    static_cast<long long>(1ULL << 63) - (1ULL << (63 - 53 - 1)),  // Halfway between two doubles
-    limits::max() - 1,
-    limits::max()};
+std::vector<long long> longValues = {limits::min(),
+                                     limits::min() + 1,
+                                     limits::min() / 2,
+                                     -(1LL << 53),
+                                     -(1LL << 52),
+                                     -(1LL << 32),
+                                     -0x100,
+                                     -0xff,
+                                     -0xaa,
+                                     -0x55,
+                                     -1,
+                                     0,
+                                     1,
+                                     2,
+                                     0x55,
+                                     0x80,
+                                     0xaa,
+                                     0x100,
+                                     512,
+                                     1024,
+                                     2048,
+                                     1LL << 31,
+                                     1LL << 32,
+                                     1LL << 52,
+                                     1LL << 53,
+                                     limits::max() / 2,
+
+#pragma warning(push)
+// C4308: negative integral constant converted to unsigned type
+#pragma warning(disable : 4308)
+                                     static_cast<long long>(1ULL << 63) -
+                                         (1ULL << (63 - 53 - 1)),  // Halfway between two doubles
+#pragma warning(pop)
+                                     limits::max() - 1,
+                                     limits::max()};
 
 std::vector<double> doubleValues = {
     1.4831356930199802e-05, -3.121724665346865,     3041897608700.073,       1001318343149.7166,
@@ -197,5 +203,33 @@ TEST(Summation, AddDoubles) {
     }
     ASSERT_EQUALS(sum.getDouble(), doubleValuesSum);
     ASSERT(straightSum != sum.getDouble());
+}
+
+TEST(Summation, ConvertInfinityToDecimal) {
+    constexpr double infinity = std::numeric_limits<double>::infinity();
+    DoubleDoubleSummation sum;
+
+    sum.addDouble(infinity);
+    ASSERT_EQUALS(infinity, sum.getDouble());
+    ASSERT_TRUE(sum.getDecimal().isInfinite());
+    ASSERT_FALSE(sum.getDecimal().isNaN());
+
+    sum.addDouble(1);
+    ASSERT_EQUALS(infinity, sum.getDouble());
+    ASSERT_TRUE(sum.getDecimal().isInfinite());
+    ASSERT_FALSE(sum.getDecimal().isNaN());
+}
+
+TEST(Summation, ConvertNaNToDecimal) {
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    DoubleDoubleSummation sum;
+
+    sum.addDouble(nan);
+    ASSERT_TRUE(sum.getDecimal().isNaN());
+    ASSERT_FALSE(sum.getDecimal().isInfinite());
+
+    sum.addDouble(1);
+    ASSERT_TRUE(sum.getDecimal().isNaN());
+    ASSERT_FALSE(sum.getDecimal().isInfinite());
 }
 }  // namespace mongo

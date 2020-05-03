@@ -1,25 +1,24 @@
-// expression_array.cpp
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -67,10 +66,9 @@ bool ArrayMatchingMatchExpression::equivalent(const MatchExpression* other) cons
 
 // -------
 
-Status ElemMatchObjectMatchExpression::init(StringData path, MatchExpression* sub) {
-    _sub.reset(sub);
-    return setPath(path);
-}
+ElemMatchObjectMatchExpression::ElemMatchObjectMatchExpression(StringData path,
+                                                               MatchExpression* sub)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_OBJECT, path), _sub(sub) {}
 
 bool ElemMatchObjectMatchExpression::matchesArray(const BSONObj& anArray,
                                                   MatchDetails* details) const {
@@ -79,7 +77,7 @@ bool ElemMatchObjectMatchExpression::matchesArray(const BSONObj& anArray,
         BSONElement inner = i.next();
         if (!inner.isABSONObj())
             continue;
-        if (_sub->matchesBSON(inner.Obj(), NULL)) {
+        if (_sub->matchesBSON(inner.Obj(), nullptr)) {
             if (details && details->needRecord()) {
                 details->setElemMatchKey(inner.fieldName());
             }
@@ -89,44 +87,49 @@ bool ElemMatchObjectMatchExpression::matchesArray(const BSONObj& anArray,
     return false;
 }
 
-void ElemMatchObjectMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void ElemMatchObjectMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " $elemMatch (obj)";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
     debug << "\n";
-    _sub->debugString(debug, level + 1);
+    _sub->debugString(debug, indentationLevel + 1);
 }
 
-void ElemMatchObjectMatchExpression::serialize(BSONObjBuilder* out) const {
+BSONObj ElemMatchObjectMatchExpression::getSerializedRightHandSide() const {
     BSONObjBuilder subBob;
-    _sub->serialize(&subBob);
-    out->append(path(), BSON("$elemMatch" << subBob.obj()));
+    _sub->serialize(&subBob, true);
+    return BSON("$elemMatch" << subBob.obj());
 }
 
+MatchExpression::ExpressionOptimizerFunc ElemMatchObjectMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        auto& elemExpression = static_cast<ElemMatchObjectMatchExpression&>(*expression);
+        elemExpression._sub = MatchExpression::optimize(std::move(elemExpression._sub));
+
+        return expression;
+    };
+}
 
 // -------
+
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(StringData path, MatchExpression* sub)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path) {
+    add(sub);
+}
+
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(StringData path)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path) {}
 
 ElemMatchValueMatchExpression::~ElemMatchValueMatchExpression() {
     for (unsigned i = 0; i < _subs.size(); i++)
         delete _subs[i];
     _subs.clear();
 }
-
-Status ElemMatchValueMatchExpression::init(StringData path, MatchExpression* sub) {
-    init(path).transitional_ignore();
-    add(sub);
-    return Status::OK();
-}
-
-Status ElemMatchValueMatchExpression::init(StringData path) {
-    return setPath(path);
-}
-
 
 void ElemMatchValueMatchExpression::add(MatchExpression* sub) {
     verify(sub);
@@ -157,40 +160,49 @@ bool ElemMatchValueMatchExpression::_arrayElementMatchesAll(const BSONElement& e
     return true;
 }
 
-void ElemMatchValueMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void ElemMatchValueMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " $elemMatch (value)";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
     debug << "\n";
     for (unsigned i = 0; i < _subs.size(); i++) {
-        _subs[i]->debugString(debug, level + 1);
+        _subs[i]->debugString(debug, indentationLevel + 1);
     }
 }
 
-void ElemMatchValueMatchExpression::serialize(BSONObjBuilder* out) const {
+BSONObj ElemMatchValueMatchExpression::getSerializedRightHandSide() const {
     BSONObjBuilder emBob;
 
-    for (unsigned i = 0; i < _subs.size(); i++) {
-        BSONObjBuilder predicate;
-        _subs[i]->serialize(&predicate);
-        BSONObj predObj = predicate.obj();
-        emBob.appendElements(predObj.firstElement().embeddedObject());
+    for (auto&& child : _subs) {
+        child->serialize(&emBob, false);
     }
-    out->append(path(), BSON("$elemMatch" << emBob.obj()));
+
+    return BSON("$elemMatch" << emBob.obj());
 }
 
+MatchExpression::ExpressionOptimizerFunc ElemMatchValueMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        auto& subs = static_cast<ElemMatchValueMatchExpression&>(*expression)._subs;
+
+        for (MatchExpression*& subExpression : subs) {
+            auto optimizedSubExpression =
+                MatchExpression::optimize(std::unique_ptr<MatchExpression>(subExpression));
+            subExpression = optimizedSubExpression.release();
+        }
+
+        return expression;
+    };
+}
 
 // ---------
 
-Status SizeMatchExpression::init(StringData path, int size) {
-    _size = size;
-    return setPath(path);
-}
+SizeMatchExpression::SizeMatchExpression(StringData path, int size)
+    : ArrayMatchingMatchExpression(SIZE, path), _size(size) {}
 
 bool SizeMatchExpression::matchesArray(const BSONObj& anArray, MatchDetails* details) const {
     if (_size < 0)
@@ -198,19 +210,19 @@ bool SizeMatchExpression::matchesArray(const BSONObj& anArray, MatchDetails* det
     return anArray.nFields() == _size;
 }
 
-void SizeMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
+void SizeMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << path() << " $size : " << _size << "\n";
 
     MatchExpression::TagData* td = getTag();
-    if (NULL != td) {
+    if (nullptr != td) {
         debug << " ";
         td->debugString(&debug);
     }
 }
 
-void SizeMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->append(path(), BSON("$size" << _size));
+BSONObj SizeMatchExpression::getSerializedRightHandSide() const {
+    return BSON("$size" << _size);
 }
 
 bool SizeMatchExpression::equivalent(const MatchExpression* other) const {
@@ -223,4 +235,4 @@ bool SizeMatchExpression::equivalent(const MatchExpression* other) const {
 
 
 // ------------------
-}
+}  // namespace mongo

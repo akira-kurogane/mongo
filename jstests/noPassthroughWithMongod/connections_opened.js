@@ -30,12 +30,14 @@ function createPersistentConnection() {
 
 function createTemporaryConnection() {
     // Retry connecting until you are successful
-    var pollString = "var conn = null;" + "assert.soon(function() {" + "try { conn = new Mongo(\"" +
-        db.getMongo().host + "\"); return conn" + "} catch (x) {return false;}}, " +
+    var pollString = "var conn = null;" +
+        "assert.soon(function() {" +
+        "try { conn = new Mongo(\"" + db.getMongo().host + "\"); return conn" +
+        "} catch (x) {return false;}}, " +
         "\"Timed out waiting for temporary connection to connect\", 30000, 5000);";
     // Poll the signal collection until it is told to terminate.
-    pollString += "assert.soon(function() {" + "return conn.getDB('" + testDB +
-        "').getCollection('" + signalCollection + "')" +
+    pollString += "assert.soon(function() {" +
+        "return conn.getDB('" + testDB + "').getCollection('" + signalCollection + "')" +
         ".findOne().stop;}, \"Parallel shell never told to terminate\", 10 * 60000);";
     return startParallelShell(pollString, null, true);
 }
@@ -47,13 +49,11 @@ function waitForConnections(expectedCurrentConnections, expectedTotalConnections
             return (expectedCurrentConnections == currentConnInfo.current) &&
                 (expectedTotalConnections, currentConnInfo.totalCreated);
         },
-        {
-          toString: function() {
-              return "Incorrect connection numbers. Expected " + expectedCurrentConnections +
-                  " current connections and " + expectedTotalConnections + " total" +
-                  " connections. Connection info from serverStatus: " +
-                  tojson(db.serverStatus().connections);
-          }
+        () => {
+            return "Incorrect connection numbers. Expected " + expectedCurrentConnections +
+                " current connections and " + expectedTotalConnections + " total" +
+                " connections. Connection info from serverStatus: " +
+                tojson(db.serverStatus().connections);
         },
         5 * 60000);
 }

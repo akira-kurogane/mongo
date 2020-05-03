@@ -1,31 +1,33 @@
-/*    Copyright 2015 MongoDB Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,13 +43,11 @@
 #include <sys/types.h>
 #endif
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/secure_zero_memory.h"
@@ -74,7 +74,7 @@ void EnablePrivilege(const wchar_t* name) {
     LUID luid;
     if (!LookupPrivilegeValueW(nullptr, name, &luid)) {
         auto str = errnoWithPrefix("Failed to LookupPrivilegeValue");
-        warning() << str;
+        LOGV2_WARNING(23704, "{str}", "str"_attr = str);
         return;
     }
 
@@ -82,11 +82,11 @@ void EnablePrivilege(const wchar_t* name) {
     HANDLE accessToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &accessToken)) {
         auto str = errnoWithPrefix("Failed to OpenProcessToken");
-        warning() << str;
+        LOGV2_WARNING(23705, "{str}", "str"_attr = str);
         return;
     }
 
-    const auto accessTokenGuard = MakeGuard([&] { CloseHandle(accessToken); });
+    const auto accessTokenGuard = makeGuard([&] { CloseHandle(accessToken); });
 
     TOKEN_PRIVILEGES privileges = {0};
 
@@ -97,12 +97,13 @@ void EnablePrivilege(const wchar_t* name) {
     if (!AdjustTokenPrivileges(
             accessToken, false, &privileges, sizeof(privileges), nullptr, nullptr)) {
         auto str = errnoWithPrefix("Failed to AdjustTokenPrivileges");
-        warning() << str;
+        LOGV2_WARNING(23706, "{str}", "str"_attr = str);
     }
 
     if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        warning() << "Failed to adjust token privilege for privilege '" << toUtf8String(name)
-                  << "'";
+        LOGV2_WARNING(23707,
+                      "Failed to adjust token privilege for privilege '{toUtf8String_name}'",
+                      "toUtf8String_name"_attr = toUtf8String(name));
     }
 }
 
@@ -113,7 +114,13 @@ void EnablePrivilege(const wchar_t* name) {
  * size, and then raising the working set. This is the same reason that "i++" has race conditions
  * across multiple threads.
  */
-stdx::mutex workingSizeMutex;
+stdx::mutex workingSizeMutex;  // NOLINT
+
+/**
+ * There is a minimum gap between the minimum working set size and maximum working set size.
+ * On Windows 2008 R2, it is 0x9000 bytes. On Windows 10, 0x7000 bytes.
+ */
+constexpr size_t minGap = 0x9000;
 
 /**
  * Grow the minimum working set size of the process to the specified size.
@@ -126,13 +133,12 @@ void growWorkingSize(std::size_t bytes) {
 
     if (!GetProcessWorkingSetSize(GetCurrentProcess(), &minWorkingSetSize, &maxWorkingSetSize)) {
         auto str = errnoWithPrefix("Failed to GetProcessWorkingSetSize");
-        severe() << str;
-        fassertFailed(40285);
+        LOGV2_FATAL(40285, "{str}", "str"_attr = str);
     }
 
     // Since allocation request is aligned to page size, we can just add it to the current working
     // set size.
-    maxWorkingSetSize = std::max(minWorkingSetSize + bytes, maxWorkingSetSize);
+    maxWorkingSetSize = std::max(minWorkingSetSize + bytes + minGap, maxWorkingSetSize);
 
     // Increase the working set size minimum to the new lower bound.
     if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(),
@@ -141,8 +147,7 @@ void growWorkingSize(std::size_t bytes) {
                                     QUOTA_LIMITS_HARDWS_MIN_ENABLE |
                                         QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
         auto str = errnoWithPrefix("Failed to SetProcessWorkingSetSizeEx");
-        severe() << str;
-        fassertFailed(40286);
+        LOGV2_FATAL(40286, "{str}", "str"_attr = str);
     }
 }
 
@@ -161,8 +166,7 @@ void* systemAllocate(std::size_t bytes) {
 
     if (!ptr) {
         auto str = errnoWithPrefix("Failed to VirtualAlloc");
-        severe() << str;
-        fassertFailed(28835);
+        LOGV2_FATAL(28835, "{str}", "str"_attr = str);
     }
 
     if (VirtualLock(ptr, bytes) == 0) {
@@ -178,8 +182,7 @@ void* systemAllocate(std::size_t bytes) {
         }
 
         auto str = errnoWithPrefix("Failed to VirtualLock");
-        severe() << str;
-        fassertFailed(28828);
+        LOGV2_FATAL(28828, "{str}", "str"_attr = str);
     }
 
     return ptr;
@@ -188,16 +191,14 @@ void* systemAllocate(std::size_t bytes) {
 void systemDeallocate(void* ptr, std::size_t bytes) {
     if (VirtualUnlock(ptr, bytes) == 0) {
         auto str = errnoWithPrefix("Failed to VirtualUnlock");
-        severe() << str;
-        fassertFailed(28829);
+        LOGV2_FATAL(28829, "{str}", "str"_attr = str);
     }
 
     // VirtualFree needs to take 0 as the size parameter for MEM_RELEASE
     // (that's how the api works).
     if (VirtualFree(ptr, 0, MEM_RELEASE) == 0) {
         auto str = errnoWithPrefix("Failed to VirtualFree");
-        severe() << str;
-        fassertFailed(28830);
+        LOGV2_FATAL(28830, "{str}", "str"_attr = str);
     }
 }
 
@@ -236,13 +237,15 @@ void* systemAllocate(std::size_t bytes) {
 
     if (!ptr) {
         auto str = errnoWithPrefix("Failed to mmap");
-        severe() << str;
+        LOGV2_FATAL(23714, "{str}", "str"_attr = str);
         fassertFailed(28831);
     }
 
     if (mlock(ptr, bytes) != 0) {
-        auto str = errnoWithPrefix("Failed to mlock");
-        severe() << str;
+        auto str = errnoWithPrefix(
+            "Failed to mlock: Cannot allocate locked memory. For more details see: "
+            "https://dochub.mongodb.org/core/cannot-allocate-locked-memory");
+        LOGV2_FATAL(23715, "{str}", "str"_attr = str);
         fassertFailed(28832);
     }
 
@@ -262,13 +265,16 @@ void systemDeallocate(void* ptr, std::size_t bytes) {
 #endif
 
     if (munlock(ptr, bytes) != 0) {
-        severe() << errnoWithPrefix("Failed to munlock");
-        fassertFailed(28833);
+        LOGV2_FATAL(28833,
+                    "{errnoWithPrefix_Failed_to_munlock}",
+                    "errnoWithPrefix_Failed_to_munlock"_attr =
+                        errnoWithPrefix("Failed to munlock"));
     }
 
     if (munmap(ptr, bytes) != 0) {
-        severe() << errnoWithPrefix("Failed to munmap");
-        fassertFailed(28834);
+        LOGV2_FATAL(28834,
+                    "{errnoWithPrefix_Failed_to_munmap}",
+                    "errnoWithPrefix_Failed_to_munmap"_attr = errnoWithPrefix("Failed to munmap"));
     }
 }
 
@@ -280,7 +286,8 @@ void systemDeallocate(void* ptr, std::size_t bytes) {
  * page size and allocate returns aligned pointers.
  */
 class Allocation {
-    MONGO_DISALLOW_COPYING(Allocation);
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
 
 public:
     explicit Allocation(std::size_t initialAllocation) {
@@ -328,7 +335,7 @@ std::shared_ptr<Allocation> lastAllocation = nullptr;
 
 }  // namespace
 
-MONGO_INITIALIZER_GENERAL(SecureAllocator, ("SystemInfo"), MONGO_NO_DEPENDENTS)
+MONGO_INITIALIZER_GENERAL(SecureAllocator, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS)
 (InitializerContext* context) {
 #if _WIN32
     // Enable the increase working set size privilege in our access token.

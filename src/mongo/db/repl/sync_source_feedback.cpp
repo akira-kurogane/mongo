@@ -1,32 +1,33 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +39,8 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/reporter.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
@@ -49,25 +50,25 @@ namespace repl {
 
 namespace {
 
+
+const Milliseconds maximumKeepAliveIntervalMS(30 * 1000);
+
+// The network timeout used for replSetUpdatePosition requests made to a node's sync source.
+const Seconds syncSourceFeedbackNetworkTimeoutSecs(30);
+
 /**
- * Calculates the keep alive interval based on the current configuration in the replication
- * coordinator.
+ * Calculates the keep alive interval based on the given ReplSetConfig.
  */
-Milliseconds calculateKeepAliveInterval(OperationContext* opCtx, stdx::mutex& mtx) {
-    stdx::lock_guard<stdx::mutex> lock(mtx);
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    auto rsConfig = replCoord->getConfig();
-    auto keepAliveInterval = rsConfig.getElectionTimeoutPeriod() / 2;
-    return keepAliveInterval;
+Milliseconds calculateKeepAliveInterval(const ReplSetConfig& rsConfig) {
+    return std::min((rsConfig.getElectionTimeoutPeriod() / 2), maximumKeepAliveIntervalMS);
 }
 
 /**
  * Returns function to prepare update command
  */
 Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePositionCommandFn(
-    OperationContext* opCtx, const HostAndPort& syncTarget, BackgroundSync* bgsync) {
-    return [syncTarget, opCtx, bgsync](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle
-                                           commandStyle) -> StatusWith<BSONObj> {
+    ReplicationCoordinator* replCoord, const HostAndPort& syncTarget, BackgroundSync* bgsync) {
+    return [syncTarget, replCoord, bgsync]() -> StatusWith<BSONObj> {
         auto currentSyncTarget = bgsync->getSyncTarget();
         if (currentSyncTarget != syncTarget) {
             if (currentSyncTarget.empty()) {
@@ -83,14 +84,13 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
             }
         }
 
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (replCoord->getMemberState().primary()) {
             // Primary has no one to send updates to.
             return Status(ErrorCodes::InvalidSyncSource,
                           "Currently primary - no one to send updates to");
         }
 
-        return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
+        return replCoord->prepareReplSetUpdatePositionCommand();
     };
 }
 
@@ -98,14 +98,17 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
 
 void SyncSourceFeedback::forwardSlaveProgress() {
     {
-        stdx::unique_lock<stdx::mutex> lock(_mtx);
+        stdx::unique_lock<Latch> lock(_mtx);
         _positionChanged = true;
         _cond.notify_all();
         if (_reporter) {
             auto triggerStatus = _reporter->trigger();
             if (!triggerStatus.isOK()) {
-                warning() << "unable to forward slave progress to " << _reporter->getTarget()
-                          << ": " << triggerStatus;
+                LOGV2_WARNING(21764,
+                              "unable to forward progress to {target}: {error}",
+                              "Unable to forward progress",
+                              "target"_attr = _reporter->getTarget(),
+                              "error"_attr = triggerStatus);
             }
         }
     }
@@ -116,15 +119,23 @@ Status SyncSourceFeedback::_updateUpstream(Reporter* reporter) {
 
     auto triggerStatus = reporter->trigger();
     if (!triggerStatus.isOK()) {
-        warning() << "unable to schedule reporter to update replication progress on " << syncTarget
-                  << ": " << triggerStatus;
+        LOGV2_WARNING(21765,
+                      "unable to schedule reporter to update replication progress on {syncTarget}: "
+                      "{error}",
+                      "Unable to schedule reporter to update replication progress",
+                      "syncTarget"_attr = syncTarget,
+                      "error"_attr = triggerStatus);
         return triggerStatus;
     }
 
     auto status = reporter->join();
 
     if (!status.isOK()) {
-        log() << "SyncSourceFeedback error sending update to " << syncTarget << ": " << status;
+        LOGV2(21760,
+              "SyncSourceFeedback error sending update to {syncTarget}: {error}",
+              "SyncSourceFeedback error sending update",
+              "syncTarget"_attr = syncTarget,
+              "error"_attr = status);
     }
 
     // Sync source blacklisting will be done in BackgroundSync and SyncSourceResolver.
@@ -133,7 +144,7 @@ Status SyncSourceFeedback::_updateUpstream(Reporter* reporter) {
 }
 
 void SyncSourceFeedback::shutdown() {
-    stdx::unique_lock<stdx::mutex> lock(_mtx);
+    stdx::unique_lock<Latch> lock(_mtx);
     if (_reporter) {
         _reporter->shutdown();
     }
@@ -141,7 +152,9 @@ void SyncSourceFeedback::shutdown() {
     _cond.notify_all();
 }
 
-void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* bgsync) {
+void SyncSourceFeedback::run(executor::TaskExecutor* executor,
+                             BackgroundSync* bgsync,
+                             ReplicationCoordinator* replCoord) {
     Client::initThread("SyncSourceFeedback");
 
     HostAndPort syncTarget;
@@ -150,17 +163,16 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
     Milliseconds keepAliveInterval(0);
 
     while (true) {  // breaks once _shutdownSignaled is true
-        auto opCtx = cc().makeOperationContext();
 
         if (keepAliveInterval == Milliseconds(0)) {
-            keepAliveInterval = calculateKeepAliveInterval(opCtx.get(), _mtx);
+            keepAliveInterval = calculateKeepAliveInterval(replCoord->getConfig());
         }
 
         {
             // Take SyncSourceFeedback lock before calling into ReplicationCoordinator
             // to avoid deadlock because ReplicationCoordinator could conceivably calling back into
             // this class.
-            stdx::unique_lock<stdx::mutex> lock(_mtx);
+            stdx::unique_lock<Latch> lock(_mtx);
             while (!_positionChanged && !_shutdownSignaled) {
                 {
                     MONGO_IDLE_THREAD_BLOCK;
@@ -169,7 +181,7 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
                         continue;
                     }
                 }
-                MemberState state = ReplicationCoordinator::get(opCtx.get())->getMemberState();
+                MemberState state = replCoord->getMemberState();
                 if (!(state.primary() || state.startup())) {
                     break;
                 }
@@ -183,8 +195,8 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
         }
 
         {
-            stdx::lock_guard<stdx::mutex> lock(_mtx);
-            MemberState state = ReplicationCoordinator::get(opCtx.get())->getMemberState();
+            stdx::lock_guard<Latch> lock(_mtx);
+            MemberState state = replCoord->getMemberState();
             if (state.primary() || state.startup()) {
                 continue;
             }
@@ -201,40 +213,54 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
         }
 
         if (syncTarget != target) {
-            LOG(1) << "setting syncSourceFeedback to " << target;
+            LOGV2_DEBUG(21761,
+                        1,
+                        "setting syncSourceFeedback to {target}",
+                        "Setting syncSourceFeedback",
+                        "target"_attr = target);
             syncTarget = target;
 
             // Update keepalive value from config.
             auto oldKeepAliveInterval = keepAliveInterval;
-            keepAliveInterval = calculateKeepAliveInterval(opCtx.get(), _mtx);
+            keepAliveInterval = calculateKeepAliveInterval(replCoord->getConfig());
             if (oldKeepAliveInterval != keepAliveInterval) {
-                LOG(1) << "new syncSourceFeedback keep alive duration = " << keepAliveInterval
-                       << " (previously " << oldKeepAliveInterval << ")";
+                LOGV2_DEBUG(21762,
+                            1,
+                            "new syncSourceFeedback keep alive duration = {newKeepAliveInterval} "
+                            "(previously {oldKeepAliveInterval})",
+                            "New syncSourceFeedback keep alive duration",
+                            "newKeepAliveInterval"_attr = keepAliveInterval,
+                            "oldKeepAliveInterval"_attr = oldKeepAliveInterval);
             }
         }
 
-        Reporter reporter(
-            executor,
-            makePrepareReplSetUpdatePositionCommandFn(opCtx.get(), syncTarget, bgsync),
-            syncTarget,
-            keepAliveInterval);
+        Reporter reporter(executor,
+                          makePrepareReplSetUpdatePositionCommandFn(replCoord, syncTarget, bgsync),
+                          syncTarget,
+                          keepAliveInterval,
+                          syncSourceFeedbackNetworkTimeoutSecs);
         {
-            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            stdx::lock_guard<Latch> lock(_mtx);
             if (_shutdownSignaled) {
                 break;
             }
             _reporter = &reporter;
         }
         ON_BLOCK_EXIT([this]() {
-            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            stdx::lock_guard<Latch> lock(_mtx);
             _reporter = nullptr;
         });
 
         auto status = _updateUpstream(&reporter);
         if (!status.isOK()) {
-            LOG(1) << "The replication progress command (replSetUpdatePosition) failed and will be "
-                      "retried: "
-                   << status;
+            LOGV2_DEBUG(
+                21763,
+                1,
+                "The replication progress command (replSetUpdatePosition) failed and will be "
+                "retried: {error}",
+                "The replication progress command (replSetUpdatePosition) failed and will be "
+                "retried",
+                "error"_attr = status);
         }
     }
 }

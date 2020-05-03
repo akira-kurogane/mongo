@@ -1,54 +1,66 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/base/initializer_dependency_graph.h"
 
 #include <algorithm>
+#include <fmt/format.h>
+#include <iostream>
 #include <iterator>
+#include <random>
 #include <sstream>
 
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
+
 namespace mongo {
+
+using namespace fmt::literals;
 
 InitializerDependencyGraph::InitializerDependencyGraph() {}
 InitializerDependencyGraph::~InitializerDependencyGraph() {}
 
-Status InitializerDependencyGraph::addInitializer(const std::string& name,
-                                                  const InitializerFunction& fn,
-                                                  const std::vector<std::string>& prerequisites,
-                                                  const std::vector<std::string>& dependents) {
-    if (!fn)
+Status InitializerDependencyGraph::addInitializer(std::string name,
+                                                  InitializerFunction initFn,
+                                                  DeinitializerFunction deinitFn,
+                                                  std::vector<std::string> prerequisites,
+                                                  std::vector<std::string> dependents) {
+    if (!initFn)
         return Status(ErrorCodes::BadValue, "Illegal to supply a NULL function");
 
-    NodeData& newNode = _nodes[name];
-    if (newNode.fn) {
-        return Status(ErrorCodes::DuplicateKey, name);
+    InitializerDependencyNode& newNode = _nodes[name];
+    if (newNode.initFn) {
+        return Status(ErrorCodes::Error(50999), name);
     }
 
-    newNode.fn = fn;
+    newNode.initFn = std::move(initFn);
+    newNode.deinitFn = std::move(deinitFn);
 
     for (size_t i = 0; i < prerequisites.size(); ++i) {
         newNode.prerequisites.insert(prerequisites[i]);
@@ -61,100 +73,151 @@ Status InitializerDependencyGraph::addInitializer(const std::string& name,
     return Status::OK();
 }
 
-InitializerFunction InitializerDependencyGraph::getInitializerFunction(
-    const std::string& name) const {
-    NodeMap::const_iterator iter = _nodes.find(name);
+InitializerDependencyNode* InitializerDependencyGraph::getInitializerNode(const std::string& name) {
+    NodeMap::iterator iter = _nodes.find(name);
     if (iter == _nodes.end())
-        return InitializerFunction();
-    return iter->second.fn;
+        return nullptr;
+
+    return &iter->second;
 }
 
-Status InitializerDependencyGraph::topSort(std::vector<std::string>* sortedNames) const {
-    /*
-     * This top-sort is implemented by performing a depth-first traversal of the dependency
-     * graph, once for each node.  "visitedNodeNames" tracks the set of node names ever visited,
-     * and it is used to prune each DFS.  A node that has been visited once on any DFS is never
-     * visited again.  Complexity of this implementation is O(n+m) where "n" is the number of
-     * nodes and "m" is the number of prerequisite edges.  Space complexity is O(n), in both
-     * stack space and size of the "visitedNodeNames" set.
-     *
-     * "inProgressNodeNames" is used to detect and report cycles.
-     */
+namespace {
 
-    std::vector<std::string> inProgressNodeNames;
-    unordered_set<std::string> visitedNodeNames;
+template <typename Seq>
+void strAppendJoin(std::string& out, StringData separator, const Seq& sequence) {
+    StringData currSep;
+    for (StringData str : sequence) {
+        out.append(currSep.rawData(), currSep.size());
+        out.append(str.rawData(), str.size());
+        currSep = separator;
+    }
+}
 
+// In the case of a cycle, copy the cycle into `names`.
+// It's undocumented behavior, but it's cheap and a test wants it.
+template <typename Iter>
+void throwGraphContainsCycle(Iter first, Iter last, std::vector<std::string>& names) {
+    std::string desc = "Cycle in dependency graph: ";
+    std::transform(first, last, std::back_inserter(names), [](auto& e) { return e->name(); });
+    names.push_back((*first)->name());  // Tests awkwardly want first element to be repeated.
+    strAppendJoin(desc, " -> ", names);
+    uasserted(ErrorCodes::GraphContainsCycle, desc);
+}
+}  // namespace
+
+Status InitializerDependencyGraph::topSort(std::vector<std::string>* sortedNames) const try {
+    // Topological sort via repeated depth-first traversal.
+    // All nodes must have an initFn before running topSort, or we return BadValue.
+    struct Element {
+        const std::string& name() const {
+            return node->first;
+        }
+        const Node* node;
+        std::vector<Element*> children;
+        std::vector<Element*>::iterator membership;  // Position of this in `elements`.
+    };
+
+    std::vector<Element> elementsStore;
+    std::vector<Element*> elements;
+
+    // Swap the pointers in the `elements` vector that point to `a` and `b`.
+    // Update their 'membership' data members to reflect the change.
+    auto swapPositions = [](Element& a, Element& b) {
+        using std::swap;
+        swap(*a.membership, *b.membership);
+        swap(a.membership, b.membership);
+    };
+
+    elementsStore.reserve(_nodes.size());
+    std::transform(
+        _nodes.begin(), _nodes.end(), std::back_inserter(elementsStore), [](const Node& n) {
+            uassert(ErrorCodes::BadValue,
+                    "No implementation provided for initializer {}"_format(n.first),
+                    n.second.initFn);
+            return Element{&n};
+        });
+
+    // Wire up all the child relationships by pointer rather than by string names.
+    {
+        StringMap<Element*> byName;
+        for (Element& e : elementsStore)
+            byName[e.name()] = &e;
+        for (Element& element : elementsStore) {
+            const auto& prereqs = element.node->second.prerequisites;
+            std::transform(prereqs.begin(),
+                           prereqs.end(),
+                           std::back_inserter(element.children),
+                           [&](StringData childName) {
+                               auto iter = byName.find(childName);
+                               uassert(ErrorCodes::BadValue,
+                                       "Initializer {} depends on missing initializer {}"_format(
+                                           element.node->first, childName),
+                                       iter != byName.end());
+                               return iter->second;
+                           });
+        }
+    }
+
+    elements.reserve(_nodes.size());
+    std::transform(elementsStore.begin(),
+                   elementsStore.end(),
+                   std::back_inserter(elements),
+                   [](auto& e) { return &e; });
+
+    // Shuffle the inputs to improve test coverage of undeclared dependencies.
+    {
+        std::random_device slowSeedGen;
+        std::mt19937 generator(slowSeedGen());
+        std::shuffle(elements.begin(), elements.end(), generator);
+        for (Element* e : elements)
+            std::shuffle(e->children.begin(), e->children.end(), generator);
+    }
+
+    // Initialize all the `membership` iterators. Must only happen after shuffle.
+    for (auto iter = elements.begin(); iter != elements.end(); ++iter)
+        (*iter)->membership = iter;
+
+    // The `elements` sequence is divided into 3 regions:
+    // elements:        [ sorted | unsorted | stack ]
+    //          unsortedBegin => [          )  <= unsortedEnd
+    // Each element of the stack region is a prerequisite of its neighbor to the right. Through
+    // 'swapPositions' calls and boundary increments, elements will transition from unsorted to
+    // stack to sorted. The unsorted region shinks to ultimately become an empty region on the
+    // right. No other moves are permitted.
+    auto unsortedBegin = elements.begin();
+    auto unsortedEnd = elements.end();
+
+    while (unsortedBegin != elements.end()) {
+        if (unsortedEnd == elements.end()) {
+            // The stack is empty but there's more work to do. Grow the stack region to enclose
+            // the rightmost unsorted element. Equivalent to pushing it.
+            --unsortedEnd;
+        }
+        auto top = unsortedEnd;
+        auto& children = (*top)->children;
+        if (!children.empty()) {
+            Element* picked = children.back();
+            children.pop_back();
+            if (picked->membership < unsortedBegin)
+                continue;
+            if (picked->membership >= unsortedEnd) {  // O(1) cycle detection
+                sortedNames->clear();
+                throwGraphContainsCycle(unsortedEnd, elements.end(), *sortedNames);
+            }
+            swapPositions(**--unsortedEnd, *picked);  // unsorted push to stack
+            continue;
+        }
+        swapPositions(**unsortedEnd++, **unsortedBegin++);  // pop from stack to sorted
+    }
     sortedNames->clear();
-    for (const auto& node : _nodes) {
-        Status status =
-            recursiveTopSort(_nodes, node, &inProgressNodeNames, &visitedNodeNames, sortedNames);
-        if (Status::OK() != status)
-            return status;
-    }
-    for (const auto& node : _nodes) {
-        if (!node.second.fn) {
-            std::ostringstream os;
-            os << "No implementation provided for initializer " << node.first;
-            return {ErrorCodes::BadValue, os.str()};
-        }
-    }
+    sortedNames->reserve(_nodes.size());
+    std::transform(elements.begin(),
+                   elements.end(),
+                   std::back_inserter(*sortedNames),
+                   [](const Element* e) { return e->name(); });
     return Status::OK();
-}
-
-Status InitializerDependencyGraph::recursiveTopSort(const NodeMap& nodeMap,
-                                                    const Node& currentNode,
-                                                    std::vector<std::string>* inProgressNodeNames,
-                                                    unordered_set<std::string>* visitedNodeNames,
-                                                    std::vector<std::string>* sortedNames) {
-
-    /*
-     * The top sort is performed by depth-first traversal starting at each node in the
-     * dependency graph, short-circuited any time a node is seen that has already been visited
-     * in any traversal.  "visitedNodeNames" is the set of nodes that have been successfully
-     * visited, while "inProgressNodeNames" are nodes currently in the exploration chain.  This
-     * structure is kept explicitly to facilitate cycle detection.
-     *
-     * This function implements a depth-first traversal, and is called once for each node in the
-     * graph by topSort(), above.
-     */
-
-    if ((*visitedNodeNames).count(currentNode.first))
-        return Status::OK();
-
-    inProgressNodeNames->push_back(currentNode.first);
-
-    auto firstOccurence =
-        std::find(inProgressNodeNames->begin(), inProgressNodeNames->end(), currentNode.first);
-    if (std::next(firstOccurence) != inProgressNodeNames->end()) {
-        sortedNames->clear();
-        std::copy(firstOccurence, inProgressNodeNames->end(), std::back_inserter(*sortedNames));
-        std::ostringstream os;
-        os << "Cycle in dependendcy graph: " << sortedNames->at(0);
-        for (size_t i = 1; i < sortedNames->size(); ++i)
-            os << " -> " << sortedNames->at(i);
-        return Status(ErrorCodes::GraphContainsCycle, os.str());
-    }
-
-    for (const auto& prereq : currentNode.second.prerequisites) {
-        auto nextNode = nodeMap.find(prereq);
-        if (nextNode == nodeMap.end()) {
-            std::ostringstream os;
-            os << "Initializer " << currentNode.first << " depends on missing initializer "
-               << prereq;
-            return {ErrorCodes::BadValue, os.str()};
-        }
-
-        Status status = recursiveTopSort(
-            nodeMap, *nextNode, inProgressNodeNames, visitedNodeNames, sortedNames);
-        if (Status::OK() != status)
-            return status;
-    }
-    sortedNames->push_back(currentNode.first);
-    if (inProgressNodeNames->back() != currentNode.first)
-        return Status(ErrorCodes::InternalError, "inProgressNodeNames stack corrupt");
-    inProgressNodeNames->pop_back();
-    visitedNodeNames->insert(currentNode.first);
-    return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 }  // namespace mongo

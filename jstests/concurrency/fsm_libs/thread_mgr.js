@@ -1,6 +1,6 @@
 'use strict';
 
-load('jstests/libs/parallelTester.js');                 // for ScopedThread and CountDownLatch
+load('jstests/libs/parallelTester.js');                 // for Thread and CountDownLatch
 load('jstests/concurrency/fsm_libs/worker_thread.js');  // for workerThread
 
 /**
@@ -28,11 +28,10 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
         };
 
         if (executionMode.composed) {
-            return new ScopedThread(
-                guardedThreadFn, workerThread.composed, workloads, args, options);
+            return new Thread(guardedThreadFn, workerThread.composed, workloads, args, options);
         }
 
-        return new ScopedThread(guardedThreadFn, workerThread.fsm, workloads, args, options);
+        return new Thread(guardedThreadFn, workerThread.fsm, workloads, args, options);
     }
 
     var latch;
@@ -53,7 +52,7 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
                   'the maximum allowed threads must be an integer');
 
         function computeNumThreads() {
-            // If we don't have any workloads, such as having no background workloads, return 0.
+            // If we don't have any workloads, return 0.
             if (workloads.length === 0) {
                 return 0;
             }
@@ -111,6 +110,8 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
                     tid: tid++,
                     data: workloadData,
                     host: cluster.getHost(),
+                    secondaryHost: cluster.getSecondaryHost(),
+                    replSetName: cluster.getReplSetName(),
                     latch: latch,
                     dbName: _context[workload].dbName,
                     collName: _context[workload].collName,
@@ -187,19 +188,6 @@ var ThreadManager = function(clusterOptions, executionMode = {composed: false}) 
         threads = [];
 
         return errors;
-    };
-
-    this.markAllForTermination = function markAllForTermination() {
-        if (_workloads.length === 0) {
-            return;
-        }
-
-        // Background threads periodically check the 'fsm_background' collection of the
-        // 'config' database for a document specifying { terminate: true }. If such a
-        // document is found the background thread terminates.
-        var coll = _context[_workloads[0]].db.getSiblingDB('config').fsm_background;
-        assert.writeOK(coll.update({terminate: true}, {terminate: true}, {upsert: true}));
-
     };
 };
 

@@ -1,7 +1,3 @@
-// Cannot implicitly shard accessed collections because of use of $near query instead of geoNear
-// command.
-// @tags: [assumes_unsharded_collection]
-
 // Check the semantics of near calls with multiple locations
 
 t = db.geoarray2;
@@ -44,9 +40,10 @@ for (var t = 0; t < 2; t++) {
             // Do near check
 
             var nearResults =
-                db.runCommand({geoNear: "geoarray2", near: center, num: count, query: {type: type}})
-                    .results;
-            // printjson( nearResults )
+                db.geoarray2
+                    .find({loc: {$near: center}, type: type}, {dis: {$meta: "geoNearDistance"}})
+                    .limit(count)
+                    .toArray();
 
             var objsFound = {};
             var lastResult = 0;
@@ -55,12 +52,10 @@ for (var t = 0; t < 2; t++) {
                 assert.gt(1.5, nearResults[k].dis);
                 // Distances should be increasing
                 assert.lte(lastResult, nearResults[k].dis);
-                // Objs should be of the right type
-                assert.eq(type, nearResults[k].obj.type);
 
                 lastResult = nearResults[k].dis;
 
-                var objKey = "" + nearResults[k].obj._id;
+                var objKey = "" + nearResults[k]._id;
 
                 if (objKey in objsFound)
                     objsFound[objKey]++;

@@ -5,9 +5,8 @@
  *
  */
 function isMongos(db) {
-    var res = db.runCommand('ismaster');
-    assert.commandWorked(res);
-
+    // Run isMaster directly on the database's session's client to bypass any session machinery.
+    const res = assert.commandWorked(db.getSession().getClient().adminCommand('ismaster'));
     return 'isdbgrid' === res.msg;
 }
 
@@ -50,22 +49,6 @@ function getStorageEngineName(db) {
 }
 
 /**
- * Returns true if the current storage engine is mmapv1, and false otherwise.
- */
-function isMMAPv1(db) {
-    return getStorageEngineName(db) === 'mmapv1';
-}
-
-/**
- * Returns true if an update can cause the RecordId of a document to change.
- */
-function recordIdCanChangeOnUpdate(db) {
-    // A RecordId on MMAPv1 is just its location on disk, which can change if the document grows and
-    // needs to be moved.
-    return isMMAPv1(db);
-}
-
-/**
  * Returns true if the current storage engine is wiredTiger, and false otherwise.
  */
 function isWiredTiger(db) {
@@ -94,4 +77,20 @@ function isEphemeral(db) {
 function supportsDocumentLevelConcurrency(db) {
     var engine = getStorageEngineName(db);
     return ['wiredTiger', 'rocksdb', 'inMemory'].indexOf(engine) !== -1;
+}
+
+/**
+ * Returns true if the current storage engine supports committed reads.
+ *
+ * Throws an error if db is connected to a mongos, or if there is no reported storage engine.
+ */
+function supportsCommittedReads(db) {
+    var status = db.serverStatus();
+    assert.commandWorked(status);
+
+    assert(isMongod(db), 'no storage engine is reported when connected to mongos');
+    assert.neq(
+        'undefined', typeof status.storageEngine, 'missing storage engine info in server status');
+
+    return status.storageEngine.supportsCommittedReads;
 }

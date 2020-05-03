@@ -22,7 +22,7 @@
     for (var i = 0; i < N; ++i) {
         bulk.insert({_id: i, x: i, a: {}});
     }
-    assert.writeOK(bulk.execute());
+    assert.commandWorked(bulk.execute());
 
     jsTestLog("3. Make sure synced");
     replTest.awaitReplication();
@@ -34,7 +34,7 @@
 
     var config = replTest.getReplSetConfig();
     config.version = replTest.getReplSetConfigFromNode().version + 1;
-    config.members.push({_id: 2, host: hostname + ":" + s.port, priority: 0});
+    config.members.push({_id: 2, host: hostname + ":" + s.port, priority: 0, votes: 0});
     try {
         m.getDB("admin").runCommand({replSetReconfig: config});
     } catch (e) {
@@ -81,6 +81,6 @@
     assert.eq(mc.getIndexKeys().length, sc.getIndexKeys().length);
 
     assert.eq(mc.find().sort({x: 1}).itcount(), sc.find().sort({x: 1}).itcount());
-
+    MongoRunner.stopMongod(s);
     replTest.stopSet(15);
 }());

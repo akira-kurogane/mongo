@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,19 +31,19 @@
 
 #include "mongo/db/ops/write_ops_parsers.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
+using write_ops::Delete;
+using write_ops::DeleteOpEntry;
 using write_ops::Insert;
 using write_ops::Update;
-using write_ops::Delete;
 using write_ops::UpdateOpEntry;
-using write_ops::DeleteOpEntry;
 
 namespace {
 
@@ -50,39 +51,20 @@ template <class T>
 void checkOpCountForCommand(const T& op, size_t numOps) {
     uassert(ErrorCodes::InvalidLength,
             str::stream() << "Write batch sizes must be between 1 and "
-                          << write_ops::kMaxWriteBatchSize
-                          << ". Got "
-                          << numOps
-                          << " operations.",
+                          << write_ops::kMaxWriteBatchSize << ". Got " << numOps << " operations.",
             numOps != 0 && numOps <= write_ops::kMaxWriteBatchSize);
 
     const auto& stmtIds = op.getWriteCommandBase().getStmtIds();
     uassert(ErrorCodes::InvalidLength,
             "Number of statement ids must match the number of batch entries",
             !stmtIds || stmtIds->size() == numOps);
+    uassert(ErrorCodes::InvalidOptions,
+            "May not specify both stmtId and stmtIds in write command",
+            !stmtIds || !op.getWriteCommandBase().getStmtId());
 }
 
 void validateInsertOp(const write_ops::Insert& insertOp) {
-    const auto& nss = insertOp.getNamespace();
     const auto& docs = insertOp.getDocuments();
-
-    if (nss.isSystemDotIndexes()) {
-        // This is only for consistency with sharding.
-        uassert(ErrorCodes::InvalidLength,
-                "Insert commands to system.indexes are limited to a single insert",
-                docs.size() == 1);
-
-        const auto indexedNss(extractIndexedNamespace(insertOp));
-
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << indexedNss.ns() << " is not a valid namespace to index",
-                indexedNss.isValid());
-
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << indexedNss.ns() << " is not in the target database " << nss.db(),
-                nss.db().compare(indexedNss.db()) == 0);
-    }
-
     checkOpCountForCommand(insertOp, docs.size());
 }
 
@@ -112,17 +94,9 @@ int32_t getStmtIdForWriteAt(const WriteCommandBase& writeCommandBase, size_t wri
         return stmtIds->at(writePos);
     }
 
-    const int32_t kFirstStmtId = 0;
+    const auto& stmtId = writeCommandBase.getStmtId();
+    const int32_t kFirstStmtId = stmtId ? *stmtId : 0;
     return kFirstStmtId + writePos;
-}
-
-NamespaceString extractIndexedNamespace(const Insert& insertOp) {
-    invariant(insertOp.getNamespace().isSystemDotIndexes());
-
-    const auto& documents = insertOp.getDocuments();
-    invariant(documents.size() == 1);
-
-    return NamespaceString(documents.at(0)["ns"].str());
 }
 
 }  // namespace write_ops
@@ -190,7 +164,8 @@ write_ops::Update UpdateOp::parseLegacy(const Message& msgRaw) {
         singleUpdate.setUpsert(flags & UpdateOption_Upsert);
         singleUpdate.setMulti(flags & UpdateOption_Multi);
         singleUpdate.setQ(msg.nextJsObj());
-        singleUpdate.setU(msg.nextJsObj());
+        singleUpdate.setU(
+            write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(msg.nextJsObj()));
 
         return updates;
     }());
@@ -231,6 +206,54 @@ write_ops::Delete DeleteOp::parseLegacy(const Message& msgRaw) {
     }());
 
     return op;
+}
+
+write_ops::UpdateModification::UpdateModification(BSONElement update) {
+    const auto type = update.type();
+    if (type == BSONType::Object) {
+        _classicUpdate = update.Obj();
+        _type = Type::kClassic;
+        return;
+    }
+
+    uassert(ErrorCodes::FailedToParse,
+            "Update argument must be either an object or an array",
+            type == BSONType::Array);
+
+    _type = Type::kPipeline;
+
+    _pipeline = uassertStatusOK(AggregationRequest::parsePipelineFromBSON(update));
+}
+
+write_ops::UpdateModification::UpdateModification(const BSONObj& update) {
+    _classicUpdate = update;
+    _type = Type::kClassic;
+}
+
+write_ops::UpdateModification::UpdateModification(std::vector<BSONObj> pipeline)
+    : _type{Type::kPipeline}, _pipeline{std::move(pipeline)} {}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseFromBSON(BSONElement elem) {
+    return UpdateModification(elem);
+}
+
+write_ops::UpdateModification write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(
+    const BSONObj& obj) {
+    return UpdateModification(obj);
+}
+
+void write_ops::UpdateModification::serializeToBSON(StringData fieldName,
+                                                    BSONObjBuilder* bob) const {
+    if (_type == Type::kClassic) {
+        *bob << fieldName << *_classicUpdate;
+        return;
+    }
+
+    BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+    for (auto&& stage : *_pipeline) {
+        arrayBuilder << stage;
+    }
+    arrayBuilder.doneFast();
 }
 
 }  // namespace mongo

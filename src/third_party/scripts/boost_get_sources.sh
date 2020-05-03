@@ -13,7 +13,7 @@ if [ "$#" -ne 0 ]; then
 fi
 
 NAME=boost
-VERSION=1.60.0
+VERSION=1.70.0
 VERSION_UNDERSCORE=$(echo $VERSION | tr . _)
 SRC_ROOT=$(mktemp -d /tmp/boost.XXXXXX)
 trap "rm -rf $SRC_ROOT" EXIT
@@ -43,7 +43,7 @@ cd $SRC
 ./b2 tools/bcp
 
 test -d $DEST_DIR || mkdir $DEST_DIR
-$SRC/dist/bin/bcp --boost=$SRC/ algorithm align array asio bind iostreams config container date_time filesystem function integer intrusive multi_index noncopyable optional program_options random smart_ptr static_assert unordered utility $DEST_DIR
+$SRC/dist/bin/bcp --boost=$SRC/ algorithm align array asio bind iostreams config container date_time filesystem function integer intrusive log multi_index noncopyable optional program_options property_tree random smart_ptr static_assert unordered utility $DEST_DIR
 
 # Trim files
 cd $DEST_DIR

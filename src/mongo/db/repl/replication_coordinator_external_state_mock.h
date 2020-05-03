@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,15 +31,14 @@
 
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -49,7 +49,10 @@ class ServiceContext;
 namespace repl {
 
 class ReplicationCoordinatorExternalStateMock : public ReplicationCoordinatorExternalState {
-    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateMock);
+    ReplicationCoordinatorExternalStateMock(const ReplicationCoordinatorExternalStateMock&) =
+        delete;
+    ReplicationCoordinatorExternalStateMock& operator=(
+        const ReplicationCoordinatorExternalStateMock&) = delete;
 
 public:
     class GlobalSharedLockAcquirer;
@@ -62,51 +65,43 @@ public:
     virtual void stopDataReplication(OperationContext* opCtx) override;
     virtual bool isInitialSyncFlagSet(OperationContext* opCtx) override;
 
-    virtual void startMasterSlave(OperationContext*);
     virtual void shutdown(OperationContext* opCtx);
+    virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
-    virtual OldThreadPool* getDbWorkThreadPool() const override;
-    virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
+    virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
-    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
-    OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
+    OpTime onTransitionToPrimary(OperationContext* opCtx) override;
     virtual void forwardSlaveProgress();
-    virtual OID ensureMe(OperationContext*);
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config);
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog);
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx);
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
-    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx);
+    virtual Timestamp getGlobalTimestamp(ServiceContext* service);
+    bool oplogExists(OperationContext* opCtx) override;
+    virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx);
     virtual void closeConnections();
-    virtual void killAllUserOperations(OperationContext* opCtx);
-    virtual void shardingOnStepDownHook();
+    virtual void onStepDownHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
+    virtual bool tooStale();
     virtual void dropAllSnapshots();
-    virtual void updateCommittedSnapshot(SnapshotInfo newCommitPoint);
-    virtual void createSnapshot(OperationContext* opCtx, SnapshotName name);
-    virtual void forceSnapshotCreation();
+    virtual void updateCommittedSnapshot(const OpTime& newCommitPoint);
+    virtual void updateLocalSnapshot(const OpTime& optime);
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
+    boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
     virtual double getElectionTimeoutOffsetLimitFraction() const;
     virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const;
-    virtual StatusWith<OpTime> multiApply(OperationContext* opCtx,
-                                          MultiApplier::Operations ops,
-                                          MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                         const HostAndPort& source,
-                                         AtomicUInt32* fetchCount) override;
-    virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
-        OperationContext* opCtx) const override;
-    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
-        OperationContext* opCtx) const override;
-    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
+    virtual bool isReadConcernSnapshotSupportedByStorageEngine(OperationContext* opCtx) const;
+    virtual std::size_t getOplogFetcherSteadyStateMaxFetcherRestarts() const override;
+    virtual std::size_t getOplogFetcherInitialSyncMaxFetcherRestarts() const override;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"
@@ -115,9 +110,20 @@ public:
     void addSelf(const HostAndPort& host);
 
     /**
+     * Remove all hosts from the list of hosts that this mock will match when responding to "isSelf"
+     * messages.
+     */
+    void clearSelfHosts();
+
+    /**
      * Sets the return value for subsequent calls to loadLocalConfigDocument().
      */
     void setLocalConfigDocument(const StatusWith<BSONObj>& localConfigDocument);
+
+    /**
+     * Initializes the return value for subsequent calls to loadLocalLastVoteDocument().
+     */
+    Status createLocalLastVoteCollection(OperationContext* opCtx) final;
 
     /**
      * Sets the return value for subsequent calls to loadLocalLastVoteDocument().
@@ -132,7 +138,8 @@ public:
     /**
      * Sets the return value for subsequent calls to loadLastOpTimeApplied.
      */
-    void setLastOpTime(const StatusWith<OpTime>& lastApplied);
+    void setLastOpTimeAndWallTime(const StatusWith<OpTime>& lastApplied,
+                                  Date_t lastAppliedWall = Date_t());
 
     /**
      * Sets the return value for subsequent calls to storeLocalConfigDocument().
@@ -152,6 +159,8 @@ public:
      */
     void setStoreLocalLastVoteDocumentToHang(bool hang);
 
+    void setFirstOpTimeOfMyTerm(const OpTime& opTime);
+
     /**
      * Returns true if startThreads() has been called.
      */
@@ -166,6 +175,11 @@ public:
      * Sets if we are taking snapshots for read concern majority use.
      */
     void setAreSnapshotsEnabled(bool val);
+
+    /**
+     * Sets the election timeout offset limit. Default is 0.15.
+     */
+    void setElectionTimeoutOffsetLimitFraction(double val);
 
     /**
      * Noop
@@ -186,12 +200,14 @@ private:
     StatusWith<BSONObj> _localRsConfigDocument;
     StatusWith<LastVote> _localRsLastVoteDocument;
     StatusWith<OpTime> _lastOpTime;
+    StatusWith<Date_t> _lastWallTime;
     std::vector<HostAndPort> _selfHosts;
     bool _canAcquireGlobalSharedLock;
     Status _storeLocalConfigDocumentStatus;
     Status _storeLocalLastVoteDocumentStatus;
     // mutex and cond var for controlling stroeLocalLastVoteDocument()'s hanging
-    stdx::mutex _shouldHangLastVoteMutex;
+    Mutex _shouldHangLastVoteMutex =
+        MONGO_MAKE_LATCH("ReplicationCoordinatorExternalStateMock::_shouldHangLastVoteMutex");
     stdx::condition_variable _shouldHangLastVoteCondVar;
     bool _storeLocalLastVoteDocumentShouldHang;
     bool _connectionsClosed;
@@ -199,6 +215,9 @@ private:
     bool _threadsStarted;
     bool _isReadCommittedSupported = true;
     bool _areSnapshotsEnabled = true;
+    OpTime _firstOpTimeOfMyTerm;
+    double _electionTimeoutOffsetLimitFraction = 0.15;
+    Timestamp _globalTimestamp;
 };
 
 }  // namespace repl

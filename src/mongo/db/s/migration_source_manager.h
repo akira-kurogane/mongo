@@ -1,46 +1,46 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <string>
+#include <boost/optional.hpp>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/s/metadata_manager.h"
-#include "mongo/s/move_chunk_request.h"
-#include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/concurrency/notification.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_chunk_cloner_source.h"
+#include "mongo/db/s/migration_coordinator.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-class MigrationChunkClonerSource;
 class OperationContext;
+struct ShardingStatistics;
 
 /**
  * The donor-side migration state machine. This object must be created and owned by a single thread,
@@ -68,9 +68,17 @@ class OperationContext;
  * is the commitDonateChunk and its comments explain the reasoning.
  */
 class MigrationSourceManager {
-    MONGO_DISALLOW_COPYING(MigrationSourceManager);
+    MigrationSourceManager(const MigrationSourceManager&) = delete;
+    MigrationSourceManager& operator=(const MigrationSourceManager&) = delete;
 
 public:
+    /**
+     * Retrieves the MigrationSourceManager pointer that corresponds to the given collection under
+     * a CollectionShardingRuntime that has its ResourceMutex locked.
+     */
+    static MigrationSourceManager* get(CollectionShardingRuntime* csr,
+                                       CollectionShardingRuntime::CSRLock& csrLock);
+
     /**
      * Instantiates a new migration source manager with the specified migration parameters. Must be
      * called with the distributed lock acquired in advance (not asserted).
@@ -101,7 +109,7 @@ public:
      * Expected state: kCreated
      * Resulting state: kCloning on success, kDone on failure
      */
-    Status startClone(OperationContext* opCtx);
+    Status startClone();
 
     /**
      * Waits for the cloning to catch up sufficiently so we won't have to stay in the critical
@@ -111,7 +119,7 @@ public:
      * Expected state: kCloning
      * Resulting state: kCloneCaughtUp on success, kDone on failure
      */
-    Status awaitToCatchUp(OperationContext* opCtx);
+    Status awaitToCatchUp();
 
     /**
      * Waits for the active clone operation to catch up and enters critical section. Once this call
@@ -122,7 +130,7 @@ public:
      * Expected state: kCloneCaughtUp
      * Resulting state: kCriticalSection on success, kDone on failure
      */
-    Status enterCriticalSection(OperationContext* opCtx);
+    Status enterCriticalSection();
 
     /**
      * Tells the recipient of the chunk to commit the chunk contents, which it received.
@@ -130,7 +138,7 @@ public:
      * Expected state: kCriticalSection
      * Resulting state: kCloneCompleted on success, kDone on failure
      */
-    Status commitChunkOnRecipient(OperationContext* opCtx);
+    Status commitChunkOnRecipient();
 
     /**
      * Tells the recipient shard to fetch the latest portion of data from the donor and to commit it
@@ -144,7 +152,7 @@ public:
      * Expected state: kCloneCompleted
      * Resulting state: kDone
      */
-    Status commitChunkMetadataOnConfig(OperationContext* opCtx);
+    Status commitChunkMetadataOnConfig();
 
     /**
      * May be called at any time. Unregisters the migration source manager from the collection,
@@ -154,35 +162,24 @@ public:
      * Expected state: Any
      * Resulting state: kDone
      */
-    void cleanupOnError(OperationContext* opCtx);
+    void cleanupOnError();
 
     /**
-     * Returns the key pattern object for the stored committed metadata.
+     * Aborts the migration after observing a concurrent index operation by marking its operation
+     * context as killed.
      */
-    BSONObj getKeyPattern() const {
-        return _keyPattern;
-    }
+    void abortDueToConflictingIndexOperation(OperationContext* opCtx);
 
     /**
      * Returns the cloner which is being used for this migration. This value is available only if
      * the migration source manager is currently in the clone phase (i.e. the previous call to
      * startClone has succeeded).
      *
-     * Must be called with some form of lock on the collection namespace.
+     * Must be called with a both a collection lock and the CSRLock.
      */
-    MigrationChunkClonerSource* getCloner() const {
-        return _cloneDriver.get();
+    std::shared_ptr<MigrationChunkClonerSource> getCloner() const {
+        return _cloneDriver;
     }
-
-    /**
-     * Retrieves a critical section object to wait on. Will return nullptr if the migration is not
-     * yet in the critical section or if the caller is a reader and the migration is still in the
-     * process of transferring the last batch of chunk modifications.
-     *
-     * Must be called with some form of lock on the collection namespace.
-     */
-    std::shared_ptr<Notification<void>> getMigrationCriticalSectionSignal(
-        bool isForReadOnlyOperation) const;
 
     /**
      * Returns a report on the active migration.
@@ -194,13 +191,34 @@ public:
 private:
     // Used to track the current state of the source manager. See the methods above, which have
     // comments explaining the various state transitions.
-    enum State { kCreated, kCloning, kCloneCaughtUp, kCriticalSection, kCloneCompleted, kDone };
+    enum State {
+        kCreated,
+        kCloning,
+        kCloneCaughtUp,
+        kCriticalSection,
+        kCloneCompleted,
+        kCommittingOnConfig,
+        kDone
+    };
+
+    CollectionMetadata _getCurrentMetadataAndCheckEpoch();
+
+    /**
+     * If this donation moves the first chunk to the recipient (i.e., the recipient didn't have any
+     * chunks), this function writes a no-op message to the oplog, so that change stream will notice
+     * that and close the cursor in order to notify mongos to target the new shard as well.
+     */
+    void _notifyChangeStreamsOnRecipientFirstChunk(const CollectionMetadata& metadata);
 
     /**
      * Called when any of the states fails. May only be called once and will put the migration
      * manager into the kDone state.
      */
-    void _cleanup(OperationContext* opCtx);
+    void _cleanup();
+
+    // This is the opCtx of the moveChunk request that constructed the MigrationSourceManager.
+    // The caller must guarantee it outlives the MigrationSourceManager.
+    OperationContext* const _opCtx;
 
     // The parameters to the moveChunk command
     const MoveChunkRequest _args;
@@ -211,40 +229,52 @@ private:
     // The resolved primary of the recipient shard
     const HostAndPort _recipientHost;
 
-    // Gets initialized at creation time and will time the entire move chunk operation
-    const Timer _startTime;
+    // Stores a reference to the process sharding statistics object which needs to be updated
+    ShardingStatistics& _stats;
+
+    // Times the entire moveChunk operation
+    const Timer _entireOpTimer;
+
+    // Starts counting from creation time and is used to time various parts from the lifetime of the
+    // move chunk sequence
+    Timer _cloneAndCommitTimer;
 
     // The current state. Used only for diagnostics and validation.
     State _state{kCreated};
 
-    // The cached collection metadata at the time the migration started.
-    ScopedCollectionMetadata _collectionMetadata;
+    // The version of the chunk at the time the migration started.
+    ChunkVersion _chunkVersion;
 
-    // The key pattern of the collection whose chunks are being moved.
-    BSONObj _keyPattern;
+    // The version of the collection at the time migration started.
+    OID _collectionEpoch;
 
     // The UUID of the the collection whose chunks are being moved. Default to empty if the
     // collection doesn't have UUID.
-    UUID _collectionUuid;
+    boost::optional<UUID> _collectionUuid;
+
+    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
+    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
+    bool _enableResumableRangeDeleter;
+
+    // Contains logic for ensuring the donor's and recipient's config.rangeDeletions entries are
+    // correctly updated based on whether the migration committed or aborted.
+    std::unique_ptr<migrationutil::MigrationCoordinator> _coordinator;
 
     // The chunk cloner source. Only available if there is an active migration going on. To set and
-    // remove it, global S lock needs to be acquired first in order to block all logOp calls and
-    // then the mutex. To access it, only the mutex is necessary. Available after cloning stage has
-    // completed.
-    std::unique_ptr<MigrationChunkClonerSource> _cloneDriver;
+    // remove it, a collection lock and the CSRLock need to be acquired first in order to block all
+    // logOp calls and then the mutex. To access it, only the mutex is necessary. Available after
+    // cloning stage has completed.
+    std::shared_ptr<MigrationChunkClonerSource> _cloneDriver;
 
-    // Whether the source manager is in a critical section. Tracked as a shared pointer so that
-    // callers don't have to hold collection lock in order to wait on it. Available after the
-    // critical section stage has completed.
-    std::shared_ptr<Notification<void>> _critSecSignal;
+    // The statistics about a chunk migration to be included in moveChunk.commit
+    BSONObj _recipientCloneCounts;
 
-    // Used to delay blocking reads up until the commit of the metadata on the config server needs
-    // to happen. This allows the shard to serve reads during transfer of the last batch of mods in
-    // the migration critical section.
-    //
-    // The transition from false to true is protected by the collection X-lock, which happens just
-    // before the config server metadata commit is scheduled.
-    bool _readsShouldWaitOnCritSec{false};
+    boost::optional<CollectionCriticalSection> _critSec;
+
+    // Optional future that is populated if the migration succeeds and range deletion is scheduled
+    // on this node. The future is set when the range deletion completes. Used if the moveChunk was
+    // sent with waitForDelete.
+    boost::optional<SemiFuture<void>> _cleanupCompleteFuture;
 };
 
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +33,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/bson_extract_optime.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 namespace repl {
@@ -40,38 +42,20 @@ namespace {
 const std::string kCandidateIndexFieldName = "candidateIndex";
 const std::string kCommandName = "replSetRequestVotes";
 const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kDryRunFieldName = "dryRun";
-// The underlying field name is inaccurate, but changing it requires a fair amount of cross
-// compatibility work for no real benefit.
-const std::string kLastDurableOpTimeFieldName = "lastCommittedOp";
+const std::string kLastAppliedOpTimeFieldName = "lastAppliedOpTime";
 const std::string kOkFieldName = "ok";
 const std::string kReasonFieldName = "reason";
 const std::string kSetNameFieldName = "setName";
 const std::string kTermFieldName = "term";
 const std::string kVoteGrantedFieldName = "voteGranted";
 const std::string kOperationTime = "operationTime";
-
-const std::string kLegalArgsFieldNames[] = {
-    kCandidateIndexFieldName,
-    kCommandName,
-    kConfigVersionFieldName,
-    kDryRunFieldName,
-    kLastDurableOpTimeFieldName,
-    kSetNameFieldName,
-    kTermFieldName,
-    kOperationTime,
-};
-
 }  // namespace
 
 
 Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
-    Status status =
-        bsonCheckOnlyHasFieldsForCommand("ReplSetRequestVotes", argsObj, kLegalArgsFieldNames);
-    if (!status.isOK())
-        return status;
-
-    status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    Status status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
         return status;
 
@@ -79,7 +63,12 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgVer);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_cfgTerm);
     if (!status.isOK())
         return status;
 
@@ -91,9 +80,10 @@ Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
     if (!status.isOK())
         return status;
 
-    status = bsonExtractOpTimeField(argsObj, kLastDurableOpTimeFieldName, &_lastDurableOpTime);
-    if (!status.isOK())
+    status = bsonExtractOpTimeField(argsObj, kLastAppliedOpTimeFieldName, &_lastAppliedOpTime);
+    if (!status.isOK()) {
         return status;
+    }
 
     return Status::OK();
 }
@@ -111,11 +101,19 @@ long long ReplSetRequestVotesArgs::getCandidateIndex() const {
 }
 
 long long ReplSetRequestVotesArgs::getConfigVersion() const {
-    return _cfgver;
+    return _cfgVer;
 }
 
-OpTime ReplSetRequestVotesArgs::getLastDurableOpTime() const {
-    return _lastDurableOpTime;
+long long ReplSetRequestVotesArgs::getConfigTerm() const {
+    return _cfgTerm;
+}
+
+ConfigVersionAndTerm ReplSetRequestVotesArgs::getConfigVersionAndTerm() const {
+    return ConfigVersionAndTerm(_cfgVer, _cfgTerm);
+}
+
+OpTime ReplSetRequestVotesArgs::getLastAppliedOpTime() const {
+    return _lastAppliedOpTime;
 }
 
 bool ReplSetRequestVotesArgs::isADryRun() const {
@@ -128,8 +126,15 @@ void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kDryRunFieldName, _dryRun);
     builder->append(kTermFieldName, _term);
     builder->appendIntOrLL(kCandidateIndexFieldName, _candidateIndex);
-    builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
-    _lastDurableOpTime.append(builder, kLastDurableOpTimeFieldName);
+    builder->appendIntOrLL(kConfigVersionFieldName, _cfgVer);
+    builder->appendIntOrLL(kConfigTermFieldName, _cfgTerm);
+    _lastAppliedOpTime.append(builder, kLastAppliedOpTimeFieldName);
+}
+
+std::string ReplSetRequestVotesArgs::toString() const {
+    BSONObjBuilder builder;
+    addToBSON(&builder);
+    return builder.done().toString();
 }
 
 Status ReplSetRequestVotesResponse::initialize(const BSONObj& argsObj) {
@@ -182,6 +187,12 @@ BSONObj ReplSetRequestVotesResponse::toBSON() const {
     BSONObjBuilder builder;
     addToBSON(&builder);
     return builder.obj();
+}
+
+std::string ReplSetRequestVotesResponse::toString() const {
+    BSONObjBuilder builder;
+    addToBSON(&builder);
+    return builder.done().toString();
 }
 
 }  // namespace repl

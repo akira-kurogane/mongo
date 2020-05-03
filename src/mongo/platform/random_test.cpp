@@ -1,38 +1,40 @@
-// random_test.cpp
-
-
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <set>
 #include <vector>
 
 #include "mongo/platform/random.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -135,13 +137,13 @@ TEST(RandomTest, NextCanonicalDistinctValues) {
 }
 
 /**
- * Test that nextCanonicalDouble() always returns values between 0 and 1.
+ * Test that nextCanonicalDouble() is at least very likely to return values in [0,1).
  */
 TEST(RandomTest, NextCanonicalWithinRange) {
     PseudoRandom prng(10);
-    for (int i = 0; i < 100; i++) {
+    for (size_t i = 0; i < 1'000'000; ++i) {
         double next = prng.nextCanonicalDouble();
-        ASSERT_LTE(0.0, next);
+        ASSERT_GTE(next, 0.0);
         ASSERT_LT(next, 1.0);
     }
 }
@@ -212,12 +214,50 @@ TEST(RandomTest, NextInt64InRange) {
     }
 }
 
-TEST(RandomTest, Secure1) {
-    auto a = SecureRandom::create();
-    auto b = SecureRandom::create();
-
-    for (int i = 0; i < 100; i++) {
-        ASSERT_NOT_EQUALS(a->nextInt64(), b->nextInt64());
+/**
+ * Test uniformity of nextInt32(max)
+ */
+TEST(RandomTest, NextInt32Uniformity) {
+    PseudoRandom prng(10);
+    /* Break the range into sections. */
+    /* Check that all sections get roughly equal # of hits */
+    constexpr int32_t kMax = (int32_t{3} << 29) - 1;
+    constexpr size_t kBuckets = 64;
+    constexpr size_t kNIter = 1'000'000;
+    constexpr double mu = kNIter / kBuckets;
+    constexpr double muSqInv = 1. / (mu * mu);
+    std::vector<size_t> hist(kBuckets);
+    for (size_t i = 0; i < kNIter; ++i) {
+        auto next = prng.nextInt32(kMax);
+        ASSERT_GTE(next, 0);
+        ASSERT_LTE(next, kMax);
+        ++hist[double(next) * kBuckets / (kMax + 1)];
+    }
+    if (kDebugBuild) {
+        for (size_t i = 0; i < hist.size(); ++i) {
+            double dev = std::pow(std::pow((hist[i] - mu) / mu, 2), .5);
+            LOGV2(22611,
+                  "{format_FMT_STRING_4_count_4_dev_6f_i_hist_i_dev_std_string_hist_i_256}",
+                  "format_FMT_STRING_4_count_4_dev_6f_i_hist_i_dev_std_string_hist_i_256"_attr =
+                      format(FMT_STRING("  [{:4}] count:{:4}, dev:{:6f}, {}"),
+                             i,
+                             hist[i],
+                             dev,
+                             std::string(hist[i] / 256, '*')));
+        }
+    }
+    for (size_t i = 0; i < hist.size(); ++i) {
+        double dev = std::pow(std::pow(hist[i] - mu, 2) * muSqInv, .5);
+        ASSERT_LT(dev, 0.1) << format(FMT_STRING("hist[{}]={}, mu={}"), i, hist[i], mu);
     }
 }
+
+TEST(RandomTest, Secure1) {
+    auto a = SecureRandom();
+    auto b = SecureRandom();
+
+    for (int i = 0; i < 100; i++) {
+        ASSERT_NOT_EQUALS(a.nextInt64(), b.nextInt64());
+    }
 }
+}  // namespace mongo

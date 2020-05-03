@@ -8,12 +8,14 @@
  * SERVER-24386. Threads perform an aggregation pipeline on one of a few collections, optionally
  * specifying a $lookup stage, a $graphLookup stage, or a $facet stage, while the database, a
  * collection, or an index is dropped concurrently.
+ *
+ * The parent test, invalidated_cursors.js, uses $currentOp.
+ * @tags: [uses_curop_agg_stage, state_functions_share_cursor]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');           // for extendWorkload
 load('jstests/concurrency/fsm_workloads/invalidated_cursors.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     /**
      * Runs the specified aggregation pipeline and stores the resulting cursor (if the command
      * is successful) in 'this.cursor'.
@@ -23,7 +25,7 @@ var $config = extendWorkload($config, function($config, $super) {
             {aggregate: collName, pipeline: pipeline, cursor: {batchSize: this.batchSize}});
 
         if (res.ok) {
-            this.cursor = new DBCommandCursor(db.getMongo(), res, this.batchSize);
+            this.cursor = new DBCommandCursor(db, res, this.batchSize);
         }
     };
 
@@ -116,7 +118,10 @@ var $config = extendWorkload($config, function($config, $super) {
 
         var pipeline = [{
             $facet: {
-                lookup: this.makeLookupPipeline(lookupForeignCollName),
+                // The lookup pipeline computes a Cartesian product of the input collection, which
+                // can occasionally create $facet documents large enough to OOM crash the test. The
+                // $limit keeps it in check.
+                lookup: this.makeLookupPipeline(lookupForeignCollName).concat({$limit: 50}),
                 graphLookup: this.makeGraphLookupPipeline(graphLookupForeignCollName)
             }
         }];
@@ -172,9 +177,6 @@ var $config = extendWorkload($config, function($config, $super) {
             assertAlways.commandWorked(db.adminCommand(
                 {setParameter: 1, internalDocumentSourceCursorBatchSizeBytes: 4 * 1024 * 1024}));
         });
-
-        var myDB = db.getSiblingDB(this.uniqueDBName);
-        myDB.dropDatabase();
     };
 
     return $config;

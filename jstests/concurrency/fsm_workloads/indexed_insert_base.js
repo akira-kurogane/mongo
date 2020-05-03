@@ -8,7 +8,6 @@
  * value is the thread's id.
  */
 var $config = (function() {
-
     function makeSortSpecFromIndexSpec(ixSpec) {
         var sort = {};
 
@@ -36,14 +35,14 @@ var $config = (function() {
 
         insert: function insert(db, collName) {
             var res = db[collName].insert(this.getDoc());
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted, tojson(res));
             this.nInserted += this.docsPerInsert;
         },
 
         find: function find(db, collName) {
             // collection scan
-            var count = db[collName].find(this.getDoc()).sort({$natural: 1}).itcount();
+            var count = db[collName].find(this.getQuery()).sort({$natural: 1}).itcount();
             assertWhenOwnColl.eq(count, this.nInserted);
 
             // Use hint() to force an index scan, but only when an appropriate index exists.
@@ -54,7 +53,7 @@ var $config = (function() {
                 ownColl = true;
             });
             if (this.indexExists && ownColl) {
-                count = db[collName].find(this.getDoc()).hint(this.getIndexSpec()).itcount();
+                count = db[collName].find(this.getQuery()).hint(this.getIndexSpec()).itcount();
                 assertWhenOwnColl.eq(count, this.nInserted);
             }
 
@@ -63,7 +62,7 @@ var $config = (function() {
                 // For single and compound-key indexes, the index specification is a
                 // valid sort spec; however, for geospatial and text indexes it is not
                 var sort = makeSortSpecFromIndexSpec(this.getIndexSpec());
-                count = db[collName].find(this.getDoc()).sort(sort).itcount();
+                count = db[collName].find(this.getQuery()).sort(sort).itcount();
                 assertWhenOwnColl.eq(count, this.nInserted);
             }
         }
@@ -93,11 +92,13 @@ var $config = (function() {
                 doc[this.indexedField] = this.indexedValue;
                 return doc;
             },
+            getQuery: function getQuery() {
+                return this.getDoc();
+            },
             indexedField: 'x',
             shardKey: {x: 1},
             docsPerInsert: 1
         },
         setup: setup
     };
-
 })();

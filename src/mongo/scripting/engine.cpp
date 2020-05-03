@@ -1,33 +1,33 @@
-// engine.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -36,15 +36,14 @@
 #include <boost/filesystem/operations.hpp>
 #include <cctype>
 
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -54,12 +53,12 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 
-AtomicInt64 Scope::_lastVersion(1);
+AtomicWord<long long> Scope::_lastVersion(1);
 
 
 namespace {
 
-MONGO_FP_DECLARE(mr_killop_test_fp);
+MONGO_FAIL_POINT_DEFINE(mr_killop_test_fp);
 // 2 GB is the largest support Javascript file size.
 const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
 
@@ -69,12 +68,16 @@ static std::unique_ptr<ScriptEngine> globalScriptEngine;
 
 }  // namespace
 
-ScriptEngine::ScriptEngine() : _scopeInitCallback() {}
+ScriptEngine::ScriptEngine(bool disableLoadStored)
+    : _disableLoadStored(disableLoadStored), _scopeInitCallback() {}
 
 ScriptEngine::~ScriptEngine() {}
 
 Scope::Scope()
-    : _localDBName(""), _loadedVersion(0), _numTimesUsed(0), _lastRetIsNativeCode(false) {}
+    : _localDBName(""),
+      _loadedVersion(0),
+      _createTime(Date_t::now()),
+      _lastRetIsNativeCode(false) {}
 
 Scope::~Scope() {}
 
@@ -134,7 +137,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
     boost::filesystem::path p(filename);
 #endif
     if (!exists(p)) {
-        error() << "file [" << filename << "] doesn't exist";
+        LOGV2_ERROR(22779, "file [{filename}] doesn't exist", "filename"_attr = filename);
         return false;
     }
 
@@ -153,7 +156,9 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
         }
 
         if (empty) {
-            error() << "directory [" << filename << "] doesn't have any *.js files";
+            LOGV2_ERROR(22780,
+                        "directory [{filename}] doesn't have any *.js files",
+                        "filename"_attr = filename);
             return false;
         }
 
@@ -168,7 +173,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
     fileofs fo = f.len();
     if (fo > kMaxJsFileLength) {
-        warning() << "attempted to execute javascript file larger than 2GB";
+        LOGV2_WARNING(22778, "attempted to execute javascript file larger than 2GB");
         return false;
     }
     unsigned len = static_cast<unsigned>(fo);
@@ -190,14 +195,14 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
 class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
 public:
-    void commit() {
+    void commit(boost::optional<Timestamp>) {
         _lastVersion.fetchAndAdd(1);
     }
     void rollback() {}
 };
 
 void Scope::storedFuncMod(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+    opCtx->recoveryUnit()->registerChange(std::make_unique<StoredFuncModLogOpHandler>());
 }
 
 void Scope::validateObjectIdString(const string& str) {
@@ -207,6 +212,8 @@ void Scope::validateObjectIdString(const string& str) {
 }
 
 void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
+    if (!getGlobalScriptEngine()->_disableLoadStored)
+        return;
     if (_localDBName.size() == 0) {
         if (ignoreNotConnected)
             return;
@@ -217,13 +224,12 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
     if (_loadedVersion == lastVersion)
         return;
 
-    _loadedVersion = lastVersion;
-    string coll = _localDBName + ".system.js";
+    NamespaceString coll(_localDBName, "system.js");
 
     auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
 
     unique_ptr<DBClientCursor> c =
-        directDBClient->query(coll, Query(), 0, 0, NULL, QueryOption_SlaveOk, 0);
+        directDBClient->query(coll, Query(), 0, 0, nullptr, QueryOption_SlaveOk, 0);
     massert(16669, "unable to get db client cursor from query", c.get());
 
     set<string> thisTime;
@@ -232,15 +238,22 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
         BSONElement n = o["_id"];
         BSONElement v = o["value"];
 
-        uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
-        uassert(10210, "value has to be set", v.type() != EOO);
+        uassert(
+            10209, str::stream() << "name has to be a string: " << n, n.type() == BSONType::String);
+        uassert(10210, "value has to be set", v.type() != BSONType::EOO);
 
-        if (MONGO_FAIL_POINT(mr_killop_test_fp)) {
+        uassert(4546000,
+                str::stream() << "BSON type 'CodeWithScope' not supported in system.js scripts. As "
+                                 "an alternative use 'Code'. Script _id value: '"
+                              << n.String() << "'",
+                v.type() != BSONType::CodeWScope);
+
+        if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
 
             /* This thread sleep makes the interrupts in the test come in at a time
-            *  where the js misses the interrupt and throw an exception instead of
-            *  being interrupted
-            */
+             *  where the js misses the interrupt and throw an exception instead of
+             *  being interrupted
+             */
             stdx::this_thread::sleep_for(stdx::chrono::seconds(1));
         }
 
@@ -253,8 +266,10 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
                 throw;
             }
 
-            error() << "unable to load stored JavaScript function " << n.valuestr()
-                    << "(): " << redact(setElemEx);
+            LOGV2_ERROR(22781,
+                        "unable to load stored JavaScript function {n_valuestr}(): {setElemEx}",
+                        "n_valuestr"_attr = n.valuestr(),
+                        "setElemEx"_attr = redact(setElemEx));
         }
     }
 
@@ -268,6 +283,10 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
             ++i;
         }
     }
+
+    // Only update _loadedVersion if loading system.js completed successfully.
+    // If any one operation failed or was interrupted we will start over next time.
+    _loadedVersion = lastVersion;
 }
 
 ScriptingFunction Scope::createFunction(const char* code) {
@@ -294,12 +313,12 @@ ScriptingFunction Scope::createFunction(const char* code) {
 
 namespace JSFiles {
 extern const JSFile collection;
+extern const JSFile check_log;
 extern const JSFile crud_api;
 extern const JSFile db;
 extern const JSFile explain_query;
 extern const JSFile explainable;
 extern const JSFile mongo;
-extern const JSFile mr;
 extern const JSFile session;
 extern const JSFile query;
 extern const JSFile utils;
@@ -307,7 +326,7 @@ extern const JSFile utils_sh;
 extern const JSFile utils_auth;
 extern const JSFile bulk_api;
 extern const JSFile error_codes;
-}
+}  // namespace JSFiles
 
 void Scope::execCoreFiles() {
     execSetup(JSFiles::utils);
@@ -315,11 +334,11 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::utils_auth);
     execSetup(JSFiles::db);
     execSetup(JSFiles::mongo);
-    execSetup(JSFiles::mr);
     execSetup(JSFiles::session);
     execSetup(JSFiles::query);
     execSetup(JSFiles::bulk_api);
     execSetup(JSFiles::error_codes);
+    execSetup(JSFiles::check_log);
     execSetup(JSFiles::collection);
     execSetup(JSFiles::crud_api);
     execSetup(JSFiles::explain_query);
@@ -330,17 +349,17 @@ namespace {
 class ScopeCache {
 public:
     void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         if (scope->hasOutOfMemoryException()) {
             // make some room
-            log() << "Clearing all idle JS contexts due to out of memory";
+            LOGV2(22777, "Clearing all idle JS contexts due to out of memory");
             _pools.clear();
             return;
         }
 
-        if (scope->getTimesUsed() > kMaxScopeReuse)
-            return;  // used too many times to save
+        if (Date_t::now() - scope->getCreateTime() > kMaxScopeReuseTime)
+            return;  // too old to save
 
         if (!scope->getError().empty())
             return;  // not saving errored scopes
@@ -356,13 +375,12 @@ public:
     }
 
     std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
             if (it->poolName == poolName) {
                 std::shared_ptr<Scope> scope = it->scope;
                 _pools.erase(it);
-                scope->incTimesUsed();
                 scope->reset();
                 scope->registerOperation(opCtx);
                 return scope;
@@ -373,7 +391,7 @@ public:
     }
 
     void clear() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
 
         _pools.clear();
     }
@@ -386,11 +404,11 @@ private:
 
     // Note: if these numbers change, reconsider choice of datastructure for _pools
     static const unsigned kMaxPoolSize = 10;
-    static const int kMaxScopeReuse = 10;
+    constexpr static inline Seconds kMaxScopeReuseTime = Seconds(10);
 
     typedef std::deque<ScopeAndPool> Pools;  // More-recently used Scopes are kept at the front.
     Pools _pools;                            // protected by _mutex
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("ScopeCache::_mutex");
 };
 
 ScopeCache scopeCache;
@@ -422,10 +440,7 @@ public:
     void init(const BSONObj* data) {
         _real->init(data);
     }
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) {
-        invariant(!"localConnectForDbEval should only be called from dbEval");
-    }
-    void setLocalDB(const string& dbName) {
+    void setLocalDB(StringData dbName) {
         _real->setLocalDB(dbName);
     }
     void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
@@ -442,6 +457,9 @@ public:
     }
     void requireOwnedObjects() override {
         _real->requireOwnedObjects();
+    }
+    void kill() {
+        _real->kill();
     }
     bool isKillPending() const {
         return _real->isKillPending();
@@ -559,7 +577,7 @@ unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientBase&) = 0;
+void (*ScriptEngine::_connectCallback)(DBClientBase&) = nullptr;
 
 ScriptEngine* getGlobalScriptEngine() {
     if (hasGlobalServiceContext())
@@ -611,4 +629,4 @@ const char* jsSkipWhiteSpace(const char* raw) {
     }
     return raw;
 }
-}
+}  // namespace mongo

@@ -7,24 +7,21 @@
  * the $lookup stage outside of the $facet stage.
  */
 (function() {
-    "use strict";
+"use strict";
 
-    var local = db.facetLookupLocal;
-    var foreign = db.facetLookupForeign;
+var local = db.facetLookupLocal;
+var foreign = db.facetLookupForeign;
 
-    local.drop();
-    assert.writeOK(local.insert({_id: 0}));
-    assert.writeOK(local.insert({_id: 1}));
+local.drop();
+assert.commandWorked(local.insert({_id: 0}));
+assert.commandWorked(local.insert({_id: 1}));
 
-    foreign.drop();
-    assert.writeOK(foreign.insert({_id: 0, foreignKey: 0}));
-    assert.writeOK(foreign.insert({_id: 1, foreignKey: 1}));
-    assert.writeOK(foreign.insert({_id: 2, foreignKey: 2}));
+foreign.drop();
+assert.commandWorked(foreign.insert({_id: 0, foreignKey: 0}));
+assert.commandWorked(foreign.insert({_id: 1, foreignKey: 1}));
+assert.commandWorked(foreign.insert({_id: 2, foreignKey: 2}));
 
-    const lookupStage = {
-        $lookup:
-            {from: foreign.getName(), localField: "_id", foreignField: "foreignKey", as: "joined"}
-    };
+function runTest(lookupStage) {
     const lookupResults = local.aggregate([lookupStage]).toArray();
     const facetedLookupResults = local.aggregate([{$facet: {nested: [lookupStage]}}]).toArray();
     assert.eq(facetedLookupResults, [{nested: lookupResults}]);
@@ -33,4 +30,29 @@
     const facetedLookupResultsUnwound =
         local.aggregate([{$facet: {nested: [lookupStage, {$unwind: "$joined"}]}}]).toArray();
     assert.eq(facetedLookupResultsUnwound, [{nested: lookupResultsUnwound}]);
+}
+
+runTest({
+    $lookup: {from: foreign.getName(), localField: "_id", foreignField: "foreignKey", as: "joined"}
+});
+
+runTest({
+        $lookup: {
+            from: foreign.getName(),
+            let : {id1: "$_id"},
+            pipeline: [
+                {$match: {$expr: {$eq: ["$$id1", "$foreignKey"]}}},
+                {
+                  $lookup: {
+                      from: foreign.getName(),
+                      let : {id2: "$_id"},
+                      pipeline: [{$match: {$expr: {$eq: ["$$id2", "$foreignKey"]}}}],
+                      as: "joined2"
+                  }
+                },
+                {$unwind: "$joined2"}
+            ],
+            as: "joined"
+        }
+    });
 }());

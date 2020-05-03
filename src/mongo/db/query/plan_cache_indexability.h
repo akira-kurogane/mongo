@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,21 +29,22 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
-
 class BSONObj;
 class CollatorInterface;
 class CompositeIndexabilityDiscriminator;
 class MatchExpression;
-struct IndexEntry;
+struct CoreIndexInfo;
+namespace projection_executor {
+class ProjectionExecutor;
+}
 
-using IndexabilityDiscriminator = stdx::function<bool(const MatchExpression* me)>;
+using IndexabilityDiscriminator = std::function<bool(const MatchExpression* me)>;
 using IndexabilityDiscriminators = std::vector<IndexabilityDiscriminator>;
 using IndexToDiscriminatorMap = StringMap<CompositeIndexabilityDiscriminator>;
 
@@ -80,7 +82,8 @@ private:
  * expressions based on the data values in the expression.
  */
 class PlanCacheIndexabilityState {
-    MONGO_DISALLOW_COPYING(PlanCacheIndexabilityState);
+    PlanCacheIndexabilityState(const PlanCacheIndexabilityState&) = delete;
+    PlanCacheIndexabilityState& operator=(const PlanCacheIndexabilityState&) = delete;
 
 public:
     PlanCacheIndexabilityState() = default;
@@ -89,17 +92,48 @@ public:
      * Returns a map from index name to discriminator for each index associated with 'path'.
      * Returns an empty set if no discriminators are registered for 'path'.
      *
-     * The object returned by reference is valid until the next call to updateDiscriminators()
-     * or until destruction of 'this', whichever is first.
+     * The object returned by reference is valid until the next call to updateDiscriminators() or
+     * until destruction of 'this', whichever is first.
      */
     const IndexToDiscriminatorMap& getDiscriminators(StringData path) const;
 
     /**
-     * Clears discriminators for all paths, and regenerate them from 'indexEntries'.
+     * Construct an IndexToDiscriminator map for the given path, only for the wildcard indexes
+     * which have been included in the indexability state.
      */
-    void updateDiscriminators(const std::vector<IndexEntry>& indexEntries);
+    IndexToDiscriminatorMap buildWildcardDiscriminators(StringData path) const;
+
+    /**
+     * Clears discriminators for all paths, and regenerates them from 'indexCores'.
+     */
+    void updateDiscriminators(const std::vector<CoreIndexInfo>& indexCores);
 
 private:
+    using PathDiscriminatorsMap = StringMap<IndexToDiscriminatorMap>;
+
+    /**
+     * A $** index may index an infinite number of fields. We cannot just store a discriminator for
+     * every possible field that it indexes, so we have to maintain some special context about the
+     * index.
+     */
+    struct WildcardIndexDiscriminatorContext {
+        WildcardIndexDiscriminatorContext(projection_executor::ProjectionExecutor* proj,
+                                          std::string name,
+                                          const MatchExpression* filter,
+                                          const CollatorInterface* coll)
+            : projectionExec(proj),
+              filterExpr(filter),
+              collator(coll),
+              catalogName(std::move(name)) {}
+
+        // These are owned by the catalog.
+        projection_executor::ProjectionExecutor* projectionExec;
+        const MatchExpression* filterExpr;  // For partial indexes.
+        const CollatorInterface* collator;
+
+        std::string catalogName;
+    };
+
     /**
      * Adds sparse index discriminators for the sparse index with the given key pattern to
      * '_pathDiscriminatorsMap'.
@@ -136,10 +170,16 @@ private:
                                const CollatorInterface* collator);
 
     /**
-     * PathDiscriminatorsMap is a map from field path to index name to IndexabilityDiscriminator.
+     * Adds special state for a $** index. When the discriminators are retrieved for a certain
+     * path, appropriate discriminators for the wildcard index will be included if it includes the
+     * given path.
      */
-    using PathDiscriminatorsMap = StringMap<IndexToDiscriminatorMap>;
+    void processWildcardIndex(const CoreIndexInfo& cii);
+
+    // PathDiscriminatorsMap is a map from field path to index name to IndexabilityDiscriminator.
     PathDiscriminatorsMap _pathDiscriminatorsMap;
+
+    std::vector<WildcardIndexDiscriminatorContext> _wildcardIndexDiscriminators;
 };
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -51,7 +51,7 @@
 %}
 
 %pythoncode %{
-import numbers
+    import argparse,numbers,os,shutil,wiredtiger
 %}
 
 %exception {
@@ -105,11 +105,10 @@ import numbers
 %extend workgen::classname {
 %pythoncode %{
     def __setattr__(self, attr, val):
-        if getattr(self, attr) == None:
+        if attr != 'this' and getattr(self, attr) == None:
             raise AttributeError("'" + #classname +
               "' object has no attribute '" + attr + "'")
-        f = _workgen.__dict__[#classname + '_' + attr + '_set']
-        f(self, val)
+        object.__setattr__(self, attr, val)
 %}
 };
 %enddef
@@ -143,6 +142,60 @@ WorkgenFrozenClass(TableOptions)
 WorkgenFrozenClass(ThreadOptions)
 WorkgenFrozenClass(WorkloadOptions)
 
+%extend workgen::Context {
+%pythoncode %{
+    # This will be the actual __init__ function after we shuffle names below!
+    def Xinit(self, parser = None):
+        self.__original_init__()
+        self._internal_init(parser)
+
+    def _internal_init(self, parser):
+        self.default_home = "WT_TEST"
+        self.default_config = "create"
+        if not parser:
+            parser = argparse.ArgumentParser("Execute workgen.")
+        parser.add_argument("--home", dest="home", type=str,
+          help="home directory for the run (default=%s)" % self.default_home)
+        parser.add_argument("--keep", dest="keep", action="store_true",
+          help="Run the workload on an existing home directory")
+        parser.add_argument("--verbose", dest="verbose", action="store_true",
+          help="Run the workload verbosely")
+        self.parser = parser
+        self._initialized = False
+
+    def parse_arguments(self, parser):
+        self.args = parser.parse_args()
+
+    def wiredtiger_open_config(self, config):
+        return config
+
+    def wiredtiger_open(self, config = None):
+        if config == None:
+            config = self.default_config
+        self.initialize()
+        return wiredtiger.wiredtiger_open(self.args.home, self.wiredtiger_open_config(config))
+
+    def initialize(self):
+        if not self._initialized:
+            self.parse_arguments(self.parser)
+            if self.args.home == None:
+               self.args.home = self.default_home
+            self._initialized = True
+            if not self.args.keep:
+                shutil.rmtree(self.args.home, True)
+                os.mkdir(self.args.home)
+        return self
+%}
+};
+
+%pythoncode %{
+# Shuffle the names of the __init__ function, we want ours (Xinit above), called first.
+# This seems to be the most natural way to intercept a C++ constructor, and do
+# Python-specific actions as part of the regular constructor.
+Context.__original_init__ = Context.__init__
+Context.__init__ = Context.Xinit
+%}
+
 %extend workgen::Operation {
 %pythoncode %{
     def __mul__(self, other):
@@ -158,7 +211,7 @@ WorkgenFrozenClass(WorkloadOptions)
     def __add__(self, other):
         if not isinstance(other, Operation):
             raise Exception('Operation.__sum__ requires an Operation')
-        if self._group == None or self._repeatgroup != 1 or self._transaction != None or self._config != '':
+        if not self.combinable():
             op = Operation()
             op._group = OpList([self, other])
             op._repeatgroup = 1

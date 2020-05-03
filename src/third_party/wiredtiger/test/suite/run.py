@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,13 @@
 #      Command line test runner
 #
 
-import glob, json, os, re, sys
+from __future__ import print_function
+import glob, json, os, random, re, sys
+
+try:
+    xrange
+except NameError:  #python3
+    xrange = range
 
 # Set paths
 suitedir = sys.path[0]
@@ -40,9 +46,15 @@ wt_3rdpartydir = os.path.join(wt_disttop, 'test', '3rdparty')
 # Check for a local build that contains the wt utility. First check in
 # current working directory, then in build_posix and finally in the disttop
 # directory. This isn't ideal - if a user has multiple builds in a tree we
-# could pick the wrong one.
-if os.path.isfile(os.path.join(os.getcwd(), 'wt')):
-    wt_builddir = os.getcwd()
+# could pick the wrong one. We also need to account for the fact that there
+# may be an executable 'wt' file the build directory and a subordinate .libs
+# directory.
+curdir = os.getcwd()
+if os.path.basename(curdir) == '.libs' and \
+   os.path.isfile(os.path.join(curdir, os.pardir, 'wt')):
+    wt_builddir = os.path.join(curdir, os.pardir)
+elif os.path.isfile(os.path.join(curdir, 'wt')):
+    wt_builddir = curdir
 elif os.path.isfile(os.path.join(wt_disttop, 'wt')):
     wt_builddir = wt_disttop
 elif os.path.isfile(os.path.join(wt_disttop, 'build_posix', 'wt')):
@@ -50,14 +62,31 @@ elif os.path.isfile(os.path.join(wt_disttop, 'build_posix', 'wt')):
 elif os.path.isfile(os.path.join(wt_disttop, 'wt.exe')):
     wt_builddir = wt_disttop
 else:
-    print 'Unable to find useable WiredTiger build'
+    print('Unable to find useable WiredTiger build')
     sys.exit(1)
 
 # Cannot import wiredtiger and supporting utils until we set up paths
 # We want our local tree in front of any installed versions of WiredTiger.
 # Don't change sys.path[0], it's the dir containing the invoked python script.
+
 sys.path.insert(1, os.path.join(wt_builddir, 'lang', 'python'))
-sys.path.insert(1, os.path.join(wt_disttop, 'lang', 'python'))
+
+# Append to a colon separated path in the environment
+def append_env_path(name, value):
+    path = os.environ.get(name)
+    if path == None:
+        v = value
+    else:
+        v = path + ':' + value
+    os.environ[name] = v
+
+# If we built with libtool, explicitly put its install directory in our library
+# search path. This only affects library loading for subprocesses, like 'wt'.
+libsdir = os.path.join(wt_builddir, '.libs')
+if os.path.isdir(libsdir):
+    append_env_path('LD_LIBRARY_PATH', libsdir)
+    if sys.platform == "darwin":
+        append_env_path('DYLD_LIBRARY_PATH', libsdir)
 
 # Add all 3rd party directories: some have code in subdirectories
 for d in os.listdir(wt_3rdpartydir):
@@ -66,17 +95,16 @@ for d in os.listdir(wt_3rdpartydir):
             sys.path.insert(1, os.path.join(wt_3rdpartydir, d, subdir))
             break
 
-import wttest
-# Use the same version of unittest found by wttest.py
-unittest = wttest.unittest
-from testscenarios.scenarios import generate_scenarios
+# unittest will be imported later, near to when it is needed.
+unittest = None
 
 def usage():
-    print 'Usage:\n\
+    print('Usage:\n\
   $ cd build_posix\n\
   $ python ../test/suite/run.py [ options ] [ tests ]\n\
 \n\
 Options:\n\
+            --asan               run with an ASAN enabled shared library\n\
   -C file | --configcreate file  create a config file for controlling tests\n\
   -c file | --config file        use a config file for controlling tests\n\
   -D dir  | --dir dir            use dir rather than WT_TEST.\n\
@@ -89,9 +117,12 @@ Options:\n\
   -j N    | --parallel N         run all tests in parallel using N processes\n\
   -l      | --long               run the entire test suite\n\
   -p      | --preserve           preserve output files in WT_TEST/<testname>\n\
+  -r N    | --random-sample N    randomly sort scenarios to be run, then\n\
+                                 execute every Nth (2<=N<=1000) scenario.\n\
   -s N    | --scenario N         use scenario N (N can be number or symbolic)\n\
   -t      | --timestamp          name WT_TEST according to timestamp\n\
   -v N    | --verbose N          set verboseness to N (0<=N<=3, default=1)\n\
+  -i      | --ignore-stdout      dont fail on unexpected stdout or stderr\n\
 \n\
 Tests:\n\
   may be a file name in test/suite: (e.g. test_base01.py)\n\
@@ -99,7 +130,33 @@ Tests:\n\
 \n\
   When -C or -c are present, there may not be any tests named.\n\
   When -s is present, there must be a test named.\n\
-'
+')
+
+# Find an executable of the given name in the execution path.
+def which(name):
+    path = os.getenv('PATH')
+    for pathdir in path.split(os.path.pathsep):
+        fname = os.path.join(pathdir, name)
+        if os.path.exists(fname) and os.access(fname, os.X_OK):
+            return fname
+    return None
+
+# Follow a symbolic link, returning the target
+def follow_symlinks(pathname):
+    return os.path.realpath(pathname)
+
+# Find all instances of a filename under a directory
+def find(topdir, filename):
+    results = []
+    for root, dirs, files in os.walk(topdir, followlinks=True):
+        if filename in files:
+            results.append(os.path.join(root, filename))
+    return results
+
+# Show an environment variable if verbose enough.
+def show_env(verbose, envvar):
+    if verbose >= 2:
+        print(envvar + "=" + os.getenv(envvar))
 
 # capture the category (AKA 'subsuite') part of a test name,
 # e.g. test_util03 -> util
@@ -234,12 +291,16 @@ def testsFromArg(tests, loader, arg, scenario):
     for t in xrange(start, end+1):
         addScenarioTests(tests, loader, 'test%03d' % t, scenario)
 
-if __name__ == '__main__':
-    tests = unittest.TestSuite()
+def error(exitval, prefix, msg):
+    print('*** ERROR: {}: {}'.format(prefix, msg.replace('\n', '\n*** ')))
+    sys.exit(exitval)
 
+if __name__ == '__main__':
     # Turn numbers and ranges into test module names
-    preserve = timestamp = debug = dryRun = gdbSub = longtest = False
+    preserve = timestamp = debug = dryRun = gdbSub = lldbSub = longtest = ignoreStdout = False
+    asan = False
     parallel = 0
+    random_sample = 0
     configfile = None
     configwrite = False
     dirarg = None
@@ -254,6 +315,9 @@ if __name__ == '__main__':
         # Command line options
         if arg[0] == '-':
             option = arg[1:]
+            if option == '-asan':
+                asan = True
+                continue
             if option == '-dir' or option == 'D':
                 if dirarg != None or len(args) == 0:
                     usage()
@@ -269,11 +333,23 @@ if __name__ == '__main__':
             if option == '-gdb' or option == 'g':
                 gdbSub = True
                 continue
+            if option == '-lldb':
+                lldbSub = True
+                continue
             if option == '-help' or option == 'h':
                 usage()
                 sys.exit(0)
             if option == '-long' or option == 'l':
                 longtest = True
+                continue
+            if option == '-random-sample' or option == 'r':
+                if len(args) == 0:
+                    usage()
+                    sys.exit(2)
+                random_sample = int(args.pop(0))
+                if random_sample < 2 or random_sample > 1000:
+                    usage()
+                    sys.exit(2)
                 continue
             if option == '-parallel' or option == 'j':
                 if parallel != 0 or len(args) == 0:
@@ -303,6 +379,9 @@ if __name__ == '__main__':
                 if verbose < 0:
                         verbose = 0
                 continue
+            if option == '--ignore-stdout' or option == 'i':
+                ignoreStdout = True
+                continue
             if option == '-config' or option == 'c':
                 if configfile != None or len(args) == 0:
                     usage()
@@ -316,16 +395,93 @@ if __name__ == '__main__':
                 configfile = args.pop(0)
                 configwrite = True
                 continue
-            print 'unknown arg: ' + arg
+            print('unknown arg: ' + arg)
             usage()
             sys.exit(2)
         testargs.append(arg)
 
+    if asan:
+        # To run ASAN, we need to ensure these environment variables are set:
+        #    ASAN_SYMBOLIZER_PATH    full path to the llvm-symbolizer program
+        #    LD_LIBRARY_PATH         includes path with wiredtiger shared object
+        #    LD_PRELOAD              includes the ASAN runtime library
+        #
+        # Note that LD_LIBRARY_PATH has already been set above. The trouble with
+        # simply setting these variables in the Python environment is that it's
+        # too late. LD_LIBRARY_PATH is commonly cached by the shared library
+        # loader at program startup, and that's already been done before Python
+        # begins execution. Likewise, any preloading indicated by LD_PRELOAD
+        # has already been done.
+        #
+        # Our solution is to set the variables as appropriate, and then restart
+        # Python with the same argument list. The shared library loader will
+        # have everything it needs on the second go round.
+        #
+        # Note: If the ASAN stops the program with the error:
+        #    Shadow memory range interleaves with an existing memory mapping.
+        #    ASan cannot proceed correctly.
+        #
+        # try rebuilding with the clang options:
+        #    "-mllvm -asan-force-dynamic-shadow=1"
+        # and make sure that clang is used for all compiles.
+        #
+        # We'd like to show this as a message, but there's no good way to
+        # detect this error from here short of capturing/parsing all output
+        # from the test run.
+        ASAN_ENV = "__WT_TEST_SUITE_ASAN"    # if set, we've been here before
+        ASAN_SYMBOLIZER_PROG = "llvm-symbolizer"
+        ASAN_SYMBOLIZER_ENV = "ASAN_SYMBOLIZER_PATH"
+        LD_PRELOAD_ENV = "LD_PRELOAD"
+        SO_FILE_NAME = "libclang_rt.asan-x86_64.so"
+        if not os.environ.get(ASAN_ENV):
+            if verbose >= 2:
+                print('Enabling ASAN environment and rerunning python')
+            os.environ[ASAN_ENV] = "1"
+            show_env(verbose, "LD_LIBRARY_PATH")
+            if not os.environ.get(ASAN_SYMBOLIZER_ENV):
+                os.environ[ASAN_SYMBOLIZER_ENV] = which(ASAN_SYMBOLIZER_PROG)
+            if not os.environ.get(ASAN_SYMBOLIZER_ENV):
+                error(ASAN_SYMBOLIZER_ENV,
+                      'symbolizer program not found in PATH')
+            show_env(verbose, ASAN_SYMBOLIZER_ENV)
+            if not os.environ.get(LD_PRELOAD_ENV):
+                symbolizer = follow_symlinks(os.environ[ASAN_SYMBOLIZER_ENV])
+                bindir = os.path.dirname(symbolizer)
+                sofiles = []
+                if os.path.basename(bindir) == 'bin':
+                    libdir = os.path.join(os.path.dirname(bindir), 'lib')
+                    sofiles = find(libdir, SO_FILE_NAME)
+                if len(sofiles) != 1:
+                    if len(sofiles) == 0:
+                        fmt = 'ASAN shared library file not found.\n' + \
+                          'Set {} to the file location and rerun.'
+                        error(3, SO_FILE_NAME, fmt.format(LD_PRELOAD_ENV))
+                    else:
+                        fmt = 'multiple ASAN shared library files found\n' + \
+                          'under {}, expected just one.\n' + \
+                          'Set {} to the correct file location and rerun.'
+                        error(3, SO_FILE_NAME, fmt.format(libdir, LD_PRELOAD_ENV))
+                os.environ[LD_PRELOAD_ENV] = sofiles[0]
+            show_env(verbose, LD_PRELOAD_ENV)
+
+            # Restart python!
+            python = sys.executable
+            os.execl(python, python, *sys.argv)
+        elif verbose >= 2:
+            print('Python restarted for ASAN')
+
+    # We don't import wttest until after ASAN environment variables are set.
+    import wttest
+    # Use the same version of unittest found by wttest.py
+    unittest = wttest.unittest
+    tests = unittest.TestSuite()
+    from testscenarios.scenarios import generate_scenarios
+
     # All global variables should be set before any test classes are loaded.
     # That way, verbose printing can be done at the class definition level.
-    wttest.WiredTigerTestCase.globalSetup(preserve, timestamp, gdbSub,
+    wttest.WiredTigerTestCase.globalSetup(preserve, timestamp, gdbSub, lldbSub,
                                           verbose, wt_builddir, dirarg,
-                                          longtest)
+                                          longtest, ignoreStdout)
 
     # Without any tests listed as arguments, do discovery
     if len(testargs) == 0:
@@ -344,6 +500,14 @@ if __name__ == '__main__':
         for arg in testargs:
             testsFromArg(tests, loader, arg, scenario)
 
+    # Shuffle the tests and create a new suite containing every Nth test from
+    # the original suite
+    if random_sample > 0:
+        random_sample_tests = []
+        for test in tests:
+            random_sample_tests.append(test)
+        random.shuffle(random_sample_tests)
+        tests = unittest.TestSuite(random_sample_tests[::random_sample])
     if debug:
         import pdb
         pdb.set_trace()
@@ -353,7 +517,7 @@ if __name__ == '__main__':
         for test in tests:
             dryOutput.add(test.shortDesc())
         for line in dryOutput:
-            print line
+            print(line)
     else:
         result = wttest.runsuite(tests, parallel)
         sys.exit(0 if result.wasSuccessful() else 1)

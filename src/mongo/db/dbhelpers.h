@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,21 +29,15 @@
 
 #pragma once
 
-#include <boost/filesystem/path.hpp>
-#include <memory>
-
-#include "mongo/db/db.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/data_protector.h"
 
 namespace mongo {
 
 class Collection;
-class Cursor;
-class DataProtector;
+class Database;
 class OperationContext;
-struct KeyRange;
-struct WriteConcernOptions;
+class QueryRequest;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -51,7 +46,6 @@ struct WriteConcernOptions;
  * all helpers assume locking is handled above them
  */
 struct Helpers {
-    class RemoveSaver;
 
     /* fetch a single object from collection ns that matches query.
        set your db SavedContext first.
@@ -75,6 +69,11 @@ struct Helpers {
                             const BSONObj& query,
                             bool requireIndex);
 
+    static RecordId findOne(OperationContext* opCtx,
+                            Collection* collection,
+                            std::unique_ptr<QueryRequest> qr,
+                            bool requireIndex);
+
     /**
      * @param foundIndex if passed in will be set to 1 if ns and index found
      * @return true if object found
@@ -84,8 +83,8 @@ struct Helpers {
                          StringData ns,
                          BSONObj query,
                          BSONObj& result,
-                         bool* nsFound = 0,
-                         bool* indexFound = 0);
+                         bool* nsFound = nullptr,
+                         bool* indexFound = nullptr);
 
     /* TODO: should this move into Collection?
      * uasserts if no _id index.
@@ -124,6 +123,18 @@ struct Helpers {
                        const BSONObj& o,
                        bool fromMigrate = false);
 
+    /**
+     * Performs an upsert of 'updateMod' if we don't match the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static void upsert(OperationContext* opCtx,
+                       const std::string& ns,
+                       const BSONObj& filter,
+                       const BSONObj& updateMod,
+                       bool fromMigrate = false);
+
     // TODO: this should be somewhere else probably
     /* Takes object o, and returns a new object with the
      * same field elements but the names stripped out.
@@ -144,30 +155,6 @@ struct Helpers {
      * Does not oplog the operation.
      */
     static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
-
-    /**
-     * for saving deleted bson objects to a flat file
-     */
-    class RemoveSaver {
-        MONGO_DISALLOW_COPYING(RemoveSaver);
-
-    public:
-        RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
-        ~RemoveSaver();
-
-        /**
-         * Writes document to file. File is created lazily before writing the first document.
-         * Returns error status if the file could not be created or if there were errors writing
-         * to the file.
-         */
-        Status goingToDelete(const BSONObj& o);
-
-    private:
-        boost::filesystem::path _root;
-        boost::filesystem::path _file;
-        std::unique_ptr<DataProtector> _protector;
-        std::unique_ptr<std::ostream> _out;
-    };
 };
 
 }  // namespace mongo

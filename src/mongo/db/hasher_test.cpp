@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,17 +42,17 @@ namespace mongo {
 namespace {
 
 // Helper methods
-long long hashIt(const BSONObj& object, int seed) {
+long long hashIt(const BSONObj& object, HashSeed seed) {
     return BSONElementHasher::hash64(object.firstElement(), seed);
 }
 long long hashIt(const BSONObj& object) {
-    int seed = 0;
+    HashSeed seed = 0;
     return hashIt(object, seed);
 }
 
 // Test different oids hash to different things
 TEST(BSONElementHasher, DifferentOidsAreDifferentHashes) {
-    int seed = 0;
+    HashSeed seed = 0;
 
     long long int oidHash =
         BSONElementHasher::hash64(BSONObjBuilder().genOID().obj().firstElement(), seed);
@@ -123,7 +124,7 @@ TEST(BSONElementHasher, SubDocumentGroupingHashesDiffer) {
 
 // Testing codeWscope scope squashing
 TEST(BSONElementHasher, CodeWithScopeSquashesScopeIntsAndDoubles) {
-    int seed = 0;
+    HashSeed seed = 0;
 
     BSONObjBuilder b1;
     b1.appendCodeWScope("a", "print('this is some stupid code')", BSON("a" << 3));
@@ -271,8 +272,7 @@ TEST(BSONElementHasher, HashString) {
 TEST(BSONElementHasher, HashObject) {
     BSONObj o = BSON("check" << BSON("a"
                                      << "abc"
-                                     << "b"
-                                     << 123LL));
+                                     << "b" << 123LL));
     ASSERT_EQUALS(hashIt(o), 4771603801758380216LL);
 
     o = BSON("check" << BSONObj());
@@ -357,6 +357,18 @@ TEST(BSONElementHasher, HashCode) {
 TEST(BSONElementHasher, HashCodeWScope) {
     BSONObj o = BSON("check" << BSONCodeWScope("func f() { return 1; }", BSON("c" << true)));
     ASSERT_EQUALS(hashIt(o), 501342939894575968LL);
+}
+
+TEST(BSONElementHasher, HashWithNonZeroSeed) {
+    HashSeed seed = 40513;
+
+    BSONObj o = BSON("check" << 42);
+    ASSERT_EQUALS(hashIt(o, seed), 4302929669663179197LL);
+
+    o = BSON("check" << BSON_ARRAY("sunflower"
+                                   << "sesame"
+                                   << "mustard"));
+    ASSERT_EQUALS(hashIt(o, seed), -9222615859251096151LL);
 }
 
 }  // namespace

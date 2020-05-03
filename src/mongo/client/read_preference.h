@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +30,8 @@
 #pragma once
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/hedging_mode_gen.h"
+#include "mongo/client/read_preference_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
@@ -38,35 +41,12 @@ namespace mongo {
 template <typename T>
 class StatusWith;
 
-enum class ReadPreference {
-    /**
-     * Read from primary only. All operations produce an error (throw an exception where
-     * applicable) if primary is unavailable. Cannot be combined with tags.
-     */
-    PrimaryOnly = 0,
+using ReadPreference = ReadPreferenceEnum;
 
-    /**
-     * Read from primary if available, otherwise a secondary. Tags will only be applied in the
-     * event that the primary is unavailable and a secondary is read from. In this event only
-     * secondaries matching the tags provided would be read from.
-     */
-    PrimaryPreferred,
-
-    /**
-     * Read from secondary if available, otherwise error.
-     */
-    SecondaryOnly,
-
-    /**
-     * Read from a secondary if available, otherwise read from the primary.
-     */
-    SecondaryPreferred,
-
-    /**
-     * Read from any member.
-     */
-    Nearest,
-};
+/**
+ * Validate a ReadPreference string. This is intended for use as an IDL validator callback.
+ */
+Status validateReadPreferenceMode(const std::string& prefStr);
 
 /**
  * A simple object for representing the list of tags requested by a $readPreference.
@@ -136,15 +116,27 @@ struct ReadPreferenceSetting {
      *     object's copy of tag will have the iterator in the initial
      *     position).
      */
-    ReadPreferenceSetting(ReadPreference pref, TagSet tags, Seconds maxStalenessSeconds);
+    ReadPreferenceSetting(ReadPreference pref,
+                          TagSet tags,
+                          Seconds maxStalenessSeconds,
+                          boost::optional<HedgingMode> hedgingMode = boost::none);
     ReadPreferenceSetting(ReadPreference pref, Seconds maxStalenessSeconds);
     ReadPreferenceSetting(ReadPreference pref, TagSet tags);
     explicit ReadPreferenceSetting(ReadPreference pref);
     ReadPreferenceSetting() : ReadPreferenceSetting(ReadPreference::PrimaryOnly) {}
 
     inline bool equals(const ReadPreferenceSetting& other) const {
+        auto hedgingModeEquals = [](const boost::optional<HedgingMode>& hedgingModeA,
+                                    const boost::optional<HedgingMode>& hedgingModeB) -> bool {
+            if (hedgingModeA && hedgingModeB) {
+                return hedgingModeA->toBSON().woCompare(hedgingModeB->toBSON()) == 0;
+            }
+            return !hedgingModeA && !hedgingModeB;
+        };
+
         return (pref == other.pref) && (tags == other.tags) &&
-            (maxStalenessSeconds == other.maxStalenessSeconds) && (minOpTime == other.minOpTime);
+            (maxStalenessSeconds == other.maxStalenessSeconds) &&
+            hedgingModeEquals(hedgingMode, other.hedgingMode) && (minOpTime == other.minOpTime);
     }
 
     /**
@@ -178,11 +170,12 @@ struct ReadPreferenceSetting {
 
     /**
      * Parses a ReadPreferenceSetting from a BSON document of the form:
-     * { mode: <mode>, tags: <array of tags>, maxStalenessSeconds: Number }. The 'mode' element must
-     * be a string equal to either "primary", "primaryPreferred", "secondary", "secondaryPreferred",
-     * or "nearest". Although the tags array is intended to be an array of unique BSON documents, no
-     * further validation is performed on it other than checking that it is an array, and that it is
-     * empty if 'mode' is 'primary'.
+     * { mode: <mode>, tags: <array of tags>, maxStalenessSeconds: Number, hedge: <hedgingMode>}.
+     * The 'mode' element must be a string equal to either "primary", "primaryPreferred",
+     * "secondary", "secondaryPreferred", or "nearest". Although the tags array is intended to be an
+     * array of unique BSON documents, no further validation is performed on it other than checking
+     * that it is an array, and that it is empty if 'mode' is 'primary'. The 'hedge' element
+     * consists of the optional field "enabled" (default true) and "delay" (default true).
      */
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONObj& readPrefSettingObj);
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONElement& readPrefSettingObj);
@@ -207,6 +200,7 @@ struct ReadPreferenceSetting {
     ReadPreference pref;
     TagSet tags;
     Seconds maxStalenessSeconds{};
+    boost::optional<HedgingMode> hedgingMode;
     repl::OpTime minOpTime{};
 };
 

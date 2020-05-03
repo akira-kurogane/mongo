@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
 namespace mongo {
@@ -45,42 +45,40 @@ public:
 
     void shutDown(OperationContext* opCtx) override;
 
-    Status enableSharding(OperationContext* opCtx, const std::string& dbName);
-
-    Status updateDatabase(OperationContext* opCtx,
-                          const std::string& dbName,
-                          const DatabaseType& db) override;
-
     StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
         OperationContext* opCtx,
         const std::string& dbName,
         repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(OperationContext* opCtx,
-                                                               const std::string& collNs) override;
+    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
+        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
 
-    Status getCollections(OperationContext* opCtx,
-                          const std::string* dbName,
-                          std::vector<CollectionType>* collections,
-                          repl::OpTime* optime) override;
+    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        repl::ReadConcernLevel readConcernLevel) override;
 
-    Status dropCollection(OperationContext* opCtx, const NamespaceString& ns) override;
+    StatusWith<std::vector<CollectionType>> getCollections(
+        OperationContext* opCtx,
+        const std::string* dbName,
+        repl::OpTime* optime,
+        repl::ReadConcernLevel readConcernLevel) override;
 
-    Status getDatabasesForShard(OperationContext* opCtx,
-                                const ShardId& shardName,
-                                std::vector<std::string>* dbs) override;
+    std::vector<NamespaceString> getAllShardedCollectionsForDb(
+        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
 
-    Status getChunks(OperationContext* opCtx,
-                     const BSONObj& filter,
-                     const BSONObj& sort,
-                     boost::optional<int> limit,
-                     std::vector<ChunkType>* chunks,
-                     repl::OpTime* opTime,
-                     repl::ReadConcernLevel readConcern) override;
+    StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
+                                                              const ShardId& shardName) override;
 
-    Status getTagsForCollection(OperationContext* opCtx,
-                                const std::string& collectionNs,
-                                std::vector<TagsType>* tags) override;
+    StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
+                                                 const BSONObj& filter,
+                                                 const BSONObj& sort,
+                                                 boost::optional<int> limit,
+                                                 repl::OpTime* opTime,
+                                                 repl::ReadConcernLevel readConcern) override;
+
+    StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
+                                                           const NamespaceString& nss) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
@@ -99,21 +97,10 @@ public:
     Status applyChunkOpsDeprecated(OperationContext* opCtx,
                                    const BSONArray& updateOps,
                                    const BSONArray& preCondition,
-                                   const std::string& nss,
+                                   const NamespaceString& nss,
                                    const ChunkVersion& lastChunkVersion,
                                    const WriteConcernOptions& writeConcern,
                                    repl::ReadConcernLevel readConcern) override;
-
-    Status logAction(OperationContext* opCtx,
-                     const std::string& what,
-                     const std::string& ns,
-                     const BSONObj& detail) override;
-
-    Status logChange(OperationContext* opCtx,
-                     const std::string& what,
-                     const std::string& ns,
-                     const BSONObj& detail,
-                     const WriteConcernOptions& writeConcern) override;
 
     StatusWith<BSONObj> getGlobalSettings(OperationContext* opCtx, StringData key) override;
 
@@ -125,29 +112,30 @@ public:
                                  BatchedCommandResponse* response) override;
 
     Status insertConfigDocument(OperationContext* opCtx,
-                                const std::string& ns,
+                                const NamespaceString& nss,
                                 const BSONObj& doc,
                                 const WriteConcernOptions& writeConcern) override;
 
+    void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
+                                               const NamespaceString& nss,
+                                               std::vector<BSONObj> docs,
+                                               const WriteConcernOptions& writeConcern) override;
+
     StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
-                                          const std::string& ns,
+                                          const NamespaceString& nss,
                                           const BSONObj& query,
                                           const BSONObj& update,
                                           bool upsert,
                                           const WriteConcernOptions& writeConcern) override;
 
     Status removeConfigDocuments(OperationContext* opCtx,
-                                 const std::string& ns,
+                                 const NamespaceString& nss,
                                  const BSONObj& query,
                                  const WriteConcernOptions& writeConcern) override;
 
-    Status createDatabase(OperationContext* opCtx, const std::string& dbName);
+    Status createDatabase(OperationContext* opCtx, StringData dbName, ShardId primaryShard);
 
     DistLockManager* getDistLockManager() override;
-
-    Status appendInfoForConfigServerDatabases(OperationContext* opCtx,
-                                              const BSONObj& listDatabasesCmd,
-                                              BSONArrayBuilder* builder) override;
 
     StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
         OperationContext* opCtx,

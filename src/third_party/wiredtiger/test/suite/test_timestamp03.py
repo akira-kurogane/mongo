@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -39,12 +39,6 @@ from wtscenario import make_scenarios
 def timestamp_str(t):
     return '%x' % t
 
-def timestamp_ret_str(t):
-    s = timestamp_str(t)
-    if len(s) % 2 == 1:
-        s = '0' + s
-    return s
-
 class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
     table_ts_log     = 'ts03_ts_logged'
     table_ts_nolog   = 'ts03_ts_nologged'
@@ -60,16 +54,17 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
     ]
 
     ckpt = [
-        ('use_ts_def', dict(ckptcfg='', val='none')),
-        ('use_ts_false', dict(ckptcfg='use_timestamp=false', val='all')),
-        ('use_ts_true', dict(ckptcfg='use_timestamp=true', val='none')),
+        ('use_ts_def', dict(ckptcfg='', ckpt_ts=True)),
+        ('use_ts_false', dict(ckptcfg='use_timestamp=false', ckpt_ts=False)),
+        ('use_ts_true', dict(ckptcfg='use_timestamp=true', ckpt_ts=True)),
     ]
 
     conncfg = [
         ('nolog', dict(conn_config='create', using_log=False)),
-        ('V1', dict(conn_config='create,log=(enabled),compatibility=(release="2.9")', using_log=True)),
-        ('V2', dict(conn_config='create,log=(enabled)', using_log=True)),
+        ('V1', dict(conn_config='create,log=(archive=false,enabled),compatibility=(release="2.9")', using_log=True)),
+        ('V2', dict(conn_config='create,log=(archive=false,enabled)', using_log=True)),
     ]
+    session_config = 'isolation=snapshot'
 
     scenarios = make_scenarios(types, ckpt, conncfg)
 
@@ -87,9 +82,9 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
 
         cur = session.open_cursor(self.uri + tablename, None)
         actual = dict((k, v) for k, v in cur if v != 0)
-        self.assertEqual(actual, expected)
+        self.assertTrue(actual == expected)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(cur[k], v, "for key " + str(k))
         cur.close()
         if txn_config:
@@ -160,9 +155,6 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
             valcnt_nots_log, valcnt_nots_nolog)
 
     def test_timestamp03(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         uri_ts_log      = self.uri + self.table_ts_log
         uri_ts_nolog    = self.uri + self.table_ts_nolog
         uri_nots_log    = self.uri + self.table_nots_log
@@ -185,7 +177,7 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
 
         # Insert keys 1..100 each with timestamp=key, in some order
         nkeys = 100
-        orig_keys = range(1, nkeys+1)
+        orig_keys = list(range(1, nkeys+1))
         keys = orig_keys[:]
         random.shuffle(keys)
 
@@ -226,22 +218,22 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
                 self.table_nots_nolog, dict((k, self.value) for k in orig_keys))
 
         # Bump the oldest_timestamp, we're not going back...
-        self.assertEqual(self.conn.query_timestamp(), timestamp_ret_str(100))
-        self.oldts = timestamp_str(100)
-        self.conn.set_timestamp('oldest_timestamp=' + self.oldts)
-        self.conn.set_timestamp('stable_timestamp=' + self.oldts)
+        self.assertTimestampsEqual(self.conn.query_timestamp(), timestamp_str(100))
+        old_ts = timestamp_str(100)
+        self.conn.set_timestamp('oldest_timestamp=' + old_ts)
+        self.conn.set_timestamp('stable_timestamp=' + old_ts)
 
         # Scenario: 3
         # Check that we see all the data values after moving the oldest_timestamp
         # to the current timestamp
         # All tables should see all the values.
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_ts_log, dict((k, self.value) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_ts_nolog, dict((k, self.value) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_nots_log, dict((k, self.value) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_nots_nolog, dict((k, self.value) for k in orig_keys))
 
         # Update the keys and checkpoint using the stable_timestamp.
@@ -251,7 +243,6 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
             # Make sure a timestamp cursor is the last one to update.  This
             # tests the scenario for a bug we found where recovery replayed
             # the last record written into the log.
-            #
             cur_nots_log[k] = self.value2
             cur_nots_nolog[k] = self.value2
             self.session.begin_transaction()
@@ -265,14 +256,33 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
         # Check that we don't see the updated data of timestamp tables
         # with the read_timestamp as oldest_timestamp
         # Tables using the timestamps should see old values (i.e. value) only
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_ts_log, dict((k, self.value) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_ts_nolog, dict((k, self.value) for k in orig_keys))
         # Tables not using the timestamps should see updated values (i.e. value2).
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
             self.table_nots_log, dict((k, self.value2) for k in orig_keys))
-        self.check(self.session, 'read_timestamp=' + self.oldts,
+        self.check(self.session, 'read_timestamp=' + old_ts,
+            self.table_nots_nolog, dict((k, self.value2) for k in orig_keys))
+
+        # Scenario: 4a
+        # This scenario is same as earlier one with read_timestamp earlier than
+        # oldest_timestamp and using the option of rounding read_timestamp to
+        # the oldest_timestamp
+        earlier_ts = timestamp_str(90)
+        self.check(self.session,
+            'read_timestamp=' + earlier_ts +',roundup_timestamps=(read=true)',
+            self.table_ts_log, dict((k, self.value) for k in orig_keys))
+        self.check(self.session,
+            'read_timestamp=' + earlier_ts +',roundup_timestamps=(read=true)',
+            self.table_ts_nolog, dict((k, self.value) for k in orig_keys))
+        # Tables not using the timestamps should see updated values (i.e. value2).
+        self.check(self.session,
+            'read_timestamp=' + earlier_ts +',roundup_timestamps=(read=true)',
+            self.table_nots_log, dict((k, self.value2) for k in orig_keys))
+        self.check(self.session,
+            'read_timestamp=' + earlier_ts +',roundup_timestamps=(read=true)',
             self.table_nots_nolog, dict((k, self.value2) for k in orig_keys))
 
         # Scenario: 5
@@ -298,15 +308,51 @@ class test_timestamp03(wttest.WiredTigerTestCase, suite_subprocess):
         # Take a checkpoint using the given configuration.  Then verify
         # whether value2 appears in a copy of that data or not.
         valcnt_ts_log = valcnt_nots_log = valcnt_nots_nolog = nkeys
-        if self.val == 'all':
+        if self.ckpt_ts == False:
             # if use_timestamp is false, then all updates will be checkpointed.
             valcnt_ts_nolog = nkeys
         else:
-            # checkpoint will happen with stable_timestamp=100, hence only
-            # table_ts_nolog will still have the old values (i.e. value)
-            self.ckpt_backup(self.value, 0, nkeys, 0, 0)
+            # Checkpoint will happen with stable_timestamp=100.
+            if self.using_log == True:
+                # only table_ts_nolog will have old values when logging is enabled
+                self.ckpt_backup(self.value, 0, nkeys, 0, 0)
+            else:
+                # Both table_ts_nolog and table_ts_log will have old values when
+                # logging is disabled.
+                self.ckpt_backup(self.value, nkeys, nkeys, 0, 0)
             # table_ts_nolog will not have any new values (i.e. value2)
             valcnt_ts_nolog = 0
+
+        if self.ckpt_ts == False:
+            valcnt_ts_log = nkeys
+        # Take a checkpoint using the given configuration.  Then verify
+        # whether value2 appears in a copy of that data or not.
+        valcnt_ts_log = valcnt_nots_log = valcnt_nots_nolog = nkeys
+        if self.ckpt_ts == False:
+            # if use_timestamp is false, then all updates will be checkpointed.
+            valcnt_ts_nolog = nkeys
+        else:
+            # Checkpoint will happen with stable_timestamp=100.
+            if self.using_log == True:
+                # only table_ts_nolog will have old values when logging is enabled
+                self.ckpt_backup(self.value, 0, nkeys, 0, 0)
+            else:
+                # Both table_ts_nolog and table_ts_log will have old values when
+                # logging is disabled.
+                self.ckpt_backup(self.value, nkeys, nkeys, 0, 0)
+            # table_ts_nolog will not have any new values (i.e. value2)
+            valcnt_ts_nolog = 0
+
+        if self.ckpt_ts == False:
+            valcnt_ts_log = nkeys
+        else:
+            # When log is enabled, table_ts_log will have all new values, else
+            # none.
+            if self.using_log == True:
+                valcnt_ts_log = nkeys
+            else:
+                valcnt_ts_log = 0
+
         self.ckpt_backup(self.value2, valcnt_ts_log, valcnt_ts_nolog,
             valcnt_nots_log, valcnt_nots_nolog)
 

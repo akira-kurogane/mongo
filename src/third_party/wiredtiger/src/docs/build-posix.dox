@@ -121,30 +121,20 @@ Configure WiredTiger to perform various run-time diagnostic tests.
 <b>DO NOT</b> configure this option in production environments.
 
 @par \c --enable-java
-Build the WiredTiger Java API.
-
-@par \c --enable-leveldb[=basho, hyper, rocksdb]
-Include a Google, Inc. compatible LevelDB API. Optionally, specify \c basho
-to build a version of the LevelDB API compatible with Basho's Riak
-product, specify \c hyper to build a version of the LevelDB API compatible
-with the HyperDex product, and specify \c rocksdb to build a version of the
-LevelDB API compatible with applications using Facebook's RocksDB
-engine. See @ref leveldb for more information.
+Build the WiredTiger Java API; requires <a href="http://swig.org">SWIG</a>
+and Java JDK.
 
 @par \c --enable-lz4
 Configure WiredTiger for <a href="https://github.com/Cyan4973/lz4">LZ4</a>
 compression; see @ref compression for more information.
 
 @par \c --enable-python
-Build the WiredTiger <a href="http://www.python.org">Python</a> API.
+Build the WiredTiger <a href="http://www.python.org">Python</a> API;
+requires <a href="http://swig.org">SWIG</a>.
 
 @par \c --enable-snappy
 Configure WiredTiger for <a href="http://code.google.com/p/snappy/">snappy</a>
 compression; see @ref compression for more information.
-
-@par \c --enable-verbose
-Configure WiredTiger to support the \c verbose configuration string to
-::wiredtiger_open.
 
 @par \c --enable-zlib
 Configure WiredTiger for <a href="http://www.zlib.net/">zlib</a>

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -38,21 +39,22 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 
 namespace {
 
 class DirectClientScope {
-    MONGO_DISALLOW_COPYING(DirectClientScope);
+    DirectClientScope(const DirectClientScope&) = delete;
+    DirectClientScope& operator=(const DirectClientScope&) = delete;
 
 public:
     explicit DirectClientScope(OperationContext* opCtx)
@@ -94,12 +96,17 @@ std::string DBDirectClient::getServerAddress() const {
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMinWireVersion() {
-    return WireSpec::instance().incoming.minWireVersion;
+    return WireSpec::instance().incomingExternalClient.minWireVersion;
 }
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMaxWireVersion() {
-    return WireSpec::instance().incoming.maxWireVersion;
+    return WireSpec::instance().incomingExternalClient.maxWireVersion;
+}
+
+bool DBDirectClient::isReplicaSetMember() const {
+    auto const* replCoord = repl::ReplicationCoordinator::get(_opCtx);
+    return replCoord && replCoord->isReplEnabled();
 }
 
 ConnectionString::ConnectionType DBDirectClient::type() const {
@@ -111,7 +118,7 @@ double DBDirectClient::getSoTimeout() const {
 }
 
 bool DBDirectClient::lazySupported() const {
-    return true;
+    return false;
 }
 
 void DBDirectClient::setOpCtx(OperationContext* opCtx) {
@@ -153,25 +160,33 @@ void DBDirectClient::say(Message& toSend, bool isRetry, string* actualServer) {
     invariant(dbResponse.response.empty());
 }
 
-unique_ptr<DBClientCursor> DBDirectClient::query(const string& ns,
+unique_ptr<DBClientCursor> DBDirectClient::query(const NamespaceStringOrUUID& nsOrUuid,
                                                  Query query,
                                                  int nToReturn,
                                                  int nToSkip,
                                                  const BSONObj* fieldsToReturn,
                                                  int queryOptions,
-                                                 int batchSize) {
+                                                 int batchSize,
+                                                 boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
     return DBClientBase::query(
-        ns, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+        nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
 }
 
-unsigned long long DBDirectClient::count(
-    const string& ns, const BSONObj& query, int options, int limit, int skip) {
-    BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
+long long DBDirectClient::count(const NamespaceStringOrUUID nsOrUuid,
+                                const BSONObj& query,
+                                int options,
+                                int limit,
+                                int skip,
+                                boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
+    DirectClientScope directClientScope(_opCtx);
+    BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip, boost::none);
 
-    NamespaceString nsString(ns);
+    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
 
-    auto result = Command::runCommandDirectly(
-        _opCtx, OpMsgRequest::fromDBAndBody(nsString.db(), std::move(cmdObj)));
+    auto result = CommandHelpers::runCommandDirectly(
+        _opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(cmdObj)));
 
     uassertStatusOK(getStatusFromCommandResult(result));
     return static_cast<unsigned long long>(result["n"].numberLong());

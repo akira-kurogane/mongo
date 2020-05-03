@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -33,9 +34,9 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/exec/filter.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/matcher/matchable.h"
 #include "mongo/db/query/index_bounds.h"
 
 namespace mongo {
@@ -65,16 +66,21 @@ typedef std::vector<std::pair<BSONObj, BSONObj>> BoundList;
  */
 class ShardKeyPattern {
 public:
-    // Maximum size of shard key
-    static const int kMaxShardKeySizeBytes;
-
-    // Maximum number of intervals produced by $in queries.
-    static const unsigned int kMaxFlattenedInCombinations;
+    /**
+     * A struct to represent the index key data. The 'data' field represents the actual key data and
+     * the 'pattern' represents the index key pattern. For an index pattern {a: 1, b: 'hashed'} the
+     * key data would look like {"": "value", "": NumberLong(12345)}.
+     */
+    struct IndexKeyData {
+        BSONObj data;
+        BSONObj pattern;
+    };
 
     /**
-     * Helper to check shard key size and generate an appropriate error message.
+     * Validates whether the specified shard key is valid to be written as part of the sharding
+     * metadata.
      */
-    static Status checkShardKeySize(const BSONObj& shardKey);
+    static Status checkShardKeyIsValidForMetadataStorage(const BSONObj& shardKey);
 
     /**
      * Constructs a shard key pattern from a BSON pattern document.  If the document is not a
@@ -87,9 +93,27 @@ public:
      */
     explicit ShardKeyPattern(const KeyPattern& keyPattern);
 
-    bool isValid() const;
+    /**
+     * Returns whether the provided element is hashed.
+     */
+    static bool isHashedPatternEl(const BSONElement& el);
+
+    /**
+     * Returns the BSONElement pointing to the hashed field. Returns empty BSONElement if not found.
+     */
+    static BSONElement extractHashedField(BSONObj keyPattern);
+
+    /**
+     * Check if the given BSONElement is of type 'MinKey', 'MaxKey' or 'NumberLong', which are the
+     * only acceptable values for hashed fields.
+     */
+    static bool isValidHashedValue(const BSONElement& el);
 
     bool isHashedPattern() const;
+
+    bool hasHashedPrefix() const;
+
+    BSONElement getHashedField() const;
 
     const KeyPattern& getKeyPattern() const;
 
@@ -106,6 +130,12 @@ public:
     bool isShardKey(const BSONObj& shardKey) const;
 
     /**
+     * Returns true if the new shard key pattern extends this shard key pattern - i.e. contains this
+     * shard key pattern as a prefix (begins with the same field names in the same order).
+     */
+    bool isExtendedBy(const ShardKeyPattern& newShardKeyPattern) const;
+
+    /**
      * Given a shard key, return it in normal form where the fields are in the same order as
      * the shard key pattern fields.
      *
@@ -114,12 +144,22 @@ public:
     BSONObj normalizeShardKey(const BSONObj& shardKey) const;
 
     /**
-     * Given a MatchableDocument, extracts the shard key corresponding to the key pattern.
-     * For each path in the shard key pattern, extracts a value from the matchable document.
+     * Given one or more index keys, potentially from more than one index, extracts the shard key
+     * corresponding to the shard key pattern.
      *
-     * Paths to shard key fields must not contain arrays at any level, and shard keys may not
-     * be array fields, undefined, or non-storable sub-documents.  If the shard key pattern is
-     * a hashed key pattern, this method performs the hashing.
+     * All the shard key fields must be present in at least one of the index keys. A missing shard
+     * key field will result in an invariant.
+     */
+    BSONObj extractShardKeyFromIndexKeyData(const std::vector<IndexKeyData>& indexKeyData) const;
+
+    /**
+     * Given a document, extracts the shard key corresponding to the key pattern. Paths to shard key
+     * fields must not contain arrays at any level, and shard keys may not be array fields or
+     * non-storable sub-documents.  If the shard key pattern is a hashed key pattern, this method
+     * performs the hashing.
+     *
+     * If any shard key fields are missing from the document, the extraction will treat these
+     * fields as null.
      *
      * If a shard key cannot be extracted, returns an empty BSONObj().
      *
@@ -134,14 +174,16 @@ public:
      *  If 'this' KeyPattern is { 'a.b' : 1 }
      *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
      *   { a : [{ b : "hi" }] } --> returns {}
-     */
-    BSONObj extractShardKeyFromMatchable(const MatchableDocument& matchable) const;
-
-    /**
-     * Given a document, extracts the shard key corresponding to the key pattern.
-     * See above.
+     *  If 'this' KeyPattern is { a: 1 , b: 1 }
+     *   { a: 1 } --> returns { a: 1, b: null }
+     *   { b: 1 } --> returns { a: null, b: 1 }
      */
     BSONObj extractShardKeyFromDoc(const BSONObj& doc) const;
+
+    /**
+     * Returns the document with missing shard key values set to null.
+     */
+    BSONObj emplaceMissingShardKeyValuesForDocument(const BSONObj doc) const;
 
     /**
      * Given a simple BSON query, extracts the shard key corresponding to the key pattern
@@ -169,6 +211,7 @@ public:
      *                                                 a : { $eq : { b : ... } }
      */
     StatusWith<BSONObj> extractShardKeyFromQuery(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
                                                  const BSONObj& basicQuery) const;
     BSONObj extractShardKeyFromQuery(const CanonicalQuery& query) const;
 
@@ -233,12 +276,13 @@ public:
     };
 
 private:
+    KeyPattern _keyPattern;
+
     // Ordered, parsed paths
     std::vector<std::unique_ptr<FieldRef>> _keyPatternPaths;
 
-    KeyPattern _keyPattern;
-
     bool _hasId;
+    BSONElement _hashedField;
 };
 
 }  // namespace mongo

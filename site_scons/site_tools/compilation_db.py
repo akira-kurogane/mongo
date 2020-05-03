@@ -1,16 +1,24 @@
-# Copyright 2015 MongoDB Inc.
+# Copyright 2020 MongoDB Inc.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
 
 import json
 import SCons
@@ -28,17 +36,18 @@ import itertools
 # compilation database can access the complete list, and also so that the writer has easy
 # access to write all of the files. But it seems clunky. How can the emitter and the scanner
 # communicate more gracefully?
-__COMPILATION_DB_ENTRIES=[]
+__COMPILATION_DB_ENTRIES = []
 
 # Cribbed from Tool/cc.py and Tool/c++.py. It would be better if
 # we could obtain this from SCons.
-_CSuffixes = ['.c']
-if not SCons.Util.case_sensitive_suffixes('.c', '.C'):
-    _CSuffixes.append('.C')
+_CSuffixes = [".c"]
+if not SCons.Util.case_sensitive_suffixes(".c", ".C"):
+    _CSuffixes.append(".C")
 
-_CXXSuffixes = ['.cpp', '.cc', '.cxx', '.c++', '.C++']
-if SCons.Util.case_sensitive_suffixes('.c', '.C'):
-    _CXXSuffixes.append('.C')
+_CXXSuffixes = [".cpp", ".cc", ".cxx", ".c++", ".C++"]
+if SCons.Util.case_sensitive_suffixes(".c", ".C"):
+    _CXXSuffixes.append(".C")
+
 
 # We make no effort to avoid rebuilding the entries. Someday, perhaps we could and even
 # integrate with the cache, but there doesn't seem to be much call for it.
@@ -48,8 +57,8 @@ class __CompilationDbNode(SCons.Node.Python.Value):
         self.Decider(changed_since_last_build_node)
 
 
-def changed_since_last_build_node(node, target, prev_ni):
-    """ Dummy decider to force alwasy building"""
+def changed_since_last_build_node(child, target, prev_ni, node):
+    """ Dummy decider to force always building"""
     return True
 
 
@@ -82,7 +91,8 @@ def makeEmitCompilationDbEntry(comstr):
             __COMPILATIONDB_UTARGET=target,
             __COMPILATIONDB_USOURCE=source,
             __COMPILATIONDB_UACTION=user_action,
-            __COMPILATIONDB_ENV=env)
+            __COMPILATIONDB_ENV=env,
+        )
 
         # TODO: Technically, these next two lines should not be required: it should be fine to
         # cache the entries. However, they don't seem to update properly. Since they are quick
@@ -109,15 +119,16 @@ def CompilationDbEntryAction(target, source, env, **kw):
     :return: None
     """
 
-    command = env['__COMPILATIONDB_UACTION'].strfunction(
-        target=env['__COMPILATIONDB_UTARGET'],
-        source=env['__COMPILATIONDB_USOURCE'],
-        env=env['__COMPILATIONDB_ENV'],)
+    command = env["__COMPILATIONDB_UACTION"].strfunction(
+        target=env["__COMPILATIONDB_UTARGET"],
+        source=env["__COMPILATIONDB_USOURCE"],
+        env=env["__COMPILATIONDB_ENV"],
+    )
 
     entry = {
-        "directory": env.Dir('#').abspath,
+        "directory": env.Dir("#").abspath,
         "command": command,
-        "file": str(env['__COMPILATIONDB_USOURCE'][0])
+        "file": str(env["__COMPILATIONDB_USOURCE"][0]),
     }
 
     target[0].write(entry)
@@ -129,32 +140,39 @@ def WriteCompilationDb(target, source, env):
     for s in __COMPILATION_DB_ENTRIES:
         entries.append(s.read())
 
-    with open(str(target[0]), 'w') as target_file:
-        json.dump(entries, target_file,
-                  sort_keys=True,
-                  indent=4,
-                  separators=(',', ': '))
+    with open(str(target[0]), "w") as target_file:
+        json.dump(
+            entries, target_file, sort_keys=True, indent=4, separators=(",", ": ")
+        )
 
 
 def ScanCompilationDb(node, env, path):
     return __COMPILATION_DB_ENTRIES
 
+
 def generate(env, **kwargs):
 
     static_obj, shared_obj = SCons.Tool.createObjBuilders(env)
 
-    env['COMPILATIONDB_COMSTR'] = kwargs.get(
-        'COMPILATIONDB_COMSTR', 'Building compilation database $TARGET')
+    env["COMPILATIONDB_COMSTR"] = kwargs.get(
+        "COMPILATIONDB_COMSTR", "Building compilation database $TARGET"
+    )
 
     components_by_suffix = itertools.chain(
-        itertools.product(_CSuffixes, [
-            (static_obj, SCons.Defaults.StaticObjectEmitter, '$CCCOM'),
-            (shared_obj, SCons.Defaults.SharedObjectEmitter, '$SHCCCOM'),
-        ]),
-        itertools.product(_CXXSuffixes, [
-            (static_obj, SCons.Defaults.StaticObjectEmitter, '$CXXCOM'),
-            (shared_obj, SCons.Defaults.SharedObjectEmitter, '$SHCXXCOM'),
-        ]),
+        itertools.product(
+            _CSuffixes,
+            [
+                (static_obj, SCons.Defaults.StaticObjectEmitter, "$CCCOM"),
+                (shared_obj, SCons.Defaults.SharedObjectEmitter, "$SHCCCOM"),
+            ],
+        ),
+        itertools.product(
+            _CXXSuffixes,
+            [
+                (static_obj, SCons.Defaults.StaticObjectEmitter, "$CXXCOM"),
+                (shared_obj, SCons.Defaults.SharedObjectEmitter, "$SHCXXCOM"),
+            ],
+        ),
     )
 
     for entry in components_by_suffix:
@@ -164,34 +182,30 @@ def generate(env, **kwargs):
         # Assumes a dictionary emitter
         emitter = builder.emitter[suffix]
         builder.emitter[suffix] = SCons.Builder.ListEmitter(
-            [
-                emitter,
-                makeEmitCompilationDbEntry(command),
-            ]
+            [emitter, makeEmitCompilationDbEntry(command),]
         )
 
-    env['BUILDERS']['__COMPILATIONDB_Entry'] = SCons.Builder.Builder(
+    env["BUILDERS"]["__COMPILATIONDB_Entry"] = SCons.Builder.Builder(
         action=SCons.Action.Action(CompilationDbEntryAction, None),
     )
 
-    env['BUILDERS']['__COMPILATIONDB_Database'] = SCons.Builder.Builder(
+    env["BUILDERS"]["__COMPILATIONDB_Database"] = SCons.Builder.Builder(
         action=SCons.Action.Action(WriteCompilationDb, "$COMPILATIONDB_COMSTR"),
         target_scanner=SCons.Scanner.Scanner(
-            function=ScanCompilationDb,
-            node_class=None)
+            function=ScanCompilationDb, node_class=None
+        ),
     )
 
     def CompilationDatabase(env, target):
-        result = env.__COMPILATIONDB_Database(
-            target=target,
-            source=[])
+        result = env.__COMPILATIONDB_Database(target=target, source=[])
 
         env.AlwaysBuild(result)
         env.NoCache(result)
 
         return result
 
-    env.AddMethod(CompilationDatabase, 'CompilationDatabase')
+    env.AddMethod(CompilationDatabase, "CompilationDatabase")
+
 
 def exists(env):
     return True

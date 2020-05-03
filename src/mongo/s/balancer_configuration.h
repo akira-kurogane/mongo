@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,14 +29,13 @@
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/posix_time/ptime.hpp>
 #include <boost/optional.hpp>
 #include <cstdint>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
 
@@ -107,6 +107,15 @@ public:
         return _waitForDelete;
     }
 
+    /**
+     * Returns whether the balancer should schedule migrations of chunks that are 'large' rather
+     * than marking these chunks as 'jumbo' (meaning they will not be scheduled for split or
+     * migration).
+     */
+    bool attemptToBalanceJumboChunks() const {
+        return _attemptToBalanceJumboChunks;
+    }
+
 private:
     BalancerSettingsType();
 
@@ -118,6 +127,8 @@ private:
     MigrationSecondaryThrottleOptions _secondaryThrottle;
 
     bool _waitForDelete{false};
+
+    bool _attemptToBalanceJumboChunks{false};
 };
 
 /**
@@ -195,7 +206,8 @@ private:
  * Contains settings, which control the behaviour of the balancer.
  */
 class BalancerConfiguration {
-    MONGO_DISALLOW_COPYING(BalancerConfiguration);
+    BalancerConfiguration(const BalancerConfiguration&) = delete;
+    BalancerConfiguration& operator=(const BalancerConfiguration&) = delete;
 
 public:
     /**
@@ -235,11 +247,23 @@ public:
     bool waitForDelete() const;
 
     /**
+     * Returns whether the balancer should attempt to schedule migrations of 'large' chunks. If
+     * false, the balancer will instead mark these chunks as 'jumbo', meaning they will not be
+     * scheduled for any split or move in the future.
+     */
+    bool attemptToBalanceJumboChunks() const;
+
+    /**
      * Returns the max chunk size after which a chunk would be considered jumbo.
      */
     uint64_t getMaxChunkSizeBytes() const {
         return _maxChunkSizeBytes.loadRelaxed();
     }
+
+    /**
+     * Change the cluster wide auto split settings.
+     */
+    Status enableAutoSplit(OperationContext* opCtx, bool enable);
 
     bool getShouldAutoSplit() const {
         return _shouldAutoSplit.loadRelaxed();
@@ -277,13 +301,14 @@ private:
     Status _refreshAutoSplitSettings(OperationContext* opCtx);
 
     // The latest read balancer settings and a mutex to protect its swaps
-    mutable stdx::mutex _balancerSettingsMutex;
+    mutable Mutex _balancerSettingsMutex =
+        MONGO_MAKE_LATCH("BalancerConfiguration::_balancerSettingsMutex");
     BalancerSettingsType _balancerSettings;
 
     // Max chunk size after which a chunk would be considered jumbo and won't be moved. This value
     // is read on the critical path after each write operation, that's why it is cached.
-    AtomicUInt64 _maxChunkSizeBytes;
-    AtomicBool _shouldAutoSplit;
+    AtomicWord<unsigned long long> _maxChunkSizeBytes;
+    AtomicWord<bool> _shouldAutoSplit;
 };
 
 }  // namespace mongo

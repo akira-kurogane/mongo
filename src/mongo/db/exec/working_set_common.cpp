@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,9 +27,13 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/working_set_common.h"
+
+#include <boost/iterator/transform_iterator.hpp>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
@@ -36,99 +41,120 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/storage/execution_context.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
-// static
-bool WorkingSetCommon::fetchAndInvalidateRecordId(OperationContext* opCtx,
-                                                  WorkingSetMember* member,
-                                                  const Collection* collection) {
-    // Already in our desired state.
-    if (member->getState() == WorkingSetMember::OWNED_OBJ) {
-        return true;
-    }
-
-    // We can't do anything without a RecordId.
-    if (!member->hasRecordId()) {
-        return false;
-    }
-
-    // Do the fetch, invalidate the DL.
-    member->obj = collection->docFor(opCtx, member->recordId);
-    member->obj.setValue(member->obj.value().getOwned());
-    member->recordId = RecordId();
-    member->transitionToOwnedObj();
-
-    return true;
-}
-
-void WorkingSetCommon::prepareForSnapshotChange(WorkingSet* workingSet) {
-    if (!supportsDocLocking()) {
-        // Non doc-locking storage engines use invalidations, so we don't need to examine the
-        // buffered working set ids. But we do need to clear the set of ids in order to keep our
-        // memory utilization in check.
-        workingSet->getAndClearYieldSensitiveIds();
-        return;
-    }
-
-    for (auto id : workingSet->getAndClearYieldSensitiveIds()) {
-        if (workingSet->isFree(id)) {
-            continue;
-        }
-
-        // We may see the same member twice, so anything we do here should be idempotent.
-        WorkingSetMember* member = workingSet->get(id);
-        if (member->getState() == WorkingSetMember::RID_AND_IDX) {
-            member->isSuspicious = true;
+namespace {
+std::string indexKeyVectorDebugString(const std::vector<IndexKeyDatum>& keyData) {
+    StringBuilder sb;
+    sb << "[";
+    if (keyData.size() > 0) {
+        auto it = keyData.begin();
+        sb << "(key: " << redact(it->keyData) << ", index key pattern: " << it->indexKeyPattern
+           << ")";
+        while (++it != keyData.end()) {
+            sb << ", (key: " << redact(it->keyData)
+               << ", index key pattern: " << it->indexKeyPattern << ")";
         }
     }
+    sb << "]";
+    return sb.str();
 }
+}  // namespace
 
 // static
 bool WorkingSetCommon::fetch(OperationContext* opCtx,
                              WorkingSet* workingSet,
                              WorkingSetID id,
-                             unowned_ptr<SeekableRecordCursor> cursor) {
+                             unowned_ptr<SeekableRecordCursor> cursor,
+                             const NamespaceString& ns) {
     WorkingSetMember* member = workingSet->get(id);
-
-    // The RecordFetcher should already have been transferred out of the WSM and used.
-    invariant(!member->hasFetcher());
 
     // We should have a RecordId but need to retrieve the obj. Get the obj now and reset all WSM
     // state appropriately.
     invariant(member->hasRecordId());
 
-    member->obj.reset();
     auto record = cursor->seekExact(member->recordId);
     if (!record) {
+        // The record referenced by this index entry is gone. If the query yielded some time after
+        // we first examined the index entry, then it's likely that the record was deleted while we
+        // were yielding. However, if the snapshot id hasn't changed since the index lookup, then
+        // there could not have been a yield, and the only explanation is corruption.
+        std::vector<IndexKeyDatum>::iterator keyDataIt;
+        if (member->getState() == WorkingSetMember::RID_AND_IDX &&
+            (keyDataIt = std::find_if(member->keyData.begin(),
+                                      member->keyData.end(),
+                                      [currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId()](
+                                          const auto& keyDatum) {
+                                          return keyDatum.snapshotId == currentSnapshotId;
+                                      })) != member->keyData.end()) {
+            auto indexKeyEntryToObjFn = [](const IndexKeyDatum& ikd) {
+                BSONObjBuilder builder;
+                builder.append("key"_sd, redact(ikd.keyData));
+                builder.append("pattern"_sd, ikd.indexKeyPattern);
+                return builder.obj();
+            };
+            LOGV2_ERROR_OPTIONS(
+                4615603,
+                {logv2::UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)},
+                "Erroneous index key found with reference to non-existent record id "
+                "{recordId}: "
+                "{indexKeyData}. Consider dropping and then re-creating the index with key "
+                "pattern "
+                "{indexKeyPattern} and then running the validate command on the collection.",
+                "recordId"_attr = member->recordId,
+                "indexKeyData"_attr = logv2::seqLog(
+                    boost::make_transform_iterator(member->keyData.begin(), indexKeyEntryToObjFn),
+                    boost::make_transform_iterator(member->keyData.end(), indexKeyEntryToObjFn)),
+                "indexKeyPattern"_attr = keyDataIt->indexKeyPattern);
+        }
         return false;
     }
 
-    member->obj = {opCtx->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
+    auto currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
+    member->resetDocument(currentSnapshotId, record->data.releaseToBson());
 
-    if (member->isSuspicious) {
-        // Make sure that all of the keyData is still valid for this copy of the document.
-        // This ensures both that index-provided filters and sort orders still hold.
-        // TODO provide a way for the query planner to opt out of this checking if it is
-        // unneeded due to the structure of the plan.
-        invariant(!member->keyData.empty());
+    // Make sure that all of the keyData is still valid for this copy of the document.  This ensures
+    // both that index-provided filters and sort orders still hold.
+    //
+    // TODO provide a way for the query planner to opt out of this checking if it is unneeded due to
+    // the structure of the plan.
+    if (member->getState() == WorkingSetMember::RID_AND_IDX) {
+        auto& executionCtx = StorageExecutionContext::get(opCtx);
         for (size_t i = 0; i < member->keyData.size(); i++) {
-            BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-            // There's no need to compute the prefixes of the indexed fields that cause the index to
-            // be multikey when ensuring the keyData is still valid.
+            auto&& memberKey = member->keyData[i];
+            // If this key was obtained in the current snapshot, then move on to the next key. There
+            // is no way for this key to be inconsistent with the document it points to.
+            if (memberKey.snapshotId == currentSnapshotId) {
+                continue;
+            }
+
+            auto keys = executionCtx.keys();
+            // There's no need to compute the prefixes of the indexed fields that cause the
+            // index to be multikey when ensuring the keyData is still valid.
+            KeyStringSet* multikeyMetadataKeys = nullptr;
             MultikeyPaths* multikeyPaths = nullptr;
-            member->keyData[i].index->getKeys(member->obj.value(),
-                                              IndexAccessMethod::GetKeysMode::kEnforceConstraints,
-                                              &keys,
-                                              multikeyPaths);
-            if (!keys.count(member->keyData[i].keyData)) {
+            auto* iam = workingSet->retrieveIndexAccessMethod(memberKey.indexId);
+            iam->getKeys(executionCtx.pooledBufferBuilder(),
+                         member->doc.value().toBson(),
+                         IndexAccessMethod::GetKeysMode::kEnforceConstraints,
+                         IndexAccessMethod::GetKeysContext::kValidatingKeys,
+                         keys.get(),
+                         multikeyMetadataKeys,
+                         multikeyPaths,
+                         member->recordId,
+                         IndexAccessMethod::kNoopOnSuppressedErrorFn);
+            KeyString::HeapBuilder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
+                                             memberKey.keyData,
+                                             iam->getSortedDataInterface()->getOrdering(),
+                                             member->recordId);
+            if (!keys->count(keyString.release())) {
                 // document would no longer be at this position in the index.
                 return false;
             }
         }
-
-        member->isSuspicious = false;
     }
 
     member->keyData.clear();
@@ -136,75 +162,77 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
     return true;
 }
 
-// static
-BSONObj WorkingSetCommon::buildMemberStatusObject(const Status& status) {
+Document WorkingSetCommon::buildMemberStatusObject(const Status& status) {
     BSONObjBuilder bob;
     bob.append("ok", status.isOK() ? 1.0 : 0.0);
     bob.append("code", status.code());
     bob.append("errmsg", status.reason());
+    if (auto extraInfo = status.extraInfo()) {
+        extraInfo->serialize(&bob);
+    }
 
-    return bob.obj();
+    return Document{bob.obj()};
 }
 
-// static
 WorkingSetID WorkingSetCommon::allocateStatusMember(WorkingSet* ws, const Status& status) {
     invariant(ws);
 
     WorkingSetID wsid = ws->allocate();
     WorkingSetMember* member = ws->get(wsid);
-    member->obj = Snapshotted<BSONObj>(SnapshotId(), buildMemberStatusObject(status));
+    member->doc = {SnapshotId(), buildMemberStatusObject(status)};
     member->transitionToOwnedObj();
 
     return wsid;
 }
 
-// static
+bool WorkingSetCommon::isValidStatusMemberObject(const Document& obj) {
+    return !obj["ok"].missing() && obj["code"].getType() == BSONType::NumberInt &&
+        obj["errmsg"].getType() == BSONType::String;
+}
+
 bool WorkingSetCommon::isValidStatusMemberObject(const BSONObj& obj) {
-    return obj.nFields() == 3 && obj.hasField("ok") && obj.hasField("code") &&
-        obj.hasField("errmsg");
+    return isValidStatusMemberObject(Document{obj});
 }
 
-// static
-void WorkingSetCommon::getStatusMemberObject(const WorkingSet& ws,
-                                             WorkingSetID wsid,
-                                             BSONObj* objOut) {
-    invariant(objOut);
-
-    // Validate ID and working set member.
+boost::optional<Document> WorkingSetCommon::getStatusMemberDocument(const WorkingSet& ws,
+                                                                    WorkingSetID wsid) {
     if (WorkingSet::INVALID_ID == wsid) {
-        return;
+        return boost::none;
     }
-    WorkingSetMember* member = ws.get(wsid);
+    auto member = ws.get(wsid);
     if (!member->hasOwnedObj()) {
-        return;
+        return boost::none;
     }
-    BSONObj obj = member->obj.value();
-    if (!isValidStatusMemberObject(obj)) {
-        return;
+
+    if (!isValidStatusMemberObject(member->doc.value())) {
+        return boost::none;
     }
-    *objOut = obj;
+    return member->doc.value();
 }
 
-// static
 Status WorkingSetCommon::getMemberObjectStatus(const BSONObj& memberObj) {
     invariant(WorkingSetCommon::isValidStatusMemberObject(memberObj));
-    return Status(ErrorCodes::fromInt(memberObj["code"].numberInt()), memberObj["errmsg"]);
+    return Status(ErrorCodes::Error(memberObj["code"].numberInt()),
+                  memberObj["errmsg"].valueStringData(),
+                  memberObj);
 }
 
-// static
+Status WorkingSetCommon::getMemberObjectStatus(const Document& doc) {
+    return getMemberObjectStatus(doc.toBson());
+}
+
 Status WorkingSetCommon::getMemberStatus(const WorkingSetMember& member) {
     invariant(member.hasObj());
-    return getMemberObjectStatus(member.obj.value());
+    return getMemberObjectStatus(member.doc.value().toBson());
 }
 
-// static
 std::string WorkingSetCommon::toStatusString(const BSONObj& obj) {
-    if (!isValidStatusMemberObject(obj)) {
+    Document doc{obj};
+    if (!isValidStatusMemberObject(doc)) {
         Status unknownStatus(ErrorCodes::UnknownError, "no details available");
         return unknownStatus.toString();
     }
-    Status status(ErrorCodes::fromInt(obj.getIntField("code")), obj.getStringField("errmsg"));
-    return status.toString();
+    return getMemberObjectStatus(doc).toString();
 }
 
 }  // namespace mongo

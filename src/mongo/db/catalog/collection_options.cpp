@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,16 +31,16 @@
 
 #include "mongo/db/catalog/collection_options.h"
 
+#include <algorithm>
+
 #include "mongo/base/string_data.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/server_parameters.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-bool enableCollectionUUIDs = true;
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> enableCollectionUUIDsParameter(
-    ServerParameterSet::getGlobal(), "enableCollectionUUIDs", &enableCollectionUUIDs);
 
 // static
 bool CollectionOptions::validMaxCappedDocs(long long* max) {
@@ -99,12 +100,11 @@ bool CollectionOptions::isView() const {
 }
 
 Status CollectionOptions::validateForStorage() const {
-    return CollectionOptions().parse(toBSON(), ParseKind::parseForStorage);
+    return CollectionOptions::parse(toBSON(), ParseKind::parseForStorage).getStatus();
 }
 
-Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
-    *this = {};
-
+StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
+    CollectionOptions collectionOptions;
     // Versions 2.4 and earlier of the server store "create" inside the collection metadata when the
     // user issues an explicit collection creation command. These versions also wrote any
     // unrecognized fields into the catalog metadata and allowed the order of these fields to be
@@ -129,58 +129,53 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
             if (!res.isOK()) {
                 return res.getStatus();
             }
-            uuid = res.getValue();
+            collectionOptions.uuid = res.getValue();
         } else if (fieldName == "capped") {
-            capped = e.trueValue();
+            collectionOptions.capped = e.trueValue();
         } else if (fieldName == "size") {
             if (!e.isNumber()) {
                 // Ignoring for backwards compatibility.
                 continue;
             }
-            cappedSize = e.numberLong();
-            if (cappedSize < 0)
+            collectionOptions.cappedSize = e.safeNumberLong();
+            if (collectionOptions.cappedSize < 0)
                 return Status(ErrorCodes::BadValue, "size has to be >= 0");
             const long long kGB = 1024 * 1024 * 1024;
             const long long kPB = 1024 * 1024 * kGB;
-            if (cappedSize > kPB)
+            if (collectionOptions.cappedSize > kPB)
                 return Status(ErrorCodes::BadValue, "size cannot exceed 1 PB");
-            cappedSize += 0xff;
-            cappedSize &= 0xffffffffffffff00LL;
+            collectionOptions.cappedSize += 0xff;
+            collectionOptions.cappedSize &= 0xffffffffffffff00LL;
         } else if (fieldName == "max") {
             if (!options["capped"].trueValue() || !e.isNumber()) {
                 // Ignoring for backwards compatibility.
                 continue;
             }
-            cappedMaxDocs = e.numberLong();
-            if (!validMaxCappedDocs(&cappedMaxDocs))
+            collectionOptions.cappedMaxDocs = e.safeNumberLong();
+            if (!validMaxCappedDocs(&collectionOptions.cappedMaxDocs))
                 return Status(ErrorCodes::BadValue,
                               "max in a capped collection has to be < 2^31 or not set");
         } else if (fieldName == "$nExtents") {
-            if (e.type() == Array) {
-                BSONObjIterator j(e.Obj());
-                while (j.more()) {
-                    BSONElement inner = j.next();
-                    initialExtentSizes.push_back(inner.numberInt());
-                }
-            } else {
-                initialNumExtents = e.numberLong();
-            }
+            // Ignoring for backwards compatibility.
+            continue;
         } else if (fieldName == "autoIndexId") {
             if (e.trueValue())
-                autoIndexId = YES;
+                collectionOptions.autoIndexId = YES;
             else
-                autoIndexId = NO;
+                collectionOptions.autoIndexId = NO;
         } else if (fieldName == "flags") {
-            flags = e.numberInt();
-            flagsSet = true;
+            // Ignoring this field as it is deprecated.
+            continue;
         } else if (fieldName == "temp") {
-            temp = e.trueValue();
+            collectionOptions.temp = e.trueValue();
+        } else if (fieldName == "recordPreImages") {
+            collectionOptions.recordPreImages = e.trueValue();
         } else if (fieldName == "storageEngine") {
             Status status = checkStorageEngineOptions(e);
             if (!status.isOK()) {
                 return status;
             }
-            storageEngine = e.Obj().getOwned();
+            collectionOptions.storageEngine = e.Obj().getOwned();
         } else if (fieldName == "indexOptionDefaults") {
             if (e.type() != mongo::Object) {
                 return {ErrorCodes::TypeMismatch, "'indexOptionDefaults' has to be a document."};
@@ -189,8 +184,7 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
                 if (option.fieldNameStringData() == "storageEngine") {
                     Status status = checkStorageEngineOptions(option);
                     if (!status.isOK()) {
-                        return {status.code(),
-                                str::stream() << "In indexOptionDefaults: " << status.reason()};
+                        return status.withContext("Error in indexOptionDefaults");
                     }
                 } else {
                     // Return an error on first unrecognized field.
@@ -199,25 +193,25 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
                                           << " is not a supported option."};
                 }
             }
-            indexOptionDefaults = e.Obj().getOwned();
+            collectionOptions.indexOptionDefaults = e.Obj().getOwned();
         } else if (fieldName == "validator") {
             if (e.type() != mongo::Object) {
                 return Status(ErrorCodes::BadValue, "'validator' has to be a document.");
             }
 
-            validator = e.Obj().getOwned();
+            collectionOptions.validator = e.Obj().getOwned();
         } else if (fieldName == "validationAction") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'validationAction' has to be a string.");
             }
 
-            validationAction = e.String();
+            collectionOptions.validationAction = e.String();
         } else if (fieldName == "validationLevel") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'validationLevel' has to be a string.");
             }
 
-            validationLevel = e.String();
+            collectionOptions.validationLevel = e.String();
         } else if (fieldName == "collation") {
             if (e.type() != mongo::Object) {
                 return Status(ErrorCodes::BadValue, "'collation' has to be a document.");
@@ -227,14 +221,14 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
                 return Status(ErrorCodes::BadValue, "'collation' cannot be an empty document.");
             }
 
-            collation = e.Obj().getOwned();
+            collectionOptions.collation = e.Obj().getOwned();
         } else if (fieldName == "viewOn") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'viewOn' has to be a string.");
             }
 
-            viewOn = e.String();
-            if (viewOn.empty()) {
+            collectionOptions.viewOn = e.String();
+            if (collectionOptions.viewOn.empty()) {
                 return Status(ErrorCodes::BadValue, "'viewOn' cannot be empty.'");
             }
         } else if (fieldName == "pipeline") {
@@ -242,83 +236,165 @@ Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
                 return Status(ErrorCodes::BadValue, "'pipeline' has to be an array.");
             }
 
-            pipeline = e.Obj().getOwned();
-        } else if (!createdOn24OrEarlier && !Command::isGenericArgument(fieldName)) {
+            collectionOptions.pipeline = e.Obj().getOwned();
+        } else if (fieldName == "idIndex" && kind == parseForCommand) {
+            if (e.type() != mongo::Object) {
+                return Status(ErrorCodes::TypeMismatch, "'idIndex' has to be an object.");
+            }
+
+            auto tempIdIndex = e.Obj().getOwned();
+            if (tempIdIndex.isEmpty()) {
+                return {ErrorCodes::FailedToParse, "idIndex cannot be empty"};
+            }
+
+            collectionOptions.idIndex = std::move(tempIdIndex);
+        } else if (!createdOn24OrEarlier && !mongo::isGenericArgument(fieldName)) {
             return Status(ErrorCodes::InvalidOptions,
-                          str::stream() << "The field '" << fieldName
-                                        << "' is not a valid collection option. Options: "
-                                        << options);
+                          str::stream()
+                              << "The field '" << fieldName
+                              << "' is not a valid collection option. Options: " << options);
         }
     }
 
-    if (viewOn.empty() && !pipeline.isEmpty()) {
+    if (collectionOptions.viewOn.empty() && !collectionOptions.pipeline.isEmpty()) {
         return Status(ErrorCodes::BadValue, "'pipeline' cannot be specified without 'viewOn'");
     }
 
-    return Status::OK();
+    return collectionOptions;
 }
 
 BSONObj CollectionOptions::toBSON() const {
     BSONObjBuilder b;
+    appendBSON(&b);
+    return b.obj();
+}
 
+void CollectionOptions::appendBSON(BSONObjBuilder* builder) const {
     if (uuid) {
-        b.appendElements(uuid->toBSON());
+        builder->appendElements(uuid->toBSON());
     }
 
     if (capped) {
-        b.appendBool("capped", true);
-        b.appendNumber("size", cappedSize);
+        builder->appendBool("capped", true);
+        builder->appendNumber("size", cappedSize);
 
         if (cappedMaxDocs)
-            b.appendNumber("max", cappedMaxDocs);
+            builder->appendNumber("max", cappedMaxDocs);
     }
 
-    if (initialNumExtents)
-        b.appendNumber("$nExtents", initialNumExtents);
-    if (!initialExtentSizes.empty())
-        b.append("$nExtents", initialExtentSizes);
-
     if (autoIndexId != DEFAULT)
-        b.appendBool("autoIndexId", autoIndexId == YES);
-
-    if (flagsSet)
-        b.append("flags", flags);
+        builder->appendBool("autoIndexId", autoIndexId == YES);
 
     if (temp)
-        b.appendBool("temp", true);
+        builder->appendBool("temp", true);
+
+    if (recordPreImages) {
+        builder->appendBool("recordPreImages", true);
+    }
 
     if (!storageEngine.isEmpty()) {
-        b.append("storageEngine", storageEngine);
+        builder->append("storageEngine", storageEngine);
     }
 
     if (!indexOptionDefaults.isEmpty()) {
-        b.append("indexOptionDefaults", indexOptionDefaults);
+        builder->append("indexOptionDefaults", indexOptionDefaults);
     }
 
     if (!validator.isEmpty()) {
-        b.append("validator", validator);
+        builder->append("validator", validator);
     }
 
     if (!validationLevel.empty()) {
-        b.append("validationLevel", validationLevel);
+        builder->append("validationLevel", validationLevel);
     }
 
     if (!validationAction.empty()) {
-        b.append("validationAction", validationAction);
+        builder->append("validationAction", validationAction);
     }
 
     if (!collation.isEmpty()) {
-        b.append("collation", collation);
+        builder->append("collation", collation);
     }
 
     if (!viewOn.empty()) {
-        b.append("viewOn", viewOn);
+        builder->append("viewOn", viewOn);
     }
 
     if (!pipeline.isEmpty()) {
-        b.append("pipeline", pipeline);
+        builder->appendArray("pipeline", pipeline);
     }
 
-    return b.obj();
+    if (!idIndex.isEmpty()) {
+        builder->append("idIndex", idIndex);
+    }
 }
+
+bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
+                                              CollatorFactoryInterface* collatorFactory) const {
+    if (capped != other.capped) {
+        return false;
+    }
+
+    if (cappedSize != other.cappedSize) {
+        return false;
+    }
+
+    if (cappedMaxDocs != other.cappedMaxDocs) {
+        return false;
+    }
+
+    if (autoIndexId != other.autoIndexId) {
+        return false;
+    }
+
+    if (recordPreImages != other.recordPreImages) {
+        return false;
+    }
+
+    if (temp != other.temp) {
+        return false;
+    }
+
+    if (storageEngine.woCompare(other.storageEngine) != 0) {
+        return false;
+    }
+
+    if (indexOptionDefaults.woCompare(other.indexOptionDefaults) != 0) {
+        return false;
+    }
+
+    if (validator.woCompare(other.validator) != 0) {
+        return false;
+    }
+
+    if (validationAction != other.validationAction) {
+        return false;
+    }
+
+    if (validationLevel != other.validationLevel) {
+        return false;
+    }
+
+    // Note: the server can add more stuff on the collation options that were not specified in
+    // the original user request. Use the collator to check for equivalence.
+    auto myCollator =
+        collation.isEmpty() ? nullptr : uassertStatusOK(collatorFactory->makeFromBSON(collation));
+    auto otherCollator = other.collation.isEmpty()
+        ? nullptr
+        : uassertStatusOK(collatorFactory->makeFromBSON(other.collation));
+
+    if (!CollatorInterface::collatorsMatch(myCollator.get(), otherCollator.get())) {
+        return false;
+    }
+
+    if (viewOn != other.viewOn) {
+        return false;
+    }
+
+    if (pipeline.woCompare(other.pipeline) != 0) {
+        return false;
+    }
+
+    return true;
 }
+}  // namespace mongo

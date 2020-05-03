@@ -1,28 +1,30 @@
-/* Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,10 +39,12 @@
 #include "mongo/db/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
+using namespace mongo;
 namespace mmb = mongo::mutablebson;
 
 TEST(TopologyBuilding, TopDownFromScratch) {
@@ -541,6 +545,26 @@ TEST(ArrayAPI, SimpleNumericArray) {
     ASSERT_FALSE(e1[1].ok());
 }
 
+DEATH_TEST_REGEX(ArrayAPI,
+                 FindFirstChildNamedOnDeserializedArray,
+                 R"#(Invariant failure.*getType\(\) != BSONType::Array)#") {
+    mmb::Document doc;
+    auto array = doc.makeElementArray("a");
+    auto elem0 = doc.makeElementInt("", 0);
+    ASSERT_OK(array.pushBack(elem0));
+    array.findFirstChildNamed("0");
+}
+
+DEATH_TEST_REGEX(ArrayAPI,
+                 FindFirstChildNamedOnSerializedArray,
+                 R"#(Invariant failure.*getType\(\) != BSONType::Array)#") {
+    auto obj = fromjson("{a: [0, 1]}");
+    mmb::Document doc(obj);
+    auto rootElem = doc.root();
+    auto array = rootElem.leftChild();
+    array.findFirstChildNamed("0");
+}
+
 TEST(Element, setters) {
     mmb::Document doc;
 
@@ -993,11 +1017,11 @@ TEST(Documentation, Example2InPlaceWithDamageVector) {
 
     // Extract the damage events
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
     size_t size = 0;
     ASSERT_EQUALS(true, doc.getInPlaceUpdates(&damages, &source, &size));
     ASSERT_NOT_EQUALS(0U, damages.size());
-    ASSERT_NOT_EQUALS(static_cast<const char*>(NULL), source);
+    ASSERT_NOT_EQUALS(static_cast<const char*>(nullptr), source);
     ASSERT_NOT_EQUALS(0U, size);
 
     apply(&obj, damages, source);
@@ -1434,7 +1458,7 @@ TEST(Document, SetValueBSONElementFieldNameHandling) {
 
     static const char inJson2[] = "{ b : 5 }";
     mongo::BSONObj inObj2 = mongo::fromjson(inJson2);
-    mongo::BSONObjIterator iterator = inObj2.begin();
+    mongo::BSONObjIterator iterator(inObj2);
 
     ASSERT_TRUE(iterator.more());
     const mongo::BSONElement b = iterator.next();
@@ -2748,12 +2772,12 @@ TEST(DocumentInPlace, InPlaceModeWorksWithNoMutations) {
     mongo::BSONObj obj;
     mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    const char* source = NULL;
+    const char* source = nullptr;
     mmb::DamageVector damages;
     ASSERT_TRUE(damages.empty());
     doc.getInPlaceUpdates(&damages, &source);
     ASSERT_TRUE(damages.empty());
-    ASSERT_NOT_EQUALS(static_cast<const char*>(NULL), source);
+    ASSERT_NOT_EQUALS(static_cast<const char*>(nullptr), source);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 }
 
@@ -2852,14 +2876,14 @@ TEST(DocumentInPlace, GettingInPlaceUpdatesWhenDisabledClearsArguments) {
     const char* source = "foo";
     ASSERT_FALSE(doc.getInPlaceUpdates(&damages, &source));
     ASSERT_TRUE(damages.empty());
-    ASSERT_EQUALS(static_cast<const char*>(NULL), source);
+    ASSERT_EQUALS(static_cast<const char*>(nullptr), source);
 
     damages.push_back(event);
     source = "bar";
     size_t size = 1;
     ASSERT_FALSE(doc.getInPlaceUpdates(&damages, &source, &size));
     ASSERT_TRUE(damages.empty());
-    ASSERT_EQUALS(static_cast<const char*>(NULL), source);
+    ASSERT_EQUALS(static_cast<const char*>(nullptr), source);
     ASSERT_EQUALS(0U, size);
 }
 
@@ -2905,7 +2929,7 @@ TEST(DocumentInPlace, StringLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueString("bar").transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -2931,7 +2955,7 @@ TEST(DocumentInPlace, BinDataLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueBinary(binData2.length, binData2.type, binData2.data).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -2961,7 +2985,7 @@ TEST(DocumentInPlace, OIDLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueOID(oid2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -2981,7 +3005,7 @@ TEST(DocumentInPlace, BooleanLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueBool(false).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3007,7 +3031,7 @@ TEST(DocumentInPlace, DateLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueDate(mongo::Date_t::fromMillisSinceEpoch(20000)).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3029,7 +3053,7 @@ TEST(DocumentInPlace, NumberIntLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueInt(value2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3055,7 +3079,7 @@ TEST(DocumentInPlace, TimestampLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueTimestamp(mongo::Timestamp(mongo::Date_t::fromMillisSinceEpoch(20000)))
         .transitional_ignore();
@@ -3079,7 +3103,7 @@ TEST(DocumentInPlace, NumberLongLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueLong(value2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3108,7 +3132,7 @@ TEST(DocumentInPlace, NumberDoubleLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueDouble(value2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3137,7 +3161,7 @@ TEST(DocumentInPlace, NumberDecimalLifecycle) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueDecimal(value2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3168,7 +3192,7 @@ TEST(DocumentInPlace, DoubleToLongAndBack) {
     mmb::Element x = doc.root().leftChild();
 
     mmb::DamageVector damages;
-    const char* source = NULL;
+    const char* source = nullptr;
 
     x.setValueLong(value2).transitional_ignore();
     ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
@@ -3411,6 +3435,18 @@ TEST(UnorderedEqualityChecker, MissingItemsInArrayAreNotEqual) {
         mongo::fromjson("{ a : [ 1, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, z : 3 } }");
 
     ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+}
+
+TEST(SERVER_36024, RegressionCheck) {
+    mongo::BSONObj obj;
+    mmb::Document doc(obj, mmb::Document::kInPlaceDisabled);
+
+    mmb::Element root = doc.root();
+    auto array = doc.makeElementArray("foo");
+    ASSERT_OK(root.pushBack(array));
+
+    mmb::Element field = root.findFirstChildNamed("foo");
+    ASSERT_OK(field.setValueInt(1));
 }
 
 }  // namespace

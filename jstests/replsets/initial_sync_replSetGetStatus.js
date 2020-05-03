@@ -4,87 +4,89 @@
  */
 
 (function() {
-    "use strict";
-    load("jstests/libs/check_log.js");
+"use strict";
 
-    var name = 'initial_sync_replSetGetStatus';
-    var replSet = new ReplSetTest({
-        name: name,
-        nodes: 1,
-    });
+load("jstests/libs/fail_point_util.js");
 
-    replSet.startSet();
-    replSet.initiate();
-    var primary = replSet.getPrimary();
+var name = 'initial_sync_replSetGetStatus';
+var replSet = new ReplSetTest({
+    name: name,
+    nodes: 1,
+});
 
-    var coll = primary.getDB('test').foo;
-    assert.writeOK(coll.insert({a: 1}));
-    assert.writeOK(coll.insert({a: 2}));
+replSet.startSet();
+replSet.initiate();
+var primary = replSet.getPrimary();
 
-    // Add a secondary node but make it hang before copying databases.
-    var secondary = replSet.add();
-    secondary.setSlaveOk();
+var coll = primary.getDB('test').foo;
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({a: 2}));
 
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'alwaysOn'}));
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeFinish', mode: 'alwaysOn'}));
-    replSet.reInitiate();
+// Add a secondary node but make it hang before copying databases.
+var secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
+secondary.setSlaveOk();
 
-    // Wait for initial sync to pause before it copies the databases.
-    checkLog.contains(secondary,
-                      'initial sync - initialSyncHangBeforeCopyingDatabases fail point enabled');
+var failPointBeforeCopying = configureFailPoint(secondary, 'initialSyncHangBeforeCopyingDatabases');
+var failPointBeforeFinish = configureFailPoint(secondary, 'initialSyncHangBeforeFinish');
+replSet.reInitiate();
 
-    // Test that replSetGetStatus returns the correct results while initial sync is in progress.
-    var res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
-    assert(!res.initialSyncStatus,
-           "Response should not have an 'initialSyncStatus' field: " + tojson(res));
+// Wait for initial sync to pause before it copies the databases.
+failPointBeforeCopying.wait();
 
-    res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1, initialSync: 1}));
-    assert(res.initialSyncStatus,
-           "Response should have an 'initialSyncStatus' field: " + tojson(res));
+// Test that replSetGetStatus returns the correct results while initial sync is in progress.
+var res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+assert(res.initialSyncStatus,
+       () => "Response should have an 'initialSyncStatus' field: " + tojson(res));
 
-    assert.commandFailed(secondary.adminCommand({replSetGetStatus: 1, initialSync: "t"}),
-                         ErrorCodes.TypeMismatch);
+res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1, initialSync: 0}));
+assert(!res.initialSyncStatus,
+       () => "Response should not have an 'initialSyncStatus' field: " + tojson(res));
 
-    assert.writeOK(coll.insert({a: 3}));
-    assert.writeOK(coll.insert({a: 4}));
+assert.commandFailedWithCode(secondary.adminCommand({replSetGetStatus: 1, initialSync: "t"}),
+                             ErrorCodes.TypeMismatch);
 
-    // Let initial sync continue working.
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));
+assert.commandWorked(coll.insert({a: 3}));
+assert.commandWorked(coll.insert({a: 4}));
 
-    // Wait for initial sync to pause right before it finishes.
-    checkLog.contains(secondary, 'initial sync - initialSyncHangBeforeFinish fail point enabled');
+// Let initial sync continue working.
+failPointBeforeCopying.off();
 
-    // Test that replSetGetStatus returns the correct results when initial sync is at the very end.
-    res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1, initialSync: 1}));
-    assert(res.initialSyncStatus, "Response should have an 'initialSyncStatus' field.");
-    assert.eq(res.initialSyncStatus.fetchedMissingDocs, 0);
-    assert.eq(res.initialSyncStatus.appliedOps, 2);
-    assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 0);
-    assert.eq(res.initialSyncStatus.maxFailedInitialSyncAttempts, 1);
-    assert.eq(res.initialSyncStatus.databases.databasesCloned, 3);
-    assert.eq(res.initialSyncStatus.databases.test.collections, 1);
-    assert.eq(res.initialSyncStatus.databases.test.clonedCollections, 1);
-    assert.eq(res.initialSyncStatus.databases.test["test.foo"].documentsToCopy, 4);
-    assert.eq(res.initialSyncStatus.databases.test["test.foo"].documentsCopied, 4);
-    assert.eq(res.initialSyncStatus.databases.test["test.foo"].indexes, 1);
-    assert.eq(res.initialSyncStatus.databases.test["test.foo"].fetchedBatches, 1);
+// Wait for initial sync to pause right before it finishes.
+failPointBeforeFinish.wait();
 
-    // Let initial sync finish and get into secondary state.
-    assert.commandWorked(secondary.getDB('admin').runCommand(
-        {configureFailPoint: 'initialSyncHangBeforeFinish', mode: 'off'}));
-    replSet.awaitSecondaryNodes(60 * 1000);
+// Test that replSetGetStatus returns the correct results when initial sync is at the very end.
+res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+assert(res.initialSyncStatus,
+       () => "Response should have an 'initialSyncStatus' field: " + tojson(res));
 
-    // Test that replSetGetStatus returns the correct results after initial sync is finished.
-    res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
-    assert(!res.initialSyncStatus,
-           "Response should not have an 'initialSyncStatus' field: " + tojson(res));
+// It is possible that we update the config document after going through a reconfig. So make sure
+// we account for this.
+assert.gte(res.initialSyncStatus.appliedOps, 3);
 
-    assert.commandFailedWithCode(secondary.adminCommand({replSetGetStatus: 1, initialSync: "m"}),
-                                 ErrorCodes.TypeMismatch);
-    assert.eq(0,
-              secondary.getDB('local')['temp_oplog_buffer'].find().itcount(),
-              "Oplog buffer was not dropped after initial sync");
+assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 0);
+assert.eq(res.initialSyncStatus.maxFailedInitialSyncAttempts, 10);
+assert.eq(res.initialSyncStatus.databases.databasesCloned, 3);
+assert.eq(res.initialSyncStatus.databases.test.collections, 1);
+assert.eq(res.initialSyncStatus.databases.test.clonedCollections, 1);
+assert.eq(res.initialSyncStatus.databases.test["test.foo"].documentsToCopy, 4);
+assert.eq(res.initialSyncStatus.databases.test["test.foo"].documentsCopied, 4);
+assert.eq(res.initialSyncStatus.databases.test["test.foo"].indexes, 1);
+assert.eq(res.initialSyncStatus.databases.test["test.foo"].fetchedBatches, 1);
+
+// Let initial sync finish and get into secondary state.
+failPointBeforeFinish.off();
+replSet.awaitSecondaryNodes(60 * 1000);
+
+// Test that replSetGetStatus returns the correct results after initial sync is finished.
+res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+assert(!res.initialSyncStatus,
+       () => "Response should not have an 'initialSyncStatus' field: " + tojson(res));
+
+assert.commandFailedWithCode(secondary.adminCommand({replSetGetStatus: 1, initialSync: "m"}),
+                             ErrorCodes.TypeMismatch);
+assert.eq(0,
+          secondary.getDB('local')['temp_oplog_buffer'].find().itcount(),
+          "Oplog buffer was not dropped after initial sync");
+
+replSet.stopSet();
 })();

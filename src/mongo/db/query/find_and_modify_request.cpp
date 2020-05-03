@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,58 +34,75 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/command_generic_argument.h"
+#include "mongo/db/query/hint_parser.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
 namespace {
-const char kCmdName[] = "findAndModify";
 const char kQueryField[] = "query";
 const char kSortField[] = "sort";
+const char kHintField[] = "hint";
 const char kCollationField[] = "collation";
 const char kArrayFiltersField[] = "arrayFilters";
+const char kRuntimeConstantsField[] = "runtimeConstants";
 const char kRemoveField[] = "remove";
 const char kUpdateField[] = "update";
 const char kNewField[] = "new";
 const char kFieldProjectionField[] = "fields";
 const char kUpsertField[] = "upsert";
 const char kWriteConcernField[] = "writeConcern";
+const char kBypassDocumentValidationField[] = "bypassDocumentValidation";
 
 const std::vector<BSONObj> emptyArrayFilters{};
+
+const std::vector<StringData> _knownFields{kQueryField,
+                                           kSortField,
+                                           kCollationField,
+                                           kArrayFiltersField,
+                                           kRemoveField,
+                                           kUpdateField,
+                                           kNewField,
+                                           kFieldProjectionField,
+                                           kUpsertField,
+                                           kWriteConcernField,
+                                           kBypassDocumentValidationField,
+                                           FindAndModifyRequest::kLegacyCommandName,
+                                           FindAndModifyRequest::kCommandName};
 }  // unnamed namespace
 
-FindAndModifyRequest::FindAndModifyRequest(NamespaceString fullNs, BSONObj query, BSONObj updateObj)
-    : _ns(std::move(fullNs)),
-      _query(query.getOwned()),
-      _updateObj(updateObj.getOwned()),
-      _isRemove(false) {}
+FindAndModifyRequest::FindAndModifyRequest(NamespaceString fullNs,
+                                           BSONObj query,
+                                           boost::optional<write_ops::UpdateModification> update)
+    : _ns(std::move(fullNs)), _query(query.getOwned()), _update(std::move(update)) {}
 
 FindAndModifyRequest FindAndModifyRequest::makeUpdate(NamespaceString fullNs,
                                                       BSONObj query,
-                                                      BSONObj updateObj) {
-    return FindAndModifyRequest(fullNs, query, updateObj);
+                                                      write_ops::UpdateModification update) {
+    return FindAndModifyRequest(fullNs, query, std::move(update));
 }
 
 FindAndModifyRequest FindAndModifyRequest::makeRemove(NamespaceString fullNs, BSONObj query) {
-    FindAndModifyRequest request(fullNs, query, BSONObj());
-    request._isRemove = true;
+    FindAndModifyRequest request(fullNs, query, {});
     return request;
 }
 
-BSONObj FindAndModifyRequest::toBSON() const {
+BSONObj FindAndModifyRequest::toBSON(const BSONObj& commandPassthroughFields) const {
     BSONObjBuilder builder;
 
-    builder.append(kCmdName, _ns.coll());
+    builder.append(kCommandName, _ns.coll());
     builder.append(kQueryField, _query);
 
-    if (_isRemove) {
-        builder.append(kRemoveField, true);
-    } else {
-        builder.append(kUpdateField, _updateObj);
+    if (_update) {
+        _update->serializeToBSON(kUpdateField, &builder);
 
         if (_isUpsert) {
-            builder.append(kUpsertField, _isUpsert.get());
+            builder.append(kUpsertField, _isUpsert);
         }
+    } else {
+        builder.append(kRemoveField, true);
     }
 
     if (_fieldProjection) {
@@ -93,6 +111,10 @@ BSONObj FindAndModifyRequest::toBSON() const {
 
     if (_sort) {
         builder.append(kSortField, _sort.get());
+    }
+
+    if (_hint) {
+        builder.append(kHintField, _hint.get());
     }
 
     if (_collation) {
@@ -107,70 +129,149 @@ BSONObj FindAndModifyRequest::toBSON() const {
         arrayBuilder.doneFast();
     }
 
+    if (_runtimeConstants) {
+        BSONObjBuilder rtcBuilder(builder.subobjStart(kRuntimeConstantsField));
+        _runtimeConstants->serialize(&rtcBuilder);
+        rtcBuilder.doneFast();
+    }
+
     if (_shouldReturnNew) {
-        builder.append(kNewField, _shouldReturnNew.get());
+        builder.append(kNewField, _shouldReturnNew);
     }
 
     if (_writeConcern) {
         builder.append(kWriteConcernField, _writeConcern->toBSON());
     }
 
+    if (_bypassDocumentValidation) {
+        builder.append(kBypassDocumentValidationField, _bypassDocumentValidation);
+    }
+
+    IDLParserErrorContext::appendGenericCommandArguments(
+        commandPassthroughFields, _knownFields, &builder);
+
     return builder.obj();
 }
 
 StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceString fullNs,
                                                                      const BSONObj& cmdObj) {
-    BSONObj query = cmdObj.getObjectField(kQueryField);
-    BSONObj fields = cmdObj.getObjectField(kFieldProjectionField);
-    BSONObj updateObj = cmdObj.getObjectField(kUpdateField);
-    BSONObj sort = cmdObj.getObjectField(kSortField);
+    BSONObj query;
+    BSONObj fields;
+    BSONObj updateObj;
+    BSONObj sort;
+    BSONObj hint;
+    boost::optional<write_ops::UpdateModification> update;
 
     BSONObj collation;
-    {
-        BSONElement collationElt;
-        Status collationEltStatus =
-            bsonExtractTypedField(cmdObj, kCollationField, BSONType::Object, &collationElt);
-        if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
-            return collationEltStatus;
-        }
-        if (collationEltStatus.isOK()) {
-            collation = collationElt.Obj();
-        }
-    }
-
-    std::vector<BSONObj> arrayFilters;
+    bool shouldReturnNew = false;
+    bool isUpsert = false;
+    bool isRemove = false;
+    bool bypassDocumentValidation = false;
     bool arrayFiltersSet = false;
-    {
-        BSONElement arrayFiltersElt;
-        Status arrayFiltersEltStatus =
-            bsonExtractTypedField(cmdObj, kArrayFiltersField, BSONType::Array, &arrayFiltersElt);
-        if (!arrayFiltersEltStatus.isOK() && (arrayFiltersEltStatus != ErrorCodes::NoSuchKey)) {
-            return arrayFiltersEltStatus;
-        }
-        if (arrayFiltersEltStatus.isOK()) {
-            arrayFiltersSet = true;
-            for (auto arrayFilter : arrayFiltersElt.Obj()) {
-                if (arrayFilter.type() != BSONType::Object) {
-                    return {ErrorCodes::TypeMismatch,
-                            str::stream() << "Each array filter must be an object, found "
-                                          << arrayFilter.type()};
-                }
-                arrayFilters.push_back(arrayFilter.Obj());
+    std::vector<BSONObj> arrayFilters;
+    boost::optional<RuntimeConstants> runtimeConstants;
+    bool writeConcernOptionsSet = false;
+    WriteConcernOptions writeConcernOptions;
+
+    for (auto&& field : cmdObj.getFieldNames<std::set<std::string>>()) {
+        if (field == kQueryField) {
+            auto queryElement = cmdObj[kQueryField];
+            if (queryElement.type() != Object) {
+                return {ErrorCodes::Error(31160),
+                        str::stream()
+                            << "'" << kQueryField << "' parameter must be an object, found "
+                            << queryElement.type()};
             }
+            query = queryElement.embeddedObject();
+        } else if (field == kSortField) {
+            auto sortElement = cmdObj[kSortField];
+            if (sortElement.type() != Object) {
+                return {ErrorCodes::Error(31174),
+                        str::stream()
+                            << "'" << kSortField << "' parameter must be an object, found "
+                            << sortElement.type()};
+            }
+            sort = sortElement.embeddedObject();
+        } else if (field == kHintField) {
+            hint = parseHint(cmdObj[kHintField]);
+        } else if (field == kRemoveField) {
+            isRemove = cmdObj[kRemoveField].trueValue();
+        } else if (field == kUpdateField) {
+            update = write_ops::UpdateModification::parseFromBSON(cmdObj[kUpdateField]);
+        } else if (field == kNewField) {
+            shouldReturnNew = cmdObj[kNewField].trueValue();
+        } else if (field == kFieldProjectionField) {
+            auto projectionElement = cmdObj[kFieldProjectionField];
+            if (projectionElement.type() != Object) {
+                return {ErrorCodes::Error(31175),
+                        str::stream()
+                            << "'" << kFieldProjectionField
+                            << "' parameter must be an object, found " << projectionElement.type()};
+            }
+            fields = projectionElement.embeddedObject();
+        } else if (field == kUpsertField) {
+            isUpsert = cmdObj[kUpsertField].trueValue();
+        } else if (field == kBypassDocumentValidationField) {
+            bypassDocumentValidation = cmdObj[kBypassDocumentValidationField].trueValue();
+        } else if (field == kCollationField) {
+            BSONElement collationElt;
+            Status collationEltStatus =
+                bsonExtractTypedField(cmdObj, kCollationField, BSONType::Object, &collationElt);
+            if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
+                return collationEltStatus;
+            }
+            if (collationEltStatus.isOK()) {
+                collation = collationElt.embeddedObject();
+            }
+        } else if (field == kArrayFiltersField) {
+            BSONElement arrayFiltersElt;
+            Status arrayFiltersEltStatus = bsonExtractTypedField(
+                cmdObj, kArrayFiltersField, BSONType::Array, &arrayFiltersElt);
+            if (!arrayFiltersEltStatus.isOK() && (arrayFiltersEltStatus != ErrorCodes::NoSuchKey)) {
+                return arrayFiltersEltStatus;
+            }
+            if (arrayFiltersEltStatus.isOK()) {
+                arrayFiltersSet = true;
+                for (auto arrayFilter : arrayFiltersElt.embeddedObject()) {
+                    if (arrayFilter.type() != BSONType::Object) {
+                        return {ErrorCodes::TypeMismatch,
+                                str::stream() << "Each array filter must be an object, found "
+                                              << arrayFilter.type()};
+                    }
+                    arrayFilters.push_back(arrayFilter.embeddedObject());
+                }
+            }
+        } else if (field == kRuntimeConstantsField) {
+            runtimeConstants =
+                RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
+                                        cmdObj.getObjectField(kRuntimeConstantsField));
+        } else if (field == kWriteConcernField) {
+            BSONElement writeConcernElt;
+            Status writeConcernEltStatus = bsonExtractTypedField(
+                cmdObj, kWriteConcernField, BSONType::Object, &writeConcernElt);
+            if (!writeConcernEltStatus.isOK()) {
+                return writeConcernEltStatus;
+            }
+            auto sw = WriteConcernOptions::parse(writeConcernElt.embeddedObject());
+            if (!sw.isOK()) {
+                return sw.getStatus();
+            } else {
+                writeConcernOptionsSet = true;
+                writeConcernOptions = sw.getValue();
+            }
+        } else if (!isGenericArgument(field) &&
+                   !std::count(_knownFields.begin(), _knownFields.end(), field)) {
+            return {ErrorCodes::Error(51177),
+                    str::stream() << "BSON field '" << field << "' is an unknown field."};
         }
     }
 
-    bool shouldReturnNew = cmdObj[kNewField].trueValue();
-    bool isUpsert = cmdObj[kUpsertField].trueValue();
-    bool isRemove = cmdObj[kRemoveField].trueValue();
-    bool isUpdate = cmdObj.hasField(kUpdateField);
-
-    if (!isRemove && !isUpdate) {
+    if (!isRemove && !update) {
         return {ErrorCodes::FailedToParse, "Either an update or remove=true must be specified"};
     }
 
     if (isRemove) {
-        if (isUpdate) {
+        if (update) {
             return {ErrorCodes::FailedToParse, "Cannot specify both an update and remove=true"};
         }
 
@@ -189,12 +290,26 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
         }
     }
 
-    FindAndModifyRequest request(std::move(fullNs), query, updateObj);
-    request._isRemove = isRemove;
+    if (update && update->type() == write_ops::UpdateModification::Type::kPipeline &&
+        arrayFiltersSet) {
+        return {ErrorCodes::FailedToParse, "Cannot specify arrayFilters and a pipeline update"};
+    }
+
+    FindAndModifyRequest request(std::move(fullNs), query, std::move(update));
     request.setFieldProjection(fields);
     request.setSort(sort);
+    request.setHint(hint);
     request.setCollation(collation);
-    request.setArrayFilters(std::move(arrayFilters));
+    request.setBypassDocumentValidation(bypassDocumentValidation);
+    if (arrayFiltersSet) {
+        request.setArrayFilters(std::move(arrayFilters));
+    }
+    if (runtimeConstants) {
+        request.setRuntimeConstants(*runtimeConstants);
+    }
+    if (writeConcernOptionsSet) {
+        request.setWriteConcern(std::move(writeConcernOptions));
+    }
 
     if (!isRemove) {
         request.setShouldReturnNew(shouldReturnNew);
@@ -212,6 +327,10 @@ void FindAndModifyRequest::setSort(BSONObj sort) {
     _sort = sort.getOwned();
 }
 
+void FindAndModifyRequest::setHint(BSONObj hint) {
+    _hint = hint.getOwned();
+}
+
 void FindAndModifyRequest::setCollation(BSONObj collation) {
     _collation = collation.getOwned();
 }
@@ -223,18 +342,29 @@ void FindAndModifyRequest::setArrayFilters(const std::vector<BSONObj>& arrayFilt
     }
 }
 
+void FindAndModifyRequest::setQuery(BSONObj query) {
+    _query = query.getOwned();
+}
+void FindAndModifyRequest::setUpdateObj(BSONObj updateObj) {
+    _update.emplace(updateObj.getOwned());
+}
+
 void FindAndModifyRequest::setShouldReturnNew(bool shouldReturnNew) {
-    dassert(!_isRemove);
+    dassert(_update);
     _shouldReturnNew = shouldReturnNew;
 }
 
 void FindAndModifyRequest::setUpsert(bool upsert) {
-    dassert(!_isRemove);
+    dassert(_update);
     _isUpsert = upsert;
 }
 
 void FindAndModifyRequest::setWriteConcern(WriteConcernOptions writeConcern) {
     _writeConcern = std::move(writeConcern);
+}
+
+void FindAndModifyRequest::setBypassDocumentValidation(bool bypassDocumentValidation) {
+    _bypassDocumentValidation = bypassDocumentValidation;
 }
 
 const NamespaceString& FindAndModifyRequest::getNamespaceString() const {
@@ -249,12 +379,16 @@ BSONObj FindAndModifyRequest::getFields() const {
     return _fieldProjection.value_or(BSONObj());
 }
 
-BSONObj FindAndModifyRequest::getUpdateObj() const {
-    return _updateObj;
+const boost::optional<write_ops::UpdateModification>& FindAndModifyRequest::getUpdate() const {
+    return _update;
 }
 
 BSONObj FindAndModifyRequest::getSort() const {
     return _sort.value_or(BSONObj());
+}
+
+BSONObj FindAndModifyRequest::getHint() const {
+    return _hint.value_or(BSONObj());
 }
 
 BSONObj FindAndModifyRequest::getCollation() const {
@@ -269,14 +403,18 @@ const std::vector<BSONObj>& FindAndModifyRequest::getArrayFilters() const {
 }
 
 bool FindAndModifyRequest::shouldReturnNew() const {
-    return _shouldReturnNew.value_or(false);
+    return _shouldReturnNew;
 }
 
 bool FindAndModifyRequest::isUpsert() const {
-    return _isUpsert.value_or(false);
+    return _isUpsert;
 }
 
 bool FindAndModifyRequest::isRemove() const {
-    return _isRemove;
+    return !static_cast<bool>(_update);
 }
+
+bool FindAndModifyRequest::getBypassDocumentValidation() const {
+    return _bypassDocumentValidation;
 }
+}  // namespace mongo

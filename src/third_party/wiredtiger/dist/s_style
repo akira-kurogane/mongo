@@ -61,6 +61,15 @@ else
 		cat $t
 	fi
 
+	if ! expr "$f" : 'examples/c/.*' > /dev/null &&
+	   ! expr "$f" : 'ext/.*' > /dev/null &&
+	   ! expr "$f" : 'src/include/wiredtiger_ext\.h' > /dev/null &&
+	   ! expr "$f" : 'src/txn/txn_ext\.c' > /dev/null &&
+	   grep WT_TXN_ISO_ $f; then
+		echo "$f: WT_TXN_ISO_XXX constants only for the extension API"
+		cat $t
+	fi
+
 	if ! expr "$f" : 'src/include/queue\.h' > /dev/null &&
 	    egrep 'STAILQ_|SLIST_|\bLIST_' $f ; then
 		echo "$f: use TAILQ for all lists"
@@ -79,7 +88,6 @@ else
 	fi
 
 	if ! expr "$f" : 'examples/c/.*' > /dev/null &&
-	   ! expr "$f" : 'ext/datasources/helium/helium.c' > /dev/null &&
 	   ! expr "$f" : 'src/include/os.h' > /dev/null &&
 	    egrep "%[0-9]*zu" $f | grep -v 'SIZET_FMT' > $t; then
 		echo "$f: %zu needs to be fixed for Windows"
@@ -91,6 +99,12 @@ else
 		echo "$f: off_t type declaration, use wt_off_t"
 		cat $t
 	}
+
+	if ! expr "$f" : 'src/include/misc.h' > /dev/null &&
+	    grep '[[:space:]]qsort(' $f > $t; then
+		echo "$f: qsort call, use WiredTiger __wt_qsort instead"
+		cat $t
+	fi
 
 	if ! expr "$f" : 'src/.*/os_setvbuf.c' > /dev/null &&
 	    egrep -w 'setvbuf' $f > $t; then
@@ -172,30 +186,10 @@ else
 	fi
 
 	tr -cd '[:alnum:][:space:][:punct:]' < $f |
-	unexpand |
-	sed -e 's/){/) {/' \
-	    -e 's/\([	 ]\)for(/\1for (/' \
-	    -e 's/\([	 ]\)if(/\1if (/' \
-	    -e 's/\([	 ]\)index(/\1strchr(/' \
-	    -e 's/\([	 ]\)return(/\1return (/' \
-	    -e 's/\([	 ]\)return \([^()]*\);/\1return (\2);/' \
-	    -e 's/\([	 ]\)rindex(/\1strrchr(/' \
-	    -e 's/\([	 ]\)sizeof (/\1sizeof(/g' \
-	    -e 's/\([	 ]\)switch(/\1switch (/' \
-	    -e 's/\([	 ]\)while(/\1while (/' \
-	    -e 's/\([	 ,]\)uint\([	 ,]\)/\1u_int\2/g' \
-	    -e 's/\([	 ,]\)u_int8_t\([	 ,]\)/\1uint8_t\2/g' \
-	    -e 's/\([	 ,]\)u_int16_t\([	 ,]\)/\1uint16_t\2/g' \
-	    -e 's/\([	 ,]\)u_int32_t\([	 ,]\)/\1uint32_t\2/g' \
-	    -e 's/\([	 ,]\)u_int64_t\([	 ,]\)/\1uint64_t\2/g' \
-	    -e 's/\([	 ,]\)u_quad\([	 ,]\)/\1uint64_t\2/g' \
-	    -e 's/\([|&=+-]\)  *\([^*]\)/\1 \2/' \
-	    -e 's/[	 ](void) \([a-zA-Z_]\)/(void)\1/' \
-	    -e '/for /!s/;;$/;/' \
+	sed -e '/for /!s/;;$/;/' \
 	    -e 's/(EOPNOTSUPP)/(ENOTSUP)/' \
 	    -e 's/(unsigned)/(u_int)/' \
-	    -e 's/hazard reference/hazard pointer/' \
-	    -e 's/^#define /#define	/' >$t
+	    -e 's/hazard reference/hazard pointer/' >$t
 
 	cmp $t $f > /dev/null 2>&1 || (echo "modifying $f" && cp $t $f)
 fi

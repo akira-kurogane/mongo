@@ -19,7 +19,6 @@ load("jstests/replsets/rslib.js");
 var basename = "jstests_initsync2";
 
 var doTest = function() {
-
     jsTest.log("1. Bring up set");
     var replTest = new ReplSetTest({name: basename, nodes: [{rsConfig: {priority: 2}}, {}]});
     var conns = replTest.startSet();
@@ -31,7 +30,7 @@ var doTest = function() {
     var foo = master.getDB("foo");
     var admin = master.getDB("admin");
 
-    var slave1 = replTest.liveNodes.slaves[0];
+    var slave1 = replTest._slaves[0];
     var admin_s1 = slave1.getDB("admin");
     var local_s1 = slave1.getDB("local");
 

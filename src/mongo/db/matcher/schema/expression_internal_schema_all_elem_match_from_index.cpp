@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,10 +37,18 @@ namespace mongo {
 
 constexpr StringData InternalSchemaAllElemMatchFromIndexMatchExpression::kName;
 
+InternalSchemaAllElemMatchFromIndexMatchExpression::
+    InternalSchemaAllElemMatchFromIndexMatchExpression(
+        StringData path, long long index, std::unique_ptr<ExpressionWithPlaceholder> expression)
+    : ArrayMatchingMatchExpression(MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+                                   path),
+      _index(index),
+      _expression(std::move(expression)) {}
+
 std::unique_ptr<MatchExpression> InternalSchemaAllElemMatchFromIndexMatchExpression::shallowClone()
     const {
-    auto clone = stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>();
-    invariantOK(clone->init(path(), _index, _expression->shallowClone()));
+    auto clone = std::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
+        path(), _index, _expression->shallowClone());
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
@@ -57,23 +66,32 @@ bool InternalSchemaAllElemMatchFromIndexMatchExpression::equivalent(
 }
 
 void InternalSchemaAllElemMatchFromIndexMatchExpression::debugString(StringBuilder& debug,
-                                                                     int level) const {
-    _debugAddSpace(debug, level);
+                                                                     int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
     debug << kName << "\n";
     debug << " index: " << _index << ", query:\n";
-    _expression->getFilter()->debugString(debug, level + 1);
+    _expression->getFilter()->debugString(debug, indentationLevel + 1);
 }
 
-void InternalSchemaAllElemMatchFromIndexMatchExpression::serialize(BSONObjBuilder* out) const {
-    BSONObjBuilder allElemMatchBob(out->subobjStart(path()));
+BSONObj InternalSchemaAllElemMatchFromIndexMatchExpression::getSerializedRightHandSide() const {
+    BSONObjBuilder allElemMatchBob;
     BSONArrayBuilder subArray(allElemMatchBob.subarrayStart(kName));
     subArray.append(_index);
     {
         BSONObjBuilder eBuilder(subArray.subobjStart());
-        _expression->getFilter()->serialize(&eBuilder);
+        _expression->getFilter()->serialize(&eBuilder, true);
         eBuilder.doneFast();
     }
     subArray.doneFast();
-    allElemMatchBob.doneFast();
+    return allElemMatchBob.obj();
+}
+
+MatchExpression::ExpressionOptimizerFunc
+InternalSchemaAllElemMatchFromIndexMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        static_cast<InternalSchemaAllElemMatchFromIndexMatchExpression&>(*expression)
+            ._expression->optimizeFilter();
+        return expression;
+    };
 }
 }  //  namespace mongo

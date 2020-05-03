@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2010-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,26 +37,23 @@
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
-
-// Global grid instance
-Grid grid;
+namespace {
+const auto grid = ServiceContext::declareDecoration<Grid>();
+}  // namespace
 
 Grid::Grid() = default;
 
 Grid::~Grid() = default;
 
 Grid* Grid::get(ServiceContext* serviceContext) {
-    return &grid;
+    return &grid(serviceContext);
 }
 
 Grid* Grid::get(OperationContext* operationContext) {
@@ -88,13 +86,22 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _shardRegistry->init();
 }
 
+bool Grid::isShardingInitialized() const {
+    return _shardingInitialized.load();
+}
+
+void Grid::setShardingInitialized() {
+    invariant(!_shardingInitialized.load());
+    _shardingInitialized.store(true);
+}
+
 Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _customConnectionPoolStatsFn;
 }
 
 void Grid::setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     invariant(!_customConnectionPoolStatsFn || !statsFn);
     _customConnectionPoolStatsFn = std::move(statsFn);
 }
@@ -110,17 +117,41 @@ void Grid::setAllowLocalHost(bool allow) {
 repl::OpTime Grid::configOpTime() const {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     return _configOpTime;
 }
 
-void Grid::advanceConfigOpTime(repl::OpTime opTime) {
+boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
+                                                        repl::OpTime opTime,
+                                                        StringData what) {
+    const auto prevOpTime = _advanceConfigOpTime(opTime);
+    if (prevOpTime && prevOpTime->getTerm() != opTime.getTerm()) {
+        std::string clientAddr = "(unknown)";
+        if (opCtx && opCtx->getClient()) {
+            clientAddr = opCtx->getClient()->clientAddress(true);
+        }
+        LOGV2(22792,
+              "Received {reason} {clientAddress} indicating config server"
+              " term has increased, previous opTime {prevOpTime}, now {opTime}",
+              "Term advanced for config server",
+              "opTime"_attr = opTime,
+              "prevOpTime"_attr = prevOpTime,
+              "reason"_attr = what,
+              "clientAddress"_attr = clientAddr);
+    }
+    return prevOpTime;
+}
+
+boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     if (_configOpTime < opTime) {
+        repl::OpTime prev = _configOpTime;
         _configOpTime = opTime;
+        return prev;
     }
+    return boost::none;
 }
 
 void Grid::clearForUnitTests() {

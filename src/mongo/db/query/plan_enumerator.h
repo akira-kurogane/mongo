@@ -1,42 +1,42 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/index_tag.h"
-#include "mongo/db/query/query_knobs.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -72,7 +72,8 @@ struct PlanEnumeratorParams {
  * predicate information to make better decisions about what indices are best.
  */
 class PlanEnumerator {
-    MONGO_DISALLOW_COPYING(PlanEnumerator);
+    PlanEnumerator(const PlanEnumerator&) = delete;
+    PlanEnumerator& operator=(const PlanEnumerator&) = delete;
 
 public:
     /**
@@ -93,12 +94,11 @@ public:
     Status init();
 
     /**
-     * Outputs a possible plan.  Leaves in the plan are tagged with an index to use.
-     * Returns true if a plan was outputted, false if no more plans will be outputted.
-     *
-     * 'tree' is set to point to the query tree.  A QueryAssignment is built from this tree.
-     * Caller owns the pointer.  Note that 'tree' itself points into data owned by the
-     * provided CanonicalQuery.
+     * Outputs a possible plan. Leaves in the plan are tagged with an index to use.
+     * Returns a MatchExpression representing a point in the query tree (which can be
+     * used to build a QueryAssignment) or nullptr if no more plans will be outputted.
+     * While owned by the caller, the MatchExpression returned points into data that is
+     * owned elsewhere.
      *
      * Nodes in 'tree' are tagged with indices that should be used to answer the tagged nodes.
      * Only nodes that have a field name (getCategory() != kLogical) will be tagged.
@@ -106,7 +106,7 @@ public:
      * The output tree is a clone identical to that used to initialize the enumerator, with tags
      * added in order to indicate index usage.
      */
-    bool getNext(MatchExpression** tree);
+    std::unique_ptr<MatchExpression> getNext();
 
 private:
     //
@@ -125,13 +125,45 @@ private:
     // The position of a field in a possibly compound index.
     typedef size_t IndexPosition;
 
+    /**
+     * Represents the route that an outside predicate has taken during the PlanEnumerator's
+     * recursive descent of the match expression tree.
+     */
+    struct OutsidePredRoute {
+        /**
+         * Whether or not the route has traversed through an $elemMatch object node. This is needed
+         * because it is not correct to push down a predicate through an $elemMatch object.
+         */
+        bool traversedThroughElemMatchObj = false;
+
+        /**
+         * The route of the outside predicate. This starts at the indexed OR sibling of the
+         * predicate.  Each value in 'route' is the index of a child in an indexed OR.
+         *
+         * For example, if the MatchExpression tree is:
+         *         AND
+         *        /    \
+         *   {a: 5}    OR
+         *           /    \
+         *         AND    {e: 9}
+         *       /     \
+         *    {b: 6}   OR
+         *           /    \
+         *       {c: 7}  {d: 8}
+         *
+         * and the predicate is {a: 5}, then the route will be {0, 1} when the recursive descent
+         * reaches {d: 8}.
+         */
+        std::deque<size_t> route;
+    };
+
     struct PrepMemoContext {
-        PrepMemoContext() : elemMatchExpr(NULL) {}
+        PrepMemoContext() : elemMatchExpr(nullptr) {}
         MatchExpression* elemMatchExpr;
 
         // Maps from indexable predicates that can be pushed into the current node to the route
         // through ORs that they have taken to get to this node.
-        unordered_map<MatchExpression*, std::deque<size_t>> outsidePreds;
+        stdx::unordered_map<MatchExpression*, OutsidePredRoute> outsidePreds;
     };
 
     /**
@@ -373,7 +405,7 @@ private:
      */
     void assignMultikeySafePredicates(
         const std::vector<MatchExpression*>& couldAssign,
-        const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
+        const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
         OneIndexAssignment* indexAssignment);
 
     /**
@@ -397,10 +429,16 @@ private:
      */
     bool alreadyCompounded(const std::set<MatchExpression*>& ixisectAssigned,
                            const AndAssignment* andAssignment);
+
+    struct CmpByIndexID {
+        bool operator()(IndexID a, IndexID b) const {
+            return a < b;
+        }
+    };
     /**
-     * Output index intersection assignments inside of an AND node.
+     * Maps from index id to the list of predicates assigned to that index.
      */
-    typedef unordered_map<IndexID, std::vector<MatchExpression*>> IndexToPredMap;
+    typedef std::map<IndexID, std::vector<MatchExpression*>, CmpByIndexID> IndexToPredMap;
 
     /**
      * Generate index intersection assignments given the predicate/index structure in idxToFirst
@@ -417,11 +455,12 @@ private:
      * and idxToNotFirst (and the sub-trees in 'subnodes').  Outputs the assignments into
      * 'andAssignment'. The predicates in 'outsidePreds' are considered for OrPushdownTags.
      */
-    void enumerateOneIndex(IndexToPredMap idxToFirst,
-                           IndexToPredMap idxToNotFirst,
-                           const std::vector<MemoID>& subnodes,
-                           const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
-                           AndAssignment* andAssignment);
+    void enumerateOneIndex(
+        IndexToPredMap idxToFirst,
+        IndexToPredMap idxToNotFirst,
+        const std::vector<MemoID>& subnodes,
+        const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
+        AndAssignment* andAssignment);
 
     /**
      * Generate single-index assignments for queries which contain mandatory
@@ -436,6 +475,17 @@ private:
                                  MatchExpression* mandatoryPred,
                                  const std::set<IndexID>& mandatoryIndices,
                                  AndAssignment* andAssignment);
+
+    /**
+     * Assigns predicates in 'predsOverLeadingField' and 'idxToNotFirst' to 'indexAssign'. Assumes
+     * that the index is not multikey. Also assumes that that the index is of a type used to answer
+     * "mandatory predicates" such as text or geoNear.
+     */
+    void assignToNonMultikeyMandatoryIndex(
+        const IndexEntry& index,
+        const std::vector<MatchExpression*>& predsOverLeadingField,
+        const IndexToPredMap& idxToNotFirst,
+        OneIndexAssignment* indexAssign);
 
     /**
      * Try to assign predicates in 'tryCompound' to 'thisIndex' as compound assignments.
@@ -459,10 +509,16 @@ private:
      * 'outsidePreds'. 'pred' must be able to use the index and be multikey-safe to add to
      * 'indexAssignment'.
      */
-    void assignPredicate(const unordered_map<MatchExpression*, std::deque<size_t>>& outsidePreds,
-                         MatchExpression* pred,
-                         size_t position,
-                         OneIndexAssignment* indexAssignment);
+    void assignPredicate(
+        const stdx::unordered_map<MatchExpression*, OutsidePredRoute>& outsidePreds,
+        MatchExpression* pred,
+        size_t position,
+        OneIndexAssignment* indexAssignment);
+
+    /**
+     * Sets a flag on all outside pred routes that descend through an $elemMatch object node.
+     */
+    void markTraversedThroughElemMatchObj(PrepMemoContext* context);
 
     /**
      * Return the memo entry for 'node'.  Does some sanity checking to ensure that a memo entry
@@ -473,10 +529,10 @@ private:
     std::string dumpMemo();
 
     // Map from expression to its MemoID.
-    unordered_map<MatchExpression*, MemoID> _nodeToId;
+    stdx::unordered_map<MatchExpression*, MemoID> _nodeToId;
 
     // Map from MemoID to its precomputed solution info.
-    unordered_map<MemoID, NodeAssignment*> _memo;
+    stdx::unordered_map<MemoID, NodeAssignment*> _memo;
 
     // If true, there are no further enumeration states, and getNext should return false.
     // We could be _done immediately after init if we're unable to output an indexed plan.

@@ -1,38 +1,66 @@
-"""Pseudo-builders for building and registering integration tests.
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
+"""
+Pseudo-builders for building and registering integration tests.
 """
 from SCons.Script import Action
+
 
 def exists(env):
     return True
 
-_integration_tests = []
-def register_integration_test(env, test):
-    installed_test = env.Install("#/build/integration_tests/", test)
-    _integration_tests.append(installed_test[0].path)
-    env.Alias('$INTEGRATION_TEST_ALIAS', installed_test)
-
-def integration_test_list_builder_action(env, target, source):
-    ofile = open(str(target[0]), 'wb')
-    try:
-        for s in _integration_tests:
-            print '\t' + str(s)
-            ofile.write('%s\n' % s)
-    finally:
-        ofile.close()
 
 def build_cpp_integration_test(env, target, source, **kwargs):
-    libdeps = kwargs.get('LIBDEPS', [])
-    libdeps.append( '$BUILD_DIR/mongo/unittest/integration_test_main' )
+    libdeps = kwargs.get("LIBDEPS", [])
+    libdeps.append("$BUILD_DIR/mongo/unittest/integration_test_main")
 
-    kwargs['LIBDEPS'] = libdeps
+    kwargs["LIBDEPS"] = libdeps
+    integration_test_components = {"tests", "integration-tests"}
+
+    primary_component = kwargs.get("AIB_COMPONENT", env.get("AIB_COMPONENT", ""))
+    if primary_component and not primary_component.endswith("-test"):
+        kwargs["AIB_COMPONENT"] += "-test"
+    elif primary_component:
+        kwargs["AIB_COMPONENT"] = primary_component
+    else:
+        kwargs["AIB_COMPONENT"] = "integration-tests"
+        integration_test_components = {"tests"}
+
+    if "AIB_COMPONENTS_EXTRA" in kwargs:
+        kwargs["AIB_COMPONENTS_EXTRA"] = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(
+            integration_test_components
+        )
+    else:
+        kwargs["AIB_COMPONENTS_EXTRA"] = integration_test_components
 
     result = env.Program(target, source, **kwargs)
-    env.RegisterIntegrationTest(result[0])
+    env.RegisterTest("$INTEGRATION_TEST_LIST", result[0])
+    env.Alias("$INTEGRATION_TEST_ALIAS", result[0])
+
     return result
 
+
 def generate(env):
-    env.Command('$INTEGRATION_TEST_LIST', env.Value(_integration_tests),
-            Action(integration_test_list_builder_action, "Generating $TARGET"))
-    env.AddMethod(register_integration_test, 'RegisterIntegrationTest')
-    env.AddMethod(build_cpp_integration_test, 'CppIntegrationTest')
-    env.Alias('$INTEGRATION_TEST_ALIAS', '$INTEGRATION_TEST_LIST')
+    env.TestList("$INTEGRATION_TEST_LIST", source=[])
+    env.AddMethod(build_cpp_integration_test, "CppIntegrationTest")
+    env.Alias("$INTEGRATION_TEST_ALIAS", "$INTEGRATION_TEST_LIST")

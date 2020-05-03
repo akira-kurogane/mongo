@@ -136,11 +136,11 @@ var multiPolygonDoc = {
         type: "MultiPolygon",
         coordinates: [
             [[
-               [-73.958, 40.8003],
-               [-73.9498, 40.7968],
-               [-73.9737, 40.7648],
-               [-73.9814, 40.7681],
-               [-73.958, 40.8003]
+                [-73.958, 40.8003],
+                [-73.9498, 40.7968],
+                [-73.9737, 40.7648],
+                [-73.9814, 40.7681],
+                [-73.958, 40.8003]
             ]],
             [[[-73.958, 40.8003], [-73.9498, 40.7968], [-73.9737, 40.7648], [-73.958, 40.8003]]]
         ]
@@ -151,22 +151,22 @@ var geometryCollectionDoc = {
         type: "GeometryCollection",
         geometries: [
             {
-              type: "MultiPoint",
-              coordinates: [
-                  [-73.9580, 40.8003],
-                  [-73.9498, 40.7968],
-                  [-73.9737, 40.7648],
-                  [-73.9814, 40.7681]
-              ]
+                type: "MultiPoint",
+                coordinates: [
+                    [-73.9580, 40.8003],
+                    [-73.9498, 40.7968],
+                    [-73.9737, 40.7648],
+                    [-73.9814, 40.7681]
+                ]
             },
             {
-              type: "MultiLineString",
-              coordinates: [
-                  [[-73.96943, 40.78519], [-73.96082, 40.78095]],
-                  [[-73.96415, 40.79229], [-73.95544, 40.78854]],
-                  [[-73.97162, 40.78205], [-73.96374, 40.77715]],
-                  [[-73.97880, 40.77247], [-73.97036, 40.76811]]
-              ]
+                type: "MultiLineString",
+                coordinates: [
+                    [[-73.96943, 40.78519], [-73.96082, 40.78095]],
+                    [[-73.96415, 40.79229], [-73.95544, 40.78854]],
+                    [[-73.97162, 40.78205], [-73.96374, 40.77715]],
+                    [[-73.97880, 40.77247], [-73.97036, 40.76811]]
+                ]
             }
         ]
     }
@@ -176,30 +176,30 @@ var geometryCollectionDoc = {
 res = coll.ensureIndex({geo: "2dsphere"}, {"2dsphereIndexVersion": 2});
 assert.commandWorked(res);
 res = coll.insert(pointDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(lineStringDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(polygonDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(multiPointDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(multiLineStringDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(multiPolygonDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(geometryCollectionDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 coll.drop();
 
 // {2dsphereIndexVersion: 1} indexes allow only Point, LineString, and Polygon.
 res = coll.ensureIndex({geo: "2dsphere"}, {"2dsphereIndexVersion": 1});
 assert.commandWorked(res);
 res = coll.insert(pointDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(lineStringDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(polygonDoc);
-assert.writeOK(res);
+assert.commandWorked(res);
 res = coll.insert(multiPointDoc);
 assert.writeError(res);
 res = coll.insert(multiLineStringDoc);

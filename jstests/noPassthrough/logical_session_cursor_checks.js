@@ -1,7 +1,11 @@
-(function() {
-    'use strict';
+// @tags: [requires_sharding]
 
-    var conn = MongoRunner.runMongod({auth: "", nojournal: ""});
+(function() {
+'use strict';
+
+function runFixture(Fixture) {
+    var fixture = new Fixture();
+    var conn = fixture.getConn();
     var admin = conn.getDB("admin");
     var data = conn.getDB("data_storage");
 
@@ -12,8 +16,8 @@
     admin.logout();
 
     data.auth("user0", "password");
-    assert.writeOK(data.test.insert({name: "first", data: 1}));
-    assert.writeOK(data.test.insert({name: "second", data: 2}));
+    assert.commandWorked(data.test.insert({name: "first", data: 1}));
+    assert.commandWorked(data.test.insert({name: "second", data: 2}));
 
     // Test that getMore works correctly on the same session.
     {
@@ -43,5 +47,46 @@
         session1.endSession();
     }
 
-    MongoRunner.stopMongod(conn);
+    // Test that query.js driven getMore works correctly on the same session.
+    {
+        var session1 = conn.startSession();
+        var session2 = conn.startSession();
+        var cursor = session1.getDatabase("data_storage").test.find({}).batchSize(1);
+        cursor.next();
+        cursor.next();
+        cursor.close();
+
+        session2.endSession();
+        session1.endSession();
+    }
+
+    fixture.stop();
+}
+
+function Standalone() {
+    this.standalone = MongoRunner.runMongod({auth: "", nojournal: ""});
+}
+
+Standalone.prototype.stop = function() {
+    MongoRunner.stopMongod(this.standalone);
+};
+
+Standalone.prototype.getConn = function() {
+    return this.standalone;
+};
+
+function Sharding() {
+    this.st =
+        new ShardingTest({shards: 1, config: 1, mongos: 1, other: {keyFile: 'jstests/libs/key1'}});
+}
+
+Sharding.prototype.stop = function() {
+    this.st.stop();
+};
+
+Sharding.prototype.getConn = function() {
+    return this.st.s0;
+};
+
+[Standalone, Sharding].forEach(runFixture);
 })();

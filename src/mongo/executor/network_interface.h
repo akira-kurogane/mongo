@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,30 +30,38 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/transport/baton.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
-
-class BSONObjBuilder;
-
 namespace executor {
+
+extern FailPoint networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder;
+extern FailPoint networkInterfaceDiscardCommandsBeforeAcquireConn;
+extern FailPoint networkInterfaceHangCommandsAfterAcquireConn;
+extern FailPoint networkInterfaceCommandsFailedWithErrorCode;
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
  */
 class NetworkInterface {
-    MONGO_DISALLOW_COPYING(NetworkInterface);
+    NetworkInterface(const NetworkInterface&) = delete;
+    NetworkInterface& operator=(const NetworkInterface&) = delete;
 
 public:
-    // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
-    static const unsigned int kMessagingPortKeepOpen = 1;
-
     using Response = RemoteCommandResponse;
-    using RemoteCommandCompletionFn = stdx::function<void(const TaskExecutor::ResponseStatus&)>;
+    using RemoteCommandCompletionFn =
+        unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+    using RemoteCommandOnReplyFn = unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+
+    // Indicates that there is no expiration time by when a request needs to complete
+    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     virtual ~NetworkInterface();
 
@@ -117,31 +126,78 @@ public:
      */
     virtual std::string getHostName() = 0;
 
+    struct Counters {
+        uint64_t sent = 0;
+        uint64_t canceled = 0;
+        uint64_t timedOut = 0;
+        uint64_t failed = 0;
+        uint64_t failedRemotely = 0;
+        uint64_t succeeded = 0;
+    };
+    /*
+     * Returns a copy of the operation counters (see struct Counters above). This method should
+     * only be used in tests, and will invariant if getTestCommands() returns false.
+     */
+    virtual Counters getCounters() const = 0;
+
     /**
      * Starts asynchronous execution of the command described by "request".
      *
-     * The request mutated to append request metadata to be sent in OP_Command messages.
+     * The request mutated to append request metadata to be merged into the request messages.
      *
      * Returns ErrorCodes::ShutdownInProgress if NetworkInterface::shutdown has already started
      * and Status::OK() otherwise. If it returns Status::OK(), then the onFinish argument will be
      * executed by NetworkInterface eventually; otherwise, it will not.
+     *
+     * Note that if you pass a baton to startCommand and that baton refuses work, then your onFinish
+     * function will not run.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                RemoteCommandRequest& request,
-                                const RemoteCommandCompletionFn& onFinish) = 0;
+                                RemoteCommandRequestOnAny& request,
+                                RemoteCommandCompletionFn&& onFinish,
+                                const BatonHandle& baton = nullptr) = 0;
+    virtual Status startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                       RemoteCommandRequestOnAny& request,
+                                       RemoteCommandOnReplyFn&& onReply,
+                                       const BatonHandle& baton = nullptr) = 0;
+
+    Future<TaskExecutor::ResponseOnAnyStatus> startCommand(
+        const TaskExecutor::CallbackHandle& cbHandle,
+        RemoteCommandRequestOnAny& request,
+        const BatonHandle& baton = nullptr) {
+        auto pf = makePromiseFuture<TaskExecutor::ResponseOnAnyStatus>();
+
+        auto status = startCommand(
+            cbHandle,
+            request,
+            [p = std::move(pf.promise)](const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
+                p.emplaceValue(rs);
+            },
+            baton);
+
+        if (!status.isOK()) {
+            return status;
+        }
+        return std::move(pf.future);
+    }
 
     /**
      * Requests cancelation of the network activity associated with "cbHandle" if it has not yet
      * completed.
+     *
+     * Note that the work involved in onFinish may run locally as a result of invoking this
+     * function. Do not hold locks while calling cancelCommand(...).
      */
-    virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) = 0;
+    virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                               const BatonHandle& baton = nullptr) = 0;
 
     /**
      * Sets an alarm, which schedules "action" to run no sooner than "when".
      *
      * Returns ErrorCodes::ShutdownInProgress if NetworkInterface::shutdown has already started
      * and true otherwise. If it returns Status::OK(), then the action will be executed by
-     * NetworkInterface eventually; otherwise, it will not.
+     * NetworkInterface eventually if no error occurs while waiting for the alarm; otherwise,
+     * it will not.
      *
      * "action" should not do anything that requires a lot of computation, or that might block for a
      * long time, as it may execute in a network thread.
@@ -149,7 +205,20 @@ public:
      * Any callbacks invoked from setAlarm must observe onNetworkThread to
      * return true. See that method for why.
      */
-    virtual Status setAlarm(Date_t when, const stdx::function<void()>& action) = 0;
+    virtual Status setAlarm(const TaskExecutor::CallbackHandle& cbHandle,
+                            Date_t when,
+                            unique_function<void(Status)> action) = 0;
+
+    /**
+     * Requests cancellation of the alarm associated with "cbHandle" if it has not yet completed.
+     */
+    virtual void cancelAlarm(const TaskExecutor::CallbackHandle& cbHandle) = 0;
+
+    /**
+     * Schedules the specified action to run as soon as possible on the network interface's
+     * execution resource
+     */
+    virtual Status schedule(unique_function<void(Status)> action) = 0;
 
     /**
      * Returns true if called from a thread dedicated to networking. I.e. not a
@@ -165,6 +234,16 @@ public:
      * Drops all connections to the given host in the connection pool.
      */
     virtual void dropConnections(const HostAndPort& hostAndPort) = 0;
+
+    /**
+     * Acquire a connection and subsequently release it.
+     * If status is not OK, the connection will be dropped,
+     * otherwise the connection will be returned to the pool.
+     */
+    virtual void testEgress(const HostAndPort& hostAndPort,
+                            transport::ConnectSSLMode sslMode,
+                            Milliseconds timeout,
+                            Status status) = 0;
 
 protected:
     NetworkInterface();

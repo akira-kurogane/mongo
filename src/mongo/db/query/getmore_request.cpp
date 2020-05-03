@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -34,11 +35,12 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -58,7 +60,7 @@ GetMoreRequest::GetMoreRequest() : cursorid(0), batchSize(0) {}
 
 GetMoreRequest::GetMoreRequest(NamespaceString namespaceString,
                                CursorId id,
-                               boost::optional<long long> sizeOfBatch,
+                               boost::optional<std::int64_t> sizeOfBatch,
                                boost::optional<Milliseconds> awaitDataTimeout,
                                boost::optional<long long> term,
                                boost::optional<repl::OpTime> lastKnownCommittedOpTime)
@@ -82,32 +84,21 @@ Status GetMoreRequest::isValid() const {
     if (batchSize && *batchSize <= 0) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Batch size for getMore must be positive, "
-                                    << "but received: "
-                                    << *batchSize);
+                                    << "but received: " << *batchSize);
     }
 
     return Status::OK();
 }
 
 // static
-NamespaceString GetMoreRequest::parseNs(const std::string& dbname, const BSONObj& cmdObj) {
-    BSONElement collElt = cmdObj["collection"];
-    const std::string coll = (collElt.type() == BSONType::String) ? collElt.String() : "";
-
-    return NamespaceString(dbname, coll);
-}
-
-// static
 StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbname,
                                                          const BSONObj& cmdObj) {
-    invariant(!dbname.empty());
-
     // Required fields.
     boost::optional<CursorId> cursorid;
     boost::optional<NamespaceString> nss;
 
     // Optional fields.
-    boost::optional<long long> batchSize;
+    boost::optional<std::int64_t> batchSize;
     boost::optional<Milliseconds> awaitDataTimeout;
     boost::optional<long long> term;
     boost::optional<repl::OpTime> lastKnownCommittedOpTime;
@@ -124,11 +115,13 @@ StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbna
         } else if (fieldName == kCollectionField) {
             if (el.type() != BSONType::String) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << "Field 'collection' must be of type string in: "
-                                      << cmdObj};
+                        str::stream()
+                            << "Field 'collection' must be of type string in: " << cmdObj};
             }
 
-            nss = parseNs(dbname, cmdObj);
+            BSONElement collElt = cmdObj["collection"];
+            const std::string coll = (collElt.type() == BSONType::String) ? collElt.String() : "";
+            nss = NamespaceString(dbname, coll);
         } else if (fieldName == kBatchSizeField) {
             if (!el.isNumber()) {
                 return {ErrorCodes::TypeMismatch,
@@ -158,12 +151,10 @@ StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbna
                 return status;
             }
             lastKnownCommittedOpTime = ot;
-        } else if (!Command::isGenericArgument(fieldName)) {
+        } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "Failed to parse: " << cmdObj << ". "
-                                  << "Unrecognized field '"
-                                  << fieldName
-                                  << "'."};
+                                  << "Unrecognized field '" << fieldName << "'."};
         }
     }
 

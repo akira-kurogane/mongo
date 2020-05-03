@@ -1,7 +1,12 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection]
+// @tags: [
+//   assumes_unsharded_collection,
+//   assumes_write_concern_unchanged,
+//   requires_non_retryable_writes,
+//   requires_fastcount,
+// ]
 
 //
 // Ensures that mongod respects the batch write protocols for updates
@@ -24,7 +29,17 @@ function resultOK(result) {
 }
 
 function resultNOK(result) {
-    return !result.ok && typeof(result.code) == 'number' && typeof(result.errmsg) == 'string';
+    return !result.ok && typeof (result.code) == 'number' && typeof (result.errmsg) == 'string';
+}
+
+function countEventually(collection, n) {
+    assert.soon(
+        function() {
+            return collection.count() === n;
+        },
+        function() {
+            return "unacknowledged write timed out";
+        });
 }
 
 // EACH TEST BELOW SHOULD BE SELF-CONTAINED, FOR EASIER DEBUGGING
@@ -97,40 +112,6 @@ assert.eq(0, result.upserted[0].index);
 upsertedId = result.upserted[0]._id;
 assert.eq(1, coll.count({_id: upsertedId}));
 assert.eq(0, result.nModified, "missing/wrong nModified");
-
-//
-// Single document upsert, write concern 0 specified, ordered = true
-coll.remove({});
-request = {
-    update: coll.getName(),
-    updates: [{q: {a: 1}, u: {$set: {a: 1}}, upsert: true}],
-    writeConcern: {w: 0},
-    ordered: true
-};
-result = coll.runCommand(request);
-assert(resultOK(result), tojson(result));
-assert.eq(1, coll.count({}));
-
-var fields = ['ok'];
-assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
-
-//
-// Two document upsert, write concern 0 specified, ordered = true
-coll.remove({});
-request = {
-    update: coll.getName(),
-    updates: [
-        {q: {a: 2}, u: {$set: {a: 1}}, upsert: true},
-        {q: {a: 2}, u: {$set: {a: 2}}, upsert: true}
-    ],
-    writeConcern: {w: 0},
-    ordered: true
-};
-result = coll.runCommand(request);
-assert(resultOK(result), tojson(result));
-assert.eq(2, coll.count());
-
-assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
 
 //
 // Single document update
@@ -252,24 +233,6 @@ assert.eq(1, coll.count());
 // Unique index tests
 coll.remove({});
 coll.ensureIndex({a: 1}, {unique: true});
-
-//
-// Upsert fail due to duplicate key index, w:0, ordered:true
-coll.remove({});
-request = {
-    update: coll.getName(),
-    updates: [
-        {q: {b: 1}, u: {$set: {b: 1, a: 1}}, upsert: true},
-        {q: {b: 2}, u: {$set: {b: 2, a: 1}}, upsert: true}
-    ],
-    writeConcern: {w: 0},
-    ordered: true
-};
-result = coll.runCommand(request);
-assert(result.ok, tojson(result));
-assert.eq(1, coll.count());
-
-assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
 
 //
 // Upsert fail due to duplicate key index, w:1, ordered:true

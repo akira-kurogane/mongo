@@ -65,20 +65,21 @@ var RenameAcrossDatabasesTest = function(options) {
         const nextVersion = currentConfig.version + 1;
         const replSetConfig = {
             _id: currentConfig._id,
+            protocolVersion: 1,
             members: [
                 {
-                  _id: 0,
-                  host: hosts[0],
+                    _id: 0,
+                    host: hosts[0],
                 },
                 {
-                  _id: 1,
-                  host: hosts[1],
-                  priority: 0,
+                    _id: 1,
+                    host: hosts[1],
+                    priority: 0,
                 },
                 {
-                  _id: 2,
-                  host: hosts[2],
-                  arbiterOnly: true,
+                    _id: 2,
+                    host: hosts[2],
+                    arbiterOnly: true,
                 },
             ],
             version: nextVersion,
@@ -104,7 +105,7 @@ var RenameAcrossDatabasesTest = function(options) {
         // options.dropTarget is true.
         const dropTarget = options.dropTarget || false;
         if (dropTarget) {
-            assert.writeOK(targetColl.insert({_id: 1000, target: 1}));
+            assert.commandWorked(targetColl.insert({_id: 1000, target: 1}));
             assert.commandWorked(targetColl.createIndex({target: 1}));
         }
 
@@ -115,7 +116,7 @@ var RenameAcrossDatabasesTest = function(options) {
         const numDocs = 10;
         _testLog('Inserting ' + numDocs + ' documents into source collection.');
         for (let i = 0; i < numDocs; ++i) {
-            assert.writeOK(sourceColl.insert({_id: i, source: 1}));
+            assert.commandWorked(sourceColl.insert({_id: i, source: 1}));
         }
         const numNonIdIndexes = 3;
         _testLog('Creating ' + numNonIdIndexes + ' indexes.');
@@ -159,5 +160,4 @@ var RenameAcrossDatabasesTest = function(options) {
         _testLog('Test completed. Stopping replica set.');
         replTest.stopSet();
     };
-
 };

@@ -1,44 +1,48 @@
 (function() {
-    "use script";
+"use script";
 
-    var res;
-    var refresh = {refreshLogicalSessionCacheNow: 1};
-    var startSession = {startSession: 1};
+// This test makes assertions about the number of sessions, which are not compatible with
+// implicit sessions.
+TestData.disableImplicitSessions = true;
 
-    // Start up a standalone server.
-    var conn = MongoRunner.runMongod({nojournal: ""});
-    var admin = conn.getDB("admin");
+var res;
+var refresh = {refreshLogicalSessionCacheNow: 1};
+var startSession = {startSession: 1};
 
-    // Trigger an initial refresh, as a sanity check.
-    res = admin.runCommand(refresh);
-    assert.commandWorked(res, "failed to refresh");
+// Start up a standalone server.
+var conn = MongoRunner.runMongod();
+var admin = conn.getDB("admin");
+var config = conn.getDB("config");
 
-    // Start a session. Should not be in the collection yet.
+// Trigger an initial refresh, as a sanity check.
+res = admin.runCommand(refresh);
+assert.commandWorked(res, "failed to refresh");
+
+// Start a session. Should not be in the collection yet.
+res = admin.runCommand(startSession);
+assert.commandWorked(res, "unable to start session");
+
+assert.eq(config.system.sessions.count(), 0, "should not have session records yet");
+
+// Trigger a refresh. Session should now be in the collection.
+res = admin.runCommand(refresh);
+assert.commandWorked(res, "failed to refresh");
+
+assert.eq(config.system.sessions.count(), 1, "should have written session records");
+
+// Start some new sessions. Should not be in the collection yet.
+var numSessions = 100;
+for (var i = 0; i < numSessions; i++) {
     res = admin.runCommand(startSession);
     assert.commandWorked(res, "unable to start session");
+}
 
-    assert.eq(admin.system.sessions.count(), 0, "should not have session records yet");
+assert.eq(config.system.sessions.count(), 1, "should not have more session records yet");
 
-    // Trigger a refresh. Session should now be in the collection.
-    res = admin.runCommand(refresh);
-    assert.commandWorked(res, "failed to refresh");
+// Trigger another refresh. All sessions should now be in the collection.
+res = admin.runCommand(refresh);
+assert.commandWorked(res, "failed to refresh");
 
-    assert.eq(admin.system.sessions.count(), 1, "should have written session records");
-
-    // Start some new sessions. Should not be in the collection yet.
-    var numSessions = 100;
-    for (var i = 0; i < numSessions; i++) {
-        res = admin.runCommand(startSession);
-        assert.commandWorked(res, "unable to start session");
-    }
-
-    assert.eq(admin.system.sessions.count(), 1, "should not have more session records yet");
-
-    // Trigger another refresh. All sessions should now be in the collection.
-    res = admin.runCommand(refresh);
-    assert.commandWorked(res, "failed to refresh");
-
-    assert.eq(
-        admin.system.sessions.count(), numSessions + 1, "should have written session records");
-
+assert.eq(config.system.sessions.count(), numSessions + 1, "should have written session records");
+MongoRunner.stopMongod(conn);
 }());

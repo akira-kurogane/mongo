@@ -1,7 +1,7 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection]
+// @tags: [assumes_unsharded_collection, requires_fastcount]
 
 t = db.find_and_modify4;
 t.drop();
@@ -11,7 +11,8 @@ function getNextVal(counterName) {
     var ret = t.findAndModify({
         query: {_id: counterName},
         update: {$inc: {val: 1}},
-        upsert: true, 'new': true,
+        upsert: true,
+        'new': true,
     });
     return ret;
 }

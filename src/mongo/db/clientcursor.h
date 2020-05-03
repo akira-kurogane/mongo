@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,16 +30,16 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/net/message.h"
+#include "mongo/db/repl/read_concern_level.h"
 
 namespace mongo {
 
@@ -50,22 +51,50 @@ class RecoveryUnit;
  * Parameters used for constructing a ClientCursor. Makes an owned copy of 'originatingCommandObj'
  * to be used across getMores.
  *
- * ClientCursors cannot be constructed in isolation, but rather must be
- * constructed and managed using a CursorManager. See cursor_manager.h for more details.
+ * ClientCursors cannot be constructed in isolation, but rather must be constructed and managed
+ * using a CursorManager. See cursor_manager.h for more details.
  */
 struct ClientCursorParams {
+    // Describes whether callers should acquire locks when using a ClientCursor. Not all cursors
+    // have the same locking behavior. In particular, find cursors require the caller to lock the
+    // collection in MODE_IS before calling methods on the underlying plan executor. Aggregate
+    // cursors, on the other hand, may access multiple collections and acquire their own locks on
+    // any involved collections while producing query results. Therefore, the caller need not
+    // explicitly acquire any locks when using a ClientCursor which houses execution machinery for
+    // an aggregate.
+    //
+    // The policy is consulted on getMore in order to determine locking behavior, since during
+    // getMore we otherwise could not easily know what flavor of cursor we're using.
+    enum class LockPolicy {
+        // The caller is responsible for locking the collection over which this ClientCursor
+        // executes.
+        kLockExternally,
+
+        // The caller need not hold no locks; this ClientCursor's plan executor acquires any
+        // necessary locks itself.
+        kLocksInternally,
+    };
+
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
-                       bool isReadCommitted,
-                       BSONObj originatingCommandObj)
+                       WriteConcernOptions writeConcernOptions,
+                       repl::ReadConcernArgs readConcernArgs,
+                       BSONObj originatingCommandObj,
+                       LockPolicy lockPolicy,
+                       PrivilegeVector originatingPrivileges,
+                       bool needsMerge)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
-          isReadCommitted(isReadCommitted),
+          writeConcernOptions(std::move(writeConcernOptions)),
+          readConcernArgs(std::move(readConcernArgs)),
           queryOptions(exec->getCanonicalQuery()
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
-          originatingCommandObj(originatingCommandObj.getOwned()) {
+          originatingCommandObj(originatingCommandObj.getOwned()),
+          lockPolicy(lockPolicy),
+          originatingPrivileges(std::move(originatingPrivileges)),
+          needsMerge(needsMerge) {
         while (authenticatedUsersIter.more()) {
             authenticatedUsers.emplace_back(authenticatedUsersIter.next());
         }
@@ -88,9 +117,13 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
-    bool isReadCommitted = false;
+    const WriteConcernOptions writeConcernOptions;
+    const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
+    const LockPolicy lockPolicy;
+    PrivilegeVector originatingPrivileges;
+    const bool needsMerge;
 };
 
 /**
@@ -110,7 +143,8 @@ struct ClientCursorParams {
  * of inactivity.
  */
 class ClientCursor {
-    MONGO_DISALLOW_COPYING(ClientCursor);
+    ClientCursor(const ClientCursor&) = delete;
+    ClientCursor& operator=(const ClientCursor&) = delete;
 
 public:
     CursorId cursorid() const {
@@ -129,8 +163,20 @@ public:
         return _lsid;
     }
 
-    bool isReadCommitted() const {
-        return _isReadCommitted;
+    boost::optional<TxnNumber> getTxnNumber() const {
+        return _txnNumber;
+    }
+
+    repl::ReadConcernArgs getReadConcernArgs() const {
+        return _readConcernArgs;
+    }
+
+    WriteConcernOptions getWriteConcernOptions() const {
+        return _writeConcernOptions;
+    }
+
+    bool needsMerge() const {
+        return _needsMerge;
     }
 
     /**
@@ -158,34 +204,83 @@ public:
         return _queryOptions & QueryOption_AwaitData;
     }
 
+    /**
+     * Returns the original command object which created this cursor.
+     */
     const BSONObj& getOriginatingCommandObj() const {
         return _originatingCommand;
     }
 
     /**
+     * Returns the privileges required to run a getMore against this cursor. This is the same as the
+     * set of privileges which would have been required to create the cursor in the first place.
+     */
+    const PrivilegeVector& getOriginatingPrivileges() const& {
+        return _originatingPrivileges;
+    }
+    void getOriginatingPrivileges() && = delete;
+
+    /**
      * Returns the total number of query results returned by the cursor so far.
      */
-    long long pos() const {
-        return _pos;
+    std::uint64_t nReturnedSoFar() const {
+        return _nReturnedSoFar;
     }
 
     /**
      * Increments the cursor's tracked number of query results returned so far by 'n'.
      */
-    void incPos(long long n) {
-        _pos += n;
+    void incNReturnedSoFar(std::uint64_t n) {
+        _nReturnedSoFar += n;
     }
 
     /**
      * Sets the cursor's tracked number of query results returned so far to 'n'.
      */
-    void setPos(long long n) {
-        _pos = n;
+    void setNReturnedSoFar(std::uint64_t n) {
+        invariant(n >= _nReturnedSoFar);
+        _nReturnedSoFar = n;
     }
 
-    //
-    // Timing.
-    //
+    /**
+     * Returns the number of batches returned by this cursor so far.
+     */
+    std::uint64_t getNBatches() const {
+        return _nBatchesReturned;
+    }
+
+    /**
+     * Increments the number of batches returned so far by one.
+     */
+    void incNBatches() {
+        ++_nBatchesReturned;
+    }
+
+    Date_t getLastUseDate() const {
+        return _lastUseDate;
+    }
+
+    Date_t getCreatedDate() const {
+        return _createdDate;
+    }
+
+    void setPlanSummary(std::string ps) {
+        _planSummary = std::move(ps);
+    }
+
+    StringData getPlanSummary() const {
+        return StringData(_planSummary);
+    }
+
+    ClientCursorParams::LockPolicy lockPolicy() const {
+        return _lockPolicy;
+    }
+
+    /**
+     * Returns a generic cursor containing diagnostics about this cursor.
+     * The caller must either have this cursor pinned or hold a mutex from the cursor manager.
+     */
+    GenericCursor toGenericCursor() const;
 
     /**
      * Returns the amount of time execution time available to this cursor. Only valid at the
@@ -207,31 +302,26 @@ public:
         _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
     }
 
-    //
-    // Replication-related methods.
-    //
-
-    // Used to report replication position only in master-slave, so we keep them as TimeStamp rather
-    // than OpTime.
-    void updateSlaveLocation(OperationContext* opCtx);
-
-    void slaveReadTill(const Timestamp& t) {
-        _slaveReadTill = t;
-    }
-
-    /** Just for testing. */
-    Timestamp getSlaveReadTill() const {
-        return _slaveReadTill;
+    /**
+     * Returns the commit point at the time the last batch was returned.
+     */
+    boost::optional<repl::OpTime> getLastKnownCommittedOpTime() const {
+        return _lastKnownCommittedOpTime;
     }
 
     /**
-     * Returns the server-wide the count of living cursors. Such a cursor is called an "open
-     * cursor".
+     * Sets the commit point at the time the last batch was returned.
      */
-    static long long totalOpen();
+    void setLastKnownCommittedOpTime(boost::optional<repl::OpTime> lastCommittedOpTime) {
+        _lastKnownCommittedOpTime = std::move(lastCommittedOpTime);
+    }
 
     friend std::size_t partitionOf(const ClientCursor* cursor) {
         return cursor->cursorid();
+    }
+
+    boost::optional<OperationKey> getOperationKey() const {
+        return _opKey;
     }
 
 private:
@@ -253,9 +343,8 @@ private:
      * private. See cursor_manager.h for more details.
      */
     ClientCursor(ClientCursorParams params,
-                 CursorManager* cursorManager,
                  CursorId cursorId,
-                 boost::optional<LogicalSessionId> lsid,
+                 OperationContext* operationUsingCursor,
                  Date_t now);
 
     /**
@@ -268,10 +357,10 @@ private:
     ~ClientCursor();
 
     /**
-     * Marks this cursor as killed, so any future uses will return an error status including
-     * 'reason'.
+     * Marks this cursor as killed, so any future uses will return 'killStatus'. It is an error to
+     * call this method with Status::OK.
      */
-    void markAsKilled(const std::string& reason);
+    void markAsKilled(Status killStatus);
 
     /**
      * Disposes this ClientCursor's PlanExecutor. Must be called before deleting a ClientCursor to
@@ -285,35 +374,54 @@ private:
     }
 
     // The ID of the ClientCursor. A value of 0 is used to mean that no cursor id has been assigned.
-    CursorId _cursorid = 0;
+    const CursorId _cursorid = 0;
 
+    // Threads may read from this field even if they don't have the cursor pinned, as long as they
+    // have the correct partition of the CursorManager locked (just like _authenticatedUsers).
     const NamespaceString _nss;
 
-    // The set of authenticated users when this cursor was created.
-    std::vector<UserName> _authenticatedUsers;
+    // The set of authenticated users when this cursor was created. Threads may read from this
+    // field (using the getter) even if they don't have the cursor pinned as long as they hold the
+    // correct partition's lock in the CursorManager. They must hold the lock to prevent the cursor
+    // from being freed by another thread during the read.
+    const std::vector<UserName> _authenticatedUsers;
 
     // A logical session id for this cursor, if it is running inside of a session.
     const boost::optional<LogicalSessionId> _lsid;
 
-    const bool _isReadCommitted = false;
+    // A transaction number for this cursor, if it was provided in the originating command.
+    const boost::optional<TxnNumber> _txnNumber;
 
-    CursorManager* _cursorManager;
+    const WriteConcernOptions _writeConcernOptions;
+    const repl::ReadConcernArgs _readConcernArgs;
 
     // Tracks whether dispose() has been called, to make sure it happens before destruction. It is
     // an error to use a ClientCursor once it has been disposed.
     bool _disposed = false;
 
     // Tracks the number of results returned by this cursor so far.
-    long long _pos = 0;
+    std::uint64_t _nReturnedSoFar = 0;
+
+    // Tracks the number of batches returned by this cursor so far.
+    std::uint64_t _nBatchesReturned = 0;
 
     // Holds an owned copy of the command specification received from the client.
     const BSONObj _originatingCommand;
 
+    // The privileges required for the _originatingCommand.
+    const PrivilegeVector _originatingPrivileges;
+
     // See the QueryOptions enum in dbclientinterface.h.
     const int _queryOptions = 0;
 
-    // The replication position only used in master-slave.
-    Timestamp _slaveReadTill;
+    const ClientCursorParams::LockPolicy _lockPolicy;
+
+    // The value of a flag specified on the originating command which indicates whether the result
+    // of this cursor will be consumed by a merging node (mongos or a mongod selected to perform a
+    // merge). Note that this flag is only set for aggregate() commands, and not for find()
+    // commands. It is therefore possible that 'needsMerge' is false when in fact there will be a
+    // merge performed.
+    const bool _needsMerge;
 
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();
@@ -321,44 +429,51 @@ private:
     // The underlying query execution machinery. Must be non-null.
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 
+    // While a cursor is being used by a client, it is marked as "pinned" by setting
+    // _operationUsingCursor to the current OperationContext.
     //
-    // The following fields are used by the CursorManager and the ClientCursorPin. In most
-    // conditions, they can only be used while holding the CursorManager's mutex. Exceptions
-    // include:
-    //   - If the ClientCursor is pinned, the CursorManager will never change '_isPinned' until
-    //     asked to by the ClientCursorPin.
-    //   - It is safe to read '_killed' while holding a collection lock, which must be held when
-    //     interacting with a ClientCursorPin.
-    //   - A ClientCursorPin can access these members after deregistering the cursor from the
-    //     CursorManager, at which point it has sole ownership of the ClientCursor.
+    // Cursors always come into existence in a pinned state ('_operationUsingCursor' must be
+    // non-null at construction).
     //
-
-    // TODO SERVER-28309 Remove this field and instead use _exec->markedAsKilled().
-    bool _killed = false;
-
-    // While a cursor is being used by a client, it is marked as "pinned". See ClientCursorPin
-    // below.
+    // To write to this field one of the following must be true:
+    // 1) You have a lock on the appropriate partition in CursorManager and the cursor is unpinned
+    // (the field is null).
+    // 2) The cursor has already been deregistered from the CursorManager. In this case, nobody else
+    // will try to pin the cursor.
     //
-    // Cursors always come into existence in a pinned state.
-    bool _isPinned = true;
+    // To read this field one of the following must be true:
+    // 1) You have a lock on the appropriate partition in CursorManager.
+    // 2) You know you have the cursor pinned.
+    OperationContext* _operationUsingCursor;
 
     Date_t _lastUseDate;
+    Date_t _createdDate;
+
+    // A string with the plan summary of the cursor's query.
+    std::string _planSummary;
+
+    // Commit point at the time the last batch was returned. This is only used by internal exhaust
+    // oplog fetching. Also see lastKnownCommittedOpTime in GetMoreRequest.
+    boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
+
+    // The client OperationKey associated with this cursor.
+    boost::optional<OperationKey> _opKey;
 };
 
 /**
- * ClientCursorPin is an RAII class which must be used in order to access a cursor. On construction,
- * the ClientCursorPin marks its cursor as in use, which is called "pinning" the cursor. On
- * destructrution, the ClientCursorPin marks its cursor as no longer in use, which is called
- * "unpinning" the cursor. Pinning is used to prevent multiple concurrent uses of the same cursor---
- * pinned cursors cannot be killed or timed out and cannot be used concurrently by other operations
- * such as getMore or killCursors. A pin is obtained using the CursorManager. See cursor_manager.h
- * for more details.
+ * ClientCursorPin is an RAII class which must be used in order to access a cursor. On
+ * construction, the ClientCursorPin marks its cursor as in use, which is called "pinning" the
+ * cursor. On destruction, the ClientCursorPin marks its cursor as no longer in use, which is
+ * called "unpinning" the cursor. Pinning is used to prevent multiple concurrent uses of the same
+ * cursor--- pinned cursors cannot be deleted or timed out and cannot be used concurrently by other
+ * operations such as getMore. They can however, be marked as interrupted and instructed to destroy
+ * themselves through killCursors.
  *
- * A pin extends the lifetime of a ClientCursor object until the pin's release.  Pinned
- * ClientCursor objects cannot not be killed due to inactivity, and cannot be killed by user
- * kill requests.  When a CursorManager is destroyed (e.g. by a collection drop), ownership of
- * any still-pinned ClientCursor objects is transferred to their managing ClientCursorPin
- * objects.
+ * A pin is obtained using the CursorManager. See cursor_manager.h for more details.
+ *
+ * A pin extends the lifetime of a ClientCursor object until the pin's release. Pinned ClientCursor
+ * objects cannot not be killed due to inactivity, and cannot be immediately erased by user kill
+ * requests (though they can be marked as interrupted).
  *
  * Example usage:
  * {
@@ -373,17 +488,14 @@ private:
  *     // Use cursor. Pin automatically released on block exit.
  * }
  *
- * Clients that wish to access ClientCursor objects owned by collection cursor managers must hold
- * the collection lock while calling any pin method, including pin acquisition by the RAII
- * constructor and pin release by the RAII destructor.  This guards from a collection drop (which
- * requires an exclusive lock on the collection) occurring concurrently with the pin request or
- * unpin request.
- *
- * Clients that wish to access ClientCursor objects owned by the global cursor manager need not
- * hold any locks; the global cursor manager can only be destroyed by a process exit.
+ * Callers need not hold any lock manager locks in order to obtain or release a client cursor pin.
+ * However, in order to use the ClientCursor itself, locks may need to be acquired. Whether locks
+ * are needed to use the ClientCursor can be determined by consulting the ClientCursor's lock
+ * policy.
  */
 class ClientCursorPin {
-    MONGO_DISALLOW_COPYING(ClientCursorPin);
+    ClientCursorPin(const ClientCursorPin&) = delete;
+    ClientCursorPin& operator=(const ClientCursorPin&) = delete;
 
 public:
     /**
@@ -404,9 +516,8 @@ public:
     ~ClientCursorPin();
 
     /**
-     * Releases the pin.  It does not delete the underlying cursor unless ownership has passed
-     * to us after kill.  Turns into a no-op if release() or deleteUnderlying() have already
-     * been called on this pin.
+     * Releases the pin without deleting the underlying cursor. Turns into a no-op if release() or
+     * deleteUnderlying() have already been called on this pin.
      */
     void release();
 
@@ -421,13 +532,18 @@ public:
      */
     ClientCursor* getCursor() const;
 
+    ClientCursor* operator->() {
+        return _cursor;
+    }
+
 private:
     friend class CursorManager;
 
-    ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor);
+    ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor, CursorManager* cursorManager);
 
     OperationContext* _opCtx = nullptr;
     ClientCursor* _cursor = nullptr;
+    CursorManager* _cursorManager = nullptr;
 };
 
 void startClientCursorMonitor();

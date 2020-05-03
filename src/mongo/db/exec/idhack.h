@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,8 +31,7 @@
 
 #include <memory>
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_index_stage.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/record_id.h"
 
@@ -45,17 +45,15 @@ class RecordCursor;
  * the _id index always has the collection default collation, the IDHackStage can only be used when
  * the query's collation is equal to the collection default.
  */
-class IDHackStage final : public PlanStage {
+class IDHackStage final : public RequiresIndexStage {
 public:
     /** Takes ownership of all the arguments -collection. */
-    IDHackStage(OperationContext* opCtx,
-                const Collection* collection,
+    IDHackStage(ExpressionContext* expCtx,
                 CanonicalQuery* query,
                 WorkingSet* ws,
                 const IndexDescriptor* descriptor);
 
-    IDHackStage(OperationContext* opCtx,
-                Collection* collection,
+    IDHackStage(ExpressionContext* expCtx,
                 const BSONObj& key,
                 WorkingSet* ws,
                 const IndexDescriptor* descriptor);
@@ -65,11 +63,8 @@ public:
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
 
-    void doSaveState() final;
-    void doRestoreState() final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     /**
      * ID Hack has a very strict criteria for the queries it supports.
@@ -86,6 +81,11 @@ public:
 
     static const char* kStageType;
 
+protected:
+    void doSaveStateRequiresIndex() final;
+
+    void doRestoreStateRequiresIndex() final;
+
 private:
     /**
      * Marks this stage as done, optionally adds key metadata, and returns PlanStage::ADVANCED.
@@ -94,31 +94,19 @@ private:
      */
     StageState advance(WorkingSetID id, WorkingSetMember* member, WorkingSetID* out);
 
-    // Not owned here.
-    const Collection* _collection;
-
     std::unique_ptr<SeekableRecordCursor> _recordCursor;
 
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
 
-    // Not owned here.
-    const IndexAccessMethod* _accessMethod;
-
     // The value to match against the _id field.
     BSONObj _key;
 
     // Have we returned our one document?
-    bool _done;
+    bool _done = false;
 
     // Do we need to add index key metadata for returnKey?
-    bool _addKeyMetadata;
-
-    // If we want to return a RecordId and it points to something that's not in memory,
-    // we return a "please page this in" result. We add a RecordFetcher given back to us by the
-    // storage engine to the WSM. The RecordFetcher is used by the PlanExecutor when it handles
-    // the fetch request.
-    WorkingSetID _idBeingPagedIn;
+    bool _addKeyMetadata = false;
 
     IDHackStats _specificStats;
 };

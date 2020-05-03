@@ -1,5 +1,6 @@
 /**
  * This tests that CLAC (collection level access control) handles system collections properly.
+ * @tags: [requires_sharding]
  */
 
 // Verify that system collections are treated correctly
@@ -9,14 +10,7 @@ function runTest(admindb) {
     admindb.createUser({user: "admin", pwd: "pwd", roles: ["userAdminAnyDatabase"]});
     assert.eq(1, admindb.auth("admin", "pwd"));
 
-    var sysCollections = [
-        "system.indexes",
-        "system.js",
-        "system.namespaces",
-        "system.profile",
-        "system.roles",
-        "system.users"
-    ];
+    var sysCollections = ["system.js", "system.profile", "system.roles", "system.users"];
     var sysPrivs = new Array();
     for (var i in sysCollections) {
         sysPrivs.push(

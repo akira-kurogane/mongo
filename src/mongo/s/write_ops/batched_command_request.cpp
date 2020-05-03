@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -36,14 +37,20 @@ namespace mongo {
 namespace {
 
 const auto kWriteConcern = "writeConcern"_sd;
+const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_sd;
 
 template <class T>
 BatchedCommandRequest constructBatchedCommandRequest(const OpMsgRequest& request) {
     auto batchRequest = BatchedCommandRequest{T::parse(request)};
 
-    auto chunkVersion = ChunkVersion::parseFromBSONForCommands(request.body);
+    auto chunkVersion = ChunkVersion::parseFromCommand(request.body);
     if (chunkVersion != ErrorCodes::NoSuchKey) {
         batchRequest.setShardVersion(uassertStatusOK(std::move(chunkVersion)));
+        if (chunkVersion == ChunkVersion::UNSHARDED()) {
+            auto dbVersion = DatabaseVersion::parse(IDLParserErrorContext("BatchedCommandRequest"),
+                                                    request.body);
+            batchRequest.setDbVersion(std::move(dbVersion));
+        }
     }
 
     auto writeConcernField = request.body[kWriteConcern];
@@ -51,22 +58,12 @@ BatchedCommandRequest constructBatchedCommandRequest(const OpMsgRequest& request
         batchRequest.setWriteConcern(writeConcernField.Obj());
     }
 
+    if (auto allowImplicitElement = request.body[kAllowImplicitCollectionCreation]) {
+        batchRequest.setAllowImplicitCreate(allowImplicitElement.boolean());
+    }
+
     return batchRequest;
 }
-
-// This macro just invokes a given method on one of the three types of ops with parameters
-#define INVOKE(M, ...)                                    \
-    {                                                     \
-        switch (_batchType) {                             \
-            case BatchedCommandRequest::BatchType_Insert: \
-                return _insertReq->M(__VA_ARGS__);        \
-            case BatchedCommandRequest::BatchType_Update: \
-                return _updateReq->M(__VA_ARGS__);        \
-            case BatchedCommandRequest::BatchType_Delete: \
-                return _deleteReq->M(__VA_ARGS__);        \
-        }                                                 \
-        MONGO_UNREACHABLE;                                \
-    }
 
 }  // namespace
 
@@ -83,38 +80,22 @@ BatchedCommandRequest BatchedCommandRequest::parseDelete(const OpMsgRequest& req
 }
 
 const NamespaceString& BatchedCommandRequest::getNS() const {
-    INVOKE(getNamespace);
-}
-
-NamespaceString BatchedCommandRequest::getTargetingNS() const {
-    if (!isInsertIndexRequest()) {
-        return getNS();
-    }
-
-    const auto& documents = _insertReq->getDocuments();
-    invariant(documents.size() == 1);
-
-    return NamespaceString(documents.at(0)["ns"].str());
-}
-
-bool BatchedCommandRequest::isInsertIndexRequest() const {
-    if (_batchType != BatchedCommandRequest::BatchType_Insert) {
-        return false;
-    }
-
-    return getNS().isSystemDotIndexes();
+    return _visit([](auto&& op) -> decltype(auto) { return op.getNamespace(); });
 }
 
 std::size_t BatchedCommandRequest::sizeWriteOps() const {
-    switch (_batchType) {
-        case BatchedCommandRequest::BatchType_Insert:
-            return getInsertRequest().getDocuments().size();
-        case BatchedCommandRequest::BatchType_Update:
-            return getUpdateRequest().getUpdates().size();
-        case BatchedCommandRequest::BatchType_Delete:
-            return getDeleteRequest().getDeletes().size();
-    }
-    MONGO_UNREACHABLE;
+    struct Visitor {
+        auto operator()(const write_ops::Insert& op) const {
+            return op.getDocuments().size();
+        }
+        auto operator()(const write_ops::Update& op) const {
+            return op.getUpdates().size();
+        }
+        auto operator()(const write_ops::Delete& op) const {
+            return op.getDeletes().size();
+        }
+    };
+    return _visit(Visitor{});
 }
 
 bool BatchedCommandRequest::isVerboseWC() const {
@@ -132,34 +113,29 @@ bool BatchedCommandRequest::isVerboseWC() const {
 }
 
 const write_ops::WriteCommandBase& BatchedCommandRequest::getWriteCommandBase() const {
-    INVOKE(getWriteCommandBase);
+    return _visit([](auto&& op) -> decltype(auto) { return op.getWriteCommandBase(); });
 }
 
 void BatchedCommandRequest::setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase) {
-    INVOKE(setWriteCommandBase, std::move(writeCommandBase));
+    return _visit([&](auto&& op) { op.setWriteCommandBase(std::move(writeCommandBase)); });
 }
 
 void BatchedCommandRequest::serialize(BSONObjBuilder* builder) const {
-    switch (_batchType) {
-        case BatchedCommandRequest::BatchType_Insert:
-            getInsertRequest().serialize({}, builder);
-            break;
-        case BatchedCommandRequest::BatchType_Update:
-            getUpdateRequest().serialize({}, builder);
-            break;
-        case BatchedCommandRequest::BatchType_Delete:
-            getDeleteRequest().serialize({}, builder);
-            break;
-        default:
-            MONGO_UNREACHABLE;
+    _visit([&](auto&& op) { op.serialize({}, builder); });
+    if (_shardVersion) {
+        _shardVersion->appendToCommand(builder);
     }
 
-    if (_shardVersion) {
-        _shardVersion->appendForCommands(builder);
+    if (_dbVersion) {
+        builder->append("databaseVersion", _dbVersion->toBSON());
     }
 
     if (_writeConcern) {
         builder->append(kWriteConcern, *_writeConcern);
+    }
+
+    if (!_allowImplicitCollectionCreation) {
+        builder->append(kAllowImplicitCollectionCreation, _allowImplicitCollectionCreation);
     }
 }
 
@@ -179,10 +155,6 @@ BatchedCommandRequest BatchedCommandRequest::cloneInsertWithIds(
     invariant(origCmdRequest.getBatchType() == BatchedCommandRequest::BatchType_Insert);
 
     BatchedCommandRequest newCmdRequest(std::move(origCmdRequest));
-
-    if (newCmdRequest.isInsertIndexRequest()) {
-        return newCmdRequest;
-    }
 
     const auto& origDocs = newCmdRequest._insertReq->getDocuments();
 
@@ -204,6 +176,11 @@ BatchedCommandRequest BatchedCommandRequest::cloneInsertWithIds(
     newCmdRequest._insertReq->setDocuments(std::move(newDocs));
 
     return newCmdRequest;
+}
+
+BatchItemRef::BatchItemRef(const BatchedCommandRequest* request, int index)
+    : _request(*request), _index(index) {
+    invariant(index < int(request->sizeWriteOps()));
 }
 
 }  // namespace mongo

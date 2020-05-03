@@ -13,7 +13,7 @@ if [ "$#" -ne 0 ]; then
 fi
 
 NAME=asio
-REVISION=230c0d2ae035c5ce1292233fcab03cea0d341264
+REVISION=22afb86087a77037cd296d27134756c9b0d2cb75
 SRC_ROOT=$(mktemp -d /tmp/asio.XXXXXX)
 #trap "rm -rf $SRC_ROOT" EXIT
 SRC=${SRC_ROOT}/${NAME}_${REVISION}

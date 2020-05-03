@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,24 +31,24 @@
 
 #include "mongo/db/repl/rollback_source_impl.h"
 
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/cloner.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplogreader.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/replication_auth.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
 
 RollbackSourceImpl::RollbackSourceImpl(GetConnectionFn getConnection,
                                        const HostAndPort& source,
-                                       const std::string& collectionName)
+                                       const std::string& collectionName,
+                                       int batchSize)
     : _getConnection(getConnection),
       _source(source),
       _collectionName(collectionName),
-      _oplog(getConnection, collectionName) {}
+      _oplog(source, getConnection, collectionName, batchSize) {}
 
 const OplogInterface& RollbackSourceImpl::getOplog() const {
     return _oplog;
@@ -66,34 +67,21 @@ int RollbackSourceImpl::getRollbackId() const {
 
 BSONObj RollbackSourceImpl::getLastOperation() const {
     const Query query = Query().sort(BSON("$natural" << -1));
-    return _getConnection()->findOne(_collectionName, query, 0, QueryOption_SlaveOk);
+    return _getConnection()->findOne(
+        _collectionName, query, nullptr, QueryOption_SlaveOk, ReadConcernArgs::kImplicitDefault);
 }
 
 BSONObj RollbackSourceImpl::findOne(const NamespaceString& nss, const BSONObj& filter) const {
-    return _getConnection()->findOne(nss.toString(), filter, NULL, QueryOption_SlaveOk).getOwned();
+    return _getConnection()
+        ->findOne(
+            nss.toString(), filter, nullptr, QueryOption_SlaveOk, ReadConcernArgs::kImplicitDefault)
+        .getOwned();
 }
 
 std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std::string& db,
                                                                       UUID uuid,
                                                                       const BSONObj& filter) const {
-    return _getConnection()->findOneByUUID(db, uuid, filter);
-}
-
-void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* opCtx,
-                                                  const NamespaceString& nss) const {
-    std::string errmsg;
-    std::unique_ptr<DBClientConnection> tmpConn(new DBClientConnection());
-    uassert(15908,
-            errmsg,
-            tmpConn->connect(_source, StringData(), errmsg) && replAuthenticate(tmpConn.get()));
-
-    // cloner owns _conn in unique_ptr
-    Cloner cloner;
-    cloner.setConnection(tmpConn.release());
-    uassert(15909,
-            str::stream() << "replSet rollback error resyncing collection " << nss.ns() << ' '
-                          << errmsg,
-            cloner.copyCollection(opCtx, nss.ns(), BSONObj(), errmsg, true));
+    return _getConnection()->findOneByUUID(db, uuid, filter, ReadConcernArgs::kImplicitDefault);
 }
 
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::string& db,
@@ -103,9 +91,7 @@ StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::strin
         return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
                                    str::stream()
                                        << "No collection info found for collection with uuid: "
-                                       << uuid.toString()
-                                       << " in db: "
-                                       << db);
+                                       << uuid.toString() << " in db: " << db);
     }
     invariant(info.size() == 1U);
     return info.front();

@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2010-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -36,24 +37,25 @@
 #include <boost/exception/exception.hpp>
 #include <csignal>
 #include <exception>
+#include <fmt/format.h>
 #include <iostream>
 #include <memory>
 #include <streambuf>
 #include <typeinfo>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
-#include "mongo/logger/log_domain.h"
-#include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/stdx/exception.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/debugger.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/text.h"
 
@@ -72,8 +74,31 @@ const char* strsignal(int signalNum) {
     }
 }
 
+int sehExceptionFilter(unsigned int code, struct _EXCEPTION_POINTERS* excPointers) {
+    exceptionFilter(excPointers);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Follow SEH conventions by defining a status code per their conventions
+// Bit 31-30: 11 = ERROR
+// Bit 29:     1 = Client bit, i.e. a user-defined code
+#define STATUS_EXIT_ABRUPT 0xE0000001
+
+// Historically we relied on raising SEH exception and letting the unhandled exception handler then
+// handle it to that we can dump the process. This works in all but one case.
+// The C++ terminate handler runs the terminate handler in a SEH __try/__catch. Therefore, any SEH
+// exceptions we raise become handled. Now, we setup our own SEH handler to quick catch the SEH
+// exception and take the dump bypassing the unhandled exception handler.
+//
 void endProcessWithSignal(int signalNum) {
-    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, NULL);
+
+    __try {
+        RaiseException(STATUS_EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    } __except (sehExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
+        // The exception filter exits the process
+        quickExit(EXIT_ABRUPT);
+    }
 }
 
 #else
@@ -93,7 +118,8 @@ void endProcessWithSignal(int signalNum) {
 
 // This should only be used with MallocFreeOSteam
 class MallocFreeStreambuf : public std::streambuf {
-    MONGO_DISALLOW_COPYING(MallocFreeStreambuf);
+    MallocFreeStreambuf(const MallocFreeStreambuf&) = delete;
+    MallocFreeStreambuf& operator=(const MallocFreeStreambuf&) = delete;
 
 public:
     MallocFreeStreambuf() {
@@ -113,7 +139,8 @@ private:
 };
 
 class MallocFreeOStream : public std::ostream {
-    MONGO_DISALLOW_COPYING(MallocFreeOStream);
+    MallocFreeOStream(const MallocFreeOStream&) = delete;
+    MallocFreeOStream& operator=(const MallocFreeOStream&) = delete;
 
 public:
     MallocFreeOStream() : std::ostream(&_buf) {}
@@ -154,31 +181,29 @@ public:
     }
 
 private:
-    static stdx::mutex _streamMutex;
+    static stdx::mutex _streamMutex;  // NOLINT
     static thread_local int terminateDepth;
     stdx::unique_lock<stdx::mutex> _lk;
 };
 
-stdx::mutex MallocFreeOStreamGuard::_streamMutex;
+stdx::mutex MallocFreeOStreamGuard::_streamMutex;  // NOLINT
 thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    logger::globalLogDomain()
-        ->append(logger::MessageEventEphemeral(Date_t::now(),
-                                               logger::LogSeverity::Severe(),
-                                               getThreadName(),
-                                               mallocFreeOStream.str())
-                     .setIsTruncatable(false))
-        .transitional_ignore();
+    LOGV2_FATAL_OPTIONS(
+        4757800,
+        logv2::LogOptions(logv2::FatalMode::kContinue, logv2::LogTruncation::Disabled),
+        "{message}",
+        "message"_attr = mallocFreeOStream.str());
     mallocFreeOStream.rewind();
 }
 
 // must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
     mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
 }
 
 // this will be called in certain c++ error cases, for example if there are two active
@@ -198,10 +223,10 @@ void myTerminate() {
                 throw;
             } catch (const DBException& ex) {
                 typeInfo = &typeid(ex);
-                mallocFreeOStream << "DBException::toString(): " << ex.toString() << '\n';
+                mallocFreeOStream << "DBException::toString(): " << redact(ex) << '\n';
             } catch (const std::exception& ex) {
                 typeInfo = &typeid(ex);
-                mallocFreeOStream << "std::exception::what(): " << ex.what() << '\n';
+                mallocFreeOStream << "std::exception::what(): " << redact(ex.what()) << '\n';
             } catch (const boost::exception& ex) {
                 typeInfo = &typeid(ex);
                 mallocFreeOStream << "boost::diagnostic_information(): "
@@ -225,9 +250,8 @@ void myTerminate() {
     } else {
         mallocFreeOStream << "terminate() called. No exception is active";
     }
-
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
     breakpoint();
     endProcessWithSignal(SIGABRT);
 }
@@ -246,23 +270,34 @@ void myInvalidParameterHandler(const wchar_t* expression,
                                const wchar_t* file,
                                unsigned int line,
                                uintptr_t pReserved) {
-    severe() << "Invalid parameter detected in function " << toUtf8String(function)
-             << " File: " << toUtf8String(file) << " Line: " << line;
-    severe() << "Expression: " << toUtf8String(expression);
-    severe() << "immediate exit due to invalid parameter";
+    LOGV2_FATAL_CONTINUE(
+        23815,
+        "Invalid parameter detected in function {function} File: "
+        "{file} Line: {line} Expression: {expression}. Immediate exit due to invalid parameter",
+        "function"_attr = toUtf8String(function),
+        "file"_attr = toUtf8String(file),
+        "line"_attr = line,
+        "expression"_attr = toUtf8String(expression));
 
     abruptQuit(SIGABRT);
 }
 
 void myPureCallHandler() {
-    severe() << "Pure call handler invoked";
-    severe() << "immediate exit due to invalid pure call";
+    LOGV2_FATAL_CONTINUE(23818,
+                         "Pure call handler invoked. Immediate exit due to invalid pure call");
     abruptQuit(SIGABRT);
 }
 
 #else
 
-void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void*) {
+void abruptQuitAction(int signalNum, siginfo_t*, void*) {
+    abruptQuit(signalNum);
+};
+
+void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void* ucontext_erased) {
+    // For convenient debugger access.
+    MONGO_COMPILER_VARIABLE_UNUSED auto ucontext = static_cast<const ucontext_t*>(ucontext_erased);
+
     MallocFreeOStreamGuard lk{};
 
     const char* action = (signalNum == SIGSEGV || signalNum == SIGBUS) ? "access" : "operation";
@@ -282,12 +317,8 @@ void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void*) {
 
 }  // namespace
 
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
-
 void setupSynchronousSignalHandlers() {
-    std::set_terminate(myTerminate);
+    stdx::set_terminate(myTerminate);
     std::set_new_handler(reportOutOfMemoryErrorAndExit);
 
 #if defined(_WIN32)
@@ -296,67 +327,55 @@ void setupSynchronousSignalHandlers() {
     _set_invalid_parameter_handler(myInvalidParameterHandler);
     setWindowsUnhandledExceptionFilter();
 #else
-    {
-        struct sigaction ignoredSignals;
-        memset(&ignoredSignals, 0, sizeof(ignoredSignals));
-        ignoredSignals.sa_handler = SIG_IGN;
-        sigemptyset(&ignoredSignals.sa_mask);
-
-        invariant(sigaction(SIGHUP, &ignoredSignals, nullptr) == 0);
-        invariant(sigaction(SIGUSR2, &ignoredSignals, nullptr) == 0);
-        invariant(sigaction(SIGPIPE, &ignoredSignals, nullptr) == 0);
+    static constexpr struct {
+        int signal;
+        void (*function)(int, siginfo_t*, void*);  // signal ignored if nullptr
+    } kSignalSpecs[] = {
+        {SIGHUP, nullptr},
+        {SIGUSR2, nullptr},
+        {SIGPIPE, nullptr},
+        {SIGQUIT, &abruptQuitAction},  // sent by '^\'. Log and hard quit, no cleanup.
+        {SIGABRT, &abruptQuitAction},
+        {SIGSEGV, &abruptQuitWithAddrSignal},
+        {SIGBUS, &abruptQuitWithAddrSignal},
+        {SIGILL, &abruptQuitWithAddrSignal},
+        {SIGFPE, &abruptQuitWithAddrSignal},
+    };
+    for (const auto& spec : kSignalSpecs) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sigemptyset(&sa.sa_mask);
+        if (spec.function == nullptr) {
+            sa.sa_handler = SIG_IGN;
+        } else {
+            sa.sa_sigaction = spec.function;
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        }
+        if (sigaction(spec.signal, &sa, nullptr) != 0) {
+            int savedErr = errno;
+            LOGV2_FATAL(
+                31334,
+                "{format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_"
+                "spec_signal_strerror_savedErr}",
+                "format_FMT_STRING_Failed_to_install_signal_handler_for_signal_with_sigaction_spec_signal_strerror_savedErr"_attr =
+                    format(FMT_STRING(
+                               "Failed to install signal handler for signal {} with sigaction: {}"),
+                           spec.signal,
+                           strerror(savedErr)));
+        }
     }
-    {
-        struct sigaction plainSignals;
-        memset(&plainSignals, 0, sizeof(plainSignals));
-        plainSignals.sa_handler = abruptQuit;
-        sigemptyset(&plainSignals.sa_mask);
-
-        // ^\ is the stronger ^C. Log and quit hard without waiting for cleanup.
-        invariant(sigaction(SIGQUIT, &plainSignals, nullptr) == 0);
-
-#if __has_feature(address_sanitizer)
-        // Sanitizers may be configured to call abort(). If so, we should omit our signal handler.
-        bool shouldRegister = true;
-        constexpr std::array<StringData, 5> sanitizerConfigVariable{"ASAN_OPTIONS"_sd,
-                                                                    "TSAN_OPTIONS"_sd,
-                                                                    "MSAN_OPTIONS"_sd,
-                                                                    "UBSAN_OPTIONS"_sd,
-                                                                    "LSAN_OPTIONS"_sd};
-        for (const StringData& option : sanitizerConfigVariable) {
-            StringData configString(getenv(option.rawData()));
-            if (configString.find("abort_on_error=1") != std::string::npos ||
-                configString.find("abort_on_error=true") != std::string::npos) {
-                shouldRegister = false;
-            }
-        }
-        if (shouldRegister) {
-            invariant(sigaction(SIGABRT, &plainSignals, nullptr) == 0);
-        }
-#else
-        invariant(sigaction(SIGABRT, &plainSignals, nullptr) == 0);
+    setupSIGTRAPforDebugger();
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+    setupStackTraceSignalAction(stackTraceSignal());
 #endif
-    }
-    {
-        struct sigaction addrSignals;
-        memset(&addrSignals, 0, sizeof(addrSignals));
-        addrSignals.sa_sigaction = abruptQuitWithAddrSignal;
-        sigemptyset(&addrSignals.sa_mask);
-        addrSignals.sa_flags = SA_SIGINFO;
-
-        invariant(sigaction(SIGSEGV, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGBUS, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGILL, &addrSignals, nullptr) == 0);
-        invariant(sigaction(SIGFPE, &addrSignals, nullptr) == 0);
-    }
-    setupSIGTRAPforGDB();
 #endif
 }
 
 void reportOutOfMemoryErrorAndExit() {
     MallocFreeOStreamGuard lk{};
-    printStackTrace(mallocFreeOStream << "out of memory.\n");
+    mallocFreeOStream << "out of memory.\n";
     writeMallocFreeStreamToLog();
+    printStackTrace();
     quickExit(EXIT_ABRUPT);
 }
 
@@ -368,4 +387,11 @@ void clearSignalMask() {
     invariant(sigprocmask(SIG_SETMASK, &unblockSignalMask, nullptr) == 0);
 #endif
 }
+
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
+int stackTraceSignal() {
+    return SIGUSR2;
+}
+#endif
+
 }  // namespace mongo

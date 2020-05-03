@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,9 +35,9 @@
 #include <vector>
 
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
-#include "mongo/platform/hash_namespace.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -50,6 +51,11 @@ class RoleName {
 public:
     RoleName() : _splitPoint(0) {}
     RoleName(StringData role, StringData dbname);
+
+    // Added for IDL support
+    static RoleName parseFromBSON(const BSONElement& elem);
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
+    void serializeToBSON(BSONArrayBuilder* bob) const;
 
     /**
      * Gets the name of the role excluding the "@dbname" component.
@@ -85,9 +91,16 @@ public:
         return getFullName();
     }
 
+    template <typename H>
+    friend H AbslHashValue(H h, const RoleName& rname) {
+        return H::combine(std::move(h), rname.getFullName());
+    }
+
 private:
     std::string _fullName;  // The full name, stored as a string.  "role@db".
     size_t _splitPoint;     // The index of the "@" separating the role and db name parts.
+
+    void _serializeToSubObj(BSONObjBuilder* sub) const;
 };
 
 static inline bool operator==(const RoleName& lhs, const RoleName& rhs) {
@@ -114,13 +127,14 @@ std::ostream& operator<<(std::ostream& os, const RoleName& name);
 class RoleNameIterator {
 public:
     class Impl {
-        MONGO_DISALLOW_COPYING(Impl);
+        Impl(const Impl&) = delete;
+        Impl& operator=(const Impl&) = delete;
 
     public:
         Impl(){};
         virtual ~Impl(){};
         static Impl* clone(Impl* orig) {
-            return orig ? orig->doClone() : NULL;
+            return orig ? orig->doClone() : nullptr;
         }
         virtual bool more() const = 0;
         virtual const RoleName& get() const = 0;
@@ -164,21 +178,12 @@ private:
 
 }  // namespace mongo
 
-// Define hash function for RoleNames so they can be keys in stdx::unordered_map
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::RoleName> {
-    size_t operator()(const mongo::RoleName& rname) const {
-        return hash<std::string>()(rname.getFullName());
-    }
-};
-MONGO_HASH_NAMESPACE_END
-
 namespace mongo {
 
 template <typename ContainerIterator>
 class RoleNameContainerIteratorImpl : public RoleNameIterator::Impl {
-    MONGO_DISALLOW_COPYING(RoleNameContainerIteratorImpl);
+    RoleNameContainerIteratorImpl(const RoleNameContainerIteratorImpl&) = delete;
+    RoleNameContainerIteratorImpl& operator=(const RoleNameContainerIteratorImpl&) = delete;
 
 public:
     RoleNameContainerIteratorImpl(const ContainerIterator& begin, const ContainerIterator& end)
@@ -211,6 +216,15 @@ RoleNameIterator makeRoleNameIterator(const ContainerIterator& begin,
 template <typename Container>
 RoleNameIterator makeRoleNameIteratorForContainer(const Container& container) {
     return makeRoleNameIterator(container.begin(), container.end());
+}
+
+template <typename Container>
+Container roleNameIteratorToContainer(RoleNameIterator it) {
+    Container container;
+    while (it.more()) {
+        container.emplace_back(it.next());
+    }
+    return container;
 }
 
 }  // namespace mongo

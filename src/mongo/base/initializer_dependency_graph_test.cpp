@@ -1,42 +1,52 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
  * Unit tests of the InitializerDependencyGraph type.
  */
 
+#include <algorithm>
+#include <string>
+#include <vector>
+
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_dependency_graph.h"
-#include "mongo/base/make_string_vector.h"
 #include "mongo/unittest/unittest.h"
 
-#define ADD_INITIALIZER(GRAPH, NAME, FN, PREREQS, DEPS) \
-    (GRAPH).addInitializer(                             \
-        (NAME), (FN), MONGO_MAKE_STRING_VECTOR PREREQS, MONGO_MAKE_STRING_VECTOR DEPS)
+#define STRIP_PARENS_(...) __VA_ARGS__
+
+#define ADD_INITIALIZER(GRAPH, NAME, FN, PREREQS, DEPS)                     \
+    (GRAPH).addInitializer((NAME),                                          \
+                           (FN),                                            \
+                           DeinitializerFunction(),                         \
+                           std::vector<std::string>{STRIP_PARENS_ PREREQS}, \
+                           std::vector<std::string>{STRIP_PARENS_ DEPS})
 
 #define ASSERT_ADD_INITIALIZER(GRAPH, NAME, FN, PREREQS, DEPS) \
     ASSERT_EQUALS(Status::OK(), ADD_INITIALIZER(GRAPH, NAME, FN, PREREQS, DEPS))
@@ -69,8 +79,8 @@ TEST(InitializerDependencyGraphTest, InsertSameNameTwiceFails) {
     InitializerDependencyGraph graph;
     ASSERT_ADD_INITIALIZER(graph, "A", doNothing, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS);
     ASSERT_EQUALS(
-        ErrorCodes::DuplicateKey,
-        ADD_INITIALIZER(graph, "A", doNothing, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS));
+        50999,
+        ADD_INITIALIZER(graph, "A", doNothing, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS).code());
 }
 
 TEST(InitializerDependencyGraphTest, TopSortEmptyGraph) {
@@ -287,6 +297,70 @@ TEST(InitializerDependencyGraphTest, TopSortFailsWhenMissingDependent) {
     auto status = graph.topSort(&nodeNames);
     ASSERT_EQUALS(ErrorCodes::BadValue, status);
     ASSERT_STRING_CONTAINS(status.reason(), "No implementation provided for initializer B");
+}
+
+std::vector<std::vector<std::string>> allPermutations(std::vector<std::string> vec,
+                                                      size_t first,
+                                                      size_t last) {
+    std::vector<std::vector<std::string>> out;
+    auto i1 = vec.begin() + first;
+    auto i2 = vec.begin() + last;
+    std::sort(i1, i2);
+    do {
+        out.push_back(vec);
+    } while (std::next_permutation(i1, i2));
+    return out;
+}
+
+template <typename Expectations, typename F>
+void doUntilAllSeen(const Expectations& expected, F&& f) {
+    std::vector<int> seen(expected.size(), 0);
+    while (std::find(seen.begin(), seen.end(), 0) != seen.end()) {
+        auto found = std::find(expected.begin(), expected.end(), f());
+        ASSERT_TRUE(found != expected.end());
+        ++seen[found - expected.begin()];
+    }
+}
+
+TEST(InitializerDependencyGraphTest, TopSortShufflesNodes) {
+    /*
+     * Make sure all node orderings can appear as outputs.
+     */
+    InitializerDependencyGraph graph;
+    std::vector<std::string> graphNodes;
+    for (int i = 0; i < 5; ++i) {
+        std::string s = "Node" + std::to_string(i);
+        graphNodes.push_back(s);
+        ASSERT_ADD_INITIALIZER(graph, s, doNothing, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS);
+    }
+    std::vector<std::string> nodeNames;
+    doUntilAllSeen(allPermutations(graphNodes, 0, graphNodes.size()), [&]() -> decltype(auto) {
+        nodeNames.clear();
+        ASSERT_EQUALS(Status::OK(), graph.topSort(&nodeNames));
+        return nodeNames;
+    });
+}
+
+TEST(InitializerDependencyGraphTest, TopSortShufflesChildren) {
+    /*
+     * Make sure all child orderings can appear as outputs.
+     */
+    InitializerDependencyGraph graph;
+    std::vector<std::string> graphNodes;
+    graphNodes.push_back("Parent");
+    ASSERT_ADD_INITIALIZER(graph, "Parent", doNothing, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS);
+    for (int i = 0; i < 5; ++i) {
+        std::string s = "Child" + std::to_string(i);
+        graphNodes.push_back(s);
+        ASSERT_ADD_INITIALIZER(graph, s, doNothing, ("Parent"), MONGO_NO_DEPENDENTS);
+    }
+    std::vector<std::string> nodeNames;
+    // Permute only the children.
+    doUntilAllSeen(allPermutations(graphNodes, 1, graphNodes.size()), [&]() -> decltype(auto) {
+        nodeNames.clear();
+        ASSERT_EQUALS(Status::OK(), graph.topSort(&nodeNames));
+        return nodeNames;
+    });
 }
 
 }  // namespace

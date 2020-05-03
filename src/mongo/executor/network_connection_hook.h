@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +31,9 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/executor/remote_command_request.h"
+
 namespace mongo {
 
 class Status;
@@ -40,7 +44,6 @@ struct HostAndPort;
 namespace executor {
 
 struct RemoteCommandResponse;
-struct RemoteCommandRequest;
 
 /**
  * An hooking interface for augmenting an implementation of NetworkInterface with domain-specific
@@ -49,6 +52,15 @@ struct RemoteCommandRequest;
 class NetworkConnectionHook {
 public:
     virtual ~NetworkConnectionHook() = default;
+
+    /**
+     * Optionally augments the isMaster request sent while initializing the wire protocol.
+     *
+     * By default this will just return the cmdObj passed in unaltered.
+     */
+    virtual BSONObj augmentIsMasterRequest(BSONObj cmdObj) {
+        return cmdObj;
+    }
 
     /**
      * Runs optional validation logic on an isMaster reply from a remote host. If a non-OK
@@ -65,6 +77,7 @@ public:
      * std::terminate.
      */
     virtual Status validateHost(const HostAndPort& remoteHost,
+                                const BSONObj& isMasterRequest,
                                 const RemoteCommandResponse& isMasterReply) = 0;
 
     /**

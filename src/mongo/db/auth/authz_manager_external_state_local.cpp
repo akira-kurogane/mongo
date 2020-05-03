@@ -1,32 +1,35 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 
@@ -35,13 +38,14 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/auth_options_gen.h"
 #include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -51,16 +55,19 @@ Status AuthzManagerExternalStateLocal::initialize(OperationContext* opCtx) {
     Status status = _initializeRoleGraph(opCtx);
     if (!status.isOK()) {
         if (status == ErrorCodes::GraphContainsCycle) {
-            error() << "Cycle detected in admin.system.roles; role inheritance disabled. "
-                       "Remove the listed cycle and any others to re-enable role inheritance. "
-                    << redact(status);
+            LOGV2_ERROR(23750,
+                        "Cycle detected in admin.system.roles; role inheritance disabled. "
+                        "Remove the listed cycle and any others to re-enable role inheritance",
+                        "status"_attr = redact(status));
         } else {
-            error() << "Could not generate role graph from admin.system.roles; "
-                       "only system roles available: "
-                    << redact(status);
+            LOGV2_ERROR(23751,
+                        "Could not generate role graph from admin.system.roles; "
+                        "only system roles available",
+                        "status"_attr = redact(status));
         }
     }
 
+    _hasAnyPrivilegeDocuments.store(_checkHasAnyPrivilegeDocuments(opCtx));
     return Status::OK();
 }
 
@@ -78,19 +85,15 @@ Status AuthzManagerExternalStateLocal::getStoredAuthorizationVersion(OperationCo
             return Status::OK();
         } else if (versionElement.eoo()) {
             return Status(ErrorCodes::NoSuchKey,
-                          mongoutils::str::stream() << "No "
-                                                    << AuthorizationManager::schemaVersionFieldName
-                                                    << " field in version document.");
+                          str::stream() << "No " << AuthorizationManager::schemaVersionFieldName
+                                        << " field in version document.");
         } else {
             return Status(ErrorCodes::TypeMismatch,
-                          mongoutils::str::stream()
+                          str::stream()
                               << "Could not determine schema version of authorization data.  "
                                  "Bad (non-numeric) type "
-                              << typeName(versionElement.type())
-                              << " ("
-                              << versionElement.type()
-                              << ") for "
-                              << AuthorizationManager::schemaVersionFieldName
+                              << typeName(versionElement.type()) << " (" << versionElement.type()
+                              << ") for " << AuthorizationManager::schemaVersionFieldName
                               << " field in version document");
         }
     } else if (status == ErrorCodes::NoMatchingDocument) {
@@ -127,11 +130,9 @@ void addPrivilegeObjectsOrWarningsToArrayElement(mutablebson::Element privileges
             fassert(17157,
                     warningsElement.appendString(
                         "",
-                        std::string(mongoutils::str::stream()
-                                    << "Skipped privileges on resource "
-                                    << privileges[i].getResourcePattern().toString()
-                                    << ". Reason: "
-                                    << errmsg)));
+                        std::string(str::stream() << "Skipped privileges on resource "
+                                                  << privileges[i].getResourcePattern().toString()
+                                                  << ". Reason: " << errmsg)));
         }
     }
 }
@@ -145,7 +146,7 @@ void addAuthenticationRestrictionObjectsToArrayElement(
 }
 }  // namespace
 
-bool AuthzManagerExternalStateLocal::hasAnyPrivilegeDocuments(OperationContext* opCtx) {
+bool AuthzManagerExternalStateLocal::_checkHasAnyPrivilegeDocuments(OperationContext* opCtx) {
     BSONObj userBSONObj;
     Status statusFindUsers =
         findOne(opCtx, AuthorizationManager::usersCollectionNamespace, BSONObj(), &userBSONObj);
@@ -161,27 +162,24 @@ bool AuthzManagerExternalStateLocal::hasAnyPrivilegeDocuments(OperationContext* 
 }
 
 Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCtx,
-                                                          const UserName& userName,
+                                                          const UserRequest& userReq,
                                                           BSONObj* result) {
     Status status = Status::OK();
+    const UserName& userName = userReq.name;
 
-    if (!shouldUseRolesFromConnection(opCtx, userName)) {
+    if (!userReq.roles) {
         status = _getUserDocument(opCtx, userName, result);
         if (!status.isOK())
             return status;
     } else {
         // We are able to artifically construct the external user from the request
         BSONArrayBuilder userRoles;
-        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-        for (const RoleName& role : sslPeerInfo.roles) {
+        for (const RoleName& role : *(userReq.roles)) {
             userRoles << BSON("role" << role.getRole() << "db" << role.getDB());
         }
         *result = BSON("_id" << userName.getUser() << "user" << userName.getUser() << "db"
-                             << userName.getDB()
-                             << "credentials"
-                             << BSON("external" << true)
-                             << "roles"
-                             << userRoles.arr());
+                             << userName.getDB() << "credentials" << BSON("external" << true)
+                             << "roles" << userRoles.arr());
     }
 
     BSONElement directRolesElement;
@@ -203,13 +201,13 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCt
 
 void AuthzManagerExternalStateLocal::resolveUserRoles(mutablebson::Document* userDoc,
                                                       const std::vector<RoleName>& directRoles) {
-    unordered_set<RoleName> indirectRoles;
+    stdx::unordered_set<RoleName> indirectRoles;
     PrivilegeVector allPrivileges;
     std::vector<SharedRestrictionDocument> allAuthenticationRestrictions;
     bool isRoleGraphConsistent = false;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_roleGraphMutex);
+        stdx::lock_guard<Latch> lk(_roleGraphMutex);
         isRoleGraphConsistent = _roleGraphState == roleGraphStateConsistent;
         for (const auto& role : directRoles) {
             indirectRoles.insert(role);
@@ -283,15 +281,14 @@ Status AuthzManagerExternalStateLocal::_getUserDocument(OperationContext* opCtx,
     Status status = findOne(opCtx,
                             AuthorizationManager::usersCollectionNamespace,
                             BSON(AuthorizationManager::USER_NAME_FIELD_NAME
-                                 << userName.getUser()
-                                 << AuthorizationManager::USER_DB_FIELD_NAME
+                                 << userName.getUser() << AuthorizationManager::USER_DB_FIELD_NAME
                                  << userName.getDB()),
                             userDoc);
 
     if (status == ErrorCodes::NoMatchingDocument) {
-        status =
-            Status(ErrorCodes::UserNotFound,
-                   mongoutils::str::stream() << "Could not find user " << userName.getFullName());
+        status = Status(ErrorCodes::UserNotFound,
+                        str::stream() << "Could not find user \"" << userName.getUser()
+                                      << "\" for db \"" << userName.getDB() << "\"");
     }
     return status;
 }
@@ -312,7 +309,7 @@ Status AuthzManagerExternalStateLocal::getRoleDescription(
         *result = resultDoc.getObject();
         return Status::OK();
     }
-    stdx::lock_guard<stdx::mutex> lk(_roleGraphMutex);
+    stdx::lock_guard<Latch> lk(_roleGraphMutex);
     return _getRoleDescription_inlock(roleName, showPrivileges, showRestrictions, result);
 }
 
@@ -332,7 +329,7 @@ Status AuthzManagerExternalStateLocal::getRolesDescription(
         return Status::OK();
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_roleGraphMutex);
+    stdx::lock_guard<Latch> lk(_roleGraphMutex);
     BSONArrayBuilder resultBuilder;
     for (const RoleName& role : roles) {
         BSONObj roleDoc;
@@ -437,7 +434,7 @@ Status AuthzManagerExternalStateLocal::_getRoleDescription_inlock(
 
 Status AuthzManagerExternalStateLocal::getRoleDescriptionsForDB(
     OperationContext* opCtx,
-    const std::string& dbname,
+    StringData dbname,
     PrivilegeFormat showPrivileges,
     AuthenticationRestrictionsFormat showRestrictions,
     bool showBuiltinRoles,
@@ -447,7 +444,7 @@ Status AuthzManagerExternalStateLocal::getRoleDescriptionsForDB(
                       "Cannot get user fragment for all roles in a database");
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_roleGraphMutex);
+    stdx::lock_guard<Latch> lk(_roleGraphMutex);
     for (RoleNameIterator it = _roleGraph.getRolesForDatabase(dbname); it.more(); it.next()) {
         if (!showBuiltinRoles && _roleGraph.isBuiltinRole(it.get())) {
             continue;
@@ -472,9 +469,11 @@ namespace {
 void addRoleFromDocumentOrWarn(RoleGraph* roleGraph, const BSONObj& doc) {
     Status status = roleGraph->addRoleFromDocument(doc);
     if (!status.isOK()) {
-        warning() << "Skipping invalid admin.system.roles document while calculating privileges"
-                     " for user-defined roles:  "
-                  << redact(status) << "; document " << redact(doc);
+        LOGV2_WARNING(23747,
+                      "Skipping invalid admin.system.roles document while calculating privileges"
+                      " for user-defined roles",
+                      "status"_attr = redact(status),
+                      "doc"_attr = redact(doc));
     }
 }
 
@@ -482,18 +481,18 @@ void addRoleFromDocumentOrWarn(RoleGraph* roleGraph, const BSONObj& doc) {
 }  // namespace
 
 Status AuthzManagerExternalStateLocal::_initializeRoleGraph(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lkInitialzeRoleGraph(_roleGraphMutex);
+    stdx::lock_guard<Latch> lkInitialzeRoleGraph(_roleGraphMutex);
 
     _roleGraphState = roleGraphStateInitial;
     _roleGraph = RoleGraph();
 
     RoleGraph newRoleGraph;
-    Status status =
-        query(opCtx,
-              AuthorizationManager::rolesCollectionNamespace,
-              BSONObj(),
-              BSONObj(),
-              stdx::bind(addRoleFromDocumentOrWarn, &newRoleGraph, stdx::placeholders::_1));
+    Status status = query(
+        opCtx,
+        AuthorizationManager::rolesCollectionNamespace,
+        BSONObj(),
+        BSONObj(),
+        [p = &newRoleGraph](const BSONObj& doc) { return addRoleFromDocumentOrWarn(p, doc); });
     if (!status.isOK())
         return status;
 
@@ -501,9 +500,10 @@ Status AuthzManagerExternalStateLocal::_initializeRoleGraph(OperationContext* op
 
     RoleGraphState newState;
     if (status == ErrorCodes::GraphContainsCycle) {
-        error() << "Inconsistent role graph during authorization manager initialization.  Only "
-                   "direct privileges available. "
-                << redact(status);
+        LOGV2_ERROR(23752,
+                    "Inconsistent role graph during authorization manager initialization. Only "
+                    "direct privileges available.",
+                    "status"_attr = redact(status));
         newState = roleGraphStateHasCycle;
         status = Status::OK();
     } else if (status.isOK()) {
@@ -524,73 +524,154 @@ public:
     // None of the parameters below (except opCtx and externalState) need to live longer than the
     // instantiations of this class
     AuthzManagerLogOpHandler(OperationContext* opCtx,
+                             AuthorizationManagerImpl* authzManager,
                              AuthzManagerExternalStateLocal* externalState,
                              const char* op,
                              const NamespaceString& nss,
                              const BSONObj& o,
                              const BSONObj* o2)
         : _opCtx(opCtx),
+          _authzManager(authzManager),
           _externalState(externalState),
           _op(op),
           _nss(nss),
           _o(o.getOwned()),
+          _o2(o2 ? boost::optional<BSONObj>(o2->getOwned()) : boost::none) {
 
-          _isO2Set(o2 ? true : false),
-          _o2(_isO2Set ? o2->getOwned() : BSONObj()) {}
+        _invalidateRelevantCacheData();
+    }
 
-    virtual void commit() {
-        stdx::lock_guard<stdx::mutex> lk(_externalState->_roleGraphMutex);
+    void commit(boost::optional<Timestamp> timestamp) final {
+        const bool isRolesColl = _nss == AuthorizationManager::rolesCollectionNamespace;
+        const bool isUsersColl = _nss == AuthorizationManager::usersCollectionNamespace;
+        const bool isAdminComm = _nss == AuthorizationManager::adminCommandNamespace;
+        if (isRolesColl || isAdminComm) {
+            _refreshRoleGraph();
+        }
+        if ((isRolesColl || isUsersColl) && (_op == "i")) {
+            _externalState->setHasAnyPrivilegeDocuments();
+        }
+    }
+
+    void rollback() final {}
+
+private:
+    // Updates to users in the oplog are done by matching on the _id, which will always have the
+    // form "<dbname>.<username>".  This function extracts the UserName from that string.
+    static StatusWith<UserName> extractUserNameFromIdString(StringData idstr) {
+        size_t splitPoint = idstr.find('.');
+        if (splitPoint == std::string::npos) {
+            return StatusWith<UserName>(ErrorCodes::FailedToParse,
+                                        str::stream()
+                                            << "_id entries for user documents must be of "
+                                               "the form <dbname>.<username>.  Found: "
+                                            << idstr);
+        }
+        return StatusWith<UserName>(
+            UserName(idstr.substr(splitPoint + 1), idstr.substr(0, splitPoint)));
+    }
+
+
+    void _refreshRoleGraph() {
+        stdx::lock_guard<Latch> lk(_externalState->_roleGraphMutex);
         Status status = _externalState->_roleGraph.handleLogOp(
-            _opCtx, _op.c_str(), _nss, _o, _isO2Set ? &_o2 : NULL);
+            _opCtx, _op.c_str(), _nss, _o, _o2 ? &*_o2 : nullptr);
 
         if (status == ErrorCodes::OplogOperationUnsupported) {
             _externalState->_roleGraph = RoleGraph();
             _externalState->_roleGraphState = _externalState->roleGraphStateInitial;
             BSONObjBuilder oplogEntryBuilder;
             oplogEntryBuilder << "op" << _op << "ns" << _nss.ns() << "o" << _o;
-            if (_isO2Set)
-                oplogEntryBuilder << "o2" << _o2;
-            error() << "Unsupported modification to roles collection in oplog; "
-                       "restart this process to reenable user-defined roles; "
-                    << redact(status) << "; Oplog entry: " << redact(oplogEntryBuilder.done());
+            if (_o2) {
+                oplogEntryBuilder << "o2" << *_o2;
+            }
+            LOGV2_ERROR(23753,
+                        "Unsupported modification to roles collection in oplog; "
+                        "restart this process to reenable user-defined roles",
+                        "status"_attr = redact(status),
+                        "entry"_attr = redact(oplogEntryBuilder.done()));
+            // If a setParameter is enabled, this condition is fatal.
+            fassert(51152, !roleGraphInvalidationIsFatal);
         } else if (!status.isOK()) {
-            warning() << "Skipping bad update to roles collection in oplog. " << redact(status)
-                      << " Oplog entry: " << redact(_op);
+            LOGV2_WARNING(23748,
+                          "Skipping bad update to roles collection in oplog",
+                          "status"_attr = redact(status),
+                          "op"_attr = redact(_op));
         }
         status = _externalState->_roleGraph.recomputePrivilegeData();
         if (status == ErrorCodes::GraphContainsCycle) {
             _externalState->_roleGraphState = _externalState->roleGraphStateHasCycle;
-            error() << "Inconsistent role graph during authorization manager initialization.  "
-                       "Only direct privileges available. "
-                    << redact(status) << " after applying oplog entry " << redact(_op);
+            LOGV2_ERROR(23754,
+                        "Inconsistent role graph during authorization manager initialization. "
+                        "Only direct privileges available after applying oplog entry",
+                        "status"_attr = redact(status),
+                        "op"_attr = redact(_op));
         } else {
             fassert(17183, status);
             _externalState->_roleGraphState = _externalState->roleGraphStateConsistent;
         }
     }
 
-    virtual void rollback() {}
+    void _invalidateRelevantCacheData() {
+        if (_nss == AuthorizationManager::rolesCollectionNamespace ||
+            _nss == AuthorizationManager::versionCollectionNamespace) {
+            _authzManager->invalidateUserCache(_opCtx);
+            return;
+        }
 
-private:
+        if (_op == "i" || _op == "d" || _op == "u") {
+            // If you got into this function isAuthzNamespace() must have returned true, and we've
+            // already checked that it's not the roles or version collection.
+            invariant(_nss == AuthorizationManager::usersCollectionNamespace);
+
+            StatusWith<UserName> userName = (_op == "u")
+                ? extractUserNameFromIdString((*_o2)["_id"].str())
+                : extractUserNameFromIdString(_o["_id"].str());
+
+            if (!userName.isOK()) {
+                LOGV2_WARNING(23749,
+                              "Invalidating user cache based on user being updated failed, will "
+                              "invalidate the entire cache instead",
+                              "user"_attr = userName.getStatus());
+                _authzManager->invalidateUserCache(_opCtx);
+                return;
+            }
+            _authzManager->invalidateUserByName(_opCtx, userName.getValue());
+        } else {
+            _authzManager->invalidateUserCache(_opCtx);
+        }
+    }
+
+
     OperationContext* _opCtx;
+    AuthorizationManagerImpl* _authzManager;
     AuthzManagerExternalStateLocal* _externalState;
     const std::string _op;
     const NamespaceString _nss;
     const BSONObj _o;
-
-    const bool _isO2Set;
-    const BSONObj _o2;
+    const boost::optional<BSONObj> _o2;
 };
 
 void AuthzManagerExternalStateLocal::logOp(OperationContext* opCtx,
+                                           AuthorizationManagerImpl* authzManager,
                                            const char* op,
                                            const NamespaceString& nss,
                                            const BSONObj& o,
                                            const BSONObj* o2) {
     if (nss == AuthorizationManager::rolesCollectionNamespace ||
+        nss == AuthorizationManager::versionCollectionNamespace ||
+        nss == AuthorizationManager::usersCollectionNamespace ||
         nss == AuthorizationManager::adminCommandNamespace) {
-        opCtx->recoveryUnit()->registerChange(
-            new AuthzManagerLogOpHandler(opCtx, this, op, nss, o, o2));
+
+        auto change =
+            std::make_unique<AuthzManagerLogOpHandler>(opCtx, authzManager, this, op, nss, o, o2);
+        // AuthzManagerExternalState's logOp method registers a RecoveryUnit::Change
+        // and to do so we need to have begun a UnitOfWork
+        WriteUnitOfWork wuow(opCtx);
+
+        opCtx->recoveryUnit()->registerChange(std::move(change));
+
+        wuow.commit();
     }
 }
 

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,10 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -98,7 +100,7 @@ TEST(EgressMetadataHookListTest, EmptyHookShouldNotFail) {
 
 TEST(EgressMetadataHookListTest, SingleHook) {
     ReadReplyArgs hook1Args;
-    auto hook1 = stdx::make_unique<TestHook>("h1", &hook1Args);
+    auto hook1 = std::make_unique<TestHook>("h1", &hook1Args);
     EgressMetadataHookList hookList;
     hookList.addHook(std::move(hook1));
 
@@ -117,12 +119,12 @@ TEST(EgressMetadataHookListTest, SingleHook) {
 
 TEST(EgressMetadataHookListTest, MultipleHooks) {
     ReadReplyArgs hook1Args;
-    auto hook1 = stdx::make_unique<TestHook>("foo", &hook1Args);
+    auto hook1 = std::make_unique<TestHook>("foo", &hook1Args);
     EgressMetadataHookList hookList;
     hookList.addHook(std::move(hook1));
 
     ReadReplyArgs hook2Args;
-    auto hook2 = stdx::make_unique<TestHook>("bar", &hook2Args);
+    auto hook2 = std::make_unique<TestHook>("bar", &hook2Args);
     hookList.addHook(std::move(hook2));
 
     BSONObjBuilder builder;
@@ -146,12 +148,12 @@ TEST(EgressMetadataHookListTest, MultipleHooks) {
 
 TEST(EgressMetadataHookListTest, SingleBadHookShouldReturnError) {
     ReadReplyArgs hook1Args;
-    auto hook1 = stdx::make_unique<TestHook>("foo", &hook1Args);
+    auto hook1 = std::make_unique<TestHook>("foo", &hook1Args);
     EgressMetadataHookList hookList;
     hookList.addHook(std::move(hook1));
 
     Status err{ErrorCodes::IllegalOperation, "intentional error by test"};
-    auto hook2 = stdx::make_unique<FixedStatusTestHook>(err);
+    auto hook2 = std::make_unique<FixedStatusTestHook>(err);
     hookList.addHook(std::move(hook2));
 
     BSONObjBuilder builder;

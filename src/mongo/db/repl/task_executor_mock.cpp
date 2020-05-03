@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,32 +38,49 @@ TaskExecutorMock::TaskExecutorMock(executor::TaskExecutor* executor)
     : unittest::TaskExecutorProxy(executor) {}
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWork(
-    const CallbackFn& work) {
+    CallbackFn&& work) {
     if (shouldFailScheduleWorkRequest()) {
         return Status(ErrorCodes::OperationFailed, "failed to schedule work");
     }
     if (shouldDeferScheduleWorkRequestByOneSecond()) {
         auto when = now() + Seconds(1);
-        return getExecutor()->scheduleWorkAt(when, work);
+        return getExecutor()->scheduleWorkAt(when, std::move(work));
     }
-    return getExecutor()->scheduleWork(work);
+    return getExecutor()->scheduleWork(std::move(work));
 }
 
 StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleWorkAt(
-    Date_t when, const CallbackFn& work) {
+    Date_t when, CallbackFn&& work) {
     if (shouldFailScheduleWorkAtRequest()) {
         return Status(ErrorCodes::OperationFailed,
                       str::stream() << "failed to schedule work at " << when.toString());
     }
-    return getExecutor()->scheduleWorkAt(when, work);
+    return getExecutor()->scheduleWorkAt(when, std::move(work));
 }
 
-StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleRemoteCommand(
-    const executor::RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) {
+StatusWith<executor::TaskExecutor::CallbackHandle> TaskExecutorMock::scheduleRemoteCommandOnAny(
+    const executor::RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
+    const BatonHandle& baton) {
     if (shouldFailScheduleRemoteCommandRequest(request)) {
         return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
     }
-    return getExecutor()->scheduleRemoteCommand(request, cb);
+    return getExecutor()->scheduleRemoteCommandOnAny(request, cb, baton);
+}
+
+StatusWith<executor::TaskExecutor::CallbackHandle>
+TaskExecutorMock::scheduleExhaustRemoteCommandOnAny(
+    const executor::RemoteCommandRequestOnAny& request,
+    const RemoteCommandOnAnyCallbackFn& cb,
+    const BatonHandle& baton) {
+    if (shouldFailScheduleRemoteCommandRequest(request)) {
+        return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
+    }
+    return getExecutor()->scheduleExhaustRemoteCommandOnAny(request, cb, baton);
+}
+
+bool TaskExecutorMock::hasTasks() {
+    return getExecutor()->hasTasks();
 }
 
 }  // namespace repl

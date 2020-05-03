@@ -1,47 +1,42 @@
-// distinct.cpp
-
 /**
-*    Copyright (C) 2012-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -51,6 +46,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
@@ -59,39 +55,53 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+namespace {
 
-using std::unique_ptr;
-using std::string;
-using std::stringstream;
-
-namespace dps = ::mongo::dotted_path_support;
+namespace dps = dotted_path_support;
 
 class DistinctCommand : public BasicCommand {
 public:
     DistinctCommand() : BasicCommand("distinct") {}
 
-    virtual bool slaveOk() const {
+    std::string help() const override {
+        return "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
+
+    bool maintenanceOk() const override {
         return false;
     }
 
-    virtual bool slaveOverrideOk() const {
-        return true;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool canIgnorePrepareConflicts() const override {
         return true;
     }
 
-    ReadWriteType getReadWriteType() const {
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
+    }
+
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
@@ -99,38 +109,47 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-    }
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
-    virtual void help(stringstream& help) const {
-        help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
-    }
-
-    virtual Status explain(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-
-        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true);
-        if (!parsedDistinct.isOK()) {
-            return parsedDistinct.getStatus();
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        const auto hasTerm = false;
+        return authSession->checkAuthForFind(
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            hasTerm);
+    }
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& request,
+                   ExplainOptions::Verbosity verbosity,
+                   rpc::ReplyBuilderInterface* result) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        // Acquire locks. The RAII object is optional, because in the case of a view, the locks
+        // need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto nss = ctx->getNss();
 
-            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        auto defaultCollator =
+            ctx->getCollection() ? ctx->getCollection()->getDefaultCollator() : nullptr;
+        auto parsedDistinct = uassertStatusOK(
+            ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true, defaultCollator));
+
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
+
+            auto viewAggregation = parsedDistinct.asAggregationCommand();
             if (!viewAggregation.isOK()) {
                 return viewAggregation.getStatus();
             }
@@ -141,64 +160,78 @@ public:
                 return viewAggRequest.getStatus();
             }
 
-            return runAggregate(
-                opCtx, nss, viewAggRequest.getValue(), viewAggregation.getValue(), *out);
+            // An empty PrivilegeVector is acceptable because these privileges are only checked on
+            // getMore and explain will not open a cursor.
+            return runAggregate(opCtx,
+                                nss,
+                                viewAggRequest.getValue(),
+                                viewAggregation.getValue(),
+                                PrivilegeVector(),
+                                result);
         }
 
-        auto executor = getExecutorDistinct(
-            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
-        if (!executor.isOK()) {
-            return executor.getStatus();
-        }
+        Collection* const collection = ctx->getCollection();
 
-        Explain::explainStages(executor.getValue().get(), collection, verbosity, out);
+        auto executor = uassertStatusOK(
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
+
+        auto bodyBuilder = result->getBodyBuilder();
+        Explain::explainStages(executor.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+             BSONObjBuilder& result) override {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto& nss = ctx->getNss();
+
+        // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
+        // collections in multi-document transactions.
+        uassert(
+            ErrorCodes::OperationNotSupportedInTransaction,
+            "Cannot run 'distinct' on a sharded collection in a multi-document transaction. "
+            "Please see http://dochub.mongodb.org/core/transaction-distinct for a recommended "
+            "alternative.",
+            !opCtx->inMultiDocumentTransaction() ||
+                !CollectionShardingState::get(opCtx, nss)->getCollectionDescription().isSharded());
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false);
-        if (!parsedDistinct.isOK()) {
-            return appendCommandStatus(result, parsedDistinct.getStatus());
-        }
+        auto defaultCollation =
+            ctx->getCollection() ? ctx->getCollection()->getDefaultCollator() : nullptr;
+        auto parsedDistinct = uassertStatusOK(
+            ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false, defaultCollation));
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        // Check whether we are allowed to read from this node after acquiring our locks.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassertStatusOK(replCoord->checkCanServeReadsFor(
+            opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
 
-            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
-            if (!viewAggregation.isOK()) {
-                return appendCommandStatus(result, viewAggregation.getStatus());
-            }
+            auto viewAggregation = parsedDistinct.asAggregationCommand();
+            uassertStatusOK(viewAggregation.getStatus());
 
-            BSONObj aggResult = Command::runCommandDirectly(
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
-
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
-                result.appendElements(aggResult);
-                return false;
-            }
-
-            ViewResponseFormatter formatter(aggResult);
-            Status formatStatus = formatter.appendAsDistinctResponse(&result);
-            if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
-            }
+            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsDistinctResponse(&result));
             return true;
         }
 
-        auto executor = getExecutorDistinct(
-            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
-        if (!executor.isOK()) {
-            return appendCommandStatus(result, executor.getStatus());
-        }
+        Collection* const collection = ctx->getCollection();
+
+        auto executor =
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct);
+        uassertStatusOK(executor.getStatus());
 
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -206,18 +239,16 @@ public:
                 Explain::getPlanSummary(executor.getValue().get()));
         }
 
-        string key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
+        const auto key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
 
-        int bufSize = BSONObjMaxUserSize - 4096;
-        BufBuilder bb(bufSize);
-        char* start = bb.buf();
-
-        BSONArrayBuilder arr(bb);
+        std::vector<BSONObj> distinctValueHolder;
         BSONElementSet values(executor.getValue()->getCanonicalQuery()->getCollator());
 
+        const int kMaxResponseSize = BSONObjMaxUserSize - 4096;
+        size_t listApproxBytes = 0;
         BSONObj obj;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = executor.getValue()->getNext(&obj, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = executor.getValue()->getNext(&obj, nullptr))) {
             // Distinct expands arrays.
             //
             // If our query is covered, each value of the key should be in the index key and
@@ -231,29 +262,34 @@ public:
                 if (values.count(elt)) {
                     continue;
                 }
-                int currentBufPos = bb.len();
 
-                uassert(17217,
-                        "distinct too big, 16mb cap",
-                        (currentBufPos + elt.size() + 1024) < bufSize);
+                // This is an approximate size check which safeguards against use of unbounded
+                // memory by the distinct command. We perform a more precise check at the end of
+                // this method to confirm that the response size is less than 16MB.
+                listApproxBytes += elt.size();
+                uassert(17217, "distinct too big, 16mb cap", listApproxBytes < kMaxResponseSize);
 
-                arr.append(elt);
-                BSONElement x(start + currentBufPos);
-                values.insert(x);
+                auto distinctObj = elt.wrap();
+                values.insert(distinctObj.firstElement());
+                distinctValueHolder.push_back(std::move(distinctObj));
             }
         }
 
         // Return an error if execution fails for any reason.
-        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            log() << "Plan executor error during distinct command: "
-                  << redact(PlanExecutor::statestr(state))
-                  << ", stats: " << redact(Explain::getWinningPlanStats(executor.getValue().get()));
+        if (PlanExecutor::FAILURE == state) {
+            // We should always have a valid status member object at this point.
+            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            invariant(!status.isOK());
+            LOGV2_WARNING(
+                23797,
+                "Plan executor error during distinct command: {PlanExecutor_statestr_state}, "
+                "status: {status}, stats: {Explain_getWinningPlanStats_executor_getValue_get}",
+                "PlanExecutor_statestr_state"_attr = redact(PlanExecutor::statestr(state)),
+                "status"_attr = status,
+                "Explain_getWinningPlanStats_executor_getValue_get"_attr =
+                    redact(Explain::getWinningPlanStats(executor.getValue().get())));
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during distinct command: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
+            uassertStatusOK(status.withContext("Executor error during distinct command"));
         }
 
 
@@ -263,7 +299,7 @@ public:
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, stats.indexesUsed);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, stats);
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 
@@ -273,12 +309,37 @@ public:
             curOp->debug().execStats = execStatsBob.obj();
         }
 
-        verify(start == bb.buf());
+        BSONArrayBuilder valueListBuilder(result.subarrayStart("values"));
+        for (const auto& value : values) {
+            valueListBuilder.append(value);
+        }
+        valueListBuilder.doneFast();
 
-        result.appendArray("values", arr.done());
+        if (repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+            result.append("atClusterTime"_sd,
+                          repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()->asTimestamp());
+        }
 
+        uassert(31299, "distinct too big, 16mb cap", result.len() < kMaxResponseSize);
         return true;
     }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+            keyBob.append("distinct", 1);
+            keyBob.append("key", 1);
+            keyBob.append("query", 1);
+            keyBob.append("collation", 1);
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
+    }
+
+
 } distinctCmd;
 
+}  // namespace
 }  // namespace mongo

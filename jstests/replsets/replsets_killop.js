@@ -17,9 +17,11 @@ assert.soon(function() {
 });
 
 // Start a parallel shell to insert new documents on the primary.
-inserter = startParallelShell('var bulk = db.test.initializeUnorderedBulkOp(); \
-     for( i = 1; i < ' + numDocs +
-                              '; ++i ) { \
+inserter = startParallelShell(
+    'var bulk = db.test.initializeUnorderedBulkOp(); \
+     for( i = 1; i < ' +
+    numDocs +
+    '; ++i ) { \
          bulk.insert({ a: i });  \
      } \
      bulk.execute();');
@@ -68,3 +70,4 @@ function allReplicated() {
 
 // Wait for the correct number of (replicated) documents to be present on the secondary.
 assert.soon(allReplicated, "didn't replicate all docs", 5 * 60 * 1000);
+replTest.stopSet();

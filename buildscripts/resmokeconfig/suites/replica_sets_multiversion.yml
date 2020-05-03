@@ -1,0 +1,16 @@
+test_kind: js_test
+
+selector:
+  roots:
+  - jstests/replsets/*.js
+  exclude_with_any_tags:
+  - multiversion_incompatible
+  - requires_fcv_46
+executor:
+  config:
+    shell_options:
+      nodb: ''
+      readMode: commands
+      global_vars:
+        TestData:
+          useRandomBinVersionsWithinReplicaSet: true

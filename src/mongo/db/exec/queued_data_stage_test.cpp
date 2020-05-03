@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,12 +34,12 @@
 #include "mongo/db/exec/queued_data_stage.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -47,32 +48,23 @@ using namespace mongo;
 namespace {
 
 using std::unique_ptr;
-using stdx::make_unique;
 
-class QueuedDataStageTest : public unittest::Test {
+const static NamespaceString kNss("db.dummy");
+
+class QueuedDataStageTest : public ServiceContextMongoDTest {
 public:
     QueuedDataStageTest() {
-        _service = stdx::make_unique<ServiceContextNoop>();
-        _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
-        _client = _service->makeClient("test");
-        _opCtxNoop = _client->makeOperationContext();
-        _opCtx = _opCtxNoop.get();
+        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+        _opCtx = makeOperationContext();
     }
 
 protected:
-    OperationContext* getOpCtx() {
-        return _opCtx;
+    OperationContext* opCtx() {
+        return _opCtx.get();
     }
 
 private:
-    OperationContext* _opCtx;
-
-    // Members of a class are destroyed in reverse order of declaration.
-    // The UniqueClient must be destroyed before the ServiceContextNoop is destroyed.
-    // The OperationContextNoop must be destroyed before the UniqueClient is destroyed.
-    std::unique_ptr<ServiceContextNoop> _service;
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtxNoop;
+    ServiceContext::UniqueOperationContext _opCtx;
 };
 
 //
@@ -80,7 +72,8 @@ private:
 //
 TEST_F(QueuedDataStageTest, getValidStats) {
     WorkingSet ws;
-    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
+    auto mock = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
     const CommonStats* commonStats = mock->getCommonStats();
     ASSERT_EQUALS(commonStats->works, static_cast<size_t>(0));
     const SpecificStats* specificStats = mock->getSpecificStats();
@@ -95,13 +88,13 @@ TEST_F(QueuedDataStageTest, getValidStats) {
 TEST_F(QueuedDataStageTest, validateStats) {
     WorkingSet ws;
     WorkingSetID wsID;
-    auto mock = make_unique<QueuedDataStage>(getOpCtx(), &ws);
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
+    auto mock = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
 
     // make sure that we're at all zero
     const CommonStats* stats = mock->getCommonStats();
     ASSERT_EQUALS(stats->yields, 0U);
     ASSERT_EQUALS(stats->unyields, 0U);
-    ASSERT_EQUALS(stats->invalidates, 0U);
     ASSERT_EQUALS(stats->works, 0U);
     ASSERT_EQUALS(stats->needTime, 0U);
     ASSERT_EQUALS(stats->advanced, 0U);
@@ -129,14 +122,10 @@ TEST_F(QueuedDataStageTest, validateStats) {
     mock->restoreState();
     ASSERT_EQUALS(stats->unyields, 1U);
 
-    // invalidates
-    const RecordId dl(0, 0);
-    mock->invalidate(NULL, dl, INVALIDATION_MUTATION);
-    ASSERT_EQUALS(stats->invalidates, 1U);
 
     // and now we are d1U, but must trigger EOF with getStats()
     ASSERT_FALSE(stats->isEOF);
     unique_ptr<PlanStageStats> allStats(mock->getStats());
     ASSERT_TRUE(stats->isEOF);
 }
-}
+}  // namespace

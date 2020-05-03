@@ -1,30 +1,33 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -36,30 +39,42 @@
 #include "mongo/base/init.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/config.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
+
+#include "mongo/logv2/log.h"
+#include <memory>
+
+namespace mongo {
+
+/**
+ * Generates a new file name on each call using a static, atomic and monotonically increasing
+ * number.
+ *
+ * Each user of the Sorter must implement this function to ensure that all temporary files that the
+ * Sorter instances produce are uniquely identified using a unique file name extension with separate
+ * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
+ * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
+ */
+std::string nextFileName() {
+    static AtomicWord<unsigned> sorterTestFileCounter;
+    return "extsort-sorter-test." + std::to_string(sorterTestFileCounter.fetchAndAdd(1));
+}
+
+}  // namespace mongo
 
 // Need access to internal classes
 #include "mongo/db/sorter/sorter.cpp"
 
 namespace mongo {
+
 using namespace mongo::sorter;
 using std::make_shared;
 using std::pair;
-
-namespace {
-
-// Stub to avoid including the server environment library.
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
-    return Status::OK();
-}
-}  // namespace
 
 //
 // Sorter framework testing utilities
@@ -115,6 +130,8 @@ class IntIterator : public IWIterator {
 public:
     IntIterator(int start = 0, int stop = INT_MAX, int increment = 1)
         : _current(start), _increment(increment), _stop(stop) {}
+    void openSource() {}
+    void closeSource() {}
     bool more() {
         if (_increment == 0)
             return true;
@@ -136,6 +153,8 @@ private:
 
 class EmptyIterator : public IWIterator {
 public:
+    void openSource() {}
+    void closeSource() {}
     bool more() {
         return false;
     }
@@ -150,6 +169,9 @@ public:
         : _remaining(limit), _source(source) {
         verify(limit > 0);
     }
+
+    void openSource() {}
+    void closeSource() {}
 
     bool more() {
         return _remaining && _source->more();
@@ -169,6 +191,8 @@ template <typename It1, typename It2>
 void _assertIteratorsEquivalent(It1 it1, It2 it2, int line) {
     int iteration;
     try {
+        it1->openSource();
+        it2->openSource();
         for (iteration = 0; true; iteration++) {
             ASSERT_EQUALS(it1->more(), it2->more());
             ASSERT_EQUALS(it1->more(), it2->more());  // make sure more() is safe to call twice
@@ -180,10 +204,15 @@ void _assertIteratorsEquivalent(It1 it1, It2 it2, int line) {
             ASSERT_EQUALS(pair1.first, pair2.first);
             ASSERT_EQUALS(pair1.second, pair2.second);
         }
-
+        it1->closeSource();
+        it2->closeSource();
     } catch (...) {
-        mongo::unittest::log() << "Failure from line " << line << " on iteration " << iteration
-                               << std::endl;
+        LOGV2(22047,
+              "Failure from line {line} on iteration {iteration}",
+              "line"_attr = line,
+              "iteration"_attr = iteration);
+        it1->closeSource();
+        it2->closeSource();
         throw;
     }
 }
@@ -201,10 +230,11 @@ template <typename IteratorPtr, int N>
 std::shared_ptr<IWIterator> mergeIterators(IteratorPtr (&array)[N],
                                            Direction Dir = ASC,
                                            const SortOptions& opts = SortOptions()) {
+    invariant(!opts.extSortAllowed);
     std::vector<std::shared_ptr<IWIterator>> vec;
     for (int i = 0; i < N; i++)
         vec.push_back(std::shared_ptr<IWIterator>(array[i]));
-    return std::shared_ptr<IWIterator>(IWIterator::merge(vec, opts, IWComparator(Dir)));
+    return std::shared_ptr<IWIterator>(IWIterator::merge(vec, "", opts, IWComparator(Dir)));
 }
 
 //
@@ -231,6 +261,8 @@ public:
             class UnsortedIter : public IWIterator {
             public:
                 UnsortedIter() : _pos(0) {}
+                void openSource() {}
+                void closeSource() {}
                 bool more() {
                     return _pos < sizeof(unsorted) / sizeof(unsorted[0]);
                 }
@@ -248,13 +280,14 @@ public:
     }
 };
 
-class SortedFileWriterAndFileIteratorTests {
+class SortedFileWriterAndFileIteratorTests : public ScopedGlobalServiceContextForTest {
 public:
     void run() {
         unittest::TempDir tempDir("sortedFileWriterTests");
         const SortOptions opts = SortOptions().TempDir(tempDir.path());
         {  // small
-            SortedFileWriter<IntWrapper, IntWrapper> sorter(opts);
+            std::string fileName = opts.tempDir + "/" + nextFileName();
+            SortedFileWriter<IntWrapper, IntWrapper> sorter(opts, fileName, 0);
             sorter.addAlreadySorted(0, 0);
             sorter.addAlreadySorted(1, -1);
             sorter.addAlreadySorted(2, -2);
@@ -262,14 +295,19 @@ public:
             sorter.addAlreadySorted(4, -4);
             ASSERT_ITERATORS_EQUIVALENT(std::shared_ptr<IWIterator>(sorter.done()),
                                         make_shared<IntIterator>(0, 5));
+
+            ASSERT_TRUE(boost::filesystem::remove(fileName));
         }
         {  // big
-            SortedFileWriter<IntWrapper, IntWrapper> sorter(opts);
+            std::string fileName = opts.tempDir + "/" + nextFileName();
+            SortedFileWriter<IntWrapper, IntWrapper> sorter(opts, fileName, 0);
             for (int i = 0; i < 10 * 1000 * 1000; i++)
                 sorter.addAlreadySorted(i, -i);
 
             ASSERT_ITERATORS_EQUIVALENT(std::shared_ptr<IWIterator>(sorter.done()),
                                         make_shared<IntIterator>(0, 10 * 1000 * 1000));
+
+            ASSERT_TRUE(boost::filesystem::remove(fileName));
         }
 
         ASSERT(boost::filesystem::is_empty(tempDir.path()));
@@ -283,7 +321,7 @@ public:
         {  // test empty (no inputs)
             std::vector<std::shared_ptr<IWIterator>> vec;
             std::shared_ptr<IWIterator> mergeIter(
-                IWIterator::merge(vec, SortOptions(), IWComparator()));
+                IWIterator::merge(vec, "", SortOptions(), IWComparator()));
             ASSERT_ITERATORS_EQUIVALENT(mergeIter, make_shared<EmptyIterator>());
         }
         {  // test empty (only empty inputs)
@@ -334,7 +372,7 @@ public:
 };
 
 namespace SorterTests {
-class Basic {
+class Basic : public ScopedGlobalServiceContextForTest {
 public:
     virtual ~Basic() {}
 
@@ -431,10 +469,10 @@ private:
 };
 
 class Limit : public Basic {
-    virtual SortOptions adjustSortOptions(SortOptions opts) {
+    SortOptions adjustSortOptions(SortOptions opts) override {
         return opts.Limit(5);
     }
-    void addData(unowned_ptr<IWSorter> sorter) {
+    void addData(unowned_ptr<IWSorter> sorter) override {
         sorter->add(0, 0);
         sorter->add(3, -3);
         sorter->add(4, -4);
@@ -442,11 +480,18 @@ class Limit : public Basic {
         sorter->add(1, -1);
         sorter->add(-1, 1);
     }
-    virtual std::shared_ptr<IWIterator> correct() {
+    std::shared_ptr<IWIterator> correct() override {
         return make_shared<IntIterator>(-1, 4);
     }
-    virtual std::shared_ptr<IWIterator> correctReverse() {
+    std::shared_ptr<IWIterator> correctReverse() override {
         return make_shared<IntIterator>(4, -1, -1);
+    }
+};
+
+template <uint64_t Limit>
+class LimitExtreme : public Basic {
+    SortOptions adjustSortOptions(SortOptions opts) override {
+        return opts.Limit(Limit);
     }
 };
 
@@ -463,11 +508,11 @@ class Dupes : public Basic {
         sorter->add(2, -2);
         sorter->add(3, -3);
     }
-    virtual std::shared_ptr<IWIterator> correct() {
+    std::shared_ptr<IWIterator> correct() override {
         const int array[] = {-1, -1, -1, 0, 1, 1, 1, 2, 2, 3};
         return makeInMemIterator(array);
     }
-    virtual std::shared_ptr<IWIterator> correctReverse() {
+    std::shared_ptr<IWIterator> correctReverse() override {
         const int array[] = {3, 2, 2, 1, 1, 1, 0, -1, -1, -1};
         return makeInMemIterator(array);
     }
@@ -476,15 +521,15 @@ class Dupes : public Basic {
 template <bool Random = true>
 class LotsOfDataLittleMemory : public Basic {
 public:
-    LotsOfDataLittleMemory() : _array(new int[NUM_ITEMS]) {
+    LotsOfDataLittleMemory() : _array(new int[NUM_ITEMS]), _random(int64_t(time(nullptr))) {
         for (int i = 0; i < NUM_ITEMS; i++)
             _array[i] = i;
 
         if (Random)
-            std::random_shuffle(_array.get(), _array.get() + NUM_ITEMS);
+            std::shuffle(_array.get(), _array.get() + NUM_ITEMS, _random.urbg());
     }
 
-    SortOptions adjustSortOptions(SortOptions opts) {
+    SortOptions adjustSortOptions(SortOptions opts) override {
         // Make sure we use a reasonable number of files when we spill
         MONGO_STATIC_ASSERT((NUM_ITEMS * sizeof(IWPair)) / MEM_LIMIT > 50);
         MONGO_STATIC_ASSERT((NUM_ITEMS * sizeof(IWPair)) / MEM_LIMIT < 500);
@@ -492,21 +537,15 @@ public:
         return opts.MaxMemoryUsageBytes(MEM_LIMIT).ExtSortAllowed();
     }
 
-    void addData(unowned_ptr<IWSorter> sorter) {
+    void addData(unowned_ptr<IWSorter> sorter) override {
         for (int i = 0; i < NUM_ITEMS; i++)
             sorter->add(_array[i], -_array[i]);
-
-        if (typeid(*this) == typeid(LotsOfDataLittleMemory)) {
-            // don't do this check in subclasses since they may set a limit
-            ASSERT_GREATER_THAN_OR_EQUALS(static_cast<size_t>(sorter->numFiles()),
-                                          (NUM_ITEMS * sizeof(IWPair)) / MEM_LIMIT);
-        }
     }
 
-    virtual std::shared_ptr<IWIterator> correct() {
+    std::shared_ptr<IWIterator> correct() override {
         return make_shared<IntIterator>(0, NUM_ITEMS);
     }
-    virtual std::shared_ptr<IWIterator> correctReverse() {
+    std::shared_ptr<IWIterator> correctReverse() override {
         return make_shared<IntIterator>(NUM_ITEMS - 1, -1, -1);
     }
 
@@ -515,6 +554,7 @@ public:
         MEM_LIMIT = 64 * 1024,
     };
     std::unique_ptr<int[]> _array;
+    PseudoRandom _random;
 };
 
 
@@ -533,21 +573,24 @@ class LotsOfDataWithLimit : public LotsOfDataLittleMemory<Random> {
 
         return opts.MaxMemoryUsageBytes(MEM_LIMIT).ExtSortAllowed().Limit(Limit);
     }
-    virtual std::shared_ptr<IWIterator> correct() {
+    std::shared_ptr<IWIterator> correct() override {
         return make_shared<LimitIterator>(Limit, Parent::correct());
     }
-    virtual std::shared_ptr<IWIterator> correctReverse() {
+    std::shared_ptr<IWIterator> correctReverse() override {
         return make_shared<LimitIterator>(Limit, Parent::correctReverse());
     }
     enum { MEM_LIMIT = 32 * 1024 };
 };
-}
+}  // namespace SorterTests
 
-class SorterSuite : public mongo::unittest::Suite {
+class SorterSuite : public mongo::unittest::OldStyleSuiteSpecification {
 public:
-    SorterSuite() : Suite("sorter") {}
+    SorterSuite() : mongo::unittest::OldStyleSuiteSpecification("sorter") {}
 
-    void setupTests() {
+    template <typename T>
+    static constexpr uint64_t kMaxAsU64 = std::numeric_limits<T>::max();
+
+    void setupTests() override {
         add<InMemIterTests>();
         add<SortedFileWriterAndFileIteratorTests>();
         add<MergeIteratorTests>();
@@ -562,8 +605,24 @@ public:
         add<SorterTests::LotsOfDataWithLimit<100, /*random=*/true>>();    // fits in mem
         add<SorterTests::LotsOfDataWithLimit<5000, /*random=*/false>>();  // spills
         add<SorterTests::LotsOfDataWithLimit<5000, /*random=*/true>>();   // spills
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint32_t>>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint32_t> - 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint32_t> + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint32_t> / 8 + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int32_t>>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int32_t> - 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int32_t> + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int32_t> / 8 + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint64_t>>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint64_t> - 1>>();
+        add<SorterTests::LimitExtreme<0>>();  // kMaxAsU64<uint64_t> + 1
+        add<SorterTests::LimitExtreme<kMaxAsU64<uint64_t> / 8 + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int64_t>>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> - 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> + 1>>();
+        add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> / 8 + 1>>();
     }
 };
 
-mongo::unittest::SuiteInstance<SorterSuite> extSortTests;
-}
+mongo::unittest::OldStyleSuiteInitializer<SorterSuite> extSortTests;
+}  // namespace mongo

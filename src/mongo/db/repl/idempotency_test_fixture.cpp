@@ -1,23 +1,24 @@
 /**
- *    Copyright 2017 (C) MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +36,8 @@
 #include <vector>
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -44,21 +46,26 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_applier_impl.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/util/md5.hpp"
 
 namespace mongo {
 namespace repl {
+
 
 /**
  * Compares BSON objects (BSONObj) in two sets of BSON objects (BSONObjSet) to see if the two
@@ -157,93 +164,12 @@ std::ostream& operator<<(std::ostream& stream, const CollectionState& state) {
     return stream << state.toString();
 }
 
-StringBuilderImpl<SharedBufferAllocator>& operator<<(StringBuilderImpl<SharedBufferAllocator>& sb,
-                                                     const CollectionState& state) {
+StringBuilder& operator<<(StringBuilder& sb, const CollectionState& state) {
     return sb << state.toString();
 }
 
 const auto kCollectionDoesNotExist = CollectionState();
 
-/**
- * Creates a command oplog entry with given optime and namespace.
- */
-OplogEntry makeCommandOplogEntry(OpTime opTime,
-                                 const NamespaceString& nss,
-                                 const BSONObj& command) {
-    return OplogEntry(opTime, 1LL, OpTypeEnum::kCommand, nss.getCommandNS(), 2, command);
-}
-
-/**
- * Creates a create collection oplog entry with given optime.
- */
-OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
-                                          const NamespaceString& nss,
-                                          const BSONObj& options) {
-    BSONObjBuilder bob;
-    bob.append("create", nss.coll());
-    bob.appendElements(options);
-    return makeCommandOplogEntry(opTime, nss, bob.obj());
-}
-
-/**
- * Creates an insert oplog entry with given optime and namespace.
- */
-OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToInsert) {
-    return OplogEntry(opTime, 1LL, OpTypeEnum::kInsert, nss, documentToInsert);
-}
-
-/**
- * Creates an update oplog entry with given optime and namespace.
- */
-OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToUpdate,
-                                        const BSONObj& updatedDocument) {
-    return OplogEntry(opTime, 1LL, OpTypeEnum::kUpdate, nss, updatedDocument, documentToUpdate);
-}
-
-/**
- * Creates an index creation entry with given optime and namespace.
- */
-OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
-                                     const NamespaceString& nss,
-                                     const std::string& indexName,
-                                     const BSONObj& keyPattern) {
-    BSONObjBuilder indexInfoBob;
-    indexInfoBob.append("v", 2);
-    indexInfoBob.append("key", keyPattern);
-    indexInfoBob.append("name", indexName);
-    indexInfoBob.append("ns", nss.ns());
-    return makeInsertDocumentOplogEntry(
-        opTime, NamespaceString(nss.getSystemIndexesCollection()), indexInfoBob.obj());
-}
-
-void appendSessionTransactionInfo(OplogEntry& entry,
-                                  LogicalSessionId lsid,
-                                  TxnNumber txnNum,
-                                  StmtId stmtId) {
-    auto info = entry.getOperationSessionInfo();
-    info.setSessionId(lsid);
-    info.setTxnNumber(txnNum);
-    entry.setOperationSessionInfo(std::move(info));
-    entry.setStatementId(stmtId);
-}
-
-Status IdempotencyTest::runOp(const OplogEntry& op) {
-    return runOps({op});
-}
-
-Status IdempotencyTest::runOps(std::vector<OplogEntry> ops) {
-    SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
-    MultiApplier::OperationPtrs opsPtrs;
-    for (auto& op : ops) {
-        opsPtrs.push_back(&op);
-    }
-    AtomicUInt32 fetchCount(0);
-    return multiInitialSyncApply_noAbort(_opCtx.get(), &opsPtrs, &syncTail, &fetchCount);
-}
 
 Status IdempotencyTest::resetState() {
     return Status::OK();
@@ -251,37 +177,41 @@ Status IdempotencyTest::resetState() {
 
 void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, SequenceType sequenceType) {
     ASSERT_OK(resetState());
-    ASSERT_OK(runOps(ops));
-    auto state1 = validate();
-    auto iterations = sequenceType == SequenceType::kEntireSequence ? 1 : ops.size();
 
+    ASSERT_OK(runOpsInitialSync(ops));
+
+    auto state1 = validateAllCollections();
+    auto iterations = sequenceType == SequenceType::kEntireSequence ? 1 : ops.size();
     for (std::size_t i = 0; i < iterations; i++) {
-        ASSERT_OK(resetState());
+        // Since the end state after each iteration is expected to be the same as the start state,
+        // we don't drop and re-create the collections. Dropping and re-creating the collections
+        // won't work either because we don't have ways to wait until second-phase drop to
+        // completely finish.
         std::vector<OplogEntry> fullSequence;
 
         if (sequenceType == SequenceType::kEntireSequence) {
-            ASSERT_OK(runOps(ops));
+            ASSERT_OK(runOpsInitialSync(ops));
             fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
         } else if (sequenceType == SequenceType::kAnyPrefix ||
                    sequenceType == SequenceType::kAnyPrefixOrSuffix) {
             std::vector<OplogEntry> prefix(ops.begin(), ops.begin() + i + 1);
-            ASSERT_OK(runOps(prefix));
+            ASSERT_OK(runOpsInitialSync(prefix));
             fullSequence.insert(fullSequence.end(), prefix.begin(), prefix.end());
         }
 
-        ASSERT_OK(runOps(ops));
+        ASSERT_OK(runOpsInitialSync(ops));
         fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
 
         if (sequenceType == SequenceType::kAnySuffix ||
             sequenceType == SequenceType::kAnyPrefixOrSuffix) {
             std::vector<OplogEntry> suffix(ops.begin() + i, ops.end());
-            ASSERT_OK(runOps(suffix));
+            ASSERT_OK(runOpsInitialSync(suffix));
             fullSequence.insert(fullSequence.end(), suffix.begin(), suffix.end());
         }
 
-        auto state2 = validate();
+        auto state2 = validateAllCollections();
         if (state1 != state2) {
-            FAIL(getStateString(state1, state2, fullSequence));
+            FAIL(getStatesString(state1, state2, fullSequence));
         }
     }
 }
@@ -303,23 +233,99 @@ OplogEntry IdempotencyTest::update(IdType _id, const BSONObj& obj) {
     return makeUpdateDocumentOplogEntry(nextOpTime(), nss, BSON("_id" << _id), obj);
 }
 
-OplogEntry IdempotencyTest::buildIndex(const BSONObj& indexSpec, const BSONObj& options) {
+OplogEntry IdempotencyTest::buildIndex(const BSONObj& indexSpec,
+                                       const BSONObj& options,
+                                       const UUID& uuid) {
     BSONObjBuilder bob;
+    bob.append("createIndexes", nss.coll());
     bob.append("v", 2);
     bob.append("key", indexSpec);
     bob.append("name", std::string(indexSpec.firstElementFieldName()) + "_index");
-    bob.append("ns", nss.ns());
     bob.appendElementsUnique(options);
-    return makeInsertDocumentOplogEntry(nextOpTime(), nssIndex, bob.obj());
+    return makeCommandOplogEntry(nextOpTime(), nss, bob.obj(), uuid);
 }
 
-OplogEntry IdempotencyTest::dropIndex(const std::string& indexName) {
-    auto cmd = BSON("deleteIndexes" << nss.coll() << "index" << indexName);
-    return makeCommandOplogEntry(nextOpTime(), nss, cmd);
+OplogEntry IdempotencyTest::dropIndex(const std::string& indexName, const UUID& uuid) {
+    auto cmd = BSON("dropIndexes" << nss.coll() << "index" << indexName);
+    return makeCommandOplogEntry(nextOpTime(), nss, cmd, uuid);
+}
+
+OplogEntry IdempotencyTest::prepare(LogicalSessionId lsid,
+                                    TxnNumber txnNum,
+                                    StmtId stmtId,
+                                    const BSONArray& ops,
+                                    OpTime prevOpTime) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+    return makeOplogEntry(nextOpTime(),
+                          OpTypeEnum::kCommand,
+                          nss.getCommandNS(),
+                          BSON("applyOps" << ops << "prepare" << true),
+                          boost::none /* o2 */,
+                          info /* sessionInfo */,
+                          Date_t::min() /* wallClockTime -- required but not checked */,
+                          stmtId,
+                          boost::none /* uuid */,
+                          prevOpTime);
+}
+
+OplogEntry IdempotencyTest::commitUnprepared(LogicalSessionId lsid,
+                                             TxnNumber txnNum,
+                                             StmtId stmtId,
+                                             const BSONArray& ops,
+                                             OpTime prevOpTime) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+    return makeCommandOplogEntryWithSessionInfoAndStmtId(
+        nextOpTime(), nss, BSON("applyOps" << ops), lsid, txnNum, stmtId, prevOpTime);
+}
+
+OplogEntry IdempotencyTest::commitPrepared(LogicalSessionId lsid,
+                                           TxnNumber txnNum,
+                                           StmtId stmtId,
+                                           OpTime prepareOpTime) {
+    return makeCommandOplogEntryWithSessionInfoAndStmtId(
+        nextOpTime(),
+        nss,
+        BSON("commitTransaction" << 1 << "commitTimestamp" << prepareOpTime.getTimestamp()),
+        lsid,
+        txnNum,
+        stmtId,
+        prepareOpTime);
+}
+
+OplogEntry IdempotencyTest::abortPrepared(LogicalSessionId lsid,
+                                          TxnNumber txnNum,
+                                          StmtId stmtId,
+                                          OpTime prepareOpTime) {
+    return makeCommandOplogEntryWithSessionInfoAndStmtId(
+        nextOpTime(), nss, BSON("abortTransaction" << 1), lsid, txnNum, stmtId, prepareOpTime);
+}
+
+OplogEntry IdempotencyTest::partialTxn(LogicalSessionId lsid,
+                                       TxnNumber txnNum,
+                                       StmtId stmtId,
+                                       OpTime prevOpTime,
+                                       const BSONArray& ops) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+    return makeOplogEntry(nextOpTime(),
+                          OpTypeEnum::kCommand,
+                          nss.getCommandNS(),
+                          BSON("applyOps" << ops << "partialTxn" << true),
+                          boost::none /* o2 */,
+                          info /* sessionInfo */,
+                          Date_t::min() /* wallClockTime -- required but not checked */,
+                          stmtId,
+                          boost::none /* uuid */,
+                          prevOpTime);
 }
 
 std::string IdempotencyTest::computeDataHash(Collection* collection) {
-    IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(_opCtx.get());
+    auto desc = collection->getIndexCatalog()->findIdIndex(_opCtx.get());
     ASSERT_TRUE(desc);
     auto exec = InternalPlanner::indexScan(_opCtx.get(),
                                            collection,
@@ -330,13 +336,13 @@ std::string IdempotencyTest::computeDataHash(Collection* collection) {
                                            PlanExecutor::NO_YIELD,
                                            InternalPlanner::FORWARD,
                                            InternalPlanner::IXSCAN_FETCH);
-    ASSERT(NULL != exec.get());
+    ASSERT(nullptr != exec.get());
     md5_state_t st;
     md5_init(&st);
 
     PlanExecutor::ExecState state;
     BSONObj obj;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
         obj = this->canonicalizeDocumentForDataHash(obj);
         md5_append(&st, (const md5_byte_t*)obj.objdata(), obj.objsize());
     }
@@ -346,33 +352,80 @@ std::string IdempotencyTest::computeDataHash(Collection* collection) {
     return digestToString(d);
 }
 
-CollectionState IdempotencyTest::validate() {
+std::vector<CollectionState> IdempotencyTest::validateAllCollections() {
+    std::vector<CollectionState> collStates;
+    auto& catalog = CollectionCatalog::get(_opCtx.get());
+    auto dbs = catalog.getAllDbNames();
+    for (auto& db : dbs) {
+        // Skip local database.
+        if (db != "local") {
+            std::vector<NamespaceString> collectionNames;
+            {
+                Lock::DBLock lk(_opCtx.get(), db, MODE_S);
+                collectionNames = catalog.getAllCollectionNamesFromDb(_opCtx.get(), db);
+            }
+            for (const auto& nss : collectionNames) {
+                collStates.push_back(validate(nss));
+            }
+        }
+    }
+    return collStates;
+}
+
+CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
+    auto collUUID = [&]() -> OptionalCollectionUUID {
+        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
+        if (auto collection = autoColl.getCollection()) {
+            return collection->uuid();
+        }
+        return boost::none;
+    }();
+
+    if (collUUID) {
+        // Allow in-progress indexes to complete before validating collection contents.
+        IndexBuildsCoordinator::get(_opCtx.get())
+            ->awaitNoIndexBuildInProgressForCollection(_opCtx.get(), collUUID.get());
+    }
+
+    {
+        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
+        auto collection = autoColl.getCollection();
+
+        if (!collection) {
+            // Return a mostly default initialized CollectionState struct with exists set to false
+            // to indicate an unfound Collection (or a view).
+            return kCollectionDoesNotExist;
+        }
+    }
+
+    {
+        ValidateResults validateResults;
+        BSONObjBuilder bob;
+
+        ASSERT_OK(
+            CollectionValidation::validate(_opCtx.get(),
+                                           nss,
+                                           CollectionValidation::ValidateOptions::kFullValidation,
+                                           false,
+                                           &validateResults,
+                                           &bob));
+        ASSERT_TRUE(validateResults.valid);
+    }
+
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
     auto collection = autoColl.getCollection();
 
-    if (!collection) {
-        // Return a mostly default initialized CollectionState struct with exists set to false to
-        // indicate an unfound Collection (or a view).
-        return kCollectionDoesNotExist;
-    }
-    ValidateResults validateResults;
-    BSONObjBuilder bob;
-
-    Lock::DBLock lk(_opCtx.get(), nss.db(), MODE_IX);
-    auto lock = stdx::make_unique<Lock::CollectionLock>(_opCtx->lockState(), nss.ns(), MODE_X);
-    ASSERT_OK(collection->validate(
-        _opCtx.get(), kValidateFull, false, std::move(lock), &validateResults, &bob));
-    ASSERT_TRUE(validateResults.valid);
-
     std::string dataHash = computeDataHash(collection);
 
-    auto collectionCatalog = collection->getCatalogEntry();
-    auto collectionOptions = collectionCatalog->getCollectionOptions(_opCtx.get());
+    auto durableCatalog = DurableCatalog::get(_opCtx.get());
+    auto collectionOptions =
+        durableCatalog->getCollectionOptions(_opCtx.get(), collection->getCatalogId());
     std::vector<std::string> allIndexes;
     BSONObjSet indexSpecs = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    collectionCatalog->getAllIndexes(_opCtx.get(), &allIndexes);
+    durableCatalog->getAllIndexes(_opCtx.get(), collection->getCatalogId(), &allIndexes);
     for (auto const& index : allIndexes) {
-        indexSpecs.insert(collectionCatalog->getIndexSpec(_opCtx.get(), index));
+        indexSpecs.insert(
+            durableCatalog->getIndexSpec(_opCtx.get(), collection->getCatalogId(), index));
     }
     ASSERT_EQUALS(indexSpecs.size(), allIndexes.size());
 
@@ -381,17 +434,33 @@ CollectionState IdempotencyTest::validate() {
     return collectionState;
 }
 
-std::string IdempotencyTest::getStateString(const CollectionState& state1,
-                                            const CollectionState& state2,
-                                            const std::vector<OplogEntry>& ops) {
+std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
+                                             const std::vector<CollectionState>& state2,
+                                             const std::vector<OplogEntry>& ops) {
     StringBuilder sb;
-    sb << "The state: " << state1 << " does not match with the state: " << state2
-       << " found after applying the operations a second time, therefore breaking idempotency.";
+    sb << "The states:\n";
+    for (const auto& s : state1) {
+        sb << s << "\n";
+    }
+    sb << "do not match with the states:\n";
+    for (const auto& s : state2) {
+        sb << s << "\n";
+    }
+    sb << "found after applying the operations a second time, therefore breaking idempotency.\n";
+    sb << "Applied ops:\n";
+    for (const auto& op : ops) {
+        sb << op.toString() << "\n";
+    }
     return sb.str();
 }
 
 template OplogEntry IdempotencyTest::update<int>(int _id, const BSONObj& obj);
 template OplogEntry IdempotencyTest::update<const char*>(char const* _id, const BSONObj& obj);
 
+BSONObj makeInsertApplyOpsEntry(const NamespaceString& nss, const UUID& uuid, const BSONObj& doc) {
+    return BSON("op"
+                << "i"
+                << "ns" << nss.toString() << "ui" << uuid << "o" << doc);
+}
 }  // namespace repl
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,12 +35,18 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/ops/modifier_interface.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/update/modifier_table.h"
+#include "mongo/db/update/object_replace_executor.h"
+#include "mongo/db/update/pipeline_executor.h"
+#include "mongo/db/update/update_node_visitor.h"
 #include "mongo/db/update/update_object_node.h"
+#include "mongo/db/update/update_tree_executor.h"
 #include "mongo/db/update_index_data.h"
 
 namespace mongo {
@@ -49,30 +56,18 @@ class OperationContext;
 
 class UpdateDriver {
 public:
-    struct Options;
-    UpdateDriver(const Options& opts);
+    enum class UpdateType { kOperator, kReplacement, kPipeline };
 
-    ~UpdateDriver();
+    UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Parses the 'updateExpr' update expression. When parsing with the kUpdateNode update
-     * semantics, 'updateExpr' is parsed into the '_root' member variable, and when parsing with the
-     * kModifierInterface update semantics, 'updateExpr' is parsed into the '_mods' member variable.
-     * It is important that the secondary applies updates with the same semantics that the primary
-     * used.
-     *   - The primary can add a "$v" field with an integer value (storing on UpdateSemantics enum
-     *     value) that this function will use to determine which update semantics to use.
-     *   - When applying an oplog entry that has no "$v" field, this function assumes
-     *     kModifierInterface semantics.
-     *   - When applying an update on the primary, this function uses the feature compatibility
-     *     version to determine which update semantics to use.
-     * Uasserts if the featureCompatibilityVersion is 3.4 and 'arrayFilters' is non-empty. Uasserts
-     * or returns a non-ok status if 'updateExpr' fails to parse.
+     * Parses the 'updateExpr' update expression into the '_updateExecutor' member variable.
+     * Uasserts if 'updateExpr' fails to parse.
      */
-    Status parse(
-        const BSONObj& updateExpr,
-        const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
-        const bool multi = false);
+    void parse(const write_ops::UpdateModification& updateExpr,
+               const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
+               boost::optional<BSONObj> constants = boost::none,
+               const bool multi = false);
 
     /**
      * Fills in document with any fields in the query which are valid.
@@ -98,12 +93,6 @@ public:
                                            mutablebson::Document& doc) const;
 
     /**
-     * return a BSONObj with the _id field of the doc passed in, or the doc itself.
-     * If no _id and multi, error.
-     */
-    BSONObj makeOplogEntryQuery(const BSONObj& doc, bool multi) const;
-
-    /**
      * Executes the update over 'doc'. If any modifier is positional, use 'matchedField' (index of
      * the array item matched). If 'doc' allows the modifiers to be applied in place and no index
      * updating is involved, then the modifiers may be applied "in place" over 'doc'.
@@ -114,36 +103,74 @@ public:
      *
      * If 'validateForStorage' is true, ensures that modified elements do not violate depth or DBRef
      * constraints. Ensures that no paths in 'immutablePaths' are modified (though they may be
-     * created, if they do not yet exist). The original document 'original' is needed for checking
-     * immutable paths for the ModifierInterface implementation.
+     * created, if they do not yet exist).
+     *
+     * The value of 'isInsert' controls whether $setOnInsert modifiers get applied.
+     *
+     * If 'modifiedPaths' is not null, this method will populate it with the set of paths that were
+     * either modified at runtime or present statically in the update modifiers. For arrays, the
+     * set will include only the path to the array if the length has changed. All paths encode array
+     * indexes explicitly.
+     *
+     * The caller must either provide a null pointer, or a non-null pointer to an empty field ref
+     * set.
      */
     Status update(StringData matchedField,
-                  BSONObj original,
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,
+                  bool isInsert,
                   BSONObj* logOpRec = nullptr,
-                  bool* docWasModified = nullptr);
+                  bool* docWasModified = nullptr,
+                  FieldRefSetWithStorage* modifiedPaths = nullptr);
+
+    /**
+     * Passes the visitor through to the root of the update tree. The visitor is responsible for
+     * implementing methods that operate on the nodes of the tree.
+     */
+    void visitRoot(UpdateNodeVisitor* visitor) {
+        if (_updateType == UpdateType::kOperator) {
+            UpdateTreeExecutor* exec = static_cast<UpdateTreeExecutor*>(_updateExecutor.get());
+            invariant(exec);
+            return exec->getUpdateTree()->acceptVisitor(visitor);
+        }
+
+        MONGO_UNREACHABLE;
+    }
+
+    UpdateExecutor* getUpdateExecutor() {
+        return _updateExecutor.get();
+    }
 
     //
     // Accessors
     //
 
-    size_t numMods() const;
+    UpdateType type() const {
+        return _updateType;
+    }
 
-    bool isDocReplacement() const;
+    static bool isDocReplacement(const write_ops::UpdateModification& updateMod);
 
-    bool modsAffectIndices() const;
-    void refreshIndexKeys(const UpdateIndexData* indexedFields);
+    bool modsAffectIndices() const {
+        return _affectIndices;
+    }
+    void refreshIndexKeys(const UpdateIndexData* indexedFields) {
+        _indexedFields = indexedFields;
+    }
 
-    bool logOp() const;
-    void setLogOp(bool logOp);
+    bool logOp() const {
+        return _logOp;
+    }
+    void setLogOp(bool logOp) {
+        _logOp = logOp;
+    }
 
-    ModifierInterface::Options modOptions() const;
-    void setModOptions(ModifierInterface::Options modOpts);
-
-    void setInsert(bool insert) {
-        _insert = insert;
+    bool fromOplogApplication() const {
+        return _fromOplogApplication;
+    }
+    void setFromOplogApplication(bool fromOplogApplication) {
+        _fromOplogApplication = fromOplogApplication;
     }
 
     mutablebson::Document& getDocument() {
@@ -159,6 +186,14 @@ public:
     }
 
     /**
+     * Serialize the update expression to Value. Output of this method is expected to, when parsed,
+     * produce a logically equivalent update expression.
+     */
+    Value serialize() const {
+        return _updateExecutor->serialize();
+    }
+
+    /**
      * Set the collator which will be used by all of the UpdateDriver's underlying modifiers.
      *
      * 'collator' must outlive the UpdateDriver.
@@ -166,9 +201,6 @@ public:
     void setCollator(const CollatorInterface* collator);
 
 private:
-    /** Resets the state of the class associated with mods (not the error state) */
-    void clear();
-
     /** Create the modifier and add it to the back of the modifiers vector */
     inline Status addAndParse(const modifiertable::ModifierType type, const BSONElement& elem);
 
@@ -176,55 +208,40 @@ private:
     // immutable properties after parsing
     //
 
-    // Is there a list of $mod's on '_mods' or is it just full object replacement?
-    bool _replacementMode;
+    UpdateType _updateType = UpdateType::kOperator;
 
-    // The root of the UpdateNode tree. If the featureCompatibilityVersion is 3.6, the update
-    // expression is parsed into '_root'.
-    std::unique_ptr<UpdateNode> _root;
-
-    // Collection of update mod instances. Owned here. If the featureCompatibilityVersion is 3.4,
-    // the update expression is parsed into '_mods'.
-    std::vector<ModifierInterface*> _mods;
+    std::unique_ptr<UpdateExecutor> _updateExecutor;
 
     // What are the list of fields in the collection over which the update is going to be
     // applied that participate in indices?
     //
     // NOTE: Owned by the collection's info cache!.
-    const UpdateIndexData* _indexedFields;
+    const UpdateIndexData* _indexedFields = nullptr;
 
     //
     // mutable properties after parsing
     //
 
     // Should this driver generate an oplog record when it applies the update?
-    bool _logOp;
+    bool _logOp = false;
 
-    // The options to initiate the mods with
-    ModifierInterface::Options _modOptions;
+    // True if this update comes from an oplog application.
+    bool _fromOplogApplication = false;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     // Are any of the fields mentioned in the mods participating in any index? Is set anew
     // at each call to update.
-    bool _affectIndices;
+    bool _affectIndices = false;
 
     // Do any of the mods require positional match details when calling 'prepare'?
-    bool _positional;
-
-    // Is this update going to be an upsert?
-    bool _insert = false;
+    bool _positional = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;
 
     // The document used to build the oplog entry for the update.
     mutablebson::Document _logDoc;
-};
-
-struct UpdateDriver::Options {
-    bool logOp;
-    ModifierInterface::Options modOptions;
-
-    Options() : logOp(false), modOptions() {}
 };
 
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,18 +30,22 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/message_compressor_base.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
+#include "mongo/transport/service_executor_task_names.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_mode.h"
+#include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
 
@@ -65,9 +70,11 @@ public:
      */
     static std::shared_ptr<ServiceStateMachine> create(ServiceContext* svcContext,
                                                        transport::SessionHandle session,
-                                                       bool sync);
+                                                       transport::Mode transportMode);
 
-    ServiceStateMachine(ServiceContext* svcContext, transport::SessionHandle session, bool sync);
+    ServiceStateMachine(ServiceContext* svcContext,
+                        transport::SessionHandle session,
+                        transport::Mode transportMode);
 
     /*
      * Any state may transition to EndSession in case of an error, otherwise the valid state
@@ -88,6 +95,18 @@ public:
     };
 
     /*
+     * When start() is called with Ownership::kOwned, the SSM will swap the Client/thread name
+     * whenever it runs a stage of the state machine, and then unswap them out when leaving the SSM.
+     *
+     * With Ownership::kStatic, it will assume that the SSM will only ever be run from one thread,
+     * and that thread will not be used for other SSM's. It will swap in the Client/thread name
+     * for the first run and leave them in place.
+     *
+     * kUnowned is used internally to mark that the SSM is inactive.
+     */
+    enum class Ownership { kUnowned, kOwned, kStatic };
+
+    /*
      * runNext() will run the current state of the state machine. It also handles all the error
      * handling and state management for requests.
      *
@@ -101,14 +120,18 @@ public:
     void runNext();
 
     /*
-     * scheduleNext() schedules a call to runNext() in the future. This will be implemented with
-     * an async TransportLayer.
+     * start() schedules a call to runNext() in the future.
      *
      * It is guaranteed to unwind the stack, and not call runNext() recursively, but is not
-     * guaranteed that runNext() will run after this returns.
+     * guaranteed that runNext() will run after this return
      */
-    void scheduleNext(
-        transport::ServiceExecutor::ScheduleFlags flags = transport::ServiceExecutor::EmptyFlags);
+    void start(Ownership ownershipModel);
+
+    /*
+     * Set the executor to be used for the next call to runNext(). This allows switching between
+     * thread models after the SSM has started.
+     */
+    void setServiceExecutor(transport::ServiceExecutor* executor);
 
     /*
      * Gets the current state of connection for testing/diagnostic purposes.
@@ -116,7 +139,16 @@ public:
     State state();
 
     /*
+     * Terminates the associated transport Session, regardless of tags.
+     *
+     * This will not block on the session terminating cleaning itself up, it returns immediately.
+     */
+    void terminate();
+
+    /*
      * Terminates the associated transport Session if its tags don't match the supplied tags.
+     * If the session is in a pending state, before any tags have been set, it will not be
+     * terminated.
      *
      * This will not block on the session terminating cleaning itself up, it returns immediately.
      */
@@ -125,7 +157,7 @@ public:
     /*
      * Sets a function to be called after the session is ended
      */
-    void setCleanupHook(stdx::function<void()> hook);
+    void setCleanupHook(std::function<void()> hook);
 
 private:
     /*
@@ -135,26 +167,22 @@ private:
     friend class ThreadGuard;
 
     /*
-     * This and scheduleFunc() are helper functions to schedule tasks on the serviceExecutor
-     * while maintaining a shared_ptr copy to anchor the lifetime of the SSM while waiting for
-     * callbacks to run.
+     * Terminates the associated transport Session if status indicate error.
+     *
+     * This will not block on the session terminating cleaning itself up, it returns immediately.
      */
-    template <typename Executor, typename Func>
-    void _maybeScheduleFunc(Executor* svcExec,
-                            Func&& func,
-                            transport::ServiceExecutor::ScheduleFlags flags) {
-        if (svcExec) {
-            uassertStatusOK(svcExec->schedule(
-                [ func = std::move(func), anchor = shared_from_this() ] { func(); }, flags));
-        }
-    }
+    void _terminateAndLogIfError(Status status);
 
-    template <typename Func>
-    void _scheduleFunc(Func&& func, transport::ServiceExecutor::ScheduleFlags flags) {
-        auto svcExec = _serviceContext->getServiceExecutor();
-        invariant(svcExec);
-        _maybeScheduleFunc(svcExec, func, flags);
-    }
+    /*
+     * This is a helper function to schedule tasks on the serviceExecutor maintaining a shared_ptr
+     * copy to anchor the lifetime of the SSM while waiting for callbacks to run.
+     *
+     * If scheduling the function fails, the SSM will be terminated and cleaned up immediately
+     */
+    void _scheduleNextWithGuard(ThreadGuard guard,
+                                transport::ServiceExecutor::ScheduleFlags flags,
+                                transport::ServiceExecutorTaskName taskName,
+                                Ownership ownershipModel = Ownership::kOwned);
 
     /*
      * Gets the transport::Session associated with this connection
@@ -167,13 +195,13 @@ private:
      * runNext() and already own a ThreadGuard, they should call this with that guard as the
      * argument.
      */
-    void _runNextInGuard(ThreadGuard& guard);
+    void _runNextInGuard(ThreadGuard guard);
 
     /*
      * This function actually calls into the database and processes a request. It's broken out
      * into its own inline function for better readability.
      */
-    inline void _processMessage(ThreadGuard& guard);
+    inline void _processMessage(ThreadGuard guard);
 
     /*
      * These get called by the TransportLayer when requested network I/O has completed.
@@ -182,30 +210,45 @@ private:
     void _sinkCallback(Status status);
 
     /*
+     * Source/Sink message from the TransportLayer. These will invalidate the ThreadGuard just
+     * before waiting on the TL.
+     */
+    void _sourceMessage(ThreadGuard guard);
+    void _sinkMessage(ThreadGuard guard, Message toSink);
+
+    /*
      * Releases all the resources associated with the session and call the cleanupHook.
      */
-    void _cleanupSession(ThreadGuard& guard);
+    void _cleanupSession(ThreadGuard guard);
+
+    /*
+     * Releases all the resources associated with the exhaust request.
+     */
+    void _cleanupExhaustResources() noexcept;
 
     AtomicWord<State> _state{State::Created};
 
     ServiceEntryPoint* _sep;
-    bool _sync;
+    transport::Mode _transportMode;
 
     ServiceContext* const _serviceContext;
+    transport::ServiceExecutor* _serviceExecutor;
 
     transport::SessionHandle _sessionHandle;
+    const std::string _threadName;
     ServiceContext::UniqueClient _dbClient;
     const Client* _dbClientPtr;
-    const std::string _threadName;
-    stdx::function<void()> _cleanupHook;
+    std::function<void()> _cleanupHook;
 
     bool _inExhaust = false;
     boost::optional<MessageCompressorId> _compressorId;
     Message _inMessage;
-    int64_t _counter = 0;
 
-    AtomicWord<stdx::thread::id> _currentOwningThread;
-    std::atomic_flag _isOwned = ATOMIC_FLAG_INIT;  // NOLINT
+    AtomicWord<Ownership> _owned{Ownership::kUnowned};
+#if MONGO_CONFIG_DEBUG_BUILD
+    AtomicWord<stdx::thread::id> _owningThread;
+#endif
+    std::string _oldThreadName;
 };
 
 template <typename T>

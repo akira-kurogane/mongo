@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -38,12 +38,6 @@ from wtscenario import make_scenarios
 def timestamp_str(t):
     return '%x' % t
 
-def timestamp_ret_str(t):
-    s = timestamp_str(t)
-    if len(s) % 2 == 1:
-        s = '0' + s
-    return s
-
 class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
     tablename = 'test_timestamp02'
     uri = 'table:' + tablename
@@ -55,6 +49,7 @@ class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
     ])
 
     conn_config = 'log=(enabled)'
+    session_config = 'isolation=snapshot'
 
     # Check that a cursor (optionally started in a new transaction), sees the
     # expected values.
@@ -63,24 +58,21 @@ class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
             session.begin_transaction(txn_config)
         c = session.open_cursor(self.uri, None)
         actual = dict((k, v) for k, v in c if v != 0)
-        self.assertEqual(actual, expected)
+        self.assertTrue(actual == expected)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(c[k], v, "for key " + str(k))
         c.close()
         if txn_config:
             session.commit_transaction()
 
     def test_basic(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         self.session.create(self.uri,
             'key_format=i,value_format=i' + self.extra_config)
         c = self.session.open_cursor(self.uri)
 
         # Insert keys 1..100 each with timestamp=key, in some order
-        orig_keys = range(1, 101)
+        orig_keys = list(range(1, 101))
         keys = orig_keys[:]
         random.shuffle(keys)
 
@@ -98,7 +90,7 @@ class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
                 dict((k, 1) for k in orig_keys[:i+1]))
 
         # Everything up to and including timestamp 100 has been committed.
-        self.assertEqual(self.conn.query_timestamp(), timestamp_ret_str(100))
+        self.assertTimestampsEqual(self.conn.query_timestamp(), timestamp_str(100))
 
         # Bump the oldest timestamp, we're not going back...
         self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(100))
@@ -111,11 +103,11 @@ class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
             self.session.commit_transaction('commit_timestamp=' + timestamp_str(k + 100))
 
         # Everything up to and including timestamp 200 has been committed.
-        self.assertEqual(self.conn.query_timestamp(), timestamp_ret_str(200))
+        self.assertTimestampsEqual(self.conn.query_timestamp(), timestamp_str(200))
 
         # Test that we can manually move the commit timestamp back
         self.conn.set_timestamp('commit_timestamp=' + timestamp_str(150))
-        self.assertEqual(self.conn.query_timestamp(), timestamp_ret_str(150))
+        self.assertTimestampsEqual(self.conn.query_timestamp(), timestamp_str(150))
         self.conn.set_timestamp('commit_timestamp=' + timestamp_str(200))
 
         # Now the stable timestamp before we read.
@@ -140,6 +132,21 @@ class test_timestamp02(wttest.WiredTigerTestCase, suite_subprocess):
         for i, t in enumerate(orig_keys):
             self.check(self.session, 'read_timestamp=' + timestamp_str(t + 200),
                 dict((k, 2) for k in orig_keys[i+1:]))
+
+    def test_read_your_writes(self):
+        self.session.create(self.uri,
+            'key_format=i,value_format=i' + self.extra_config)
+        c = self.session.open_cursor(self.uri)
+
+        k = 10
+        c[k] = 0
+
+        self.session.begin_transaction('read_timestamp=10')
+        self.session.timestamp_transaction('commit_timestamp=20')
+        c[k] = 1
+        # We should see the value we just inserted
+        self.assertEqual(c[k], 1)
+        self.session.commit_transaction()
 
 if __name__ == '__main__':
     wttest.run()

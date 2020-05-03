@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,13 +33,14 @@
 
 #include "mongo/db/commands/index_filter_commands.h"
 
+#include <memory>
+
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
@@ -103,17 +105,17 @@ vector<BSONObj> getFilters(const QuerySettings& querySettings) {
 /**
  * Utility function to create a PlanRankingDecision
  */
-PlanRankingDecision* createDecision(size_t numPlans) {
+std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans) {
     unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
+        auto stats = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
         stats->specific.reset(new CollectionScanStats());
         why->stats.push_back(std::move(stats));
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
-    return why.release();
+    return why;
 }
 
 /**
@@ -126,7 +128,7 @@ void addQueryShapeToPlanCache(OperationContext* opCtx,
                               const char* projectionStr,
                               const char* collationStr) {
     // Create canonical query.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projectionStr));
@@ -140,55 +142,53 @@ void addQueryShapeToPlanCache(OperationContext* opCtx,
     qs.cacheData->tree.reset(new PlanCacheIndexTree());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    ASSERT_OK(planCache->add(*cq, solns, createDecision(1U)));
+    ASSERT_OK(planCache->set(*cq,
+                             solns,
+                             createDecision(1U),
+                             opCtx->getServiceContext()->getPreciseClockSource()->now()));
 }
 
 /**
  * Checks if plan cache contains query shape.
  */
-bool planCacheContains(const PlanCache& planCache,
+bool planCacheContains(OperationContext* opCtx,
+                       const PlanCache& planCache,
                        const char* queryStr,
                        const char* sortStr,
                        const char* projectionStr,
                        const char* collationStr) {
-    QueryTestServiceContext serviceContext;
-    auto opCtx = serviceContext.makeOperationContext();
 
     // Create canonical query.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto qr = std::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projectionStr));
     qr->setCollation(fromjson(collationStr));
-    auto statusWithInputQuery = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+    auto statusWithInputQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
     ASSERT_OK(statusWithInputQuery.getStatus());
     unique_ptr<CanonicalQuery> inputQuery = std::move(statusWithInputQuery.getValue());
 
     // Retrieve cache entries from plan cache.
-    vector<PlanCacheEntry*> entries = planCache.getAllEntries();
+    auto entries = planCache.getAllEntries();
 
     // Search keys.
     bool found = false;
-    for (vector<PlanCacheEntry*>::const_iterator i = entries.begin(); i != entries.end(); i++) {
-        PlanCacheEntry* entry = *i;
-
+    for (auto&& entry : entries) {
         // Canonicalizing query shape in cache entry to get cache key.
         // Alternatively, we could add key to PlanCacheEntry but that would be used in one place
         // only.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(entry->query);
         qr->setSort(entry->sort);
         qr->setProj(entry->projection);
         qr->setCollation(entry->collation);
-        auto statusWithCurrentQuery = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+        auto statusWithCurrentQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         ASSERT_OK(statusWithCurrentQuery.getStatus());
         unique_ptr<CanonicalQuery> currentQuery = std::move(statusWithCurrentQuery.getValue());
 
         if (planCache.computeKey(*currentQuery) == planCache.computeKey(*inputQuery)) {
             found = true;
         }
-        // Release resources for cache entry after extracting key.
-        delete entry;
     }
     return found;
 }
@@ -330,8 +330,12 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
                              "{a: -1}",
                              "{_id: 0, a: 1}",
                              "{locale: 'mock_reverse_string'}");
-    ASSERT_TRUE(planCacheContains(
-        planCache, "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}", "{locale: 'mock_reverse_string'}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(),
+                                  planCache,
+                                  "{a: 1, b: 1}",
+                                  "{a: -1}",
+                                  "{_id: 0, a: 1}",
+                                  "{locale: 'mock_reverse_string'}"));
 
     ASSERT_OK(SetFilter::set(opCtx.get(),
                              &querySettings,
@@ -344,8 +348,12 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
     ASSERT_EQUALS(filters.size(), 1U);
 
     // Query shape should not exist in plan cache after hint is updated.
-    ASSERT_FALSE(planCacheContains(
-        planCache, "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}", "{locale: 'mock_reverse_string'}"));
+    ASSERT_FALSE(planCacheContains(opCtx.get(),
+                                   planCache,
+                                   "{a: 1, b: 1}",
+                                   "{a: -1}",
+                                   "{_id: 0, a: 1}",
+                                   "{locale: 'mock_reverse_string'}"));
 
     // Fields in filter should match criteria in most recent query settings update.
     ASSERT_BSONOBJ_EQ(filters[0].getObjectField("query"), fromjson("{a: 1, b: 1}"));
@@ -400,8 +408,8 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
     ASSERT_EQUALS(filters.size(), 2U);
 
     // Query shape should not exist in plan cache after cleaing 1 hint.
-    ASSERT_FALSE(planCacheContains(planCache, "{a: 1}", "{}", "{}", "{}"));
-    ASSERT_TRUE(planCacheContains(planCache, "{b: 1}", "{}", "{}", "{}"));
+    ASSERT_FALSE(planCacheContains(opCtx.get(), planCache, "{a: 1}", "{}", "{}", "{}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{b: 1}", "{}", "{}", "{}"));
 
     // Clear all filters
     ASSERT_OK(
@@ -410,7 +418,7 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
     ASSERT_TRUE(filters.empty());
 
     // {b: 1} should be gone from plan cache after flushing query settings.
-    ASSERT_FALSE(planCacheContains(planCache, "{b: 1}", "{}", "{}", "{}"));
+    ASSERT_FALSE(planCacheContains(opCtx.get(), planCache, "{b: 1}", "{}", "{}", "{}"));
 }
 
 TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
@@ -420,16 +428,20 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
 
     // Create a plan cache. Add an index so that indexability is included in the plan cache keys.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "index_name", NULL, BSONObj())});
+    const auto keyPattern = fromjson("{a: 1}");
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       true,                                     // sparse
+                       IndexEntry::Identifier{"index_name"})});  // name
 
     // Inject query shapes with and without collation into plan cache.
     addQueryShapeToPlanCache(
         opCtx.get(), &planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}");
     addQueryShapeToPlanCache(opCtx.get(), &planCache, "{a: 'foo'}", "{}", "{}", "{}");
-    ASSERT_TRUE(
-        planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
-    ASSERT_TRUE(planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{}"));
+    ASSERT_TRUE(planCacheContains(
+        opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{}"));
 
     ASSERT_OK(SetFilter::set(opCtx.get(),
                              &querySettings,
@@ -446,10 +458,11 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
     ASSERT_EQUALS(StringData(filters[0].getObjectField("collation").getStringField("locale")),
                   "mock_reverse_string");
 
-    // Plan cache should only contain entry for query without collation.
-    ASSERT_FALSE(
-        planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
-    ASSERT_TRUE(planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{}"));
+    // Setting a filter will remove the cache entry associated with the query so now the plan cache
+    // should only contain the entry for the query without collation.
+    ASSERT_FALSE(planCacheContains(
+        opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{}"));
 
     // Add filter for query shape without collation.
     ASSERT_OK(SetFilter::set(opCtx.get(),
@@ -480,28 +493,34 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
     ASSERT_BSONOBJ_EQ(filters[0].getObjectField("collation"), fromjson("{}"));
 
     // Plan cache should only contain entry for query without collation.
-    ASSERT_FALSE(
-        planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
-    ASSERT_TRUE(planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{}"));
+    ASSERT_FALSE(planCacheContains(
+        opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{}"));
 }
 
 
 TEST(IndexFilterCommandsTest, SetFilterAcceptsIndexNames) {
     CollatorInterfaceMock reverseCollator(CollatorInterfaceMock::MockType::kReverseString);
-    IndexEntry collatedIndex(
-        fromjson("{a: 1}"), false, false, false, "a_1:rev", nullptr, BSONObj());
+    PlanCache planCache;
+    const auto keyPattern = fromjson("{a: 1}");
+    CoreIndexInfo collatedIndex(keyPattern,
+                                IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                                false,                               // sparse
+                                IndexEntry::Identifier{"a_1:rev"});  // name
     collatedIndex.collator = &reverseCollator;
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
     QuerySettings querySettings;
 
-    PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "a_1", nullptr, BSONObj()),
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                           // sparse
+                       IndexEntry::Identifier{"a_1"}),  // name
          collatedIndex});
 
     addQueryShapeToPlanCache(opCtx.get(), &planCache, "{a: 2}", "{}", "{}", "{}");
-    ASSERT_TRUE(planCacheContains(planCache, "{a: 2}", "{}", "{}", "{}"));
+    ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 2}", "{}", "{}", "{}"));
 
     ASSERT_OK(SetFilter::set(opCtx.get(),
                              &querySettings,

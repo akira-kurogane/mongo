@@ -1,4 +1,16 @@
 // Test that interrupting a count returns an error code.
+//
+// @tags: [
+//   # This test attempts to perform a count command and find it using the currentOp command. The
+//   # former operation may be routed to a secondary in the replica set, whereas the latter must be
+//   # routed to the primary.
+//   assumes_read_preference_unchanged,
+//   does_not_support_stepdowns,
+//   # Uses $where operator
+//   requires_scripting,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
 
 t = db.count10;
 t.drop();

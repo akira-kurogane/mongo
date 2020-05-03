@@ -72,20 +72,23 @@ run()
 # Non parallelizable scripts The following scripts either modify files or
 # already parallelize internally.
 run "sh ./s_readme $force"
+run "sh ./s_install $force"
 run "python api_config.py"
 run "python api_err.py"
 run "python flags.py"
 run "python log.py"
 run "python stat.py"
 run "python java_doc.py"
-run "sh ./s_prototypes"
-run "sh ./s_typedef -b"
 run "sh ./s_copyright"
 run "sh ./s_style"
+run "./s_clang-format"
+run "python prototypes.py"
+run "sh ./s_typedef -b"
 
 COMMANDS="
 2>&1 ./s_define > ${t_pfx}s_define
 2>&1 ./s_docs > ${t_pfx}s_docs
+2>&1 ./s_evergreen > ${t_pfx}s_evergreen
 2>&1 ./s_export > ${t_pfx}s_export
 2>&1 ./s_funcs > ${t_pfx}s_funcs
 2>&1 ./s_function > ${t_pfx}s_function
@@ -100,6 +103,7 @@ COMMANDS="
 2>&1 ./s_void > ${t_pfx}s_void
 2>&1 ./s_whitespace > ${t_pfx}s_whitespace
 2>&1 ./s_win > ${t_pfx}s_win
+2>&1 python function.py > ${t_pfx}py_function
 2>&1 python style.py > ${t_pfx}py_style"
 
 # Parallelize if possible.

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,20 +31,17 @@
 
 #include "mongo/rpc/factory.h"
 
-#include "mongo/rpc/command_reply.h"
-#include "mongo/rpc/command_reply_builder.h"
-#include "mongo/rpc/command_request.h"
-#include "mongo/rpc/command_request_builder.h"
+#include <memory>
+
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
 #include "mongo/rpc/legacy_request.h"
 #include "mongo/rpc/legacy_request_builder.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/protocol.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/message.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -54,21 +52,16 @@ Message messageFromOpMsgRequest(Protocol proto, const OpMsgRequest& request) {
             return request.serialize();
         case Protocol::kOpQuery:
             return legacyRequestFromOpMsgRequest(request);
-        case Protocol::kOpCommandV1:
-            return opCommandRequestFromOpMsgRequest(request);
-        default:
-            MONGO_UNREACHABLE;
     }
+    MONGO_UNREACHABLE;
 }
 
 std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
     switch (unownedMessage->operation()) {
         case mongo::dbMsg:
-            return stdx::make_unique<OpMsgReply>(OpMsg::parseOwned(*unownedMessage));
+            return std::make_unique<OpMsgReply>(OpMsg::parseOwned(*unownedMessage));
         case mongo::opReply:
-            return stdx::make_unique<LegacyReply>(unownedMessage);
-        case mongo::dbCommandReply:
-            return stdx::make_unique<CommandReply>(unownedMessage);
+            return std::make_unique<LegacyReply>(unownedMessage);
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "
@@ -79,11 +72,9 @@ std::unique_ptr<ReplyInterface> makeReply(const Message* unownedMessage) {
 OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
     switch (unownedMessage.operation()) {
         case mongo::dbMsg:
-            return OpMsgRequest::parse(unownedMessage);
+            return OpMsgRequest::parseOwned(unownedMessage);
         case mongo::dbQuery:
             return opMsgRequestFromLegacyRequest(unownedMessage);
-        case mongo::dbCommand:
-            return opMsgRequestFromCommandRequest(unownedMessage);
         default:
             uasserted(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Received a reply message with unexpected opcode: "
@@ -94,14 +85,11 @@ OpMsgRequest opMsgRequestFromAnyProtocol(const Message& unownedMessage) {
 std::unique_ptr<ReplyBuilderInterface> makeReplyBuilder(Protocol protocol) {
     switch (protocol) {
         case Protocol::kOpMsg:
-            return stdx::make_unique<OpMsgReplyBuilder>();
+            return std::make_unique<OpMsgReplyBuilder>();
         case Protocol::kOpQuery:
-            return stdx::make_unique<LegacyReplyBuilder>();
-        case Protocol::kOpCommandV1:
-            return stdx::make_unique<CommandReplyBuilder>();
-        default:
-            MONGO_UNREACHABLE;
+            return std::make_unique<LegacyReplyBuilder>();
     }
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace rpc

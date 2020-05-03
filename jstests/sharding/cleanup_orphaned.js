@@ -1,7 +1,6 @@
 //
 // Shards data from the key range, then inserts orphan documents, runs cleanupOrphans
 // and makes sure that orphans are removed. Uses an _id as a shard key.
-//
 
 load('./jstests/libs/cleanup_orphaned_util.js');
 

@@ -6,7 +6,6 @@
  * Each thread does a $rename to cause documents to jump between indexes.
  */
 var $config = (function() {
-
     var fieldNames = ['update_rename_x', 'update_rename_y', 'update_rename_z'];
 
     function choose(array) {
@@ -56,7 +55,7 @@ var $config = (function() {
             var doc = {};
             doc[fieldName] = i;
             var res = db[collName].insert(doc);
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted);
         }
     }
@@ -69,5 +68,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

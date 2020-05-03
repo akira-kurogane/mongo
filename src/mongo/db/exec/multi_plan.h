@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,7 +31,7 @@
 
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/canonical_query.h"
@@ -49,7 +50,7 @@ namespace mongo {
  *
  * Owns the query solutions and PlanStage roots for all candidate plans.
  */
-class MultiPlanStage final : public PlanStage {
+class MultiPlanStage final : public RequiresCollectionStage {
 public:
     /**
      * Callers use this to specify how the MultiPlanStage should interact with the plan cache.
@@ -75,7 +76,7 @@ public:
      * If 'shouldCache' is true, writes a cache entry for the winning plan to the plan cache
      * when possible. If 'shouldCache' is false, the plan cache will never be written.
      */
-    MultiPlanStage(OperationContext* opCtx,
+    MultiPlanStage(ExpressionContext* expCtx,
                    const Collection* collection,
                    CanonicalQuery* cq,
                    CachingMode cachingMode = CachingMode::AlwaysCache);
@@ -83,8 +84,6 @@ public:
     bool isEOF() final;
 
     StageState doWork(WorkingSetID* out) final;
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_MULTI_PLAN;
@@ -96,9 +95,11 @@ public:
     const SpecificStats* getSpecificStats() const final;
 
     /**
-     * Takes ownership of QuerySolution and PlanStage. not of WorkingSet
+     * Adsd a new candidate plan to be considered for selection by the MultiPlanStage trial period.
      */
-    void addPlan(QuerySolution* solution, PlanStage* root, WorkingSet* sharedWs);
+    void addPlan(std::unique_ptr<QuerySolution> solution,
+                 std::unique_ptr<PlanStage> root,
+                 WorkingSet* sharedWs);
 
     /**
      * Runs all plans added by addPlan, ranks them, and picks a best.
@@ -153,6 +154,11 @@ public:
 
     static const char* kStageType;
 
+protected:
+    void doSaveStateRequiresCollection() final {}
+
+    void doRestoreStateRequiresCollection() final {}
+
 private:
     //
     // Have all our candidate plans do something.
@@ -177,9 +183,6 @@ private:
     Status tryYield(PlanYieldPolicy* yieldPolicy);
 
     static const int kNoSuchPlan = -1;
-
-    // Not owned here. Must be non-null.
-    const Collection* _collection;
 
     // Describes the cases in which we should write an entry for the winning plan to the plan cache.
     const CachingMode _cachingMode;
@@ -221,12 +224,6 @@ private:
     // if pickBestPlan fails, this is set to the wsid of the statusMember
     // returned by ::work()
     WorkingSetID _statusMemberId;
-
-    // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
-    // to use to pull the record into memory. We take ownership of the RecordFetcher here,
-    // deleting it after we've had a chance to do the fetch. For timing-based yields, we
-    // just pass a NULL fetcher.
-    std::unique_ptr<RecordFetcher> _fetcher;
 
     // Stats
     MultiPlanStats _specificStats;

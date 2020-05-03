@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,17 +57,12 @@ class MergeSortStageParams;
  */
 class MergeSortStage final : public PlanStage {
 public:
-    MergeSortStage(OperationContext* opCtx,
-                   const MergeSortStageParams& params,
-                   WorkingSet* ws,
-                   const Collection* collection);
+    MergeSortStage(ExpressionContext* expCtx, const MergeSortStageParams& params, WorkingSet* ws);
 
-    void addChild(PlanStage* child);
+    void addChild(std::unique_ptr<PlanStage> child);
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_SORT_MERGE;
@@ -79,49 +75,15 @@ public:
     static const char* kStageType;
 
 private:
-    // Not owned by us.
-    const Collection* _collection;
-
-    // Not owned by us.
-    WorkingSet* _ws;
-
-    // The pattern that we're sorting by.
-    BSONObj _pattern;
-
-    // Null if this merge sort stage orders strings according to simple binary compare. If non-null,
-    // represents the collator used to compare strings.
-    const CollatorInterface* _collator;
-
-    // Are we deduplicating on RecordId?
-    bool _dedup;
-
-    // Which RecordIds have we seen?
-    unordered_set<RecordId, RecordId::Hasher> _seen;
-
-    // In order to pick the next smallest value, we need each child work(...) until it produces
-    // a result.  This is the queue of children that haven't given us a result yet.
-    std::queue<PlanStage*> _noResultToMerge;
-
-    // There is some confusing STL wrangling going on below.  Here's a guide:
-    //
-    // We want to keep a priority_queue of results so we can quickly return the min result.
-    //
-    // If we receive an invalidate, we need to iterate over any cached state to see if the
-    // invalidate is relevant.
-    //
-    // We can't iterate over a priority_queue, so we keep the actual cached state in a list and
-    // have a priority_queue of iterators into that list.
-    //
-    // Why an iterator instead of a pointer?  We need to be able to use the information in the
-    // priority_queue to remove the item from the list and quickly.
-
     struct StageWithValue {
-        StageWithValue() : id(WorkingSet::INVALID_ID), stage(NULL) {}
+        StageWithValue() : id(WorkingSet::INVALID_ID), stage(nullptr) {}
         WorkingSetID id;
         PlanStage* stage;
     };
 
-    // We have a priority queue of these.
+    // This stage maintains a priority queue of results from each child stage so that it can quickly
+    // return the next result according to the sort order. A value in the priority queue is a
+    // MergingRef, an iterator which refers to a buffered (WorkingSetMember, child stage) pair.
     typedef std::list<StageWithValue>::iterator MergingRef;
 
     // The comparison function used in our priority queue.
@@ -140,6 +102,26 @@ private:
         const CollatorInterface* _collator;
     };
 
+    // Not owned by us.
+    WorkingSet* _ws;
+
+    // The pattern that we're sorting by.
+    BSONObj _pattern;
+
+    // Null if this merge sort stage orders strings according to simple binary compare. If non-null,
+    // represents the collator used to compare strings.
+    const CollatorInterface* _collator;
+
+    // Are we deduplicating on RecordId?
+    const bool _dedup;
+
+    // Which RecordIds have we seen?
+    stdx::unordered_set<RecordId, RecordId::Hasher> _seen;
+
+    // In order to pick the next smallest value, we need each child work(...) until it produces
+    // a result.  This is the queue of children that haven't given us a result yet.
+    std::queue<PlanStage*> _noResultToMerge;
+
     // The min heap of the results we're returning.
     std::priority_queue<MergingRef, std::vector<MergingRef>, StageWithValueComparison> _merging;
 
@@ -153,7 +135,7 @@ private:
 // Parameters that must be provided to a MergeSortStage
 class MergeSortStageParams {
 public:
-    MergeSortStageParams() : collator(NULL), dedup(true) {}
+    MergeSortStageParams() : collator(nullptr), dedup(true) {}
 
     // How we're sorting.
     BSONObj pattern;

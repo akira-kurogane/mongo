@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,78 +31,105 @@
 
 #include "mongo/db/service_context_d_test_fixture.h"
 
+#include <memory>
+
 #include "mongo/base/checked_cast.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog/catalog_control.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
+#include "mongo/db/catalog/database_holder_impl.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
+#include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
+#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
 
-void ServiceContextMongoDTest::setUp() {
-    Client::initThread(getThreadName());
-    ServiceContext* serviceContext = getServiceContext();
+ServiceContextMongoDTest::ServiceContextMongoDTest()
+    : ServiceContextMongoDTest("ephemeralForTest") {}
 
-    auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine)
+    : ServiceContextMongoDTest(engine, RepairAction::kNoRepair) {}
+
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAction repair)
+    : _tempDir("service_context_d_test_fixture") {
+
+    _stashedStorageParams.engine = std::exchange(storageGlobalParams.engine, std::move(engine));
+    _stashedStorageParams.engineSetByUser =
+        std::exchange(storageGlobalParams.engineSetByUser, true);
+    _stashedStorageParams.repair =
+        std::exchange(storageGlobalParams.repair, (repair == RepairAction::kRepair));
+
+    auto const serviceContext = getServiceContext();
+    serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
+    auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
 
-    if (!serviceContext->getGlobalStorageEngine()) {
-        // When using the "ephemeralForTest" storage engine, it is fine for the temporary directory
-        // to go away after the global storage engine is initialized.
-        unittest::TempDir tempDir("service_context_d_test_fixture");
-        storageGlobalParams.dbpath = tempDir.path();
-        storageGlobalParams.engine = "ephemeralForTest";
-        storageGlobalParams.engineSetByUser = true;
-        checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
-        serviceContext->initializeGlobalStorageEngine();
-        serviceContext->setOpObserver(stdx::make_unique<OpObserverNoop>());
+    // Set up the periodic runner to allow background job execution for tests that require it.
+    auto runner = makePeriodicRunner(getServiceContext());
+    getServiceContext()->setPeriodicRunner(std::move(runner));
+
+    storageGlobalParams.dbpath = _tempDir.path();
+
+    // Since unit tests start in their own directories, skip lock file and metadata file for faster
+    // startup.
+    initializeStorageEngine(serviceContext,
+                            StorageEngineInitFlags::kAllowNoLockFile |
+                                StorageEngineInitFlags::kSkipMetadataFile);
+    StorageControl::startStorageControls(serviceContext);
+
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
+    IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+}
+
+ServiceContextMongoDTest::~ServiceContextMongoDTest() {
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        Lock::GlobalLock glk(opCtx.get(), MODE_X);
+        auto databaseHolder = DatabaseHolder::get(opCtx.get());
+        databaseHolder->closeAll(opCtx.get());
     }
+
+    shutdownGlobalStorageEngineCleanly(getServiceContext());
+
+    std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
+    std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
+    std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
+}
+
+void ServiceContextMongoDTest::setUp() {
+    ServiceContextTest::setUp();
+
+    CollectionShardingStateFactory::set(
+        getServiceContext(),
+        std::make_unique<CollectionShardingStateFactoryShard>(getServiceContext()));
 }
 
 void ServiceContextMongoDTest::tearDown() {
-    ON_BLOCK_EXIT([&] { Client::destroy(); });
-    auto opCtx = cc().makeOperationContext();
-    _dropAllDBs(opCtx.get());
-}
-
-ServiceContext* ServiceContextMongoDTest::getServiceContext() {
-    return getGlobalServiceContext();
-}
-
-void ServiceContextMongoDTest::_doTest() {
-    MONGO_UNREACHABLE;
-}
-
-void ServiceContextMongoDTest::_dropAllDBs(OperationContext* opCtx) {
-    dropAllDatabasesExceptLocal(opCtx);
-
-    Lock::GlobalWrite lk(opCtx);
-    AutoGetDb autoDBLocal(opCtx, "local", MODE_X);
-    const auto localDB = autoDBLocal.getDb();
-    if (localDB) {
-        writeConflictRetry(opCtx, "_dropAllDBs", "local", [&] {
-            // Do not wrap in a WriteUnitOfWork until SERVER-17103 is addressed.
-            autoDBLocal.getDb()->dropDatabase(opCtx, localDB);
-        });
+    {
+        // Some tests set the current OperationContext but do not release it until destruction.
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        auto opCtx = getClient()->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = getClient()->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+        IndexBuildsCoordinator::get(opCtx)->shutdown(opCtx);
     }
 
-    // dropAllDatabasesExceptLocal() does not close empty databases. However the holder still
-    // allocates resources to track these empty databases. These resources not released by
-    // dropAllDatabasesExceptLocal() will be leaked at exit unless we call DatabaseHolder::closeAll.
-    BSONObjBuilder unused;
-    invariant(dbHolder().closeAll(opCtx, unused, false, "all databases dropped"));
+    CollectionShardingStateFactory::clear(getServiceContext());
+
+    ServiceContextTest::tearDown();
 }
 
 }  // namespace mongo

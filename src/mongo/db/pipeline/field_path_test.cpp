@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -41,7 +42,7 @@ using std::vector;
 
 /** FieldPath constructed from empty string. */
 TEST(FieldPathTest, Empty) {
-    ASSERT_THROWS(FieldPath path(""), AssertionException);
+    ASSERT_THROWS(FieldPath(""), AssertionException);
 }
 
 /** FieldPath constructed from a simple string (without dots). */
@@ -55,12 +56,12 @@ TEST(FieldPathTest, Simple) {
 
 /** FieldPath consisting of a '$' character. */
 TEST(FieldPathTest, DollarSign) {
-    ASSERT_THROWS(FieldPath path("$"), AssertionException);
+    ASSERT_THROWS(FieldPath("$"), AssertionException);
 }
 
 /** FieldPath with a '$' prefix. */
 TEST(FieldPathTest, DollarSignPrefix) {
-    ASSERT_THROWS(FieldPath path("$a"), AssertionException);
+    ASSERT_THROWS(FieldPath("$a"), AssertionException);
 }
 
 /** FieldPath constructed from a string with one dot. */
@@ -75,7 +76,7 @@ TEST(FieldPathTest, Dotted) {
 
 /** FieldPath with a '$' prefix in the second field. */
 TEST(FieldPathTest, DollarSignPrefixSecondField) {
-    ASSERT_THROWS(FieldPath path("a.$b"), AssertionException);
+    ASSERT_THROWS(FieldPath("a.$b"), AssertionException);
 }
 
 /** FieldPath constructed from a string with two dots. */
@@ -90,22 +91,22 @@ TEST(FieldPathTest, TwoDotted) {
 
 /** FieldPath constructed from a string ending in a dot. */
 TEST(FieldPathTest, TerminalDot) {
-    ASSERT_THROWS(FieldPath path("foo."), AssertionException);
+    ASSERT_THROWS(FieldPath("foo."), AssertionException);
 }
 
 /** FieldPath constructed from a string beginning with a dot. */
 TEST(FieldPathTest, PrefixDot) {
-    ASSERT_THROWS(FieldPath path(".foo"), AssertionException);
+    ASSERT_THROWS(FieldPath(".foo"), AssertionException);
 }
 
 /** FieldPath constructed from a string with adjacent dots. */
 TEST(FieldPathTest, AdjacentDots) {
-    ASSERT_THROWS(FieldPath path("foo..bar"), AssertionException);
+    ASSERT_THROWS(FieldPath("foo..bar"), AssertionException);
 }
 
 /** FieldPath constructed with only dots. */
 TEST(FieldPathTest, OnlyDots) {
-    ASSERT_THROWS(FieldPath path("..."), AssertionException);
+    ASSERT_THROWS(FieldPath("..."), AssertionException);
 }
 
 /** FieldPath constructed from a string with one letter between two dots. */
@@ -117,7 +118,7 @@ TEST(FieldPathTest, LetterBetweenDots) {
 
 /** FieldPath containing a null character. */
 TEST(FieldPathTest, NullCharacter) {
-    ASSERT_THROWS(FieldPath path(string("foo.b\0r", 7)), AssertionException);
+    ASSERT_THROWS(FieldPath(string("foo.b\0r", 7)), AssertionException);
 }
 
 /** Tail of a FieldPath. */
@@ -186,6 +187,44 @@ TEST(FieldPathTest, ConstructorAssertsOnDeeplyNestedArrayPath) {
     ASSERT_THROWS_CODE(makeArrayFieldPathOfDepth(BSONDepth::getMaxAllowableDepth() + 1),
                        AssertionException,
                        ErrorCodes::Overflow);
+}
+
+// Test FieldPath::getSubpath().
+TEST(FieldPathTest, GetSubpath) {
+    FieldPath path = FieldPath("foo.bar.baz");
+    ASSERT_EQUALS("foo", path.getSubpath(0));
+    ASSERT_EQUALS("foo.bar", path.getSubpath(1));
+    ASSERT_EQUALS("foo.bar.baz", path.getSubpath(2));
+}
+
+void checkConcatWorks(const FieldPath& head, const FieldPath& tail) {
+    FieldPath concat = head.concat(tail);
+    ASSERT(concat == FieldPath::getFullyQualifiedPath(head.fullPath(), tail.fullPath()));
+    ASSERT_EQ(concat.getPathLength(), head.getPathLength() + tail.getPathLength());
+
+    const auto expectedTail = head.getPathLength() == 1
+        ? tail
+        : FieldPath::getFullyQualifiedPath(head.tail().fullPath(), tail.fullPath());
+    ASSERT(FieldPath(concat.tail()) == expectedTail);
+
+    ASSERT_EQ(concat.front(), head.front());
+    ASSERT_EQ(concat.back(), tail.back());
+    for (size_t i = 0; i < concat.getPathLength(); i++) {
+        const auto expected = (i < head.getPathLength())
+            ? head.getFieldName(i)
+            : tail.getFieldName(i - head.getPathLength());
+        ASSERT_EQ(concat.getFieldName(i), expected);
+    }
+}
+
+TEST(FieldPathTest, Concat) {
+    checkConcatWorks("abc", "cde");
+    checkConcatWorks("abc.ef", "cde.ab");
+    checkConcatWorks("abc.$id", "cde");
+    checkConcatWorks("abc", "$id.x");
+    checkConcatWorks("some.long.path.with.many.parts", "another.long.ish.path");
+    checkConcatWorks("$db", "$id");
+    checkConcatWorks("$db.$id", "$id.$db");
 }
 }  // namespace
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,13 +34,13 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
@@ -54,11 +55,33 @@ class ShardType;
 
 class ShardRegistryData {
 public:
+    /**
+     * Reads shards docs from the catalog client and fills in maps.
+     */
     ShardRegistryData(OperationContext* opCtx, ShardFactory* shardFactory);
     ShardRegistryData() = default;
     ~ShardRegistryData() = default;
 
     void swap(ShardRegistryData& other);
+
+    /*
+     * Swaps _shardIdLookup, _rsLookup, and _configShard with other. Merges _hostLookup and
+     * _connStringLookup without overwriting existing entries in either map.
+     *
+     * Called when reloading the shard registry. It is important to merge _hostLookup because
+     * reloading the shard registry can interleave with updates to the shard registry passed by the
+     * RSM.
+     */
+    void swapAndMerge(ShardRegistryData& other);
+
+    /**
+     * Returns a shared pointer the shard object with the given shard id.
+     *
+     * Callers might pass in the connection string or HostAndPort rather than ShardId, so this
+     * method will first look for the shard by ShardId, then connection string, then HostAndPort
+     * stopping once it finds the shard.
+     */
+    std::shared_ptr<Shard> findShard(ShardId const& shardId) const;
 
     /**
      * Lookup shard by replica set name. Returns nullptr if the name can't be found.
@@ -71,7 +94,7 @@ public:
     std::shared_ptr<Shard> findByShardId(const ShardId&) const;
 
     /**
-     * Finds the Shard that the mongod listening at this HostAndPort is a member of.
+     * Finds the shard that the mongod listening at this HostAndPort is a member of.
      */
     std::shared_ptr<Shard> findByHostAndPort(const HostAndPort&) const;
 
@@ -100,31 +123,36 @@ public:
 
 private:
     /**
-     * Reads shards docs from the catalog client and fills in maps.
-     */
-    void _init(OperationContext* opCtx, ShardFactory* factory);
-
-    /**
      * Creates a shard based on the specified information and puts it into the lookup maps.
      * if useOriginalCS = true it will use the ConnectionSring used for shard creation to update
      * lookup maps. Otherwise the current connection string from the Shard's RemoteCommandTargeter
      * will be used.
      */
-    void _addShard_inlock(const std::shared_ptr<Shard>&, bool useOriginalCS);
-    std::shared_ptr<Shard> _findByShardId_inlock(const ShardId&) const;
-    void _rebuildShard_inlock(const ConnectionString& newConnString, ShardFactory* factory);
+    void _addShard(WithLock, std::shared_ptr<Shard> const&, bool useOriginalCS);
+    auto _findByShardId(WithLock, ShardId const&) const -> std::shared_ptr<Shard>;
+    auto _findByHostAndPort(WithLock, const HostAndPort& hostAndPort) const
+        -> std::shared_ptr<Shard>;
+    auto _findByConnectionString(WithLock, const ConnectionString& connectionString) const
+        -> std::shared_ptr<Shard>;
+    auto _findShard(WithLock lk, ShardId const& shardId) const -> std::shared_ptr<Shard>;
+    void _rebuildShard(WithLock, ConnectionString const& newConnString, ShardFactory* factory);
 
     // Protects the lookup maps below.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ShardRegistryData::_mutex");
+
     using ShardMap = stdx::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
 
-    // Map of both shardName -> Shard and hostName -> Shard
-    ShardMap _lookup;
+    // Map of shardName -> Shard
+    ShardMap _shardIdLookup;
 
     // Map from replica set name to shard corresponding to this replica set
     ShardMap _rsLookup;
 
+    // Map of HostAndPort to Shard
     stdx::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
+
+    // Map of connection string to Shard
+    std::map<ConnectionString, std::shared_ptr<Shard>> _connStringLookup;
 
     // store configShard separately to always have a reference
     std::shared_ptr<Shard> _configShard;
@@ -137,17 +165,32 @@ private:
  * errors automatically as well.
  */
 class ShardRegistry {
-    MONGO_DISALLOW_COPYING(ShardRegistry);
+    ShardRegistry(const ShardRegistry&) = delete;
+    ShardRegistry& operator=(const ShardRegistry&) = delete;
 
 public:
     /**
+     * A ShardId for the config servers.
+     */
+    static const ShardId kConfigServerShardId;
+
+    /**
+     * A callback type for functions that can be called on shard removal.
+     */
+    using ShardRemovalHook = std::function<void(const ShardId&)>;
+
+    /**
      * Instantiates a new shard registry.
      *
-     * @param shardFactory Makes shards
-     * @param configServerCS ConnectionString used for communicating with the config servers
+     * @param shardFactory      Makes shards
+     * @param configServerCS    ConnectionString used for communicating with the config servers
+     * @param shardRemovalHooks A list of hooks that will be called when a shard is removed. The
+     *                          hook is expected not to throw. If it does throw, the process will be
+     *                          terminated.
      */
     ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
-                  const ConnectionString& configServerCS);
+                  const ConnectionString& configServerCS,
+                  std::vector<ShardRemovalHook> shardRemovalHooks = {});
 
     ~ShardRegistry();
     /**
@@ -173,6 +216,12 @@ public:
      * returned false.
      */
     bool reload(OperationContext* opCtx);
+
+    /**
+     * Clears all entries from the shard registry entries, which will force the registry to do a
+     * reload on next access.
+     */
+    void clearEntries();
 
     /**
      * Takes a connection string describing either a shard or config server replica set, looks
@@ -227,7 +276,16 @@ public:
      */
     std::shared_ptr<Shard> lookupRSName(const std::string& name) const;
 
-    void getAllShardIds(std::vector<ShardId>* all) const;
+    void getAllShardIdsNoReload(std::vector<ShardId>* all) const;
+
+    /**
+     * Like getAllShardIdsNoReload(), but does a reload internally in the case that
+     * getAllShardIdsNoReload() comes back empty
+     */
+    void getAllShardIds(OperationContext* opCtx, std::vector<ShardId>* all);
+
+    int getNumShards() const;
+
     void toBSON(BSONObjBuilder* result) const;
     bool isUp() const;
 
@@ -244,22 +302,11 @@ public:
     void shutdown();
 
     /**
-     * For use in mongos and mongod which needs notifications about changes to shard and config
-     * server replset membership to update the ShardRegistry.
-     *
-     * This is expected to be run in an existing thread.
-     */
-    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
-                                                        const std::string& newConnectionString);
-
-    /**
      * For use in mongos which needs notifications about changes to shard replset membership to
      * update the config.shards collection.
-     *
-     * This is expected to be run in a brand new thread.
      */
-    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
-                                                       const std::string& newConnectionString);
+    static void updateReplicaSetOnConfigServer(ServiceContext* serviceContex,
+                                               const ConnectionString& connStr) noexcept;
 
 private:
     /**
@@ -272,11 +319,18 @@ private:
      * shard
      */
     ConnectionString _initConfigServerCS;
+
+    /**
+     * A list of callbacks to be called asynchronously when it has been discovered that a shard was
+     * removed.
+     */
+    std::vector<ShardRemovalHook> _shardRemovalHooks;
+
     void _internalReload(const executor::TaskExecutor::CallbackArgs& cbArgs);
     ShardRegistryData _data;
 
     // Protects the _reloadState and _initConfigServerCS during startup.
-    mutable stdx::mutex _reloadMutex;
+    mutable Mutex _reloadMutex = MONGO_MAKE_LATCH("ShardRegistry::_reloadMutex");
     stdx::condition_variable _inReloadCV;
 
     enum class ReloadState {

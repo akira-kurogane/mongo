@@ -1,25 +1,24 @@
-// path.cpp
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,11 +34,10 @@
 
 namespace mongo {
 
-Status ElementPath::init(StringData path) {
-    _shouldTraverseNonleafArrays = true;
-    _shouldTraverseLeafArray = true;
+void ElementPath::init(StringData path) {
+    _nonLeafArrayBehavior = NonLeafArrayBehavior::kTraverse;
+    _leafArrayBehavior = LeafArrayBehavior::kTraverse;
     _fieldRef.parse(path);
-    return Status::OK();
 }
 
 // -----
@@ -80,7 +78,7 @@ ElementIterator::Context SimpleArrayElementIterator::next() {
 
 // ------
 BSONElementIterator::BSONElementIterator() {
-    _path = NULL;
+    _path = nullptr;
 }
 
 BSONElementIterator::BSONElementIterator(const ElementPath* path,
@@ -194,15 +192,14 @@ bool BSONElementIterator::subCursorHasMore() {
             }
 
             _subCursorPath.reset(new ElementPath());
-            _subCursorPath
-                ->init(_arrayIterationState.restOfPath.substr(
-                    _arrayIterationState.nextPieceOfPath.size() + 1))
-                .transitional_ignore();
-            _subCursorPath->setTraverseLeafArray(_path->shouldTraverseLeafArray());
+            _subCursorPath->init(_arrayIterationState.restOfPath.substr(
+                _arrayIterationState.nextPieceOfPath.size() + 1));
+            _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
 
             // If we're here, we must be able to traverse nonleaf arrays.
-            dassert(_path->shouldTraverseNonleafArrays());
-            dassert(_subCursorPath->shouldTraverseNonleafArrays());
+            dassert(_path->nonLeafArrayBehavior() == ElementPath::NonLeafArrayBehavior::kTraverse);
+            dassert(_subCursorPath->nonLeafArrayBehavior() ==
+                    ElementPath::NonLeafArrayBehavior::kTraverse);
 
             _subCursor.reset(
                 new BSONElementIterator(_subCursorPath.get(), _arrayIterationState._current.Obj()));
@@ -241,11 +238,19 @@ bool BSONElementIterator::more() {
 
         _arrayIterationState.reset(_path->fieldRef(), _traversalStartIndex + 1);
 
-        if (_arrayIterationState.hasMore && !_path->shouldTraverseNonleafArrays()) {
+        if (_arrayIterationState.hasMore &&
+            _path->nonLeafArrayBehavior() != ElementPath::NonLeafArrayBehavior::kTraverse) {
             // Don't allow traversing the array.
+            if (_path->nonLeafArrayBehavior() == ElementPath::NonLeafArrayBehavior::kMatchSubpath) {
+                _next.reset(_traversalStart, BSONElement());
+                _state = DONE;
+                return true;
+            }
+
             _state = DONE;
             return false;
-        } else if (!_arrayIterationState.hasMore && !_path->shouldTraverseLeafArray()) {
+        } else if (!_arrayIterationState.hasMore &&
+                   _path->leafArrayBehavior() == ElementPath::LeafArrayBehavior::kNoTraversal) {
             // Return the leaf array.
             _next.reset(_traversalStart, BSONElement());
             _state = DONE;
@@ -277,8 +282,8 @@ bool BSONElementIterator::more() {
                 // The current array element is a subdocument.  See if the subdocument generates
                 // any elements matching the remaining subpath.
                 _subCursorPath.reset(new ElementPath());
-                _subCursorPath->init(_arrayIterationState.restOfPath).transitional_ignore();
-                _subCursorPath->setTraverseLeafArray(_path->shouldTraverseLeafArray());
+                _subCursorPath->init(_arrayIterationState.restOfPath);
+                _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
 
                 _subCursor.reset(new BSONElementIterator(_subCursorPath.get(), eltInArray.Obj()));
                 if (subCursorHasMore()) {
@@ -303,11 +308,9 @@ bool BSONElementIterator::more() {
                     // The current array element is itself an array.  See if the nested array
                     // has any elements matching the remainihng.
                     _subCursorPath.reset(new ElementPath());
-                    _subCursorPath
-                        ->init(_arrayIterationState.restOfPath.substr(
-                            _arrayIterationState.nextPieceOfPath.size() + 1))
-                        .transitional_ignore();
-                    _subCursorPath->setTraverseLeafArray(_path->shouldTraverseLeafArray());
+                    _subCursorPath->init(_arrayIterationState.restOfPath.substr(
+                        _arrayIterationState.nextPieceOfPath.size() + 1));
+                    _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
                     BSONElementIterator* real = new BSONElementIterator(
                         _subCursorPath.get(), _arrayIterationState._current.Obj());
                     _subCursor.reset(real);
@@ -356,4 +359,4 @@ ElementIterator::Context BSONElementIterator::next() {
     _next.reset();
     return x;
 }
-}
+}  // namespace mongo

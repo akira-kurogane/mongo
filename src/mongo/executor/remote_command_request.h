@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,59 +34,41 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/concepts.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {
 
-/**
- * Type of object describing a command to execute against a remote MongoDB node.
- */
-struct RemoteCommandRequest {
+struct RemoteCommandRequestBase {
+    struct HedgeOptions {
+        size_t count;
+        int maxTimeMSForHedgedReads;
+    };
+
+    enum FireAndForgetMode { kOn, kOff };
+
     // Indicates that there is no timeout for the request to complete
     static constexpr Milliseconds kNoTimeout{-1};
-
-    // Indicates that there is no expiration time by when the request needs to complete
-    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     // Type to represent the internal id of this request
     typedef uint64_t RequestId;
 
-    RemoteCommandRequest();
-
-    RemoteCommandRequest(RequestId requestId,
-                         const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
-                         const BSONObj& metadataObj,
-                         OperationContext* opCtx,
-                         Milliseconds timeoutMillis);
-
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
-                         const BSONObj& metadataObj,
-                         OperationContext* opCtx,
-                         Milliseconds timeoutMillis = kNoTimeout);
-
-    RemoteCommandRequest(const HostAndPort& theTarget,
-                         const std::string& theDbName,
-                         const BSONObj& theCmdObj,
-                         OperationContext* opCtx,
-                         Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequest(
-              theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), opCtx, timeoutMillis) {}
-
-    std::string toString() const;
-
-    bool operator==(const RemoteCommandRequest& rhs) const;
-    bool operator!=(const RemoteCommandRequest& rhs) const;
+    RemoteCommandRequestBase();
+    RemoteCommandRequestBase(RequestId requestId,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode);
 
     // Internal id of this request. Not interpreted and used for tracing purposes only.
     RequestId id;
 
-    HostAndPort target;
     std::string dbname;
     BSONObj metadata{rpc::makeEmptyMetadata()};
     BSONObj cmdObj;
@@ -99,13 +82,111 @@ struct RemoteCommandRequest {
     // metadata attachment (i.e., replication).
     OperationContext* opCtx{nullptr};
 
+    boost::optional<HedgeOptions> hedgeOptions;
+
+    boost::optional<UUID> operationKey;
+
+    FireAndForgetMode fireAndForgetMode;
+
     Milliseconds timeout = kNoTimeout;
 
-    // Deadline by when the request must be completed
-    Date_t expirationDate = kNoExpirationDate;
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
+
+    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
+
+protected:
+    ~RemoteCommandRequestBase() = default;
 };
 
-std::ostream& operator<<(std::ostream& os, const RemoteCommandRequest& response);
+/**
+ * Type of object describing a command to execute against a remote MongoDB node.
+ */
+template <typename Target>
+struct RemoteCommandRequestImpl : RemoteCommandRequestBase {
+    RemoteCommandRequestImpl();
+
+    // Allow implicit conversion from RemoteCommandRequest to RemoteCommandRequestOnAny
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<Target, std::vector<HostAndPort>>)
+    RemoteCommandRequestImpl(const RemoteCommandRequestImpl<HostAndPort>& other)
+        : RemoteCommandRequestBase(other), target({other.target}) {}
+
+    // Allow conversion from RemoteCommandRequestOnAny to RemoteCommandRequest with the index of a
+    // particular host
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<Target, HostAndPort>)
+    RemoteCommandRequestImpl(const RemoteCommandRequestImpl<std::vector<HostAndPort>>& other,
+                             size_t idx)
+        : RemoteCommandRequestBase(other), target(other.target[idx]) {}
+
+    RemoteCommandRequestImpl(RequestId requestId,
+                             const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             const BSONObj& metadataObj,
+                             OperationContext* opCtx,
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   metadataObj,
+                                   opCtx,
+                                   kNoTimeout,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
+
+    RemoteCommandRequestImpl(const Target& theTarget,
+                             const std::string& theDbName,
+                             const BSONObj& theCmdObj,
+                             OperationContext* opCtx,
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   rpc::makeEmptyMetadata(),
+                                   opCtx,
+                                   timeoutMillis,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
+    std::string toString() const;
+
+    bool operator==(const RemoteCommandRequestImpl& rhs) const;
+    bool operator!=(const RemoteCommandRequestImpl& rhs) const;
+
+    friend std::ostream& operator<<(std::ostream& os, const RemoteCommandRequestImpl& response) {
+        return (os << response.toString());
+    }
+
+    Target target;
+};
+
+extern template struct RemoteCommandRequestImpl<HostAndPort>;
+extern template struct RemoteCommandRequestImpl<std::vector<HostAndPort>>;
+
+using RemoteCommandRequest = RemoteCommandRequestImpl<HostAndPort>;
+using RemoteCommandRequestOnAny = RemoteCommandRequestImpl<std::vector<HostAndPort>>;
 
 }  // namespace executor
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +38,7 @@
 namespace mongo {
 
 class StringData;
-class NamespaceString;
+class NamespaceStringOrUUID;
 
 class Lock {
 public:
@@ -45,7 +46,8 @@ public:
      * NOTE: DO NOT add any new usages of TempRelease. It is being deprecated/removed.
      */
     class TempRelease {
-        MONGO_DISALLOW_COPYING(TempRelease);
+        TempRelease(const TempRelease&) = delete;
+        TempRelease& operator=(const TempRelease&) = delete;
 
     public:
         explicit TempRelease(Locker* lockState);
@@ -63,7 +65,6 @@ public:
         const bool _locksReleased;
     };
 
-
     /**
      * General purpose RAII wrapper for a resource managed by the lock manager
      *
@@ -72,7 +73,8 @@ public:
      * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
      */
     class ResourceLock {
-        MONGO_DISALLOW_COPYING(ResourceLock);
+        ResourceLock(const ResourceLock&) = delete;
+        ResourceLock& operator=(const ResourceLock&) = delete;
 
     public:
         ResourceLock(Locker* locker, ResourceId rid)
@@ -80,7 +82,7 @@ public:
 
         ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
             : _rid(rid), _locker(locker), _result(LOCK_INVALID) {
-            lock(mode);
+            lock(nullptr, mode);
         }
 
         ResourceLock(ResourceLock&& otherLock)
@@ -96,7 +98,17 @@ public:
             }
         }
 
-        void lock(LockMode mode);
+        /**
+         * Acquires lock on this specified resource in the specified mode.
+         *
+         * If 'opCtx' is provided, it will be used to interrupt a LOCK_WAITING state.
+         * If 'deadline' is provided, we will wait until 'deadline' for the lock to be granted.
+         * Otherwise, this parameter defaults to an infinite deadline.
+         *
+         * This function may throw an exception if it is interrupted.
+         */
+        void lock(OperationContext* opCtx, LockMode mode, Date_t deadline = Date_t::max());
+
         void unlock();
 
         bool isLocked() const {
@@ -154,6 +166,16 @@ public:
     public:
         ExclusiveLock(Locker* locker, ResourceMutex mutex)
             : ResourceLock(locker, mutex.rid(), MODE_X) {}
+
+        using ResourceLock::lock;
+
+        /**
+         * Parameterless overload to allow ExclusiveLock to be used with stdx::unique_lock and
+         * stdx::condition_variable_any
+         */
+        void lock() {
+            lock(nullptr, MODE_X);
+        }
     };
 
     /**
@@ -168,64 +190,73 @@ public:
     };
 
     /**
+     * The interrupt behavior is used to tell a lock how to handle an interrupted lock acquisition.
+     */
+    enum class InterruptBehavior {
+        kThrow,         // Throw the interruption exception.
+        kLeaveUnlocked  // Suppress the exception, but leave unlocked such that a call to isLocked()
+                        // returns false.
+    };
+
+    /**
      * Global lock.
      *
      * Grabs global resource lock. Allows further (recursive) acquisition of the global lock
-     * in any mode, see LockMode. An outermost GlobalLock calls abandonSnapshot() on destruction, so
-     * that the storage engine can release resources, such as snapshots or locks, that it may have
-     * acquired during the transaction. Note that any writes are committed in nested WriteUnitOfWork
-     * scopes, so write conflicts cannot happen when releasing the GlobalLock.
-     *
-     * NOTE: Does not acquire flush lock.
+     * in any mode, see LockMode. An outermost GlobalLock, when not in a WriteUnitOfWork, calls
+     * abandonSnapshot() on destruction. This allows the storage engine to release resources, such
+     * as snapshots or locks, that it may have acquired during the transaction.
      */
     class GlobalLock {
     public:
-        class EnqueueOnly {};
-
-        GlobalLock(OperationContext* opCtx, LockMode lockMode, unsigned timeoutMs);
-        GlobalLock(GlobalLock&&);
+        /**
+         * A GlobalLock without a deadline defaults to Date_t::max() and an InterruptBehavior of
+         * kThrow.
+         */
+        GlobalLock(OperationContext* opCtx, LockMode lockMode)
+            : GlobalLock(opCtx, lockMode, Date_t::max(), InterruptBehavior::kThrow) {}
 
         /**
-         * Enqueues lock but does not block on lock acquisition.
-         * Call waitForLock() to complete locking process.
-         *
-         * Does not set that the global lock was taken on the GlobalLockAcquisitionTracker. Call
-         * waitForLock to do so.
+         * A GlobalLock with a deadline requires the interrupt behavior to be explicitly defined.
          */
         GlobalLock(OperationContext* opCtx,
                    LockMode lockMode,
-                   unsigned timeoutMs,
-                   EnqueueOnly enqueueOnly);
+                   Date_t deadline,
+                   InterruptBehavior behavior);
+
+        GlobalLock(GlobalLock&&);
 
         ~GlobalLock() {
-            if (_result != LOCK_INVALID) {
-                if (isLocked() && _isOutermostLock) {
+            // Preserve the original lock result which will be overridden by unlock().
+            auto lockResult = _result;
+            if (isLocked()) {
+                // Abandon our snapshot if destruction of the GlobalLock object results in actually
+                // unlocking the global lock. Recursive locking and the two-phase locking protocol
+                // may prevent lock release.
+                const bool willReleaseLock = _isOutermostLock &&
+                    !(_opCtx->lockState() && _opCtx->lockState()->inAWriteUnitOfWork());
+                if (willReleaseLock) {
                     _opCtx->recoveryUnit()->abandonSnapshot();
                 }
                 _unlock();
             }
+            if (lockResult == LOCK_OK || lockResult == LOCK_WAITING) {
+                _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
+            }
         }
-
-        /**
-         * Waits for lock to be granted. Sets that the global lock was taken on the
-         * GlobalLockAcquisitionTracker.
-         */
-        void waitForLock(unsigned timeoutMs);
 
         bool isLocked() const {
             return _result == LOCK_OK;
         }
 
     private:
-        void _enqueue(LockMode lockMode, unsigned timeoutMs);
         void _unlock();
 
         OperationContext* const _opCtx;
         LockResult _result;
         ResourceLock _pbwm;
+        InterruptBehavior _interruptBehavior;
         const bool _isOutermostLock;
     };
-
 
     /**
      * Global exclusive lock
@@ -236,14 +267,11 @@ public:
      */
     class GlobalWrite : public GlobalLock {
     public:
-        explicit GlobalWrite(OperationContext* opCtx, unsigned timeoutMs = UINT_MAX)
-            : GlobalLock(opCtx, MODE_X, timeoutMs) {
-            if (isLocked()) {
-                opCtx->lockState()->lockMMAPV1Flush();
-            }
-        }
+        explicit GlobalWrite(OperationContext* opCtx)
+            : GlobalWrite(opCtx, Date_t::max(), InterruptBehavior::kThrow) {}
+        explicit GlobalWrite(OperationContext* opCtx, Date_t deadline, InterruptBehavior behavior)
+            : GlobalLock(opCtx, MODE_X, deadline, behavior) {}
     };
-
 
     /**
      * Global shared lock
@@ -254,14 +282,11 @@ public:
      */
     class GlobalRead : public GlobalLock {
     public:
-        explicit GlobalRead(OperationContext* opCtx, unsigned timeoutMs = UINT_MAX)
-            : GlobalLock(opCtx, MODE_S, timeoutMs) {
-            if (isLocked()) {
-                opCtx->lockState()->lockMMAPV1Flush();
-            }
-        }
+        explicit GlobalRead(OperationContext* opCtx)
+            : GlobalRead(opCtx, Date_t::max(), InterruptBehavior::kThrow) {}
+        explicit GlobalRead(OperationContext* opCtx, Date_t deadline, InterruptBehavior behavior)
+            : GlobalLock(opCtx, MODE_S, deadline, behavior) {}
     };
-
 
     /**
      * Database lock with support for collection- and document-level locking
@@ -279,7 +304,10 @@ public:
      */
     class DBLock {
     public:
-        DBLock(OperationContext* opCtx, StringData db, LockMode mode);
+        DBLock(OperationContext* opCtx,
+               StringData db,
+               LockMode mode,
+               Date_t deadline = Date_t::max());
         DBLock(DBLock&&);
         ~DBLock();
 
@@ -291,9 +319,18 @@ public:
          */
         void relockWithMode(LockMode newMode);
 
+        bool isLocked() const {
+            return _result == LOCK_OK;
+        }
+
+        LockMode mode() const {
+            return _mode;
+        }
+
     private:
         const ResourceId _id;
         OperationContext* const _opCtx;
+        LockResult _result;
 
         // May be changed through relockWithMode. The global lock mode won't change though,
         // because we never change from IS/S to IX/X or vice versa, just convert locks from
@@ -303,7 +340,6 @@ public:
         // Acquires the global lock on our behalf.
         GlobalLock _globalLock;
     };
-
 
     /**
      * Collection lock with support for document-level locking
@@ -320,47 +356,22 @@ public:
      * will be upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
      */
     class CollectionLock {
-        MONGO_DISALLOW_COPYING(CollectionLock);
+        CollectionLock(const CollectionLock&) = delete;
+        CollectionLock& operator=(const CollectionLock&) = delete;
 
     public:
-        CollectionLock(Locker* lockState, StringData ns, LockMode mode);
+        CollectionLock(OperationContext* opCtx,
+                       const NamespaceStringOrUUID& nssOrUUID,
+                       LockMode mode,
+                       Date_t deadline = Date_t::max());
+
+        CollectionLock(CollectionLock&&);
         ~CollectionLock();
 
-        /**
-         * When holding the collection in MODE_IX or MODE_X, calling this will release the
-         * collection and database locks, and relocks the database in MODE_X. This is typically
-         * used if the collection still needs to be created. Upgrading would not be safe as
-         * it could lead to deadlock, similarly for relocking the database without releasing
-         * the collection lock. The collection lock will also be reacquired even though it is
-         * not really needed, as it simplifies invariant checking: the CollectionLock class
-         * has as invariant that a collection lock is being held.
-         */
-        void relockAsDatabaseExclusive(Lock::DBLock& dbLock);
-
     private:
-        const ResourceId _id;
-        Locker* const _lockState;
+        ResourceId _id;
+        OperationContext* _opCtx;
     };
-
-    /**
-     * Like the CollectionLock, but optimized for the local oplog. Always locks in MODE_IX,
-     * must call serializeIfNeeded() before doing any concurrent operations in order to
-     * support storage engines without document level locking. It is an error, checked with a
-     * dassert(), to not have a suitable database lock when taking this lock.
-     */
-    class OplogIntentWriteLock {
-        MONGO_DISALLOW_COPYING(OplogIntentWriteLock);
-
-    public:
-        explicit OplogIntentWriteLock(Locker* lockState);
-        ~OplogIntentWriteLock();
-        void serializeIfNeeded();
-
-    private:
-        Locker* const _lockState;
-        bool _serialized;
-    };
-
 
     /**
      * Turn on "parallel batch writer mode" by locking the global ParallelBatchWriterMode
@@ -369,23 +380,16 @@ public:
      * writers just call setShouldConflictWithSecondaryBatchApplication(false).
      */
     class ParallelBatchWriterMode {
-        MONGO_DISALLOW_COPYING(ParallelBatchWriterMode);
+        ParallelBatchWriterMode(const ParallelBatchWriterMode&) = delete;
+        ParallelBatchWriterMode& operator=(const ParallelBatchWriterMode&) = delete;
 
     public:
         explicit ParallelBatchWriterMode(Locker* lockState);
-        ~ParallelBatchWriterMode();
 
     private:
         ResourceLock _pbwm;
-        Locker* const _lockState;
-        const bool _orginalShouldConflict;
+        ShouldNotConflictWithSecondaryBatchApplicationBlock _shouldNotConflictBlock;
     };
 };
 
-/**
- * Takes a lock on resourceCappedInFlight in MODE_IX which will be held until the end of your
- * WUOW. This ensures that a MODE_X lock on this resource will wait for all in-flight oplog
- * inserts to either commit or rollback and block new ones from starting.
- */
-void synchronizeOnOplogInFlightResource(Locker* opCtx);
-}
+}  // namespace mongo

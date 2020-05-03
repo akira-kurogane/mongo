@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,6 +41,9 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store_test_harness.h"
@@ -51,7 +55,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -61,9 +64,9 @@
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 
 class PrefixedWiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
@@ -74,10 +77,16 @@ public:
                                          _cs.get(),
                                          "",
                                          1,
+                                         0,
                                          false,
                                          false,
                                          false,
-                                         false)) {}
+                                         false)) {
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
+                getGlobalServiceContext(), repl::ReplSettings())));
+    }
 
     PrefixedWiredTigerHarnessHelper(StringData extraStrings) : _dbpath("wt_test") {}
 
@@ -89,24 +98,25 @@ public:
         WiredTigerRecoveryUnit* ru =
             checked_cast<WiredTigerRecoveryUnit*>(_engine->newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:" + ns;
+        string ident = ns;
+        string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
 
         const bool prefixed = true;
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, CollectionOptions(), "", prefixed);
+            kWiredTigerEngineName, StringData(ns), CollectionOptions(), "", prefixed);
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
         {
             WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession(&opCtx)->getSession();
+            WT_SESSION* s = ru->getSession()->getSession();
             invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
             uow.commit();
         }
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
         params.isEphemeral = false;
@@ -114,8 +124,9 @@ public:
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.tracksSizeAdjustments = true;
 
-        auto ret = stdx::make_unique<PrefixedWiredTigerRecordStore>(
+        auto ret = std::make_unique<PrefixedWiredTigerRecordStore>(
             _engine.get(), &opCtx, params, KVPrefix::generateNextPrefix());
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
@@ -132,27 +143,28 @@ public:
         WiredTigerRecoveryUnit* ru =
             checked_cast<WiredTigerRecoveryUnit*>(_engine->newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:a.b";
+        string ident = "a.b";
+        string uri = WiredTigerKVEngine::kTableUriPrefix + ident;
 
         CollectionOptions options;
         options.capped = true;
 
         KVPrefix prefix = KVPrefix::generateNextPrefix();
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, options, "", prefix.isPrefixed());
+            kWiredTigerEngineName, StringData(ns), options, "", prefix.isPrefixed());
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
         {
             WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession(&opCtx)->getSession();
+            WT_SESSION* s = ru->getSession()->getSession();
             invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
             uow.commit();
         }
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = true;
         params.isEphemeral = false;
@@ -160,9 +172,10 @@ public:
         params.cappedMaxDocs = cappedMaxDocs;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.tracksSizeAdjustments = true;
 
         auto ret =
-            stdx::make_unique<PrefixedWiredTigerRecordStore>(_engine.get(), &opCtx, params, prefix);
+            std::make_unique<PrefixedWiredTigerRecordStore>(_engine.get(), &opCtx, params, prefix);
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }
@@ -182,17 +195,17 @@ public:
 
 private:
     unittest::TempDir _dbpath;
-    const std::unique_ptr<ClockSource> _cs = stdx::make_unique<ClockSourceMock>();
+    const std::unique_ptr<ClockSource> _cs = std::make_unique<ClockSourceMock>();
 
     std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<PrefixedWiredTigerHarnessHelper>();
+std::unique_ptr<RecordStoreHarnessHelper> makeWTRSHarnessHelper() {
+    return std::make_unique<PrefixedWiredTigerHarnessHelper>();
 }
 
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
+MONGO_INITIALIZER(RegisterRecordStoreHarnessFactory)(InitializerContext* const) {
+    mongo::registerRecordStoreHarnessHelperFactory(makeWTRSHarnessHelper);
     return Status::OK();
 }
 
@@ -205,7 +218,7 @@ TEST(WiredTigerRecordStoreTest, PrefixedTableScan) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         for (int num = 0; num < numDocs; ++num) {
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             uow.commit();
         }
@@ -231,7 +244,7 @@ TEST(WiredTigerRecordStoreTest, PrefixedSeekingCursor) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         for (int num = 0; num < numDocs; ++num) {
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             if (startRecordId.isNull()) {
                 startRecordId = res.getValue();
             }
@@ -251,4 +264,4 @@ TEST(WiredTigerRecordStoreTest, PrefixedSeekingCursor) {
 }
 
 }  // namespace
-}  // mongo
+}  // namespace mongo

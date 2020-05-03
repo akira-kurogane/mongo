@@ -1,14 +1,4 @@
-"""
-Interface for customizing the behavior of a test fixture by executing a
-JavaScript file.
-"""
-
-from __future__ import absolute_import
-
-import sys
-
-import pymongo
-import pymongo.errors
+"""Interface for customizing the behavior of a test fixture by executing a JavaScript file."""
 
 from . import interface
 from ..testcases import jstest
@@ -16,51 +6,81 @@ from ... import errors
 from ...utils import registry
 
 
-class JsCustomBehavior(interface.CustomBehavior):
+class JSHook(interface.Hook):
+    """A hook with a static JavaScript file to execute."""
+
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
-    def __init__(self, hook_logger, fixture, js_filename, description, shell_options=None):
-        interface.CustomBehavior.__init__(self, hook_logger, fixture, description)
-        self.hook_test_case = jstest.JSTestCase(hook_logger,
-                                                js_filename,
-                                                shell_options=shell_options,
-                                                test_kind="Hook")
-        self.test_case_is_configured = False
+    def __init__(  # pylint: disable=too-many-arguments
+            self, hook_logger, fixture, js_filename, description, shell_options=None):
+        """Initialize JSHook."""
+        interface.Hook.__init__(self, hook_logger, fixture, description)
+        self._js_filename = js_filename
+        self._shell_options = shell_options
 
-    def before_suite(self, test_report):
-        if not self.test_case_is_configured:
-            # Configure the test case after the fixture has been set up.
-            self.hook_test_case.configure(self.fixture)
-            self.test_case_is_configured = True
+    def _should_run_after_test(self):  # pylint: disable=no-self-use
+        """Provide base callback.
 
-    def _should_run_after_test_impl(self):
+        Callback that can be overrided by subclasses to indicate if the JavaScript file should be
+        executed after the current test.
+        """
         return True
 
-    def _after_test_impl(self, test, test_report, description):
-        self.hook_test_case.run_test()
-
     def after_test(self, test, test_report):
-        if not self._should_run_after_test_impl():
+        """After test execution."""
+        if not self._should_run_after_test():
             return
 
-        # Change test_name and description to be more descriptive.
-        description = "{0} after running '{1}'".format(self.description, test.short_name())
-        self.hook_test_case.test_name = test.short_name() + ":" + self.logger_name
-        interface.CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
+        hook_test_case = DynamicJSTestCase.create_after_test(
+            self.logger.test_case_logger, test, self, self._js_filename, self._shell_options)
+        hook_test_case.configure(self.fixture)
+        hook_test_case.run_dynamic_test(test_report)
 
+
+class DataConsistencyHook(JSHook):
+    """
+    A hook for running a static JavaScript file that checks data consistency of the server.
+
+    If the mongo shell process running the JavaScript file exits with a non-zero return code, then
+    an errors.ServerFailure exception is raised to cause resmoke.py's test execution to stop.
+    """
+
+    REGISTERED_NAME = registry.LEAVE_UNREGISTERED
+
+    def after_test(self, test, test_report):
+        """After test execution."""
         try:
-            self._after_test_impl(test, test_report, description)
-        except pymongo.errors.OperationFailure as err:
-            self.hook_test_case.logger.exception("{0} failed".format(description))
-            self.hook_test_case.return_code = 1
-            test_report.addFailure(self.hook_test_case, sys.exc_info())
-            raise errors.StopExecution(err.args[0])
-        except self.hook_test_case.failureException as err:
-            self.hook_test_case.logger.exception("{0} failed".format(description))
-            test_report.addFailure(self.hook_test_case, sys.exc_info())
-            raise errors.StopExecution(err.args[0])
-        else:
-            self.hook_test_case.return_code = 0
-            test_report.addSuccess(self.hook_test_case)
-        finally:
-            test_report.stopTest(self.hook_test_case)
+            JSHook.after_test(self, test, test_report)
+        except errors.TestFailure as err:
+            raise errors.ServerFailure(err.args[0])
+
+
+class DynamicJSTestCase(interface.DynamicTestCase):
+    """A dynamic TestCase that runs a JavaScript file."""
+
+    def __init__(  # pylint: disable=too-many-arguments
+            self, logger, test_name, description, base_test_name, hook, js_filename,
+            shell_options=None):
+        """Initialize DynamicJSTestCase."""
+        interface.DynamicTestCase.__init__(self, logger, test_name, description, base_test_name,
+                                           hook)
+        self._js_test = jstest.JSTestCase(logger, js_filename, shell_options=shell_options)
+
+    def override_logger(self, new_logger):
+        """Override logger."""
+        interface.DynamicTestCase.override_logger(self, new_logger)
+        self._js_test.override_logger(new_logger)
+
+    def reset_logger(self):
+        """Reset the logger."""
+        interface.DynamicTestCase.reset_logger(self)
+        self._js_test.reset_logger()
+
+    def configure(self, fixture, *args, **kwargs):  # pylint: disable=unused-argument
+        """Configure the fixture."""
+        interface.DynamicTestCase.configure(self, fixture, *args, **kwargs)
+        self._js_test.configure(fixture, *args, **kwargs)
+
+    def run_test(self):
+        """Execute the test."""
+        self._js_test.run_test()

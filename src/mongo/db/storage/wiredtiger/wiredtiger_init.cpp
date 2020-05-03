@@ -1,24 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #if defined(__linux__)
 #include <sys/vfs.h>
@@ -39,19 +39,24 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_engine_impl.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_parameters.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/processinfo.h"
+
+#if __has_feature(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#endif
 
 namespace mongo {
 
@@ -62,7 +67,7 @@ public:
     virtual StorageEngine* create(const StorageGlobalParams& params,
                                   const StorageEngineLockFile* lockFile) const {
         if (lockFile && lockFile->createdByUncleanShutdown()) {
-            warning() << "Recovering data from the last clean checkpoint.";
+            LOGV2_WARNING(22302, "Recovering data from the last clean checkpoint.");
         }
 
 #if defined(__linux__)
@@ -74,40 +79,75 @@ public:
             int ret = statfs(params.dbpath.c_str(), &fs_stats);
 
             if (ret == 0 && fs_stats.f_type == EXT4_SUPER_MAGIC) {
-                log() << startupWarningsLog;
-                log() << "** WARNING: Using the XFS filesystem is strongly recommended with the "
-                         "WiredTiger storage engine"
-                      << startupWarningsLog;
-                log() << "**          See "
-                         "http://dochub.mongodb.org/core/prodnotes-filesystem"
-                      << startupWarningsLog;
+                LOGV2_OPTIONS(22296, {logv2::LogTag::kStartupWarnings}, "");
+                LOGV2_OPTIONS(
+                    22297,
+                    {logv2::LogTag::kStartupWarnings},
+                    "** WARNING: Using the XFS filesystem is strongly recommended with the "
+                    "WiredTiger storage engine");
+                LOGV2_OPTIONS(22298,
+                              {logv2::LogTag::kStartupWarnings},
+                              "**          See "
+                              "http://dochub.mongodb.org/core/prodnotes-filesystem");
             }
         }
 #endif
 
         size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
+        const double memoryThresholdPercentage = 0.8;
+        ProcessInfo p;
+        if (p.supported()) {
+            if (cacheMB > memoryThresholdPercentage * p.getMemSizeMB()) {
+                LOGV2_OPTIONS(22299, {logv2::LogTag::kStartupWarnings}, "");
+                LOGV2_OPTIONS(22300,
+                              {logv2::LogTag::kStartupWarnings},
+                              "** WARNING: The configured WiredTiger cache size is more than "
+                              "{memoryThresholdPercentage_100}% of available RAM.",
+                              "memoryThresholdPercentage_100"_attr =
+                                  memoryThresholdPercentage * 100);
+                LOGV2_OPTIONS(22301,
+                              {logv2::LogTag::kStartupWarnings},
+                              "**          See "
+                              "http://dochub.mongodb.org/core/faq-memory-diagnostics-wt");
+            }
+        }
         const bool ephemeral = false;
+        const auto maxCacheOverflowMB =
+            static_cast<size_t>(1024 * wiredTigerGlobalOptions.maxCacheOverflowFileSizeGB);
         WiredTigerKVEngine* kv =
             new WiredTigerKVEngine(getCanonicalName().toString(),
                                    params.dbpath,
                                    getGlobalServiceContext()->getFastClockSource(),
                                    wiredTigerGlobalOptions.engineConfig,
                                    cacheMB,
+                                   maxCacheOverflowMB,
                                    params.dur,
                                    ephemeral,
                                    params.repair,
                                    params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
-        // Intentionally leaked.
-        new WiredTigerServerStatusSection(kv);
-        new WiredTigerEngineRuntimeConfigParameter(kv);
 
-        KVStorageEngineOptions options;
+        // We must only add the server parameters to the global registry once during unit testing.
+        static int setupCountForUnitTests = 0;
+        if (setupCountForUnitTests == 0) {
+            ++setupCountForUnitTests;
+
+            // Intentionally leaked.
+            MONGO_COMPILER_VARIABLE_UNUSED auto leakedSection =
+                new WiredTigerServerStatusSection(kv);
+
+            // This allows unit tests to run this code without encountering memory leaks
+#if __has_feature(address_sanitizer)
+            __lsan_ignore_object(leakedSection);
+#endif
+        }
+
+        StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new KVStorageEngine(kv, options);
+        return new StorageEngineImpl(kv, options);
     }
 
     virtual StringData getCanonicalName() const {
@@ -164,13 +204,10 @@ public:
         return true;
     }
 };
+
+ServiceContext::ConstructorActionRegisterer registerWiredTiger(
+    "WiredTigerEngineInit", [](ServiceContext* service) {
+        registerStorageEngine(service, std::make_unique<WiredTigerFactory>());
+    });
 }  // namespace
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(WiredTigerEngineInit, ("SetGlobalEnvironment"))
-(InitializerContext* context) {
-    getGlobalServiceContext()->registerStorageEngine(kWiredTigerEngineName,
-                                                     new WiredTigerFactory());
-
-    return Status::OK();
-}
-}
+}  // namespace mongo

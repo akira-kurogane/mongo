@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,9 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -43,7 +46,31 @@ namespace mongo {
  * and a disk location.
  */
 struct IndexKeyEntry {
+    /**
+     * Given an index key 'dehyratedKey' with no field names, returns a new BSONObj representing the
+     * index key after adding field names according to 'keyPattern'.
+     */
+    static BSONObj rehydrateKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) {
+        BSONObjBuilder bob;
+        BSONObjIterator keyIter(keyPattern);
+        BSONObjIterator valueIter(dehydratedKey);
+
+        while (keyIter.more() && valueIter.more()) {
+            bob.appendAs(valueIter.next(), keyIter.next().fieldNameStringData());
+        }
+
+        invariant(!keyIter.more());
+        invariant(!valueIter.more());
+
+        return bob.obj();
+    }
+
     IndexKeyEntry(BSONObj key, RecordId loc) : key(std::move(key)), loc(std::move(loc)) {}
+
+    void serialize(BSONObjBuilder* builder) const {
+        builder->append("key"_sd, key);
+        loc.serialize(builder);
+    }
 
     BSONObj key;
     RecordId loc;
@@ -58,6 +85,18 @@ inline bool operator==(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
 inline bool operator!=(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
     return !(lhs == rhs);
 }
+
+/**
+ * Represents KeyString struct containing a KeyString::Value and its RecordId
+ */
+struct KeyStringEntry {
+    KeyStringEntry(KeyString::Value ks, RecordId loc) : keyString(ks), loc(loc) {
+        invariant(loc == KeyString::decodeRecordIdAtEnd(ks.getBuffer(), ks.getSize()));
+    }
+
+    KeyString::Value keyString;
+    RecordId loc;
+};
 
 /**
  * Describes a query that can be compared against an IndexKeyEntry in a way that allows
@@ -98,8 +137,6 @@ inline bool operator!=(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) {
  *          with the comparison being done exclusively
  *
  * 'prefixLen = 0' and 'prefixExclusive = true' are mutually incompatible.
- *
- * @see IndexEntryComparison::makeQueryObject
  */
 struct IndexSeekPoint {
     BSONObj keyPrefix;
@@ -131,11 +168,10 @@ struct IndexSeekPoint {
 };
 
 /**
- * Compares two different IndexKeyEntry instances.
- * The existence of compound indexes necessitates some complicated logic. This is meant to
- * support the comparisons of IndexKeyEntries (that are stored in an index) with IndexSeekPoints
- * (that were encoded with makeQueryObject) to support fine-grained control over whether the
- * ranges of various keys comprising a compound index are inclusive or exclusive.
+ * Compares two different IndexKeyEntry instances. The existence of compound indexes necessitates
+ * some complicated logic. This is meant to support the comparisons of IndexKeyEntries (that are
+ * stored in an index) with IndexSeekPoints to support fine-grained control over whether the ranges
+ * of various keys comprising a compound index are inclusive or exclusive.
  */
 class IndexEntryComparison {
 public:
@@ -148,24 +184,19 @@ public:
      * otherwise.
      *
      * IndexKeyEntries are compared lexicographically field by field in the BSONObj, followed by
-     * the RecordId. Either lhs or rhs (but not both) can be a query object returned by
-     * makeQueryObject(). See makeQueryObject() for a description of how its arguments affect
-     * the outcome of the comparison.
+     * the RecordId.
      */
     int compare(const IndexKeyEntry& lhs, const IndexKeyEntry& rhs) const;
 
     /**
-     * Encodes the arguments into a query object suitable to pass in to compare().
+     * Encodes the SeekPoint into a KeyString object suitable to pass in to seek().
      *
-     * A query object is used for seeking an iterator to a position in a sorted index.  The
-     * difference between a query object and the keys inserted into indexes is that query
-     * objects can be exclusive. This means that the first matching entry in the index is the
-     * first key in the index after the query. The meaning of "after" depends on
-     * cursorDirection.
-     *
-     * The fields of the key are the combination of keyPrefix and keySuffix. The first prefixLen
-     * keys of keyPrefix are used, as well as the keys starting at the prefixLen index of
-     * keySuffix.  The first prefixLen elements of keySuffix are ignored.
+     * A KeyString is used for seeking an iterator to a position in a sorted index. The difference
+     * between a query KeyString and the KeyStrings inserted into indexes is that a query KeyString
+     * can have an exclusive discriminator, which forces the key to compare less than or greater to
+     * a matching key in the index. This means that the first matching key is not returned, but
+     * rather the one immediately after. The meaning of "after" depends on the cursor directory,
+     * isForward.
      *
      * If a field is marked as exclusive, then comparisons stop after that field and return
      * either higher or lower, even if that field compares equal. If prefixExclusive is true and
@@ -178,30 +209,66 @@ public:
      * database, as their format may change. The only reason this is the same type as the
      * entries in an index is to support storage engines that require comparators that take
      * arguments of the same type.
-     *
-     * A cursurDirection of 1 indicates a forward cursor, and -1 indicates a reverse cursor.
-     * This effects the result when the exclusive field compares equal.
      */
-    static BSONObj makeQueryObject(const BSONObj& keyPrefix,
-                                   int prefixLen,
-                                   bool prefixExclusive,
-                                   const std::vector<const BSONElement*>& keySuffix,
-                                   const std::vector<bool>& suffixInclusive,
-                                   const int cursorDirection);
+    static KeyString::Value makeKeyStringFromSeekPointForSeek(const IndexSeekPoint& seekPoint,
+                                                              KeyString::Version version,
+                                                              Ordering ord,
+                                                              bool isForward);
 
-    static BSONObj makeQueryObject(const IndexSeekPoint& seekPoint, bool isForward) {
-        return makeQueryObject(seekPoint.keyPrefix,
-                               seekPoint.prefixLen,
-                               seekPoint.prefixExclusive,
-                               seekPoint.keySuffix,
-                               seekPoint.suffixInclusive,
-                               isForward ? 1 : -1);
-    }
+    /**
+     * Encodes the BSON Key into a KeyString object to pass in to SortedDataInterface::seek().
+     *
+     * `isForward` and `inclusive` together decide which discriminator we will put into the
+     * KeyString. This logic is closely related to how WiredTiger uses its API
+     * (search_near/prev/next) to do the seek. Other storage engines' SortedDataInterface should use
+     * the discriminator to deduce the `inclusive` and the use their own ways to seek to the right
+     * position.
+     *
+     * 1. When isForward == true, inclusive == true, bsonKey will be encoded with kExclusiveBefore
+     * (which is less than bsonKey). WT's search_near() could land either on the previous key or
+     * bsonKey. WT will selectively call next() if it's on the previous key.
+     *
+     * 2. When isForward == true, inclusive == false, bsonKey will be encoded with kExclusiveAfter
+     * (which is greater than bsonKey). WT's search_near() could land either on bsonKey or the next
+     * key. WT will selectively call next() if it's on bsonKey.
+     *
+     * 3. When isForward == false, inclusive == true, bsonKey will be encoded with kExclusiveAfter
+     * (which is greater than bsonKey). WT's search_near() could land either on bsonKey or the next
+     * key. WT will selectively call prev() if it's on the next key.
+     *
+     * 4. When isForward == false, inclusive == false, bsonKey will be encoded with kExclusiveBefore
+     * (which is less than bsonKey). WT's search_near() could land either on the previous key or the
+     * bsonKey. WT will selectively call prev() if it's on bsonKey.
+     */
+    static KeyString::Value makeKeyStringFromBSONKeyForSeek(const BSONObj& bsonKey,
+                                                            KeyString::Version version,
+                                                            Ordering ord,
+                                                            bool isForward,
+                                                            bool inclusive);
 
 private:
     // Ordering is used in comparison() to compare BSONElements
     const Ordering _order;
 
 };  // struct IndexEntryComparison
+
+/**
+ * Returns the formatted error status about the duplicate key.
+ */
+Status buildDupKeyErrorStatus(const BSONObj& key,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation);
+
+/**
+ * Returns the formatted error status about the duplicate KeyString.
+ */
+Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+                              const NamespaceString& collectionNamespace,
+                              const std::string& indexName,
+                              const BSONObj& keyPattern,
+                              const BSONObj& indexCollation,
+                              const Ordering& ordering);
 
 }  // namespace mongo

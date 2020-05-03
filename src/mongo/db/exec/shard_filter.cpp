@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,36 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/shard_filter.h"
 
+#include <memory>
+
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/s/metadata_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::shared_ptr;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 // static
 const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
-ShardFilterStage::ShardFilterStage(OperationContext* opCtx,
-                                   ScopedCollectionMetadata metadata,
+ShardFilterStage::ShardFilterStage(ExpressionContext* expCtx,
+                                   ScopedCollectionFilter collectionFilter,
                                    WorkingSet* ws,
-                                   PlanStage* child)
-    : PlanStage(kStageType, opCtx), _ws(ws), _metadata(std::move(metadata)) {
-    _children.emplace_back(child);
+                                   std::unique_ptr<PlanStage> child)
+    : PlanStage(kStageType, expCtx), _ws(ws), _shardFilterer(std::move(collectionFilter)) {
+    _children.emplace_back(std::move(child));
 }
 
 ShardFilterStage::~ShardFilterStage() {}
@@ -76,37 +76,29 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
         // If we're sharded make sure that we don't return data that is not owned by us,
         // including pending documents from in-progress migrations and orphaned documents from
         // aborted migrations
-        if (_metadata) {
-            ShardKeyPattern shardKeyPattern(_metadata->getKeyPattern());
+        if (_shardFilterer.isCollectionSharded()) {
             WorkingSetMember* member = _ws->get(*out);
-            WorkingSetMatchableDocument matchable(member);
-            BSONObj shardKey = shardKeyPattern.extractShardKeyFromMatchable(matchable);
+            ShardFilterer::DocumentBelongsResult res = _shardFilterer.documentBelongsToMe(*member);
+            if (res != ShardFilterer::DocumentBelongsResult::kBelongs) {
+                if (res == ShardFilterer::DocumentBelongsResult::kNoShardKey) {
+                    // We can't find a shard key for this working set member - this should never
+                    // happen with a non-fetched result unless our query planning is screwed up
+                    invariant(member->hasObj());
 
-            if (shardKey.isEmpty()) {
-                // We can't find a shard key for this document - this should never happen with
-                // a non-fetched result unless our query planning is screwed up
-                if (!member->hasObj()) {
-                    Status status(ErrorCodes::InternalError,
-                                  "shard key not found after a covered stage, "
-                                  "query planning has failed");
-
-                    // Fail loudly and cleanly in production, fatally in debug
-                    error() << redact(status);
-                    dassert(false);
-
-                    _ws->free(*out);
-                    *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-                    return PlanStage::FAILURE;
+                    // Skip this working set member with a warning - no shard key should not be
+                    // possible unless manually inserting data into a shard
+                    LOGV2_WARNING(
+                        23787,
+                        "no shard key found in document {member_doc_value_toBson} for shard key "
+                        "pattern {shardFilterer_getKeyPattern}, document may have been inserted "
+                        "manually into shard",
+                        "member_doc_value_toBson"_attr = redact(member->doc.value().toBson()),
+                        "shardFilterer_getKeyPattern"_attr = _shardFilterer.getKeyPattern());
+                } else {
+                    invariant(res == ShardFilterer::DocumentBelongsResult::kDoesNotBelong);
                 }
 
-                // Skip this document with a warning - no shard key should not be possible
-                // unless manually inserting data into a shard
-                warning() << "no shard key found in document " << redact(member->obj.value()) << " "
-                          << "for shard key pattern " << _metadata->getKeyPattern() << ", "
-                          << "document may have been inserted manually into shard";
-            }
-
-            if (!_metadata->keyBelongsToMe(shardKey)) {
+                // If the document had no shard key, or doesn't belong to us, skip it.
                 _ws->free(*out);
                 ++_specificStats.chunkSkips;
                 return PlanStage::NEED_TIME;
@@ -124,9 +116,9 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
 unique_ptr<PlanStageStats> ShardFilterStage::getStats() {
     _commonStats.isEOF = isEOF();
     unique_ptr<PlanStageStats> ret =
-        make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
     ret->children.emplace_back(child()->getStats());
-    ret->specific = make_unique<ShardingFilterStats>(_specificStats);
+    ret->specific = std::make_unique<ShardingFilterStats>(_specificStats);
     return ret;
 }
 

@@ -1,25 +1,24 @@
-// key_string.h
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +31,10 @@
 
 #include <limits>
 
+#include <absl/hash/hash.h>
+
 #include "mongo/base/static_assert.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -40,310 +42,554 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/record_id.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+
+#include <boost/container/flat_set.hpp>
 
 namespace mongo {
 
-class KeyString {
+namespace KeyString {
+
+enum class Version : uint8_t { V0 = 0, V1 = 1, kLatestVersion = V1 };
+
+static StringData keyStringVersionToString(Version version) {
+    return version == Version::V0 ? "V0" : "V1";
+}
+
+static const Ordering ALL_ASCENDING = Ordering::make(BSONObj());
+
+/**
+ * Encodes info needed to restore the original BSONTypes from a KeyString. They cannot be
+ * stored in place since we don't want them to affect the ordering (1 and 1.0 compare as
+ * equal).
+ */
+class TypeBits {
 public:
+    // See comments in getBuffer() about short/long encoding schemes.
+    static const uint8_t kMaxBytesForShortEncoding = 127;
+    static const uint8_t kPrefixBytes = 5;
+    static const uint8_t kStoredDecimalExponentBits = 6;
+    static const uint32_t kStoredDecimalExponentMask = (1U << kStoredDecimalExponentBits) - 1;
+
+    explicit TypeBits(Version version) : version(version) {
+        reset();
+    }
+
+    TypeBits(const TypeBits& tb)
+        : version(tb.version), _curBit(tb._curBit), _isAllZeros(tb._isAllZeros) {
+        _buf.reset();
+        _buf.appendBuf(tb._buf.buf(), tb._buf.len());
+    }
+
+    TypeBits& operator=(const TypeBits& tb);
+    TypeBits(TypeBits&&) = default;
+    TypeBits& operator=(TypeBits&&) = default;
+
     /**
-     * Selects version of KeyString to use. V0 and V1 differ in their encoding of numeric values.
+     * If there are no bytes remaining, assumes AllZeros. Otherwise, reads bytes out of the
+     * BufReader in the format described on the getBuffer() method.
      */
-    enum class Version : uint8_t { V0 = 0, V1 = 1 };
-    static StringData versionToString(Version version) {
-        return version == Version::V0 ? "V0" : "V1";
+    void resetFromBuffer(BufReader* reader);
+    static TypeBits fromBuffer(Version version, BufReader* reader) {
+        TypeBits out(version);
+        out.resetFromBuffer(reader);
+        return out;
     }
 
     /**
-     * Provides the latest version of KeyString available.
+     * If true, no bits have been set to one. This is true if no bits have been set at all.
      */
-    static const Version kLatestVersion = Version::V1;
+    bool isAllZeros() const {
+        return _isAllZeros;
+    }
 
     /**
-     * Encodes info needed to restore the original BSONTypes from a KeyString. They cannot be
-     * stored in place since we don't want them to affect the ordering (1 and 1.0 compare as
-     * equal).
+     * These methods return a buffer and size which encodes all of the type bits in this
+     * instance.
+     *
+     * Encoded format:
+     * Case 1 (first byte is 0x0):
+     *     This encodes the "AllZeros" state which represents an infinite stream of bits set
+     *     to 0. Callers may optionally encode this case as an empty buffer if they have
+     *     another way to mark the end of the buffer. There are no follow-up bytes.
+     *
+     * Case 2 (first byte isn't 0x0 but has high bit set to 0):
+     *     The first byte is the only data byte. This can represent any 7-bit sequence or an
+     *     8-bit sequence if the 8th bit is 0, since the 8th bit is the same as the bit that
+     *     is 1 if the first byte is the size byte. There are no follow-up bytes.
+     *
+     * Case 3 (first byte has high bit set to 1 but it's not 0x80):
+     *     Remaining bits of first byte encode number of follow-up bytes that are data
+     *     bytes.
+     *
+     * Case 4 (first byte is 0x80)
+     *     The first byte is the signal byte indicating that this TypeBits is encoded with long
+     *     encoding scheme: the next four bytes (in little endian order) represent the number of
+     *     data bytes.
+     *
+     * Within data bytes (ie everything excluding the size byte if there is one), bits are
+     * packed in from low to high.
      */
-    class TypeBits {
+    const char* getBuffer() const {
+        if (_isAllZeros)
+            return "";  // Case 1: pointer to a zero byte.
+
+        if (getSize() == 1)
+            return getDataBuffer();  // Case 2: all bits in one byte; no size byte.
+
+        // Case 3 & 4: size byte(s) + data bytes.
+        return isLongEncoding() ? _buf.buf() : (getDataBuffer() - 1);
+    }
+    size_t getSize() const {
+        if (_isAllZeros) {  // Case 1
+            dassert(getDataBufferLen() == 0 || getDataBuffer()[0] == 0);
+            return 1;
+        }
+
+        uint32_t rawSize = getDataBufferLen();
+        dassert(rawSize >= 1);                      // 0 should be handled as isAllZeros.
+        if (rawSize > kMaxBytesForShortEncoding) {  // Case 4
+            return rawSize + kPrefixBytes;
+        }
+        if (rawSize == 1 && !(getDataBuffer()[0] & 0x80)) {  // Case 2
+            return 1;
+        }
+
+        return rawSize + 1;  // Case 3
+    }
+
+    bool isLongEncoding() const {
+        // TypeBits with all zeros is in short encoding regardless of the data buffer length.
+        return !_isAllZeros && getDataBufferLen() > kMaxBytesForShortEncoding;
+    }
+
+    //
+    // Everything below is only for use by KeyString::Builder.
+    //
+
+    // Note: No space is used if all bits are 0 so the most common cases should be 0x0.
+    static const uint8_t kString = 0x0;
+    static const uint8_t kSymbol = 0x1;
+
+    static const uint8_t kInt = 0x0;
+    static const uint8_t kLong = 0x1;
+    static const uint8_t kDouble = 0x2;
+    static const uint8_t kDecimal = 0x3;               // indicates 6 more bits of typeinfo follow.
+    static const uint8_t kSpecialZeroPrefix = 0x3;     // kNumericZero case, 3 more bits follow.
+    static const uint8_t kNegativeDoubleZero = 0x3;    // normalized -0.0 double, either V0 or V1.
+    static const uint8_t kV0NegativeDoubleZero = 0x3;  // legacy encoding for V0
+
+    // The following describe the initial 5 type bits for kNegativeOrDecimalZero. These bits
+    // encode double -0 or a 3-bit prefix (range 0 to 5) of the 15-bit decimal zero type.
+    static const uint8_t kV1NegativeDoubleZero = 0x18;  // 0b11000
+
+    static const uint8_t kUnusedEncoding = 0x19;  // 0b11001
+
+    // There are 6 * (1<<12) == 2 * (kMaxBiasedExponent + 1) == 24576 decimal zeros.
+    static const uint8_t kDecimalZero0xxx = 0x1a;  // 0b11010 12 more exponent bits follow
+    static const uint8_t kDecimalZero1xxx = 0x1b;  // 0b11011
+    static const uint8_t kDecimalZero2xxx = 0x1c;  // 0b11100
+    static const uint8_t kDecimalZero3xxx = 0x1d;  // 0b11101
+    static const uint8_t kDecimalZero4xxx = 0x1e;  // 0b11110
+    static const uint8_t kDecimalZero5xxx = 0x1f;  // 0b11111
+
+    void reset() {
+        _curBit = 0;
+        _isAllZeros = true;
+        _buf.setlen(kPrefixBytes);
+    }
+
+    void appendString() {
+        appendBit(kString);
+    }
+    void appendSymbol() {
+        appendBit(kSymbol);
+    }
+
+    void appendNumberDouble() {
+        appendBit(kDouble >> 1);
+        appendBit(kDouble & 1);
+    }
+    void appendNumberInt() {
+        appendBit(kInt >> 1);
+        appendBit(kInt & 1);
+    }
+    void appendNumberLong() {
+        appendBit(kLong >> 1);
+        appendBit(kLong & 1);
+    }
+    void appendNumberDecimal() {
+        appendBit(kDecimal >> 1);
+        appendBit(kDecimal & 1);
+    }
+    void appendZero(uint8_t zeroType);
+    void appendDecimalZero(uint32_t whichZero);
+    void appendDecimalExponent(uint8_t storedExponentBits);
+
+    class Reader {
     public:
-        // Sufficient bytes to encode extra type information for any BSON key that fits in 1KB.
-        // The encoding format will need to change if we raise this limit.
-        static const uint8_t kMaxBytesNeeded = 127;
-        static const uint32_t kMaxKeyBytes = 1024;
-        static const uint32_t kMaxTypeBitsPerDecimal = 17;
-        static const uint32_t kBytesForTypeAndEmptyKey = 2;
-        static const uint32_t kMaxDecimalsPerKey =
-            kMaxKeyBytes / (sizeof(Decimal128::Value) + kBytesForTypeAndEmptyKey);
-        MONGO_STATIC_ASSERT_MSG(
-            kMaxTypeBitsPerDecimal* kMaxDecimalsPerKey < kMaxBytesNeeded * 8UL,
-            "encoding needs change to contain all type bits for worst case key");
-        static const uint8_t kStoredDecimalExponentBits = 6;
-        static const uint32_t kStoredDecimalExponentMask = (1U << kStoredDecimalExponentBits) - 1;
-
-        explicit TypeBits(Version version) : version(version) {
-            reset();
-        }
-
         /**
-         * If there are no bytes remaining, assumes AllZeros. Otherwise, reads bytes out of the
-         * BufReader in the format described on the getBuffer() method.
+         * Passed in TypeBits must outlive this Reader instance.
          */
-        void resetFromBuffer(BufReader* reader);
-        static TypeBits fromBuffer(Version version, BufReader* reader) {
-            TypeBits out(version);
-            out.resetFromBuffer(reader);
-            return out;
+        explicit Reader(const TypeBits& typeBits) : _curBit(0), _typeBits(typeBits) {}
+
+        uint8_t readStringLike() {
+            return readBit();
         }
-
-        /**
-         * If true, no bits have been set to one. This is true if no bits have been set at all.
-         */
-        bool isAllZeros() const {
-            return _isAllZeros;
+        uint8_t readNumeric() {
+            uint8_t highBit = readBit();
+            return (highBit << 1) | readBit();
         }
+        uint8_t readZero();
 
-        /**
-         * These methods return a buffer and size which encodes all of the type bits in this
-         * instance.
-         *
-         * Encoded format:
-         * Case 1 (first byte has high bit set to 1):
-         *     Remaining bits of first byte encode number of follow-up bytes that are data
-         *     bytes. Note that _buf is always maintained in this format but these methods may
-         *     return one of the other formats, if possible, by skipping over the first byte.
-         *
-         * Case 2 (first byte is 0x0):
-         *     This encodes the "AllZeros" state which represents an infinite stream of bits set
-         *     to 0. Callers may optionally encode this case as an empty buffer if they have
-         *     another way to mark the end of the buffer. There are no follow-up bytes.
-         *
-         * Case 3 (first byte isn't 0x0 but has high bit set to 0):
-         *     The first byte is the only data byte. This can represent any 7-bit sequence or an
-         *     8-bit sequence if the 8th bit is 0, since the 8th bit is the same as the bit that
-         *     is 1 if the first byte is the size byte. There are no follow-up bytes.
-         *
-         * Within data bytes (ie everything excluding the size byte if there is one), bits are
-         * packed in from low to high.
-         */
-        const uint8_t* getBuffer() const {
-            return getSize() == 1 ? _buf + 1 : _buf;
-        }
-        size_t getSize() const {
-            if (_isAllZeros) {  // Case 2
-                dassert(_buf[1] == 0);
-                return 1;
-            }
+        // Given a decimal zero type between kDecimalZero0xxx and kDecimal5xxx, read the
+        // remaining 12 bits and return which of the 24576 decimal zeros to produce.
+        uint32_t readDecimalZero(uint8_t zeroType);
 
-            uint8_t rawSize = getSizeByte();
-            dassert(rawSize >= 1);                    // 0 should be handled as isAllZeros.
-            if (rawSize == 1 && !(_buf[1] & 0x80)) {  // Case 3
-                return 1;
-            }
-
-            return rawSize + 1;  // Case 1
-        }
-
-        //
-        // Everything below is only for use by KeyString.
-        //
-
-        // Note: No space is used if all bits are 0 so the most common cases should be 0x0.
-        static const uint8_t kString = 0x0;
-        static const uint8_t kSymbol = 0x1;
-
-        static const uint8_t kInt = 0x0;
-        static const uint8_t kLong = 0x1;
-        static const uint8_t kDouble = 0x2;
-        static const uint8_t kDecimal = 0x3;            // indicates 6 more bits of typeinfo follow.
-        static const uint8_t kSpecialZeroPrefix = 0x3;  // kNumericZero case, 3 more bits follow.
-        static const uint8_t kNegativeDoubleZero = 0x3;  // normalized -0.0 double, either V0 or V1.
-        static const uint8_t kV0NegativeDoubleZero = 0x3;  // legacy encoding for V0
-
-        // The following describe the initial 5 type bits for kNegativeOrDecimalZero. These bits
-        // encode double -0 or a 3-bit prefix (range 0 to 5) of the 15-bit decimal zero type.
-        static const uint8_t kV1NegativeDoubleZero = 0x18;  // 0b11000
-
-        static const uint8_t kUnusedEncoding = 0x19;  // 0b11001
-
-        // There are 6 * (1<<12) == 2 * (kMaxBiasedExponent + 1) == 24576 decimal zeros.
-        static const uint8_t kDecimalZero0xxx = 0x1a;  // 0b11010 12 more exponent bits follow
-        static const uint8_t kDecimalZero1xxx = 0x1b;  // 0b11011
-        static const uint8_t kDecimalZero2xxx = 0x1c;  // 0b11100
-        static const uint8_t kDecimalZero3xxx = 0x1d;  // 0b11101
-        static const uint8_t kDecimalZero4xxx = 0x1e;  // 0b11110
-        static const uint8_t kDecimalZero5xxx = 0x1f;  // 0b11111
-
-        void reset() {
-            _curBit = 0;
-            _isAllZeros = true;
-            setSizeByte(0);
-            _buf[1] = 0;
-        }
-
-        void appendString() {
-            appendBit(kString);
-        }
-        void appendSymbol() {
-            appendBit(kSymbol);
-        }
-
-        void appendNumberDouble() {
-            appendBit(kDouble >> 1);
-            appendBit(kDouble & 1);
-        }
-        void appendNumberInt() {
-            appendBit(kInt >> 1);
-            appendBit(kInt & 1);
-        }
-        void appendNumberLong() {
-            appendBit(kLong >> 1);
-            appendBit(kLong & 1);
-        }
-        void appendNumberDecimal() {
-            appendBit(kDecimal >> 1);
-            appendBit(kDecimal & 1);
-        }
-        void appendZero(uint8_t zeroType);
-        void appendDecimalZero(uint32_t whichZero);
-        void appendDecimalExponent(uint8_t storedExponentBits);
-
-        class Reader {
-        public:
-            /**
-             * Passed in TypeBits must outlive this Reader instance.
-             */
-            explicit Reader(const TypeBits& typeBits) : _curBit(0), _typeBits(typeBits) {}
-
-            uint8_t readStringLike() {
-                return readBit();
-            }
-            uint8_t readNumeric() {
-                uint8_t highBit = readBit();
-                return (highBit << 1) | readBit();
-            }
-            uint8_t readZero();
-
-            // Given a decimal zero type between kDecimalZero0xxx and kDecimal5xxx, read the
-            // remaining 12 bits and return which of the 24576 decimal zeros to produce.
-            uint32_t readDecimalZero(uint8_t zeroType);
-
-            // Reads the stored exponent bits of a non-zero decimal number.
-            uint8_t readDecimalExponent();
-
-        private:
-            uint8_t readBit();
-
-            size_t _curBit;
-            const TypeBits& _typeBits;
-        };
-
-        const Version version;
+        // Reads the stored exponent bits of a non-zero decimal number.
+        uint8_t readDecimalExponent();
 
     private:
-        /**
-         * size only includes data bytes, not the size byte itself.
-         */
-        uint8_t getSizeByte() const {
-            return _buf[0] & 0x7f;
-        }
-        void setSizeByte(uint8_t size) {
-            dassert(size < kMaxBytesNeeded);
-            _buf[0] = 0x80 | size;
-        }
+        uint8_t readBit();
 
-        void appendBit(uint8_t oneOrZero);
-
-        size_t _curBit;
-        bool _isAllZeros;
-
-        // See getBuffer()/getSize() documentation for a description of how data is encoded.
-        // Currently whole buffer is copied in default copy methods. If they ever show up as hot
-        // in profiling, we should add copy operations that only copy the parts of _buf that are
-        // in use.
-        uint8_t _buf[1 /*size*/ + kMaxBytesNeeded];
+        uint32_t _curBit;
+        const TypeBits& _typeBits;
     };
 
-    enum Discriminator {
-        kInclusive,  // Anything to be stored in an index must use this.
-        kExclusiveBefore,
-        kExclusiveAfter,
-    };
+    Version version;
+
+private:
+    static uint32_t readSizeFromBuffer(BufReader* reader);
+
+    void setRawSize(uint32_t size);
+
+    const char* getDataBuffer() const {
+        return _buf.buf() + kPrefixBytes;
+    }
+    char* getDataBuffer() {
+        return _buf.buf() + kPrefixBytes;
+    }
+    uint32_t getDataBufferLen() const {
+        return _buf.len() - kPrefixBytes;
+    }
+
+    void appendBit(uint8_t oneOrZero);
+
+    uint32_t _curBit;
+    bool _isAllZeros;
 
     /**
-     * Encodes the kind of NumberDecimal that is stored.
+     * See getBuffer()/getSize() documentation for a description of how data is encoded. When
+     * the TypeBits size is in short encoding range(<=127), the bytes starting from the fifth
+     * byte are the complete TypeBits in short encoding scheme (1 size byte + data bytes).  When
+     * the TypeBits size is in long encoding range(>127), all the bytes are used for the long
+     * encoding format (first byte + 4 size bytes + data bytes).
      */
-    enum DecimalContinuationMarker {
-        kDCMEqualToDouble = 0x0,
-        kDCMHasContinuationLessThanDoubleRoundedUpTo15Digits = 0x1,
-        kDCMEqualToDoubleRoundedUpTo15Digits = 0x2,
-        kDCMHasContinuationLargerThanDoubleRoundedUpTo15Digits = 0x3
+
+    // TypeBits buffers are often small and at least 5 bytes. Only pre-allocate a small amount of
+    // memory despite using a StackBufBuilder, which can use cheap stack space. Because TypeBits is
+    // allowed to be allocated dynamically on the heap, so is the owned StackBufBuilder. Lower the
+    // initial buffer size so that we do not pre-allocate excessively large buffers on the heap when
+    // TypeBits is not a stack variable.
+    enum { SmallStackSize = 8 };
+    StackBufBuilderBase<SmallStackSize> _buf;
+};
+
+
+/**
+ * Value owns a buffer that corresponds to a completely generated KeyString::Builder with the
+ * TypeBits appended.
+ *
+ * To optimize copy performance and space requirements of this structure, the buffer will contain
+ * the full KeyString with the TypeBits appended at the end.
+ */
+class Value {
+
+public:
+    Value() : _version(Version::kLatestVersion), _ksSize(0) {}
+
+    Value(Version version, int32_t ksSize, SharedBufferFragment buffer)
+        : _version(version), _ksSize(ksSize), _buffer(std::move(buffer)) {
+        invariant(ksSize >= 0);
+        invariant(ksSize <= static_cast<int32_t>(_buffer.size()));
+    }
+
+    Value(const Value&) = default;
+    Value(Value&&) = default;
+
+    // Use a copy-and-swap, which prevents unnecessary allocation and deallocations.
+    Value& operator=(Value copy) noexcept {
+        _version = copy._version;
+        _ksSize = copy._ksSize;
+        std::swap(_buffer, copy._buffer);
+        return *this;
+    }
+
+    template <class T>
+    int compare(const T& other) const;
+
+    int compareWithTypeBits(const Value& other) const;
+
+    template <class T>
+    int compareWithoutRecordId(const T& other) const;
+
+    // Returns the size of the stored KeyString.
+    size_t getSize() const {
+        return _ksSize;
+    }
+
+    // Returns whether the size of the stored KeyString is 0.
+    bool isEmpty() const {
+        return _ksSize == 0;
+    }
+
+    const char* getBuffer() const {
+        return _buffer.get();
+    }
+
+    // Returns the stored TypeBits.
+    TypeBits getTypeBits() const {
+        const char* buf = _buffer.get() + _ksSize;
+        BufReader reader(buf, _buffer.size() - _ksSize);
+        return TypeBits::fromBuffer(_version, &reader);
+    }
+
+    // Compute hash over key
+    uint64_t hash(uint64_t seed = 0) const {
+        return absl::hash_internal::CityHash64WithSeed(_buffer.get(), _buffer.size(), seed);
+    }
+
+    /**
+     * Returns a hex encoding of this key.
+     */
+    std::string toString() const;
+
+    // Serializes this Value into a storable format with TypeBits information. The serialized
+    // format takes the following form:
+    //   [keystring size][keystring encoding][typebits encoding]
+    void serialize(BufBuilder& buf) const {
+        buf.appendNum(_ksSize);                        // Serialize size of Keystring
+        buf.appendBuf(_buffer.get(), _buffer.size());  // Serialize Keystring + Typebits
+    }
+
+    // Deserialize the Value from a serialized format.
+    static Value deserialize(BufReader& buf, KeyString::Version version) {
+        const int32_t sizeOfKeystring = buf.read<LittleEndian<int32_t>>();
+        const void* keystringPtr = buf.skip(sizeOfKeystring);
+
+        BufBuilder newBuf;
+        newBuf.appendBuf(keystringPtr, sizeOfKeystring);
+
+        auto typeBits = TypeBits::fromBuffer(version, &buf);  // advances the buf
+        if (typeBits.isAllZeros()) {
+            newBuf.appendChar(0);
+        } else {
+            newBuf.appendBuf(typeBits.getBuffer(), typeBits.getSize());
+        }
+        return {version, sizeOfKeystring, SharedBufferFragment(newBuf.release(), newBuf.len())};
+    }
+
+    /// Members for Sorter
+    struct SorterDeserializeSettings {
+        SorterDeserializeSettings(Version version) : keyStringVersion(version) {}
+        Version keyStringVersion;
     };
 
-    explicit KeyString(Version version) : version(version), _typeBits(version) {}
+    void serializeForSorter(BufBuilder& buf) const {
+        serialize(buf);
+    }
 
-    KeyString(Version version, const BSONObj& obj, Ordering ord, RecordId recordId)
-        : KeyString(version) {
+    static Value deserializeForSorter(BufReader& buf, const SorterDeserializeSettings& settings) {
+        return deserialize(buf, settings.keyStringVersion);
+    }
+
+    int memUsageForSorter() const {
+        // Ideally we want to always use the buffer capacity as a more accurate measure of memory
+        // usage here. But when built using the PooledBuilder we cannot do that as the buffer is
+        // shared between many instances we have to use the size() as an approximation of memory
+        // use. There might be a chunk at the end of the buffer that's not used by any KeyString and
+        // that memory will be unaccounted for unfortunately.
+        // When the PooledBuilder is used this buffer will always be shared as the
+        // SharedBufferFragmentBuilder will keep a reference. If it is not shared we've used either
+        // the Heap or Static builder and want to report the whole memory allocation in the buffer.
+        return sizeof(Value) + (_buffer.isShared() ? _buffer.size() : _buffer.underlyingCapacity());
+    }
+
+    Value getOwned() const {
+        return *this;
+    }
+
+private:
+    Version _version;
+    // _ksSize is the total length that the KeyString takes up in the buffer.
+    int32_t _ksSize;
+    SharedBufferFragment _buffer;
+};
+
+enum class Discriminator {
+    kInclusive,  // Anything to be stored in an index must use this.
+    kExclusiveBefore,
+    kExclusiveAfter,
+};
+
+enum class BuildState {
+    kEmpty,                  // Buffer is empty.
+    kAppendingBSONElements,  // In the process of appending BSON Elements
+    kEndAdded,               // Finished appedning BSON Elements.
+    kAppendedRecordID,       // Finished appending a RecordID.
+    kAppendedTypeBits,       // Finished appending a TypeBits.
+    kReleased                // Released the buffer and so the buffer is no longer valid.
+};
+
+/**
+ * Encodes the kind of NumberDecimal that is stored.
+ */
+enum DecimalContinuationMarker {
+    kDCMEqualToDouble = 0x0,
+    kDCMHasContinuationLessThanDoubleRoundedUpTo15Digits = 0x1,
+    kDCMEqualToDoubleRoundedUpTo15Digits = 0x2,
+    kDCMHasContinuationLargerThanDoubleRoundedUpTo15Digits = 0x3
+};
+
+using StringTransformFn = std::function<std::string(StringData)>;
+
+template <class BuilderT>
+class BuilderBase {
+public:
+    BuilderBase(Version version, Ordering ord, Discriminator discriminator)
+        : version(version),
+          _typeBits(version),
+          _state(BuildState::kEmpty),
+          _elemCount(0),
+          _ordering(ord),
+          _discriminator(discriminator) {}
+
+    BuilderBase(Version version, Ordering ord)
+        : BuilderBase(version, ord, Discriminator::kInclusive) {}
+    explicit BuilderBase(Version version)
+        : BuilderBase(version, ALL_ASCENDING, Discriminator::kInclusive) {}
+
+    BuilderBase(Version version, const BSONObj& obj, Ordering ord, RecordId recordId)
+        : BuilderBase(version, ord) {
         resetToKey(obj, ord, recordId);
     }
 
-    KeyString(Version version,
-              const BSONObj& obj,
-              Ordering ord,
-              Discriminator discriminator = kInclusive)
-        : KeyString(version) {
+    BuilderBase(Version version,
+                const BSONObj& obj,
+                Ordering ord,
+                Discriminator discriminator = Discriminator::kInclusive)
+        : BuilderBase(version, ord) {
         resetToKey(obj, ord, discriminator);
     }
 
-    KeyString(Version version, RecordId rid) : version(version), _typeBits(version) {
+    BuilderBase(const BuilderBase& other)
+        : version(other.version),
+          _typeBits(other.getTypeBits()),
+          _state(other._state),
+          _elemCount(other._elemCount),
+          _ordering(other._ordering),
+          _discriminator(other._discriminator) {
+        resetFromBuffer(other.getBuffer(), other.getSize());
+    }
+
+    BuilderBase(Version version, RecordId rid) : BuilderBase(version) {
         appendRecordId(rid);
     }
 
-    static BSONObj toBson(StringData data, Ordering ord, const TypeBits& types);
-    static BSONObj toBson(const char* buffer, size_t len, Ordering ord, const TypeBits& types);
-
     /**
-     * Decodes a RecordId from the end of a buffer.
+     * Copies the data held in this buffer into a Value type that holds and owns a copy of the
+     * buffer.
      */
-    static RecordId decodeRecordIdAtEnd(const void* buf, size_t size);
+    Value getValueCopy() {
+        _doneAppending();
 
-    /**
-     * Decodes a RecordId, consuming all bytes needed from reader.
-     */
-    static RecordId decodeRecordId(BufReader* reader);
+        // Create a new buffer that is a concatenation of the KeyString and its TypeBits.
+        BufBuilder newBuf(_buffer().len() + _typeBits.getSize());
+        newBuf.appendBuf(_buffer().buf(), _buffer().len());
+        if (_typeBits.isAllZeros()) {
+            newBuf.appendChar(0);
+        } else {
+            newBuf.appendBuf(_typeBits.getBuffer(), _typeBits.getSize());
+        }
+        return {version, _buffer().len(), SharedBufferFragment(newBuf.release(), newBuf.len())};
+    }
 
     void appendRecordId(RecordId loc);
     void appendTypeBits(const TypeBits& bits);
 
+    /*
+     * Function 'f' will be applied to all string elements contained in 'elem'.
+     */
+    void appendBSONElement(const BSONElement& elem, const StringTransformFn& f = nullptr);
+
+    void appendString(StringData val);
+    void appendNumberDouble(double num);
+    void appendNumberLong(long long num);
+    void appendNull();
+    void appendUndefined();
+    void appendBinData(const BSONBinData& data);
+    void appendSetAsArray(const BSONElementSet& set, const StringTransformFn& f = nullptr);
+
+    /**
+     * Appends a Discriminator byte and kEnd byte to a key string.
+     */
+    void appendDiscriminator(const Discriminator discriminator);
+
     /**
      * Resets to an empty state.
-     * Equivalent to but faster than *this = KeyString()
+     * Equivalent to but faster than *this = Builder(ord, discriminator)
      */
-    void resetToEmpty() {
-        _buffer.reset();
+    void resetToEmpty(Ordering ord = ALL_ASCENDING,
+                      Discriminator discriminator = Discriminator::kInclusive) {
+        _reinstantiateBufferIfNeeded();
+        _buffer().reset();
         _typeBits.reset();
+
+        _elemCount = 0;
+        _ordering = ord;
+        _discriminator = discriminator;
+        _transition(BuildState::kEmpty);
     }
 
     void resetToKey(const BSONObj& obj, Ordering ord, RecordId recordId);
-    void resetToKey(const BSONObj& obj, Ordering ord, Discriminator discriminator = kInclusive);
+    void resetToKey(const BSONObj& obj,
+                    Ordering ord,
+                    Discriminator discriminator = Discriminator::kInclusive);
     void resetFromBuffer(const void* buffer, size_t size) {
-        _buffer.reset();
-        memcpy(_buffer.skip(size), buffer, size);
+        _buffer().reset();
+        memcpy(_buffer().skip(size), buffer, size);
     }
 
     const char* getBuffer() const {
-        return _buffer.buf();
+        invariant(_state != BuildState::kReleased);
+        return _buffer().buf();
     }
+
     size_t getSize() const {
-        return _buffer.len();
+        invariant(_state != BuildState::kReleased);
+        return _buffer().len();
     }
+
     bool isEmpty() const {
-        return _buffer.len() == 0;
+        invariant(_state != BuildState::kReleased);
+        return _buffer().len() == 0;
+    }
+
+    void setTypeBits(const TypeBits& typeBits) {
+        invariant(_state != BuildState::kReleased);
+        _typeBits = typeBits;
     }
 
     const TypeBits& getTypeBits() const {
+        invariant(_state != BuildState::kReleased);
         return _typeBits;
     }
 
-    int compare(const KeyString& other) const;
+    template <class T>
+    int compare(const T& other) const;
+
+    template <class T>
+    int compareWithoutRecordId(const T& other) const;
 
     /**
      * @return a hex encoding of this key
@@ -356,24 +602,23 @@ public:
      */
     const Version version;
 
-private:
-    void _appendAllElementsForIndexing(const BSONObj& obj,
-                                       Ordering ord,
-                                       Discriminator discriminator);
+protected:
+    void _appendAllElementsForIndexing(const BSONObj& obj, Discriminator discriminator);
 
     void _appendBool(bool val, bool invert);
     void _appendDate(Date_t val, bool invert);
     void _appendTimestamp(Timestamp val, bool invert);
     void _appendOID(OID val, bool invert);
-    void _appendString(StringData val, bool invert);
+    void _appendString(StringData val, bool invert, const StringTransformFn& f);
     void _appendSymbol(StringData val, bool invert);
     void _appendCode(StringData val, bool invert);
     void _appendCodeWString(const BSONCodeWScope& val, bool invert);
     void _appendBinData(const BSONBinData& val, bool invert);
     void _appendRegex(const BSONRegEx& val, bool invert);
     void _appendDBRef(const BSONDBRef& val, bool invert);
-    void _appendArray(const BSONArray& val, bool invert);
-    void _appendObject(const BSONObj& val, bool invert);
+    void _appendArray(const BSONArray& val, bool invert, const StringTransformFn& f);
+    void _appendSetAsArray(const BSONElementSet& val, bool invert, const StringTransformFn& f);
+    void _appendObject(const BSONObj& val, bool invert, const StringTransformFn& f);
     void _appendNumberDouble(const double num, bool invert);
     void _appendNumberLong(const long long num, bool invert);
     void _appendNumberInt(const int num, bool invert);
@@ -384,10 +629,13 @@ private:
      *              if NULL, not included in encoding
      *              if not NULL, put in after type, before value
      */
-    void _appendBsonValue(const BSONElement& elem, bool invert, const StringData* name);
+    void _appendBsonValue(const BSONElement& elem,
+                          bool invert,
+                          const StringData* name,
+                          const StringTransformFn& f);
 
     void _appendStringLike(StringData str, bool invert);
-    void _appendBson(const BSONObj& obj, bool invert);
+    void _appendBson(const BSONObj& obj, bool invert, const StringTransformFn& f);
     void _appendSmallDouble(double value, DecimalContinuationMarker dcm, bool invert);
     void _appendLargeDouble(double value, DecimalContinuationMarker dcm, bool invert);
     void _appendInteger(const long long num, bool invert);
@@ -396,41 +644,345 @@ private:
     void _appendDoubleWithoutTypeBits(const double num, DecimalContinuationMarker dcm, bool invert);
     void _appendHugeDecimalWithoutTypeBits(const Decimal128 dec, bool invert);
     void _appendTinyDecimalWithoutTypeBits(const Decimal128 dec, const double bin, bool invert);
+    void _appendEnd();
 
     template <typename T>
-    void _append(const T& thing, bool invert);
+    void _append(const T& thing, bool invert) {
+        _appendBytes(&thing, sizeof(thing), invert);
+    }
+
     void _appendBytes(const void* source, size_t bytes, bool invert);
 
+    void _doneAppending() {
+        if (_state == BuildState::kAppendingBSONElements) {
+            appendDiscriminator(_discriminator);
+        }
+    }
+
+    void _verifyAppendingState() {
+        invariant(_state == BuildState::kEmpty || _state == BuildState::kAppendingBSONElements);
+
+        if (_state == BuildState::kEmpty) {
+            _transition(BuildState::kAppendingBSONElements);
+        }
+    }
+
+    void _transition(BuildState to) {
+        // We can empty at any point since it just means that we are clearing the buffer.
+        if (to == BuildState::kEmpty) {
+            _state = to;
+            return;
+        }
+
+        switch (_state) {
+            case BuildState::kEmpty:
+                invariant(to == BuildState::kAppendingBSONElements || to == BuildState::kEndAdded ||
+                          to == BuildState::kAppendedRecordID);
+                break;
+            case BuildState::kAppendingBSONElements:
+                invariant(to == BuildState::kEndAdded);
+                break;
+            case BuildState::kEndAdded:
+                invariant(to == BuildState::kAppendedRecordID || to == BuildState::kReleased);
+                break;
+            case BuildState::kAppendedRecordID:
+                // This first case is the special case in
+                // WiredTigerIndexUnique::_insertTimestampUnsafe.
+                // The third case is the case when we are appending a list of RecordIDs as in the
+                // KeyString test RecordIDs.
+                invariant(to == BuildState::kAppendedTypeBits || to == BuildState::kReleased ||
+                          to == BuildState::kAppendedRecordID);
+                break;
+            case BuildState::kAppendedTypeBits:
+                // This first case is the special case in
+                // WiredTigerIndexUnique::_insertTimestampUnsafe.
+                invariant(to == BuildState::kAppendedRecordID || to == BuildState::kReleased);
+                break;
+            case BuildState::kReleased:
+                invariant(to == BuildState::kEmpty);
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+        _state = to;
+    }
+
+    bool _shouldInvertOnAppend() const {
+        return _ordering.get(_elemCount) == -1;
+    }
+
+    // Appends the TypeBits buffer to the main buffer and returns the offset of where the TypeBits
+    // begin
+    int32_t _appendTypeBits() {
+        _doneAppending();
+
+        // append the TypeBits.
+        int32_t ksSize = _buffer().len();
+        if (_typeBits.isAllZeros()) {
+            _buffer().appendChar(0);
+        } else {
+            _buffer().appendBuf(_typeBits.getBuffer(), _typeBits.getSize());
+        }
+        return ksSize;
+    }
+
+    auto& _buffer() {
+        return static_cast<BuilderT*>(this)->_buffer();
+    }
+
+    const auto& _buffer() const {
+        return static_cast<const BuilderT*>(this)->_buffer();
+    }
+
+    void _reinstantiateBufferIfNeeded() {
+        static_cast<BuilderT*>(this)->_reinstantiateBufferIfNeeded();
+    }
+
     TypeBits _typeBits;
-    StackBufBuilder _buffer;
+    BuildState _state;
+    int _elemCount;
+    Ordering _ordering;
+    Discriminator _discriminator;
 };
 
-inline bool operator<(const KeyString& lhs, const KeyString& rhs) {
+// Helper class to hold a buffer builder. This class needs to be before BuilderBase when inheriting
+// to ensure the buffer is constructed first
+template <typename BufferBuilderT>
+class BufferHolder {
+protected:
+    template <typename... Args>
+    BufferHolder(Args&&... args) : _bufferBuilder(std::forward<Args>(args)...) {}
+    BufferBuilderT _bufferBuilder;
+};
+
+class Builder : private BufferHolder<StackBufBuilder>, public BuilderBase<Builder> {
+public:
+    using BuilderBase::BuilderBase;
+
+    Builder(const Builder& other) : BuilderBase(other) {}
+
+public:
+    friend class BuilderBase;
+
+    StackBufBuilder& _buffer() {
+        return _bufferBuilder;
+    }
+    const StackBufBuilder& _buffer() const {
+        return _bufferBuilder;
+    }
+
+    void _reinstantiateBufferIfNeeded() {}
+};
+class HeapBuilder : private BufferHolder<BufBuilder>, public BuilderBase<HeapBuilder> {
+public:
+    static constexpr uint8_t kHeapAllocatorDefaultBytes = 32;
+
+    // Forwarding constructor to BuilderBase
+    template <typename... Args>
+    HeapBuilder(Args&&... args)
+        : BufferHolder(kHeapAllocatorDefaultBytes), BuilderBase(std::forward<Args>(args)...) {}
+
+    // When copying don't allocate memory by default. Copy-constructor will request the right amount
+    // of memory
+    HeapBuilder(const HeapBuilder& other) : BufferHolder(0), BuilderBase(other) {}
+
+    /**
+     * Releases the data held in this buffer into a Value type, releasing and transfering ownership
+     * of the buffer _buffer and TypeBits _typeBits to the returned Value object from the current
+     * Builder.
+     */
+    Value release() {
+        int32_t ksSize = _appendTypeBits();
+        _transition(BuildState::kReleased);
+
+        return {
+            version, ksSize, SharedBufferFragment(_bufferBuilder.release(), _bufferBuilder.len())};
+    }
+
+protected:
+    friend class BuilderBase;
+
+    BufBuilder& _buffer() {
+        return _bufferBuilder;
+    }
+    const BufBuilder& _buffer() const {
+        return _bufferBuilder;
+    }
+
+    void _reinstantiateBufferIfNeeded() {
+        if (_state == BuildState::kReleased) {
+            _bufferBuilder = BufBuilder(kHeapAllocatorDefaultBytes);
+        }
+    }
+};
+class PooledBuilder : private BufferHolder<PooledFragmentBuilder>,
+                      public BuilderBase<PooledBuilder> {
+public:
+    template <typename... Args>
+    PooledBuilder(SharedBufferFragmentBuilder& memoryPool, Args&&... args)
+        : BufferHolder(memoryPool), BuilderBase(std::forward<Args>(args)...) {}
+
+    // Underlying SharedBufferFragmentBuilder can only build one buffer at the time, so copy does
+    // not work for the PooledBuilder.
+    PooledBuilder(const PooledBuilder&) = delete;
+
+    Value release() {
+        int32_t ksSize = _appendTypeBits();
+        _transition(BuildState::kReleased);
+        return {version, ksSize, _bufferBuilder.done()};
+    }
+
+public:
+    friend class BuilderBase;
+
+    PooledFragmentBuilder& _buffer() {
+        return _bufferBuilder;
+    }
+    const PooledFragmentBuilder& _buffer() const {
+        return _bufferBuilder;
+    }
+
+    void _reinstantiateBufferIfNeeded() {}
+};
+
+/*
+ * The isKeyString struct allows the operators below to only be enabled if the types being operated
+ * on are KeyStrings.
+ */
+template <class T>
+struct isKeyString : public std::false_type {};
+
+template <>
+struct isKeyString<Builder> : public std::true_type {};
+template <>
+struct isKeyString<HeapBuilder> : public std::true_type {};
+template <>
+struct isKeyString<PooledBuilder> : public std::true_type {};
+
+template <>
+struct isKeyString<Value> : public std::true_type {};
+
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator<(const T& lhs,
+                                                                            const U& rhs) {
     return lhs.compare(rhs) < 0;
 }
 
-inline bool operator<=(const KeyString& lhs, const KeyString& rhs) {
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator<=(const T& lhs,
+                                                                             const U& rhs) {
     return lhs.compare(rhs) <= 0;
 }
 
-inline bool operator==(const KeyString& lhs, const KeyString& rhs) {
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator==(const T& lhs,
+                                                                             const U& rhs) {
     return lhs.compare(rhs) == 0;
 }
 
-inline bool operator>(const KeyString& lhs, const KeyString& rhs) {
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator>(const T& lhs,
+                                                                            const U& rhs) {
     return lhs.compare(rhs) > 0;
 }
 
-inline bool operator>=(const KeyString& lhs, const KeyString& rhs) {
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator>=(const T& lhs,
+                                                                             const U& rhs) {
     return lhs.compare(rhs) >= 0;
 }
 
-inline bool operator!=(const KeyString& lhs, const KeyString& rhs) {
+template <class T, class U>
+inline typename std::enable_if<isKeyString<T>::value, bool>::type operator!=(const T& lhs,
+                                                                             const U& rhs) {
     return !(lhs == rhs);
 }
 
-inline std::ostream& operator<<(std::ostream& stream, const KeyString& value) {
+template <class T>
+inline typename std::enable_if<isKeyString<T>::value, std::ostream&>::type operator<<(
+    std::ostream& stream, const T& value) {
     return stream << value.toString();
 }
+
+/**
+ * Given a KeyString which may or may not have a RecordId, returns the length of the section without
+ * the RecordId. More expensive than sizeWithoutRecordIdAtEnd
+ */
+size_t getKeySize(const char* buffer, size_t len, Ordering ord, const TypeBits& typeBits);
+
+/**
+ * Decodes the given KeyString buffer into it's BSONObj representation. This is marked as
+ * noexcept since the assumption is that 'buffer' is a valid KeyString buffer and this method
+ * is not expected to throw.
+ *
+ * If the buffer provided may not be valid, use the 'safe' version instead.
+ */
+BSONObj toBson(StringData data, Ordering ord, const TypeBits& types);
+BSONObj toBson(const char* buffer, size_t len, Ordering ord, const TypeBits& types) noexcept;
+BSONObj toBsonSafe(const char* buffer, size_t len, Ordering ord, const TypeBits& types);
+BSONObj toBsonSafeWithDiscriminator(const char* buffer,
+                                    size_t len,
+                                    Ordering ord,
+                                    const TypeBits& typeBits);
+Discriminator decodeDiscriminator(const char* buffer,
+                                  size_t len,
+                                  Ordering ord,
+                                  const TypeBits& typeBits);
+
+template <class T>
+BSONObj toBson(const T& keyString, Ordering ord) noexcept {
+    return toBson(keyString.getBuffer(), keyString.getSize(), ord, keyString.getTypeBits());
+}
+
+/**
+ * Decodes a RecordId from the end of a buffer.
+ */
+RecordId decodeRecordIdAtEnd(const void* buf, size_t size);
+
+/**
+ * Given a KeyString with a RecordId, returns the length of the section without the RecordId.
+ */
+size_t sizeWithoutRecordIdAtEnd(const void* bufferRaw, size_t bufSize);
+
+/**
+ * Decodes a RecordId, consuming all bytes needed from reader.
+ */
+RecordId decodeRecordId(BufReader* reader);
+
+int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize);
+
+template <class BufferT>
+template <class T>
+int BuilderBase<BufferT>::compare(const T& other) const {
+    return KeyString::compare(getBuffer(), other.getBuffer(), getSize(), other.getSize());
+}
+
+template <class BufferT>
+template <class T>
+int BuilderBase<BufferT>::compareWithoutRecordId(const T& other) const {
+    return KeyString::compare(
+        getBuffer(),
+        other.getBuffer(),
+        !isEmpty() ? sizeWithoutRecordIdAtEnd(getBuffer(), getSize()) : 0,
+        !other.isEmpty() ? sizeWithoutRecordIdAtEnd(other.getBuffer(), other.getSize()) : 0);
+}
+
+template <class T>
+int Value::compare(const T& other) const {
+    return KeyString::compare(getBuffer(), other.getBuffer(), getSize(), other.getSize());
+}
+
+template <class T>
+int Value::compareWithoutRecordId(const T& other) const {
+    return KeyString::compare(
+        getBuffer(),
+        other.getBuffer(),
+        !isEmpty() ? sizeWithoutRecordIdAtEnd(getBuffer(), getSize()) : 0,
+        !other.isEmpty() ? sizeWithoutRecordIdAtEnd(other.getBuffer(), other.getSize()) : 0);
+}
+
+}  // namespace KeyString
+
+using KeyStringSet = boost::container::flat_set<KeyString::Value>;
 
 }  // namespace mongo

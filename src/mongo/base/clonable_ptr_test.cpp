@@ -1,41 +1,43 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/base/clonable_ptr.h"
 
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
+#include <functional>
+#include <memory>
+#include <tuple>
+
 #include "mongo/unittest/unittest.h"
 
 #include <boost/lexical_cast.hpp>
 
 namespace {
-namespace stdx = mongo::stdx;
 
 template <typename Test>
 void runSyntaxTest(Test&& t) {
@@ -56,7 +58,7 @@ private:
 
 public:
     std::unique_ptr<ClonableTest> clone() const {
-        return mongo::stdx::make_unique<ClonableTest>();
+        return std::make_unique<ClonableTest>();
     }
 };
 
@@ -72,7 +74,7 @@ private:
 public:
     struct clone_factory_type {
         std::unique_ptr<AltClonableTest> operator()(const AltClonableTest&) const {
-            return mongo::stdx::make_unique<AltClonableTest>();
+            return std::make_unique<AltClonableTest>();
         }
     };
 };
@@ -95,7 +97,7 @@ template <>
 struct clonable_traits<::Alt2ClonableTest> {
     struct clone_factory_type {
         std::unique_ptr<Alt2ClonableTest> operator()(const Alt2ClonableTest&) const {
-            return mongo::stdx::make_unique<Alt2ClonableTest>();
+            return std::make_unique<Alt2ClonableTest>();
         }
     };
 };
@@ -113,11 +115,10 @@ private:
 
 public:
     using CloningFunctionType =
-        mongo::stdx::function<std::unique_ptr<FunctorClonable>(const FunctorClonable&)>;
+        std::function<std::unique_ptr<FunctorClonable>(const FunctorClonable&)>;
 
     static CloningFunctionType getCloningFunction() {
-        return
-            [](const FunctorClonable& c) { return mongo::stdx::make_unique<FunctorClonable>(c); };
+        return [](const FunctorClonable& c) { return std::make_unique<FunctorClonable>(c); };
     }
 };
 
@@ -138,12 +139,12 @@ public:
 
     FunctorWithDynamicStateClonable(const std::string& s) : data(s) {}
 
-    using CloningFunctionType = stdx::function<std::unique_ptr<FunctorWithDynamicStateClonable>(
+    using CloningFunctionType = std::function<std::unique_ptr<FunctorWithDynamicStateClonable>(
         const FunctorWithDynamicStateClonable&)>;
 
     static CloningFunctionType getCloningFunction() {
         return [calls = 0](const FunctorWithDynamicStateClonable& c) mutable {
-            return mongo::stdx::make_unique<FunctorWithDynamicStateClonable>(
+            return std::make_unique<FunctorWithDynamicStateClonable>(
                 c.data + boost::lexical_cast<std::string>(++calls));
         };
     }
@@ -169,7 +170,7 @@ public:
 class UniquePtrClonable {
 public:
     std::unique_ptr<UniquePtrClonable> clone() const {
-        return mongo::stdx::make_unique<UniquePtrClonable>();
+        return std::make_unique<UniquePtrClonable>();
     }
 };
 
@@ -180,7 +181,7 @@ TEST(ClonablePtrTest, syntax_smoke_test) {
     {
         mongo::clonable_ptr<ClonableTest> p;
 
-        p = mongo::stdx::make_unique<ClonableTest>();
+        p = std::make_unique<ClonableTest>();
 
         mongo::clonable_ptr<ClonableTest> p2 = p;
 
@@ -195,7 +196,7 @@ TEST(ClonablePtrTest, syntax_smoke_test) {
     {
         mongo::clonable_ptr<AltClonableTest> p;
 
-        p = mongo::stdx::make_unique<AltClonableTest>();
+        p = std::make_unique<AltClonableTest>();
 
         mongo::clonable_ptr<AltClonableTest> p2 = p;
 
@@ -205,7 +206,7 @@ TEST(ClonablePtrTest, syntax_smoke_test) {
     {
         mongo::clonable_ptr<Alt2ClonableTest> p;
 
-        p = mongo::stdx::make_unique<Alt2ClonableTest>();
+        p = std::make_unique<Alt2ClonableTest>();
 
         mongo::clonable_ptr<Alt2ClonableTest> p2 = p;
 
@@ -216,7 +217,7 @@ TEST(ClonablePtrTest, syntax_smoke_test) {
         mongo::clonable_ptr<FunctorClonable, FunctorClonable::CloningFunctionType> p{
             FunctorClonable::getCloningFunction()};
 
-        p = mongo::stdx::make_unique<FunctorClonable>();
+        p = std::make_unique<FunctorClonable>();
 
         mongo::clonable_ptr<FunctorClonable, FunctorClonable::CloningFunctionType> p2 = p;
 
@@ -225,7 +226,7 @@ TEST(ClonablePtrTest, syntax_smoke_test) {
         mongo::clonable_ptr<FunctorClonable, FunctorClonable::CloningFunctionType> p3{
             FunctorClonable::getCloningFunction()};
 
-        auto tmp = mongo::stdx::make_unique<FunctorClonable>();
+        auto tmp = std::make_unique<FunctorClonable>();
         p3 = std::move(tmp);
 
         ASSERT_TRUE(p != p2);
@@ -255,7 +256,7 @@ void construction() {
     }
 
     // Test move construction.
-    { mongo::clonable_ptr<Clonable>{mongo::clonable_ptr<Clonable>{}}; }
+    { std::ignore = mongo::clonable_ptr<Clonable>{mongo::clonable_ptr<Clonable>{}}; }
 
     // Test copy construction.
     {
@@ -277,12 +278,12 @@ void construction() {
     }
 
     // Test unique pointer construction
-    { mongo::clonable_ptr<Clonable>{mongo::stdx::make_unique<Clonable>()}; }
+    { mongo::clonable_ptr<Clonable>{std::make_unique<Clonable>()}; }
 
     // Test unique pointer construction (conversion)
     {
         auto acceptor = [](const mongo::clonable_ptr<Clonable>&) {};
-        acceptor(mongo::stdx::make_unique<Clonable>());
+        acceptor(std::make_unique<Clonable>());
     }
 
     // Test non-conversion pointer construction
@@ -341,7 +342,7 @@ void augmentedConstruction() {
 
     // Test move construction.
     {
-        mongo::clonable_ptr<Clonable, CloneFactory>{
+        std::ignore = mongo::clonable_ptr<Clonable, CloneFactory>{
             mongo::clonable_ptr<Clonable, CloneFactory>{Clonable::getCloningFunction()}};
     }
 
@@ -373,13 +374,13 @@ void augmentedConstruction() {
 
     // Test unique pointer construction
     {
-        mongo::clonable_ptr<Clonable, CloneFactory>{mongo::stdx::make_unique<Clonable>(),
+        mongo::clonable_ptr<Clonable, CloneFactory>{std::make_unique<Clonable>(),
                                                     Clonable::getCloningFunction()};
     }
 
     // Test augmented unique pointer construction
     {
-        mongo::clonable_ptr<Clonable, CloneFactory>{mongo::stdx::make_unique<Clonable>(),
+        mongo::clonable_ptr<Clonable, CloneFactory>{std::make_unique<Clonable>(),
                                                     Clonable::getCloningFunction()};
     }
 
@@ -530,7 +531,7 @@ public:
     }
 
     std::unique_ptr<DetectDestruction> clone() const {
-        return mongo::stdx::make_unique<DetectDestruction>(*this);
+        return std::make_unique<DetectDestruction>(*this);
     }
 };
 
@@ -567,12 +568,12 @@ TEST(ClonablePtrTest, basic_construction_test) {
     // Do not make unnecessary copies of the object from unique_ptr
     {
         DestructionGuard check;
-        mongo::clonable_ptr<DetectDestruction> p{mongo::stdx::make_unique<DetectDestruction>()};
+        mongo::clonable_ptr<DetectDestruction> p{std::make_unique<DetectDestruction>()};
         ASSERT_EQ(DetectDestruction::activeCount, 1);
     }
     {
         DestructionGuard check;
-        mongo::clonable_ptr<DetectDestruction> p = mongo::stdx::make_unique<DetectDestruction>();
+        mongo::clonable_ptr<DetectDestruction> p = std::make_unique<DetectDestruction>();
         ASSERT_EQ(DetectDestruction::activeCount, 1);
     }
 
@@ -580,12 +581,11 @@ TEST(ClonablePtrTest, basic_construction_test) {
     {
         DestructionGuard check;
 
-        mongo::clonable_ptr<DetectDestruction> p1{mongo::stdx::make_unique<DetectDestruction>()};
+        mongo::clonable_ptr<DetectDestruction> p1{std::make_unique<DetectDestruction>()};
         ASSERT_EQ(DetectDestruction::activeCount, 1);
 
         {
-            mongo::clonable_ptr<DetectDestruction> p2{
-                mongo::stdx::make_unique<DetectDestruction>()};
+            mongo::clonable_ptr<DetectDestruction> p2{std::make_unique<DetectDestruction>()};
             ASSERT_EQ(DetectDestruction::activeCount, 2);
         }
         ASSERT_EQ(DetectDestruction::activeCount, 1);
@@ -595,12 +595,12 @@ TEST(ClonablePtrTest, basic_construction_test) {
     {
         DestructionGuard check;
 
-        auto p1 = mongo::stdx::make_unique<mongo::clonable_ptr<DetectDestruction>>(
-            mongo::stdx::make_unique<DetectDestruction>());
+        auto p1 = std::make_unique<mongo::clonable_ptr<DetectDestruction>>(
+            std::make_unique<DetectDestruction>());
         ASSERT_EQ(DetectDestruction::activeCount, 1);
 
-        auto p2 = mongo::stdx::make_unique<mongo::clonable_ptr<DetectDestruction>>(
-            mongo::stdx::make_unique<DetectDestruction>());
+        auto p2 = std::make_unique<mongo::clonable_ptr<DetectDestruction>>(
+            std::make_unique<DetectDestruction>());
         ASSERT_EQ(DetectDestruction::activeCount, 2);
 
         p1.reset();
@@ -642,9 +642,9 @@ TEST(ClonablePtrTest, basicEqualityTest) {
     mongo::clonable_ptr<DetectDestruction> n2;
     mongo::clonable_ptr<DetectDestruction> n3;
 
-    mongo::clonable_ptr<DetectDestruction> a = mongo::stdx::make_unique<DetectDestruction>();
-    mongo::clonable_ptr<DetectDestruction> b = mongo::stdx::make_unique<DetectDestruction>();
-    mongo::clonable_ptr<DetectDestruction> c = mongo::stdx::make_unique<DetectDestruction>();
+    mongo::clonable_ptr<DetectDestruction> a = std::make_unique<DetectDestruction>();
+    mongo::clonable_ptr<DetectDestruction> b = std::make_unique<DetectDestruction>();
+    mongo::clonable_ptr<DetectDestruction> c = std::make_unique<DetectDestruction>();
 
     const mongo::clonable_ptr<DetectDestruction>& ap = a;
     const mongo::clonable_ptr<DetectDestruction>& bp = b;
@@ -801,7 +801,7 @@ TEST(ClonablePtrTest, ownershipStabilityTest) {
     {
         DestructionGuard check;
 
-        auto ptr_init = mongo::stdx::make_unique<DetectDestruction>();
+        auto ptr_init = std::make_unique<DetectDestruction>();
         const auto* rp = ptr_init.get();
 
         mongo::clonable_ptr<DetectDestruction> cp = std::move(ptr_init);
@@ -822,7 +822,7 @@ TEST(ClonablePtrTest, ownershipStabilityTest) {
     }
 
     {
-        auto ptr_init = mongo::stdx::make_unique<DetectDestruction>();
+        auto ptr_init = std::make_unique<DetectDestruction>();
         const auto* rp = ptr_init.get();
 
         mongo::clonable_ptr<DetectDestruction> cp{ptr_init.release()};
@@ -853,7 +853,7 @@ public:
     explicit ClonableObject(const int v) : value(v) {}
 
     std::unique_ptr<ClonableObject> clone() const {
-        return mongo::stdx::make_unique<ClonableObject>(*this);
+        return std::make_unique<ClonableObject>(*this);
     }
 
     auto make_equality_lens() const -> decltype(std::tie(this->value)) {
@@ -882,8 +882,8 @@ TEST(ClonablePtrTest, noObjectCopySemanticTest) {
 }
 
 TEST(ClonablePtrTest, objectCopySemanticTest) {
-    mongo::clonable_ptr<ClonableObject> p = mongo::stdx::make_unique<ClonableObject>(1);
-    mongo::clonable_ptr<ClonableObject> q = mongo::stdx::make_unique<ClonableObject>(2);
+    mongo::clonable_ptr<ClonableObject> p = std::make_unique<ClonableObject>(1);
+    mongo::clonable_ptr<ClonableObject> q = std::make_unique<ClonableObject>(2);
     ASSERT(p != q);
     ASSERT(*p != *q);
 
@@ -959,13 +959,13 @@ TEST(ClonablePtrSimpleTest, simpleUsageExample) {
     mongo::clonable_ptr<Interface> source;
     mongo::clonable_ptr<Interface> sink;
 
-    mongo::clonable_ptr<Interface> instance = stdx::make_unique<StorageImplementation>();
+    mongo::clonable_ptr<Interface> instance = std::make_unique<StorageImplementation>();
 
     sink = instance;
 
     ASSERT(instance.get() != sink.get());
 
-    instance = stdx::make_unique<GeneratorImplementation>("base message");
+    instance = std::make_unique<GeneratorImplementation>("base message");
 
 
     source = std::move(instance);

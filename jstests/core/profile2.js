@@ -1,6 +1,8 @@
 // Tests that large queries and updates are properly profiled.
 
 // Special db so that it can be run in parallel tests.
+// @tags: [requires_profiling]
+
 var coll = db.getSisterDB("profile2").profile2;
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));
@@ -22,7 +24,7 @@ var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('command'));
-assert.eq('string', typeof(result.command.$truncated));
+assert.eq('string', typeof (result.command.$truncated));
 // String value is truncated.
 assert(result.command.$truncated.match(/filter: { a: "a+\.\.\." }/));
 
@@ -31,14 +33,14 @@ coll.getDB().system.profile.drop();
 assert.commandWorked(coll.getDB().runCommand({profile: 2}));
 
 // Test update with large string element in query portion.
-assert.writeOK(coll.update({a: hugeStr}, {}));
+assert.commandWorked(coll.update({a: hugeStr}, {}));
 var results = coll.getDB().system.profile.find().toArray();
 assert.eq(1, results.length);
 var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('command'));
-assert.eq('string', typeof(result.command.$truncated));
+assert.eq('string', typeof (result.command.$truncated));
 // String value is truncated.
 assert(result.command.$truncated.match(
     /^{ q: { a: "a+\.\.\." }, u: {}, multi: false, upsert: false }$/));
@@ -48,14 +50,14 @@ coll.getDB().system.profile.drop();
 assert.commandWorked(coll.getDB().runCommand({profile: 2}));
 
 // Test update with large string element in update portion.
-assert.writeOK(coll.update({}, {a: hugeStr}));
+assert.commandWorked(coll.update({}, {a: hugeStr}));
 var results = coll.getDB().system.profile.find().toArray();
 assert.eq(1, results.length);
 var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('command'));
-assert.eq('string', typeof(result.command.$truncated));
+assert.eq('string', typeof (result.command.$truncated));
 // String value is truncated.
 assert(result.command.$truncated.match(
     /^{ q: {}, u: { a: "a+\.\.\." }, multi: false, upsert: false }$/));
@@ -76,7 +78,7 @@ var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('command'));
-assert.eq('string', typeof(result.command.$truncated));
+assert.eq('string', typeof (result.command.$truncated));
 // Query object itself is truncated.
 assert(result.command.$truncated.match(/filter: { a0: 1\.0, a1: .*\.\.\.$/));
 

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,15 +29,15 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
 
 class ClockSource;
-class RecordFetcher;
 
 class PlanYieldPolicy {
 public:
@@ -52,40 +53,36 @@ public:
     PlanYieldPolicy(PlanExecutor::YieldPolicy policy, ClockSource* cs);
 
     /**
-     * Used by YIELD_AUTO plan executors in order to check whether it is time to yield.
-     * PlanExecutors give up their locks periodically in order to be fair to other
-     * threads.
+     * Periodically returns true to indicate that it is time to check for interrupt (in the case of
+     * YIELD_AUTO and INTERRUPT_ONLY) or release locks or storage engine state (in the case of
+     * auto-yielding plans).
      */
-    virtual bool shouldYield();
+    virtual bool shouldYieldOrInterrupt();
 
     /**
-     * Resets the yield timer so that we wait for a while before yielding again.
+     * Resets the yield timer so that we wait for a while before yielding/interrupting again.
      */
     void resetTimer();
 
     /**
-     * Used to cause a plan executor to release locks or storage engine state. The PlanExecutor must
-     * *not* be in saved state. Handles calls to save/restore state internally.
-     *
-     * If 'fetcher' is non-NULL, then we are yielding because the storage engine told us
-     * that we will page fault on this record. We use 'fetcher' to retrieve the record
-     * after we give up our locks.
+     * Used to cause a plan executor to check for interrupt (in the case of YIELD_AUTO and
+     * INTERRUPT_ONLY) or release locks or storage engine state (in the case of auto-yielding
+     * plans). The PlanExecutor must *not* be in saved state. Handles calls to save/restore state
+     * internally.
      *
      * Returns Status::OK() if the executor was restored successfully and is still alive. Returns
      * ErrorCodes::QueryPlanKilled if the executor got killed during yield, and
      * ErrorCodes::ExceededTimeLimit if the operation has exceeded the time limit.
+     *
+     * Calls 'whileYieldingFn' after relinquishing locks and before reacquiring the locks that have
+     * been relinquished.
      */
-    virtual Status yield(RecordFetcher* fetcher = NULL);
+    virtual Status yieldOrInterrupt(std::function<void()> whileYieldingFn = nullptr);
 
     /**
-     * More generic version of yield() above.  This version calls 'beforeYieldingFn' immediately
-     * before locks are yielded (if they are), and 'whileYieldingFn' before locks are restored.
-     */
-    virtual Status yield(stdx::function<void()> beforeYieldingFn,
-                         stdx::function<void()> whileYieldingFn);
-
-    /**
-     * All calls to shouldYield() will return true until the next call to yield.
+     * All calls to shouldYieldOrInterrupt() will return true until the next call to
+     * yieldOrInterrupt(). This must only be called for auto-yielding plans, to force a yield. It
+     * cannot be used to force an interrupt for INTERRUPT_ONLY plans.
      */
     void forceYield() {
         dassert(canAutoYield());
@@ -105,7 +102,8 @@ public:
                 return true;
             }
             case PlanExecutor::NO_YIELD:
-            case PlanExecutor::WRITE_CONFLICT_RETRY_ONLY: {
+            case PlanExecutor::WRITE_CONFLICT_RETRY_ONLY:
+            case PlanExecutor::INTERRUPT_ONLY: {
                 return false;
             }
         }
@@ -127,6 +125,7 @@ public:
             }
             case PlanExecutor::NO_YIELD:
             case PlanExecutor::YIELD_MANUAL:
+            case PlanExecutor::INTERRUPT_ONLY:
                 return false;
         }
         MONGO_UNREACHABLE;
@@ -145,6 +144,18 @@ private:
     // The plan executor which this yield policy is responsible for yielding. Must
     // not outlive the plan executor.
     PlanExecutor* const _planYielding;
+
+    /**
+     * If not in a nested context, unlocks all locks, suggests to the operating system to
+     * switch to another thread, and then reacquires all locks.
+     *
+     * If in a nested context (eg DBDirectClient), does nothing.
+     *
+     * The whileYieldingFn will be executed after unlocking the locks and before re-acquiring them.
+     */
+    void _yieldAllLocks(OperationContext* opCtx,
+                        std::function<void()> whileYieldingFn,
+                        const NamespaceString& planExecNS);
 };
 
 }  // namespace mongo

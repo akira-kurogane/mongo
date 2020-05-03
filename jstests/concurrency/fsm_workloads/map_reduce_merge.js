@@ -12,12 +12,15 @@
  * of the output collection.
  *
  * Writes the results of each thread to the same collection.
+ * @tags: [
+ *   # mapReduce does not support afterClusterTime.
+ *   does_not_support_causal_consistency
+ * ]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
 load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as the database name,
     // since the workload name is assumed to be unique.
     var uniqueDBName = 'map_reduce_merge';
@@ -46,13 +49,6 @@ var $config = extendWorkload($config, function($config, $super) {
 
         var outDB = db.getSiblingDB(db.getName() + uniqueDBName);
         assertAlways.commandWorked(outDB.createCollection(collName));
-    };
-
-    $config.teardown = function teardown(db, collName, cluster) {
-        var outDB = db.getSiblingDB(db.getName() + uniqueDBName);
-        var res = outDB.dropDatabase();
-        assertAlways.commandWorked(res);
-        assertAlways.eq(db.getName() + uniqueDBName, res.dropped);
     };
 
     return $config;

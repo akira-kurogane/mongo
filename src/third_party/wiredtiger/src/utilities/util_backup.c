@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,138 +9,117 @@
 #include "util.h"
 
 static int copy(WT_SESSION *, const char *, const char *);
-static int usage(void);
 
-/*
- * append_target --
- *	Build a list of comma-separated targets.
- */
 static int
-append_target(WT_SESSION *session, const char *target, char **bufp)
+usage(void)
 {
-	static bool first = true;
-	static size_t len = 0, remain = 0;
-	static char *buf = NULL;
+    static const char *options[] = {"-t uri",
+      "backup the named data sources (by default the entire database is backed up)", NULL, NULL};
 
-						/* 20 bytes of slop */
-	if (buf == NULL || remain < strlen(target) + 20) {
-		len += strlen(target) + 512;
-		remain += strlen(target) + 512;
-		if ((buf = realloc(buf, len)) == NULL)
-			return (util_err(session, errno, NULL));
-		*bufp = buf;
-	}
-	if (first) {
-		first = false;
-		strcpy(buf, "target=(");
-	} else
-		buf[strlen(buf) - 1] = ',';	/* overwrite previous ")" */
-	strcat(buf, "\"");
-	strcat(buf, target);
-	strcat(buf, "\")");
-	remain -= strlen(target) + 1;
-
-	return (0);
+    util_usage("backup [-t uri] directory", "options:", options);
+    return (1);
 }
 
 int
 util_backup(WT_SESSION *session, int argc, char *argv[])
 {
-	WT_CURSOR *cursor;
-	WT_DECL_RET;
-	int ch;
-	char *config;
-	const char *directory, *name;
+    WT_CURSOR *cursor;
+    WT_DECL_ITEM(tmp);
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session_impl;
+    int ch;
+    const char *directory, *name;
+    bool target;
 
-	config = NULL;
-	while ((ch = __wt_getopt(progname, argc, argv, "t:")) != EOF)
-		switch (ch) {
-		case 't':
-			if (append_target(session, __wt_optarg, &config))
-				return (1);
-			break;
-		case '?':
-		default:
-			return (usage());
-		}
-	argc -= __wt_optind;
-	argv += __wt_optind;
+    session_impl = (WT_SESSION_IMPL *)session;
 
-	if (argc != 1) {
-		(void)usage();
-		goto err;
-	}
-	directory = *argv;
+    target = false;
+    while ((ch = __wt_getopt(progname, argc, argv, "t:")) != EOF)
+        switch (ch) {
+        case 't':
+            if (!target) {
+                WT_ERR(__wt_scr_alloc(session_impl, 0, &tmp));
+                WT_ERR(__wt_buf_fmt(session_impl, tmp, "%s", "target=("));
+            }
+            WT_ERR(__wt_buf_catfmt(session_impl, tmp, "%s\"%s\"", target ? "," : "", __wt_optarg));
+            target = true;
+            break;
+        case '?':
+        default:
+            WT_ERR(usage());
+        }
+    argc -= __wt_optind;
+    argv += __wt_optind;
 
-	if ((ret = session->open_cursor(
-	    session, "backup:", NULL, config, &cursor)) != 0) {
-		fprintf(stderr, "%s: cursor open(backup:) failed: %s\n",
-		    progname, session->strerror(session, ret));
-		goto err;
-	}
+    if (argc != 1) {
+        (void)usage();
+        goto err;
+    }
+    directory = *argv;
 
-	/* Copy the files. */
-	while (
-	    (ret = cursor->next(cursor)) == 0 &&
-	    (ret = cursor->get_key(cursor, &name)) == 0)
-		if ((ret = copy(session, directory, name)) != 0)
-			goto err;
-	if (ret == WT_NOTFOUND)
-		ret = 0;
+    /* Terminate any target. */
+    if (target)
+        WT_ERR(__wt_buf_catfmt(session_impl, tmp, "%s", ")"));
 
-	if (ret != 0) {
-		fprintf(stderr, "%s: cursor next(backup:) failed: %s\n",
-		    progname, session->strerror(session, ret));
-		goto err;
-	}
+    if ((ret = session->open_cursor(
+           session, "backup:", NULL, target ? (char *)tmp->data : NULL, &cursor)) != 0) {
+        fprintf(stderr, "%s: cursor open(backup:) failed: %s\n", progname,
+          session->strerror(session, ret));
+        goto err;
+    }
 
-err:	free(config);
-	return (ret);
+    /* Copy the files. */
+    while ((ret = cursor->next(cursor)) == 0 && (ret = cursor->get_key(cursor, &name)) == 0)
+        if ((ret = copy(session, directory, name)) != 0)
+            goto err;
+    if (ret == WT_NOTFOUND)
+        ret = 0;
+
+    if (ret != 0) {
+        fprintf(stderr, "%s: cursor next(backup:) failed: %s\n", progname,
+          session->strerror(session, ret));
+        goto err;
+    }
+
+err:
+    __wt_scr_free(session_impl, &tmp);
+    return (ret);
 }
 
 static int
 copy(WT_SESSION *session, const char *directory, const char *name)
 {
-	WT_DECL_RET;
-	size_t len;
-	char *to;
+    WT_DECL_RET;
+    size_t len;
+    char *to;
 
-	to = NULL;
+    to = NULL;
 
-	/* Build the target pathname. */
-	len = strlen(directory) + strlen(name) + 2;
-	if ((to = malloc(len)) == NULL) {
-		fprintf(stderr, "%s: %s\n", progname, strerror(errno));
-		return (1);
-	}
-	if ((ret = __wt_snprintf(to, len, "%s/%s", directory, name)) != 0) {
-		fprintf(stderr, "%s: %s\n", progname, strerror(ret));
-		goto err;
-	}
+    /* Build the target pathname. */
+    len = strlen(directory) + strlen(name) + 2;
+    if ((to = malloc(len)) == NULL) {
+        fprintf(stderr, "%s: %s\n", progname, strerror(errno));
+        return (1);
+    }
+    if ((ret = __wt_snprintf(to, len, "%s/%s", directory, name)) != 0) {
+        fprintf(stderr, "%s: %s\n", progname, strerror(ret));
+        goto err;
+    }
 
-	if (verbose && printf("Backing up %s/%s to %s\n", home, name, to) < 0) {
-		fprintf(stderr, "%s: %s\n", progname, strerror(EIO));
-		goto err;
-	}
+    if (verbose && printf("Backing up %s/%s to %s\n", home, name, to) < 0) {
+        fprintf(stderr, "%s: %s\n", progname, strerror(EIO));
+        goto err;
+    }
 
-	/*
-	 * Use WiredTiger to copy the file: ensuring stability of the copied
-	 * file on disk requires care, and WiredTiger knows how to do it.
-	 */
-	if ((ret = __wt_copy_and_sync(session, name, to)) != 0)
-		fprintf(stderr, "%s/%s to %s: backup copy: %s\n",
-		    home, name, to, session->strerror(session, ret));
+    /*
+     * Use WiredTiger to copy the file: ensuring stability of the copied file on disk requires care,
+     * and WiredTiger knows how to do it.
+     */
+    if ((ret = __wt_copy_and_sync(session, name, to)) != 0)
+        fprintf(stderr, "%s/%s to %s: backup copy: %s\n", home, name, to,
+          session->strerror(session, ret));
 
-err:	free(to);
-	return (ret);
-}
-
-static int
-usage(void)
-{
-	(void)fprintf(stderr,
-	    "usage: %s %s "
-	    "backup [-t uri] directory\n",
-	    progname, usage_prefix);
-	return (1);
+err:
+    free(to);
+    return (ret);
 }

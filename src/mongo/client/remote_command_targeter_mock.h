@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,6 +28,8 @@
  */
 
 #pragma once
+
+#include <set>
 
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
@@ -54,19 +57,22 @@ public:
      * Returns the return value last set by setFindHostReturnValue.
      * Returns ErrorCodes::InternalError if setFindHostReturnValue was never called.
      */
-    StatusWith<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
+    SemiFuture<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
                                                 Milliseconds maxWait) override;
+
+    SemiFuture<std::vector<HostAndPort>> findHostsWithMaxWait(const ReadPreferenceSetting& readPref,
+                                                              Milliseconds maxWait) override;
 
     StatusWith<HostAndPort> findHost(OperationContext* opCtx,
                                      const ReadPreferenceSetting& readPref) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostNotMaster(const HostAndPort& host, const Status& status) override;
 
     /**
-     * No-op for the mock.
+     * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
 
@@ -80,9 +86,24 @@ public:
      */
     void setFindHostReturnValue(StatusWith<HostAndPort> returnValue);
 
+    void setFindHostsReturnValue(StatusWith<std::vector<HostAndPort>> returnValue);
+
+    /**
+     * Returns the current set of hosts marked down and resets the mock's internal list of marked
+     * down hosts.
+     */
+    std::set<HostAndPort> getAndClearMarkedDownHosts();
+
 private:
     ConnectionString _connectionStringReturnValue;
-    StatusWith<HostAndPort> _findHostReturnValue;
+    StatusWith<std::vector<HostAndPort>> _findHostReturnValue;
+
+    // Protects _hostsMarkedDown.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("RemoteCommandTargeterMock::_mutex");
+
+    // HostAndPorts marked not master or unreachable. Meant to verify a code path updates the
+    // RemoteCommandTargeterMock.
+    std::set<HostAndPort> _hostsMarkedDown;
 };
 
 }  // namespace mongo

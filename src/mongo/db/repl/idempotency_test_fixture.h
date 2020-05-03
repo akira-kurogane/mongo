@@ -1,23 +1,24 @@
 /**
- *    Copyright 2017 (C) MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,9 +40,9 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/sync_tail_test_fixture.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/uuid.h"
 
@@ -83,10 +84,22 @@ struct CollectionState {
 bool operator==(const CollectionState& lhs, const CollectionState& rhs);
 bool operator!=(const CollectionState& lhs, const CollectionState& rhs);
 std::ostream& operator<<(std::ostream& stream, const CollectionState& state);
-StringBuilderImpl<SharedBufferAllocator>& operator<<(StringBuilderImpl<SharedBufferAllocator>& sb,
-                                                     const CollectionState& state);
+StringBuilder& operator<<(StringBuilder& sb, const CollectionState& state);
 
-class IdempotencyTest : public SyncTailTest {
+class IdempotencyTest : public OplogApplierImplTest {
+public:
+    IdempotencyTest() : OplogApplierImplTest("wiredTiger") {
+        globalFailPointRegistry()
+            .find("doUntimestampedWritesForIdempotencyTests")
+            ->setMode(FailPoint::alwaysOn);
+    }
+
+    ~IdempotencyTest() {
+        globalFailPointRegistry()
+            .find("doUntimestampedWritesForIdempotencyTests")
+            ->setMode(FailPoint::off);
+    }
+
 protected:
     enum class SequenceType : int { kEntireSequence, kAnyPrefix, kAnySuffix, kAnyPrefixOrSuffix };
     OplogEntry createCollection(CollectionUUID uuid = UUID::gen());
@@ -94,14 +107,31 @@ protected:
     OplogEntry insert(const BSONObj& obj);
     template <class IdType>
     OplogEntry update(IdType _id, const BSONObj& obj);
-    OplogEntry buildIndex(const BSONObj& indexSpec, const BSONObj& options = BSONObj());
-    OplogEntry dropIndex(const std::string& indexName);
-    OpTime nextOpTime() {
-        static long long lastSecond = 1;
-        return OpTime(Timestamp(Seconds(lastSecond++), 0), 1LL);
-    }
-    Status runOp(const OplogEntry& entry);
-    Status runOps(std::vector<OplogEntry> ops);
+    OplogEntry buildIndex(const BSONObj& indexSpec, const BSONObj& options, const UUID& uuid);
+    OplogEntry dropIndex(const std::string& indexName, const UUID& uuid);
+    OplogEntry prepare(LogicalSessionId lsid,
+                       TxnNumber txnNum,
+                       StmtId stmtId,
+                       const BSONArray& ops,
+                       OpTime prevOpTime = OpTime());
+    OplogEntry commitUnprepared(LogicalSessionId lsid,
+                                TxnNumber txnNum,
+                                StmtId stmtId,
+                                const BSONArray& ops,
+                                OpTime prevOpTime = OpTime());
+    OplogEntry commitPrepared(LogicalSessionId lsid,
+                              TxnNumber txnNum,
+                              StmtId stmtId,
+                              OpTime prepareOpTime);
+    OplogEntry abortPrepared(LogicalSessionId lsid,
+                             TxnNumber txnNum,
+                             StmtId stmtId,
+                             OpTime prepareOpTime);
+    OplogEntry partialTxn(LogicalSessionId lsid,
+                          TxnNumber txnNum,
+                          StmtId stmtId,
+                          OpTime prevOpTime,
+                          const BSONArray& ops);
     virtual Status resetState();
 
     /**
@@ -122,41 +152,17 @@ protected:
     };
 
     std::string computeDataHash(Collection* collection);
-    virtual std::string getStateString(const CollectionState& state1,
-                                       const CollectionState& state2,
-                                       const std::vector<OplogEntry>& ops);
+    virtual std::string getStatesString(const std::vector<CollectionState>& state1,
+                                        const std::vector<CollectionState>& state2,
+                                        const std::vector<OplogEntry>& ops);
     /**
      * Validate data and indexes. Return the MD5 hash of the documents ordered by _id.
      */
-    CollectionState validate();
+    CollectionState validate(const NamespaceString& nss = NamespaceString("test.foo"));
+    std::vector<CollectionState> validateAllCollections();
 
     NamespaceString nss{"test.foo"};
-    NamespaceString nssIndex{"test.system.indexes"};
 };
-
-OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
-                                          const NamespaceString& nss = NamespaceString("test.t"),
-                                          const BSONObj& options = BSONObj());
-
-OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToInsert);
-OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToUpdate,
-                                        const BSONObj& updatedDocument);
-
-OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
-                                     const NamespaceString& nss,
-                                     const std::string& indexName,
-                                     const BSONObj& keyPattern);
-
-OplogEntry makeCommandOplogEntry(OpTime opTime, const NamespaceString& nss, const BSONObj& command);
-
-void appendSessionTransactionInfo(OplogEntry& entry,
-                                  LogicalSessionId lsid,
-                                  TxnNumber txnNum,
-                                  StmtId stmtId);
 
 }  // namespace repl
 }  // namespace mongo

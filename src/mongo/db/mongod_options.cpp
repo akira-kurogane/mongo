@@ -1,23 +1,24 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/mongod_options.h"
 
@@ -39,551 +40,60 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
-#include "mongo/db/db.h"
-#include "mongo/db/diag_log.h"
+#include "mongo/db/cluster_auth_mode_option_gen.h"
+#include "mongo/db/global_settings.h"
+#include "mongo/db/keyfile_option_gen.h"
+#include "mongo/db/mongod_options_general_gen.h"
+#include "mongo/db/mongod_options_legacy_gen.h"
+#include "mongo/db/mongod_options_replication_gen.h"
+#include "mongo/db/mongod_options_sharding_gen.h"
+#include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_options_helpers.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/server_options_base.h"
+#include "mongo/db/server_options_nongeneral_gen.h"
+#include "mongo/db/server_options_server_helpers.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-using std::cout;
 using std::endl;
-using std::string;
 
-MongodGlobalParams mongodGlobalParams;
+std::string storageDBPathDescription() {
+    StringBuilder sb;
 
-Status addMongodOptions(moe::OptionSection* options) {
-    moe::OptionSection general_options("General options");
-
-    Status ret = addGeneralServerOptions(&general_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-#if defined(_WIN32)
-    moe::OptionSection windows_scm_options("Windows Service Control Manager options");
-
-    ret = addWindowsServerOptions(&windows_scm_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-#ifdef MONGO_CONFIG_SSL
-    moe::OptionSection ssl_options("SSL options");
-
-    ret = addSSLServerOptions(&ssl_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-    moe::OptionSection ms_options("Master/slave options (old; use replica sets instead)");
-    moe::OptionSection rs_options("Replica set options");
-    moe::OptionSection replication_options("Replication options");
-    moe::OptionSection sharding_options("Sharding options");
-    moe::OptionSection storage_options("Storage options");
-
-    // Authentication Options
-
-    // Way to enable or disable auth on command line and in Legacy config file
-    general_options.addOptionChaining("auth", "auth", moe::Switch, "run with security")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("noauth");
-
-    // IP Whitelisting Options
-    general_options
-        .addOptionChaining("security.clusterIpSourceWhitelist",
-                           "clusterIpSourceWhitelist",
-                           moe::StringVector,
-                           "Network CIDR specification of permitted origin for `__system` access.")
-        .composing();
-
-
-    // Way to enable or disable auth in JSON Config
-    general_options
-        .addOptionChaining(
-            "security.authorization",
-            "",
-            moe::String,
-            "How the database behaves with respect to authorization of clients.  "
-            "Options are \"disabled\", which means that authorization checks are not "
-            "performed, and \"enabled\" which means that a client cannot perform actions it is "
-            "not authorized to do.")
-        .setSources(moe::SourceYAMLConfig)
-        .format("(:?disabled)|(:?enabled)", "(disabled/enabled)");
-
-    // setParameter parameters that we want as config file options
-    // TODO: Actually read these into our environment.  Currently they have no effect
-    general_options.addOptionChaining("security.authSchemaVersion", "", moe::String, "TODO")
-        .setSources(moe::SourceYAMLConfig);
-
-    general_options.addOptionChaining("security.enableLocalhostAuthBypass", "", moe::String, "TODO")
-        .setSources(moe::SourceYAMLConfig);
-
-    // Diagnostic Options
-
-    general_options
-        .addOptionChaining(
-            "diaglog", "diaglog", moe::Int, "DEPRECATED: 0=off 1=W 2=R 3=both 7=W+some reads")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining("operationProfiling.slowOpThresholdMs",
-                           "slowms",
-                           moe::Int,
-                           "value of slow for profile and console log")
-        .setDefault(moe::Value(100));
-
-    general_options
-        .addOptionChaining("operationProfiling.slowOpSampleRate",
-                           "slowOpSampleRate",
-                           moe::Double,
-                           "fraction of slow ops to include in the profile and console log")
-        .setDefault(moe::Value(1.0));
-
-    general_options.addOptionChaining("profile", "profile", moe::Int, "0=off 1=slow, 2=all")
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining("operationProfiling.mode", "", moe::String, "(off/slowOp/all)")
-        .setSources(moe::SourceYAMLConfig)
-        .format("(:?off)|(:?slowOp)|(:?all)", "(off/slowOp/all)");
-
-    general_options
-        .addOptionChaining(
-            "cpu", "cpu", moe::Switch, "periodically show cpu and iowait utilization")
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining(
-            "sysinfo", "sysinfo", moe::Switch, "print some diagnostic system information")
-        .setSources(moe::SourceAllLegacy);
-
-    // Storage Options
-
-    storage_options.addOptionChaining(
-        "storage.engine",
-        "storageEngine",
-        moe::String,
-        "what storage engine to use - defaults to wiredTiger if no data files present");
-
+    sb << "Directory for datafiles - defaults to " << storageGlobalParams.kDefaultDbPath;
 
 #ifdef _WIN32
     boost::filesystem::path currentPath = boost::filesystem::current_path();
 
-    std::string defaultPath = currentPath.root_name().string() + storageGlobalParams.kDefaultDbPath;
-    storage_options.addOptionChaining("storage.dbPath",
-                                      "dbpath",
-                                      moe::String,
-                                      std::string("directory for datafiles - defaults to ") +
-                                          storageGlobalParams.kDefaultDbPath + " which is " +
-                                          defaultPath + " based on the current working drive");
-
-#else
-    storage_options.addOptionChaining("storage.dbPath",
-                                      "dbpath",
-                                      moe::String,
-                                      std::string("directory for datafiles - defaults to ") +
-                                          storageGlobalParams.kDefaultDbPath);
-
-#endif
-    storage_options.addOptionChaining("storage.directoryPerDB",
-                                      "directoryperdb",
-                                      moe::Switch,
-                                      "each database will be stored in a separate directory");
-
-    storage_options
-        .addOptionChaining("storage.queryableBackupMode",
-                           "queryableBackupMode",
-                           moe::Switch,
-                           "enable read-only mode - if true the server will not accept writes.")
-        .setSources(moe::SourceAll)
-        .hidden();
-
-    storage_options
-        .addOptionChaining("storage.groupCollections",
-                           "groupCollections",
-                           moe::Switch,
-                           "group collections - if true the storage engine may group "
-                           "collections within a database into a shared record store.")
-        .hidden();
-
-    general_options
-        .addOptionChaining("noIndexBuildRetry",
-                           "noIndexBuildRetry",
-                           moe::Switch,
-                           "don't retry any index builds that were interrupted by shutdown")
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining("storage.indexBuildRetry",
-                           "",
-                           moe::Bool,
-                           "don't retry any index builds that were interrupted by shutdown")
-        .setSources(moe::SourceYAMLConfig);
-
-    storage_options
-        .addOptionChaining("noprealloc",
-                           "noprealloc",
-                           moe::Switch,
-                           "disable data file preallocation - will often hurt performance")
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options
-        .addOptionChaining("storage.mmapv1.preallocDataFiles",
-                           "",
-                           moe::Bool,
-                           "disable data file preallocation - will often hurt performance",
-                           "storage.preallocDataFiles")
-        .setSources(moe::SourceYAMLConfig);
-
-    storage_options
-        .addOptionChaining("storage.mmapv1.nsSize",
-                           "nssize",
-                           moe::Int,
-                           ".ns file size (in MB) for new databases",
-                           "storage.nsSize")
-        .setDefault(moe::Value(16));
-
-    storage_options
-        .addOptionChaining("storage.mmapv1.quota.enforced",
-                           "quota",
-                           moe::Switch,
-                           "limits each database to a certain number of files (8 default)",
-                           "storage.quota.enforced")
-        .incompatibleWith("keyFile");
-
-    storage_options.addOptionChaining("storage.mmapv1.quota.maxFilesPerDB",
-                                      "quotaFiles",
-                                      moe::Int,
-                                      "number of files allowed per db, implies --quota",
-                                      "storage.quota.maxFilesPerDB");
-
-    storage_options.addOptionChaining("storage.mmapv1.smallFiles",
-                                      "smallfiles",
-                                      moe::Switch,
-                                      "use a smaller default file size",
-                                      "storage.smallFiles");
-
-    storage_options
-        .addOptionChaining("storage.syncPeriodSecs",
-                           "syncdelay",
-                           moe::Double,
-                           "seconds between disk syncs (0=never, but not recommended)")
-        .setDefault(moe::Value(60.0));
-
-    // Upgrade and repair are disallowed in JSON configs since they trigger very heavyweight
-    // actions rather than specify configuration data
-    storage_options.addOptionChaining("upgrade", "upgrade", moe::Switch, "upgrade db if needed")
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options.addOptionChaining("repair", "repair", moe::Switch, "run repair on all dbs")
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options.addOptionChaining("storage.repairPath",
-                                      "repairpath",
-                                      moe::String,
-                                      "root directory for repair files - defaults to dbpath");
-
-    // Javascript Options
-
-    general_options
-        .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
-        .setSources(moe::SourceAllLegacy);
-
-    general_options
-        .addOptionChaining(
-            "security.javascriptEnabled", "", moe::Bool, "Enable javascript execution")
-        .setSources(moe::SourceYAMLConfig);
-
-    // Query Options
-
-    general_options
-        .addOptionChaining("notablescan", "notablescan", moe::Switch, "do not allow table scans")
-        .setSources(moe::SourceAllLegacy);
-
-    // Journaling Options
-
-    // Way to enable or disable journaling on command line and in Legacy config file
-    storage_options.addOptionChaining("journal", "journal", moe::Switch, "enable journaling")
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options
-        .addOptionChaining("nojournal",
-                           "nojournal",
-                           moe::Switch,
-                           "disable journaling (journaling is on by default for 64 bit)")
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options.addOptionChaining("dur", "dur", moe::Switch, "enable journaling")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    storage_options.addOptionChaining("nodur", "nodur", moe::Switch, "disable journaling")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    // Way to enable or disable journaling in JSON Config
-    general_options.addOptionChaining("storage.journal.enabled", "", moe::Bool, "enable journaling")
-        .setSources(moe::SourceYAMLConfig);
-
-    // Two ways to set durability diagnostic options.  durOptions is deprecated
-    storage_options
-        .addOptionChaining("storage.mmapv1.journal.debugFlags",
-                           "journalOptions",
-                           moe::Int,
-                           "journal diagnostic options",
-                           "storage.journal.debugFlags")
-        .incompatibleWith("durOptions");
-
-    storage_options
-        .addOptionChaining("durOptions", "durOptions", moe::Int, "durability diagnostic options")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("storage.mmapv1.journal.debugFlags");
-
-    storage_options.addOptionChaining("storage.journal.commitIntervalMs",
-                                      "journalCommitInterval",
-                                      moe::Int,
-                                      "how often to group/batch commit (ms)",
-                                      "storage.mmapv1.journal.commitIntervalMs");
-
-    // Deprecated option that we don't want people to use for performance reasons
-    storage_options
-        .addOptionChaining("storage.mmapv1.journal.nopreallocj",
-                           "nopreallocj",
-                           moe::Switch,
-                           "don't preallocate journal files")
-        .hidden()
-        .setSources(moe::SourceAll);
-
-#if defined(__linux__)
-    general_options.addOptionChaining(
-        "shutdown", "shutdown", moe::Switch, "kill a running server (for init scripts)");
-
+    sb << " which is " << currentPath.root_name().string() << storageGlobalParams.kDefaultDbPath
+       << " based on the current working drive";
 #endif
 
-    // Master Slave Options
+    return sb.str();
+}
 
-    ms_options.addOptionChaining("master", "master", moe::Switch, "master mode")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    ms_options.addOptionChaining("slave", "slave", moe::Switch, "slave mode")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    ms_options
-        .addOptionChaining(
-            "source", "source", moe::String, "when slave: specify master as <server:port>")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    ms_options
-        .addOptionChaining(
-            "only", "only", moe::String, "when slave: specify a single database to replicate")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    ms_options
-        .addOptionChaining(
-            "slavedelay",
-            "slavedelay",
-            moe::Int,
-            "specify delay (in seconds) to be used when applying master ops to slave")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    ms_options
-        .addOptionChaining(
-            "autoresync", "autoresync", moe::Switch, "automatically resync if slave data is stale")
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName")
-        .setSources(moe::SourceAllLegacy);
-
-    // Replication Options
-
-    replication_options.addOptionChaining(
-        "replication.oplogSizeMB",
-        "oplogSize",
-        moe::Int,
-        "size to use (in MB) for replication op log. default is 5% of disk space "
-        "(i.e. large is good)");
-
-    rs_options
-        .addOptionChaining("replication.replSet",
-                           "replSet",
-                           moe::String,
-                           "arg is <setname>[/<optionalseedhostlist>]")
-        .setSources(moe::SourceAllLegacy);
-
-    rs_options.addOptionChaining("replication.replSetName", "", moe::String, "arg is <setname>")
-        .setSources(moe::SourceYAMLConfig)
-        .format("[^/]+", "[replica set name with no \"/\"]");
-
-    rs_options
-        .addOptionChaining("replication.secondaryIndexPrefetch",
-                           "replIndexPrefetch",
-                           moe::String,
-                           "specify index prefetching behavior (if secondary) [none|_id_only|all]")
-        .format("(:?none)|(:?_id_only)|(:?all)", "(none/_id_only/all)");
-
-    rs_options.addOptionChaining("replication.enableMajorityReadConcern",
-                                 "enableMajorityReadConcern",
-                                 moe::Switch,
-                                 "enables majority readConcern");
-
-    // Sharding Options
-
-    sharding_options
-        .addOptionChaining("configsvr",
-                           "configsvr",
-                           moe::Switch,
-                           "declare this is a config db of a cluster; default port 27019; "
-                           "default dir /data/configdb")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("shardsvr")
-        .incompatibleWith("nojournal");
-
-    sharding_options
-        .addOptionChaining("shardsvr",
-                           "shardsvr",
-                           moe::Switch,
-                           "declare this is a shard db of a cluster; default port 27018")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("configsvr")
-        .incompatibleWith("master")
-        .incompatibleWith("slave");
-
-    sharding_options
-        .addOptionChaining(
-            "sharding.clusterRole",
-            "",
-            moe::String,
-            "Choose what role this mongod has in a sharded cluster.  Possible values are:\n"
-            "    \"configsvr\": Start this node as a config server.  Starts on port 27019 by "
-            "default."
-            "    \"shardsvr\": Start this node as a shard server.  Starts on port 27018 by "
-            "default.")
-        .setSources(moe::SourceYAMLConfig)
-        .format("(:?configsvr)|(:?shardsvr)", "(configsvr/shardsvr)");
-
-    sharding_options
-        .addOptionChaining(
-            "sharding._overrideShardIdentity",
-            "",
-            moe::String,
-            "overrides the shardIdentity document settings stored in the local storage with "
-            "a MongoDB Extended JSON document in string format")
-        .setSources(moe::SourceYAMLConfig)
-        .incompatibleWith("configsvr")
-        .requires("storage.queryableBackupMode");
-
-    sharding_options
-        .addOptionChaining("noMoveParanoia",
-                           "noMoveParanoia",
-                           moe::Switch,
-                           "turn off paranoid saving of data for the moveChunk command; default")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("moveParanoia");
-
-    sharding_options
-        .addOptionChaining("moveParanoia",
-                           "moveParanoia",
-                           moe::Switch,
-                           "turn on paranoid saving of data during the moveChunk command "
-                           "(used for internal system diagnostics)")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("noMoveParanoia");
-
-    sharding_options
-        .addOptionChaining("sharding.archiveMovedChunks",
-                           "",
-                           moe::Bool,
-                           "config file option to turn on paranoid saving of data during the "
-                           "moveChunk command (used for internal system diagnostics)")
-        .hidden()
-        .setSources(moe::SourceYAMLConfig);
-
-
-    options->addSection(general_options).transitional_ignore();
-#if defined(_WIN32)
-    options->addSection(windows_scm_options).transitional_ignore();
-#endif
-    options->addSection(replication_options).transitional_ignore();
-    options->addSection(ms_options).transitional_ignore();
-    options->addSection(rs_options).transitional_ignore();
-    options->addSection(sharding_options).transitional_ignore();
-#ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options).transitional_ignore();
-#endif
-    options->addSection(storage_options).transitional_ignore();
-
-    // The following are legacy options that are disallowed in the JSON config file
-
-    options
-        ->addOptionChaining(
-            "fastsync",
-            "fastsync",
-            moe::Switch,
-            "indicate that this instance is starting from a dbpath snapshot of the repl peer")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining("pretouch",
-                            "pretouch",
-                            moe::Int,
-                            "n pretouch threads for applying master/slave operations")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    // This is a deprecated option that we are supporting for backwards compatibility
-    // The first value for this option can be either 'dbpath' or 'run'.
-    // If it is 'dbpath', mongod prints the dbpath and exits.  Any extra values are ignored.
-    // If it is 'run', mongod runs normally.  Providing extra values is an error.
-    options->addOptionChaining("command", "command", moe::StringVector, "command")
-        .hidden()
-        .positional(1, 3)
-        .setSources(moe::SourceAllLegacy);
-
-    options
-        ->addOptionChaining("cacheSize", "cacheSize", moe::Long, "cache size (in MB) for rec store")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    // deprecated pairing command line options
-    options->addOptionChaining("pairwith", "pairwith", moe::Switch, "DEPRECATED")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("arbiter", "arbiter", moe::Switch, "DEPRECATED")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
-
-    options->addOptionChaining("opIdMem", "opIdMem", moe::Switch, "DEPRECATED")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
+Status addMongodOptions(moe::OptionSection* options) try {
+    uassertStatusOK(addGeneralServerOptions(options));
+    uassertStatusOK(addNonGeneralServerOptions(options));
+    uassertStatusOK(addMongodGeneralOptions(options));
+    uassertStatusOK(addMongodReplicationOptions(options));
+    uassertStatusOK(addMongodShardingOptions(options));
+    uassertStatusOK(addMongodStorageOptions(options));
+    uassertStatusOK(addMongodLegacyOptions(options));
+    uassertStatusOK(addKeyfileServerOption(options));
+    uassertStatusOK(addClusterAuthModeServerOption(options));
 
     return Status::OK();
+} catch (const AssertionException& ex) {
+    return ex.toStatus();
 }
 
 void printMongodHelp(const moe::OptionSection& options) {
@@ -591,17 +101,20 @@ void printMongodHelp(const moe::OptionSection& options) {
 };
 
 namespace {
-void sysRuntimeInfo() {
+
+void appendSysInfo(BSONObjBuilder* obj) {
+    auto o = BSONObjBuilder(obj->subobjStart("sysinfo"));
 #if defined(_SC_PAGE_SIZE)
-    log() << "  page size: " << (int)sysconf(_SC_PAGE_SIZE);
+    o.append("_SC_PAGE_SIZE", (long long)sysconf(_SC_PAGE_SIZE));
 #endif
 #if defined(_SC_PHYS_PAGES)
-    log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES);
+    o.append("_SC_PHYS_PAGES", (long long)sysconf(_SC_PHYS_PAGES));
 #endif
 #if defined(_SC_AVPHYS_PAGES)
-    log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES);
+    o.append("_SC_AVPHYS_PAGES", (long long)sysconf(_SC_AVPHYS_PAGES));
 #endif
 }
+
 }  // namespace
 
 bool handlePreValidationMongodOptions(const moe::Environment& params,
@@ -611,15 +124,20 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        setPlainConsoleLogger();
         auto&& vii = VersionInfoInterface::instance();
-        log() << mongodVersion(vii);
-        vii.logBuildInfo();
+        std::cout << mongodVersion(vii) << std::endl;
+        vii.logBuildInfo(&std::cout);
         return false;
     }
     if (params.count("sysinfo") && params["sysinfo"].as<bool>() == true) {
-        setPlainConsoleLogger();
-        sysRuntimeInfo();
+        BSONObjBuilder obj;
+        appendSysInfo(&obj);
+        std::cout << tojson(obj.done(), ExtendedRelaxedV2_0_0, true) << std::endl;
+        return false;
+    }
+
+    if (params.count("master") || params.count("slave")) {
+        LOGV2_FATAL_CONTINUE(20881, "Master/slave replication is no longer supported");
         return false;
     }
 
@@ -632,8 +150,7 @@ Status validateMongodOptions(const moe::Environment& params) {
         return ret;
     }
 
-    if ((params.count("nodur") || params.count("nojournal")) &&
-        (params.count("dur") || params.count("journal"))) {
+    if (params.count("nojournal") && params.count("storage.journal.enabled")) {
         return Status(ErrorCodes::BadValue,
                       "Can't specify both --journal and --nojournal options.");
     }
@@ -641,7 +158,7 @@ Status validateMongodOptions(const moe::Environment& params) {
 #ifdef _WIN32
     if (params.count("install") || params.count("reinstall")) {
         if (params.count("storage.dbPath") &&
-            !boost::filesystem::path(params["storage.dbPath"].as<string>()).is_absolute()) {
+            !boost::filesystem::path(params["storage.dbPath"].as<std::string>()).is_absolute()) {
             return Status(ErrorCodes::BadValue,
                           "dbPath requires an absolute file path with Windows services");
         }
@@ -650,18 +167,8 @@ Status validateMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.queryableBackupMode")) {
         // Command line options that are disallowed when --queryableBackupMode is specified.
-        for (const auto& disallowedOption : {"replication.replSet",
-                                             "configsvr",
-                                             "upgrade",
-                                             "repair",
-                                             "profile",
-                                             "master",
-                                             "slave",
-                                             "source",
-                                             "only",
-                                             "slavedelay",
-                                             "autoresync",
-                                             "fastsync"}) {
+        for (const auto& disallowedOption :
+             {"replication.replSet", "configsvr", "upgrade", "repair", "profile"}) {
             if (params.count(disallowedOption)) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() << "Cannot specify both queryable backup mode and "
@@ -669,14 +176,13 @@ Status validateMongodOptions(const moe::Environment& params) {
             }
         }
 
-        bool isClusterRoleShard = false;
+        bool isClusterRoleShard = params.count("shardsvr");
         if (params.count("sharding.clusterRole")) {
             auto clusterRole = params["sharding.clusterRole"].as<std::string>();
-            isClusterRoleShard = (clusterRole == "shardsvr");
+            isClusterRoleShard = isClusterRoleShard || (clusterRole == "shardsvr");
         }
 
-        if ((isClusterRoleShard || params.count("shardsvr")) &&
-            !params.count("sharding._overrideShardIdentity")) {
+        if (isClusterRoleShard && !params.count("sharding._overrideShardIdentity")) {
             return Status(
                 ErrorCodes::BadValue,
                 "shardsvr cluster role with queryableBackupMode requires _overrideShardIdentity");
@@ -693,26 +199,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         return ret;
     }
 
-#ifdef MONGO_CONFIG_SSL
-    ret = canonicalizeSSLServerOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-    // "storage.journal.enabled" comes from the config file, so override it if any of "journal",
-    // "nojournal", "dur", and "nodur" are set, since those come from the command line.
-    if (params->count("journal")) {
-        Status ret =
-            params->set("storage.journal.enabled", moe::Value((*params)["journal"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("journal");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
     if (params->count("nojournal")) {
         Status ret =
             params->set("storage.journal.enabled", moe::Value(!(*params)["nojournal"].as<bool>()));
@@ -720,46 +206,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("nojournal");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-    if (params->count("dur")) {
-        Status ret =
-            params->set("storage.journal.enabled", moe::Value((*params)["dur"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("dur");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-    if (params->count("nodur")) {
-        Status ret =
-            params->set("storage.journal.enabled", moe::Value(!(*params)["nodur"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("nodur");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
-    // "storage.mmapv1.journal.durOptions" comes from the config file, so override it
-    // if "durOptions" is set since that comes from the command line.
-    if (params->count("durOptions")) {
-        int durOptions;
-        Status ret = params->get("durOptions", &durOptions);
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("durOptions");
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->set("storage.mmapv1.journal.debugFlags", moe::Value(durOptions));
         if (!ret.isOK()) {
             return ret;
         }
@@ -776,20 +222,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("auth");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
-    // "storage.mmapv1.preallocDataFiles" comes from the config file, so override it if "noprealloc"
-    // is set since that comes from the command line.
-    if (params->count("noprealloc")) {
-        Status ret = params->set("storage.mmapv1.preallocDataFiles",
-                                 moe::Value(!(*params)["noprealloc"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noprealloc");
         if (!ret.isOK()) {
             return ret;
         }
@@ -884,20 +316,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         }
     }
 
-    // "storage.indexBuildRetry" comes from the config file, so override it if
-    // "noIndexBuildRetry" is set since that comes from the command line.
-    if (params->count("noIndexBuildRetry")) {
-        Status ret = params->set("storage.indexBuildRetry",
-                                 moe::Value(!(*params)["noIndexBuildRetry"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noIndexBuildRetry");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
     // Ensure that "replication.replSet" logically overrides "replication.replSetName".  We
     // can't canonicalize them as the same option, because they mean slightly different things.
     // "replication.replSet" can include a seed list, while "replication.replSetName" just has
@@ -945,12 +363,12 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     if (params.count("storage.engine")) {
-        storageGlobalParams.engine = params["storage.engine"].as<string>();
+        storageGlobalParams.engine = params["storage.engine"].as<std::string>();
         storageGlobalParams.engineSetByUser = true;
     }
 
     if (params.count("storage.dbPath")) {
-        storageGlobalParams.dbpath = params["storage.dbPath"].as<string>();
+        storageGlobalParams.dbpath = params["storage.dbPath"].as<std::string>();
         if (params.count("processManagement.fork") && storageGlobalParams.dbpath[0] != '/') {
             // we need to change dbpath if we fork since we change
             // cwd to "/"
@@ -984,22 +402,13 @@ Status storeMongodOptions(const moe::Environment& params) {
         }
     }
 
-    if (params.count("operationProfiling.slowOpThresholdMs")) {
-        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
-    }
-
-    if (params.count("operationProfiling.slowOpSampleRate")) {
-        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
-    }
-
     if (params.count("storage.syncPeriodSecs")) {
         storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
         if (storageGlobalParams.syncdelay < 0 ||
             storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "syncdelay out of allowed range (0-"
-                                        << StorageGlobalParams::kMaxSyncdelaySecs
-                                        << "s)");
+                                        << StorageGlobalParams::kMaxSyncdelaySecs << "s)");
         }
     }
 
@@ -1010,7 +419,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("storage.queryableBackupMode") &&
         params["storage.queryableBackupMode"].as<bool>()) {
         storageGlobalParams.readOnly = true;
-        storageGlobalParams.dur = false;
     }
 
     if (params.count("storage.groupCollections")) {
@@ -1019,13 +427,6 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("cpu")) {
         serverGlobalParams.cpu = params["cpu"].as<bool>();
-    }
-    if (params.count("storage.mmapv1.quota.enforced")) {
-        mmapv1GlobalOptions.quota = params["storage.mmapv1.quota.enforced"].as<bool>();
-    }
-    if (params.count("storage.mmapv1.quota.maxFilesPerDB")) {
-        mmapv1GlobalOptions.quota = true;
-        mmapv1GlobalOptions.quotaFiles = params["storage.mmapv1.quota.maxFilesPerDB"].as<int>() - 1;
     }
 
     if (params.count("storage.journal.enabled")) {
@@ -1041,16 +442,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         if (journalCommitIntervalMs < 1 ||
             journalCommitIntervalMs > StorageGlobalParams::kMaxJournalCommitIntervalMs) {
             return Status(ErrorCodes::BadValue,
-                          str::stream() << "--journalCommitInterval out of allowed range (1-"
-                                        << StorageGlobalParams::kMaxJournalCommitIntervalMs
-                                        << "ms)");
+                          str::stream()
+                              << "--journalCommitInterval out of allowed range (1-"
+                              << StorageGlobalParams::kMaxJournalCommitIntervalMs << "ms)");
         }
-    }
-    if (params.count("storage.mmapv1.journal.debugFlags")) {
-        mmapv1GlobalOptions.journalOptions = params["storage.mmapv1.journal.debugFlags"].as<int>();
-    }
-    if (params.count("storage.mmapv1.journal.nopreallocj")) {
-        mmapv1GlobalOptions.preallocj = !params["storage.mmapv1.journal.nopreallocj"].as<bool>();
     }
 
     if (params.count("security.javascriptEnabled")) {
@@ -1062,41 +457,16 @@ Status storeMongodOptions(const moe::Environment& params) {
         for (const std::string& whitelistEntry :
              params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
             std::vector<std::string> intermediates;
-            splitStringDelim(whitelistEntry, &intermediates, ',');
+            str::splitStringDelim(whitelistEntry, &intermediates, ',');
             std::copy(intermediates.begin(),
                       intermediates.end(),
                       std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
         }
     }
 
-    if (params.count("storage.mmapv1.preallocDataFiles")) {
-        mmapv1GlobalOptions.prealloc = params["storage.mmapv1.preallocDataFiles"].as<bool>();
-        cout << "note: noprealloc may hurt performance in many applications" << endl;
-    }
-    if (params.count("storage.mmapv1.smallFiles")) {
-        mmapv1GlobalOptions.smallfiles = params["storage.mmapv1.smallFiles"].as<bool>();
-    }
-    if (params.count("diaglog")) {
-        warning() << "--diaglog is deprecated and will be removed in a future release"
-                  << startupWarningsLog;
-        int x = params["diaglog"].as<int>();
-        if (x < 0 || x > 7) {
-            return Status(ErrorCodes::BadValue, "can't interpret --diaglog setting");
-        }
-        _diaglog.setLevel(x);
-    }
-
-    if ((params.count("storage.journal.enabled") &&
-         params["storage.journal.enabled"].as<bool>() == true) &&
-        params.count("repair")) {
-        return Status(ErrorCodes::BadValue,
-                      "Can't have journaling enabled when using --repair option.");
-    }
-
     if (params.count("repair") && params["repair"].as<bool>() == true) {
         storageGlobalParams.upgrade = 1;  // --repair implies --upgrade
         storageGlobalParams.repair = 1;
-        storageGlobalParams.dur = false;
     }
     if (params.count("upgrade") && params["upgrade"].as<bool>() == true) {
         storageGlobalParams.upgrade = 1;
@@ -1106,64 +476,36 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     repl::ReplSettings replSettings;
-    if (params.count("master")) {
-        replSettings.setMaster(params["master"].as<bool>());
-    }
-    if (params.count("slave") && params["slave"].as<bool>() == true) {
-        replSettings.setSlave(true);
-    }
-    if (params.count("slavedelay")) {
-        replSettings.setSlaveDelaySecs(params["slavedelay"].as<int>());
-    }
-    if (params.count("fastsync")) {
-        if (!replSettings.isSlave()) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "--fastsync must only be used with --slave");
-        }
-        replSettings.setFastSyncEnabled(params["fastsync"].as<bool>());
-    }
-    if (params.count("autoresync")) {
-        replSettings.setAutoResyncEnabled(params["autoresync"].as<bool>());
-    }
-    if (params.count("source")) {
-        /* specifies what the source in local.sources should be */
-        replSettings.setSource(params["source"].as<string>().c_str());
-    }
-    if (params.count("pretouch")) {
-        replSettings.setPretouch(params["pretouch"].as<int>());
-    }
-    if (params.count("replication.replSetName")) {
-        replSettings.setReplSetString(params["replication.replSetName"].as<string>().c_str());
-    }
     if (params.count("replication.replSet")) {
         /* seed list of hosts for the repl set */
-        replSettings.setReplSetString(params["replication.replSet"].as<string>().c_str());
-    }
-    if (params.count("replication.secondaryIndexPrefetch")) {
-        replSettings.setPrefetchIndexMode(
-            params["replication.secondaryIndexPrefetch"].as<std::string>());
+        replSettings.setReplSetString(params["replication.replSet"].as<std::string>().c_str());
+    } else if (params.count("replication.replSetName")) {
+        // "replSetName" is previously removed if "replSet" and "replSetName" are both found to be
+        // set by the user. Therefore, we only need to check for it if "replSet" in not found.
+        replSettings.setReplSetString(params["replication.replSetName"].as<std::string>().c_str());
+    } else {
+        // If neither "replication.replSet" nor "replication.replSetName" is set, then we are in
+        // standalone mode.
+        //
+        // A standalone node does not use the oplog collection, so special truncation handling for
+        // the capped collection is unnecessary.
+        //
+        // A standalone node that will be reintroduced to its replica set must not allow oplog
+        // truncation while in standalone mode because oplog history needed for startup recovery as
+        // a replica set member could be deleted. Replication can need history older than the last
+        // checkpoint to support transactions.
+        //
+        // Note: we only use this to defer oplog collection truncation via OplogStones in WT. Non-WT
+        // storage engines will continue to perform regular capped collection handling for the oplog
+        // collection, regardless of this parameter setting.
+        storageGlobalParams.allowOplogTruncation = false;
     }
 
     if (params.count("replication.enableMajorityReadConcern")) {
-        replSettings.setMajorityReadConcernEnabled(
-            params["replication.enableMajorityReadConcern"].as<bool>());
+        serverGlobalParams.enableMajorityReadConcern =
+            params["replication.enableMajorityReadConcern"].as<bool>();
     }
 
-    if (params.count("storage.indexBuildRetry")) {
-        serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
-    }
-
-    if (params.count("only")) {
-        replSettings.setOnly(params["only"].as<string>().c_str());
-    }
-    if (params.count("storage.mmapv1.nsSize")) {
-        int x = params["storage.mmapv1.nsSize"].as<int>();
-        if (x <= 0 || x > (0x7fffffff / 1024 / 1024)) {
-            return Status(ErrorCodes::BadValue, "bad --nssize arg");
-        }
-        mmapv1GlobalOptions.lenForNewNsFiles = x * 1024 * 1024;
-        verify(mmapv1GlobalOptions.lenForNewNsFiles > 0);
-    }
     if (params.count("replication.oplogSizeMB")) {
         long long x = params["replication.oplogSizeMB"].as<int>();
         if (x <= 0) {
@@ -1182,6 +524,17 @@ Status storeMongodOptions(const moe::Environment& params) {
         replSettings.setOplogSizeBytes(x * 1024 * 1024);
         invariant(replSettings.getOplogSizeBytes() > 0);
     }
+
+    if (params.count("storage.oplogMinRetentionHours")) {
+        storageGlobalParams.oplogMinRetentionHours.store(
+            params["storage.oplogMinRetentionHours"].as<double>());
+        if (storageGlobalParams.oplogMinRetentionHours.load() < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "bad --oplogMinRetentionHours, argument must be greater or equal to 0");
+        }
+        invariant(storageGlobalParams.oplogMinRetentionHours.load() >= 0);
+    }
+
     if (params.count("cacheSize")) {
         long x = params["cacheSize"].as<long>();
         if (x <= 0) {
@@ -1212,7 +565,14 @@ Status storeMongodOptions(const moe::Environment& params) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
         if (clusterRoleParam == "configsvr") {
             serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-            replSettings.setMajorityReadConcernEnabled(true);
+
+            if (params.count("replication.enableMajorityReadConcern") &&
+                !params["replication.enableMajorityReadConcern"].as<bool>()) {
+                LOGV2_WARNING(20879,
+                              "Ignoring read concern override as config server requires majority "
+                              "read concern");
+            }
+            serverGlobalParams.enableMajorityReadConcern = true;
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role
@@ -1262,49 +622,33 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 #endif
 
-    // needs to be after things like --configsvr parsing, thus here.
-    if (params.count("storage.repairPath")) {
-        storageGlobalParams.repairpath = params["storage.repairPath"].as<string>();
-        if (!storageGlobalParams.repairpath.size()) {
-            return Status(ErrorCodes::BadValue, "repairpath is empty");
-        }
-
-        if (storageGlobalParams.dur &&
-            !str::startsWith(storageGlobalParams.repairpath, storageGlobalParams.dbpath)) {
-            return Status(ErrorCodes::BadValue,
-                          "You must use a --repairpath that is a subdirectory of --dbpath when "
-                          "using journaling");
-        }
-    } else {
-        storageGlobalParams.repairpath = storageGlobalParams.dbpath;
-    }
-
-    if (replSettings.getPretouch())
-        log() << "--pretouch " << replSettings.getPretouch();
-
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
         // trying to make this stand out more like startup warnings
-        log() << endl;
-        warning() << "32-bit servers don't have journaling enabled by default. "
-                  << "Please use --journal if you want durability.";
-        log() << endl;
+        LOGV2(20877, "");
+        LOGV2_WARNING(20880,
+                      "32-bit servers don't have journaling enabled by default. Please use "
+                      "--journal if you want durability");
+        LOGV2(20878, "");
+    }
+
+    bool isClusterRoleShard = params.count("shardsvr");
+    bool isClusterRoleConfig = params.count("configsvr");
+    if (params.count("sharding.clusterRole")) {
+        auto clusterRole = params["sharding.clusterRole"].as<std::string>();
+        isClusterRoleShard = isClusterRoleShard || (clusterRole == "shardsvr");
+        isClusterRoleConfig = isClusterRoleConfig || (clusterRole == "configsvr");
+    }
+
+    if ((isClusterRoleShard || isClusterRoleConfig) && skipShardingConfigurationChecks) {
+        auto clusterRoleStr = isClusterRoleConfig ? "--configsvr" : "--shardsvr";
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Can not specify " << clusterRoleStr
+                                    << " and set skipShardingConfigurationChecks=true");
     }
 
     setGlobalReplSettings(replSettings);
     return Status::OK();
-}
-
-namespace {
-repl::ReplSettings globalReplSettings;
-}  // namespace
-
-void setGlobalReplSettings(const repl::ReplSettings& settings) {
-    globalReplSettings = settings;
-}
-
-const repl::ReplSettings& getGlobalReplSettings() {
-    return globalReplSettings;
 }
 
 }  // namespace mongo

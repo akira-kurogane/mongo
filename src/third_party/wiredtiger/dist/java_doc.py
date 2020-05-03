@@ -3,6 +3,7 @@
 # This program pulls the function names from wiredtiger.in and generates
 # an input file for Java SWIG that adds doxygen copydoc comments to functions.
 
+from __future__ import print_function
 import os, re, sys
 import api_data
 from dist import compare_srcfile
@@ -22,7 +23,7 @@ tfile.write('''/* DO NOT EDIT: automatically built by dist/java_doc.py. */
 ''')
 
 cclass_re = re.compile('^struct __([a-z_]*) {')
-cfunc_re = re.compile('\t.*? __F\(([a-z_]*)\)')
+cfunc_re = re.compile('\s+.*? __F\(([a-z_]*)\)')
 
 curr_class = ""
 for line in open(f, 'r'):

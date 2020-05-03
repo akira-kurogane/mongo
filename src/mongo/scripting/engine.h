@@ -1,34 +1,35 @@
-// engine.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
@@ -43,11 +44,12 @@ class OperationContext;
 
 struct JSFile {
     const char* name;
-    const StringData& source;
+    const StringData source;
 };
 
 class Scope {
-    MONGO_DISALLOW_COPYING(Scope);
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
 
 public:
     Scope();
@@ -63,10 +65,9 @@ public:
         init(&o);
     }
 
-    virtual void localConnectForDbEval(OperationContext* opCtx, const char* dbName) = 0;
     virtual void externalSetup() = 0;
-    virtual void setLocalDB(const std::string& localDBName) {
-        _localDBName = localDBName;
+    virtual void setLocalDB(StringData localDBName) {
+        _localDBName = localDBName.toString();
     }
 
     virtual BSONObj getObject(const char* field) = 0;
@@ -95,6 +96,8 @@ public:
     virtual std::string getError() = 0;
 
     virtual bool hasOutOfMemoryException() = 0;
+
+    virtual void kill() = 0;
 
     virtual bool isKillPending() const = 0;
 
@@ -138,7 +141,7 @@ public:
         uasserted(9005, std::string("invoke failed: ") + getError());
     }
 
-    virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
+    virtual void injectNative(const char* field, NativeFunction func, void* data = nullptr) = 0;
 
     virtual bool exec(StringData code,
                       const std::string& name,
@@ -172,33 +175,14 @@ public:
 
     static void validateObjectIdString(const std::string& str);
 
-    /** increments the number of times a scope was used */
-    void incTimesUsed() {
-        ++_numTimesUsed;
-    }
-
-    /** gets the number of times a scope was used */
-    int getTimesUsed() const {
-        return _numTimesUsed;
+    /** gets the time at which the scope was created */
+    Date_t getCreateTime() const {
+        return _createTime;
     }
 
     /** return true if last invoke() return'd native code */
     virtual bool isLastRetNativeCode() {
         return _lastRetIsNativeCode;
-    }
-
-    class NoDBAccess {
-        Scope* _s;
-
-    public:
-        NoDBAccess(Scope* s) : _s(s) {}
-        ~NoDBAccess() {
-            _s->rename("____db____", "db");
-        }
-    };
-    NoDBAccess disableDBAccess(const char* why) {
-        rename("db", "____db____");
-        return NoDBAccess(this);
     }
 
 protected:
@@ -215,25 +199,30 @@ protected:
     std::string _localDBName;
     int64_t _loadedVersion;
     std::set<std::string> _storedNames;
-    static AtomicInt64 _lastVersion;
+    static AtomicWord<long long> _lastVersion;
     FunctionCacheMap _cachedFunctions;
-    int _numTimesUsed;
+    Date_t _createTime;
     bool _lastRetIsNativeCode;  // v8 only: set to true if eval'd script returns a native func
 };
 
 class ScriptEngine : public KillOpListenerInterface {
-    MONGO_DISALLOW_COPYING(ScriptEngine);
+    ScriptEngine(const ScriptEngine&) = delete;
+    ScriptEngine& operator=(const ScriptEngine&) = delete;
 
 public:
-    ScriptEngine();
+    ScriptEngine(bool disableLoadStored);
     virtual ~ScriptEngine();
 
     virtual Scope* newScope() {
         return createScope();
     }
 
-    virtual Scope* newScopeForCurrentThread() {
-        return createScopeForCurrentThread();
+    virtual Scope* newScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+        return createScopeForCurrentThread(jsHeapLimitMB);
+    }
+
+    Scope* newScopeForCurrentThread() {
+        return newScopeForCurrentThread(boost::none);
     }
 
     virtual void runTest() = 0;
@@ -249,7 +238,12 @@ public:
     virtual int getJSHeapLimitMB() const = 0;
     virtual void setJSHeapLimitMB(int limit) = 0;
 
-    static void setup();
+    /**
+     * Calls the constructor for the Global ScriptEngine. 'disableLoadStored' causes future calls to
+     * the function Scope::loadStored(), which would otherwise load stored procedures, to be
+     * ignored.
+     */
+    static void setup(bool disableLoadStored = true);
     static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
@@ -279,10 +273,11 @@ public:
     virtual void interruptAll() {}
 
     static std::string getInterpreterVersionString();
+    const bool _disableLoadStored;
 
 protected:
     virtual Scope* createScope() = 0;
-    virtual Scope* createScopeForCurrentThread() = 0;
+    virtual Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) = 0;
     void (*_scopeInitCallback)(Scope&);
 
 private:
@@ -295,4 +290,4 @@ const char* jsSkipWhiteSpace(const char* raw);
 
 ScriptEngine* getGlobalScriptEngine();
 void setGlobalScriptEngine(ScriptEngine* impl);
-}
+}  // namespace mongo

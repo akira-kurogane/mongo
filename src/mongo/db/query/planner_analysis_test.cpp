@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +40,24 @@
 using namespace mongo;
 
 namespace {
+
+/**
+ * Make a minimal IndexEntry from just a key pattern. A dummy name will be added.
+ */
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            false,
+            {},
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier("test_foo"),
+            nullptr,
+            {},
+            nullptr,
+            nullptr};
+}
 
 TEST(QueryPlannerAnalysis, GetSortPatternBasic) {
     ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"), QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1}")));
@@ -98,21 +117,21 @@ TEST(QueryPlannerAnalysis, GetSortPatternSpecialIndexTypes) {
 
     ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
                       QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 'text', c: 1}")));
-    ASSERT_BSONOBJ_EQ(fromjson("{a: 1}"),
-                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: '2dsphere',"
-                                                                    " c: 1}")));
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: 1}"),
+        QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: '2dsphere', c: 1}")));
 
     ASSERT_BSONOBJ_EQ(fromjson("{a: 1, b: 1}"),
                       QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1, c: 'text'}")));
-    ASSERT_BSONOBJ_EQ(fromjson("{a: 1, b: 1}"),
-                      QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1, c: 'text',"
-                                                                    " d: 1}")));
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: 1, b: 1}"),
+        QueryPlannerAnalysis::getSortPattern(fromjson("{a: 1, b: 1, c: 'text', d: 1}")));
 }
 
 // Test the generation of sort orders provided by an index scan done by
 // IndexScanNode::computeProperties().
 TEST(QueryPlannerAnalysis, IxscanSortOrdersBasic) {
-    IndexScanNode ixscan(IndexEntry(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")));
+    IndexScanNode ixscan(buildSimpleIndexEntry(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")));
 
     // Bounds are {a: [[1,1]], b: [[2,2]], c: [[3,3]], d: [[1,5]], e:[[1,1],[2,2]]},
     // all inclusive.
@@ -139,36 +158,42 @@ TEST(QueryPlannerAnalysis, IxscanSortOrdersBasic) {
 
     // Compute and retrieve the set of sorts.
     ixscan.computeProperties();
-    const BSONObjSet& sorts = ixscan.getSort();
+    auto sorts = ixscan.providedSorts();
 
     // One possible sort is the index key pattern.
-    ASSERT(sorts.find(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")) != sorts.end());
+    ASSERT(sorts.contains(fromjson("{a: 1, b: 1, c: 1, d: 1, e: 1}")));
 
     // All prefixes of the key pattern.
-    ASSERT(sorts.find(fromjson("{a: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{a: 1, b: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{a: 1, b: 1, c: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{a: 1, b: 1, c: 1, d: 1}")) != sorts.end());
+    ASSERT(sorts.contains(fromjson("{a: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: -1, b: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: 1, b: -1, c: 1}")));
+    ASSERT(sorts.contains(fromjson("{a: 1, b: 1, c: -1, d: 1}")));
 
     // Additional sorts considered due to point intervals on 'a', 'b', and 'c'.
-    ASSERT(sorts.find(fromjson("{b: 1, c: 1, d: 1, e: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{c: 1, d: 1, e: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{d: 1, e: 1}")) != sorts.end());
-    ASSERT(sorts.find(fromjson("{d: 1}")) != sorts.end());
+    ASSERT(sorts.contains(fromjson("{b: -1, d: 1, e: 1}")));
+    ASSERT(sorts.contains(fromjson("{d: 1, c: 1, e: 1}")));
+    ASSERT(sorts.contains(fromjson("{d: 1, c: -1}")));
 
-    // There should be 9 total sorts: make sure no other ones snuck their way in.
-    ASSERT_EQ(9U, sorts.size());
+    // Sorts that are not considered.
+    ASSERT_FALSE(sorts.contains(fromjson("{d: -1, e: -1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{e: 1, a: 1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{d: 1, e: -1}")));
+    ASSERT_FALSE(sorts.contains(fromjson("{a: 1, d: 1, e: -1}")));
+
+    // Verify that the 'sorts' object has expected internal fields.
+    ASSERT(sorts.getIgnoredFields() == std::set<std::string>({"a", "b", "c"}));
+    ASSERT_BSONOBJ_EQ(fromjson("{d: 1, e: 1}"), sorts.getBaseSortPattern());
 }
 
 TEST(QueryPlannerAnalysis, GeoSkipValidation) {
     BSONObj unsupportedVersion = fromjson("{'2dsphereIndexVersion': 2}");
     BSONObj supportedVersion = fromjson("{'2dsphereIndexVersion': 3}");
 
-    IndexEntry relevantIndex(fromjson("{'geometry.field': '2dsphere'}"));
-    IndexEntry irrelevantIndex(fromjson("{'geometry.field': 1}"));
-    IndexEntry differentFieldIndex(fromjson("{'geometry.blah': '2dsphere'}"));
-    IndexEntry compoundIndex(fromjson("{'geometry.field': '2dsphere', 'a': -1}"));
-    IndexEntry unsupportedIndex(fromjson("{'geometry.field': '2dsphere'}"));
+    auto relevantIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere'}"));
+    auto irrelevantIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': 1}"));
+    auto differentFieldIndex = buildSimpleIndexEntry(fromjson("{'geometry.blah': '2dsphere'}"));
+    auto compoundIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere', 'a': -1}"));
+    auto unsupportedIndex = buildSimpleIndexEntry(fromjson("{'geometry.field': '2dsphere'}"));
 
     relevantIndex.infoObj = irrelevantIndex.infoObj = differentFieldIndex.infoObj =
         compoundIndex.infoObj = supportedVersion;
@@ -176,11 +201,11 @@ TEST(QueryPlannerAnalysis, GeoSkipValidation) {
 
     QueryPlannerParams params;
 
-    std::unique_ptr<FetchNode> fetchNodePtr = stdx::make_unique<FetchNode>();
-    std::unique_ptr<GeoMatchExpression> exprPtr = stdx::make_unique<GeoMatchExpression>();
+    std::unique_ptr<FetchNode> fetchNodePtr = std::make_unique<FetchNode>();
+    std::unique_ptr<GeoMatchExpression> exprPtr =
+        std::make_unique<GeoMatchExpression>("geometry.field", nullptr, BSONObj());
 
     GeoMatchExpression* expr = exprPtr.get();
-    expr->init("geometry.field", nullptr, BSONObj()).transitional_ignore();
 
     FetchNode* fetchNode = fetchNodePtr.get();
     // Takes ownership.

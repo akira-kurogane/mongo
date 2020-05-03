@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -26,8 +26,10 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import os, subprocess
+from __future__ import print_function
+import os, re, subprocess, sys
 from run import wt_builddir
+from wttest import WiredTigerTestCase
 
 # suite_subprocess.py
 #    Run a subprocess within the test suite
@@ -68,33 +70,61 @@ class suite_subprocess:
                         lines.pop(0)
                         hasPrevious = True
         if hasError:
-            print '**************** ' + match + ' in output file: ' + filename + ' ****************'
+            print('**************** ' + match + ' in output file: ' + filename + ' ****************')
             if hasPrevious:
-                print '...'
+                print('...')
             for line in lines:
-                print line,
+                print(line, end=' ')
             if hasNext:
-                print '...'
-            print '********************************'
+                print('...')
+            print('********************************')
             self.fail('ERROR found in output file: ' + filename)
+
+    # If the string is of the form '/.../', then return just the embedded
+    # pattern, otherwise, return None
+    def convert_to_pattern(self, s):
+        if len(s) >= 2 and s[0] == '/' and s[-1] == '/':
+            return s[1:-1]
+        else:
+            return None
 
     def check_file_content(self, filename, expect):
         with open(filename, 'r') as f:
             got = f.read(len(expect) + 100)
             self.assertEqual(got, expect, filename + ': does not contain expected:\n\'' + expect + '\', but contains:\n\'' + got + '\'.')
 
-    def check_file_contains(self, filename, expect):
+    def check_file_contains_one_of(self, filename, expectlist):
         """
         Check that the file contains the expected string in the first 100K bytes
         """
         maxbytes = 1024*100
         with open(filename, 'r') as f:
             got = f.read(maxbytes)
-            if not (expect in got):
-                if len(got) >= maxbytes:
-                    self.fail(filename + ': does not contain expected \'' + expect + '\', or output is too large')
+            found = False
+            for expect in expectlist:
+                pat = self.convert_to_pattern(expect)
+                if pat == None:
+                    if expect in got:
+                        found = True
+                        break
                 else:
-                    self.fail(filename + ': does not contain expected \'' + expect + '\'')
+                    if re.search(pat, got):
+                        found = True
+                        break
+            if not found:
+                if len(expectlist) == 1:
+                    expect = '\'' + expectlist[0] + '\''
+                else:
+                    expect = str(expectlist)
+                gotstr = '\'' + \
+                    (got if len(got) < 1000 else (got[0:1000] + '...')) + '\''
+                if len(got) >= maxbytes:
+                    self.fail(filename + ': does not contain expected ' + expect + ', or output is too large, got ' + gotstr)
+                else:
+                    self.fail(filename + ': does not contain expected ' + expect + ', got ' + gotstr)
+
+    def check_file_contains(self, filename, expect):
+        self.check_file_contains_one_of(filename, [expect])
 
     def check_empty_file(self, filename):
         """
@@ -104,8 +134,8 @@ class suite_subprocess:
         if filesize > 0:
             with open(filename, 'r') as f:
                 contents = f.read(1000)
-                print 'ERROR: ' + filename + ' expected to be empty, but contains:\n'
-                print contents + '...\n'
+                print('ERROR: ' + filename + ' expected to be empty, but contains:\n')
+                print(contents + '...\n')
         self.assertEqual(filesize, 0, filename + ': expected to be empty')
 
     def check_non_empty_file(self, filename):
@@ -114,8 +144,73 @@ class suite_subprocess:
         """
         filesize = os.path.getsize(filename)
         if filesize == 0:
-            print 'ERROR: ' + filename + ' should not be empty (this command expected error output)'
+            print('ERROR: ' + filename + ' should not be empty (this command expected error output)')
         self.assertNotEqual(filesize, 0, filename + ': expected to not be empty')
+
+    def verbose_env(self, envvar):
+        return envvar + '=' + str(os.environ.get(envvar)) + '\n'
+
+    def show_outputs(self, procargs, message, filenames):
+        out = message + ': ' + \
+              str(procargs) + '\n' + \
+              self.verbose_env('PATH') + \
+              self.verbose_env('LD_LIBRARY_PATH') + \
+              self.verbose_env('DYLD_LIBRARY_PATH') + \
+              self.verbose_env('PYTHONPATH') + \
+              'output files follow:'
+        WiredTigerTestCase.prout(out)
+        for filename in filenames:
+            maxbytes = 1024*100
+            with open(filename, 'r') as f:
+                contents = f.read(maxbytes)
+                if len(contents) > 0:
+                    if len(contents) >= maxbytes:
+                        contents += '...\n'
+                    sepline = '*' * 50 + '\n'
+                    out = sepline + filename + '\n' + sepline + contents
+                    WiredTigerTestCase.prout(out)
+
+    # Run a method as a subprocess using the run.py machinery.
+    # Return the process exit status and the the WiredTiger
+    # home directory used by the subprocess.
+    def run_subprocess_function(self, directory, funcname):
+        testparts = funcname.split('.')
+        if len(testparts) != 3:
+            raise ValueError('bad function name "' + funcname +
+                '", should be three part dotted name')
+        topdir = os.path.dirname(self.buildDirectory())
+        runscript = os.path.join(topdir, 'test', 'suite', 'run.py')
+        procargs = [ sys.executable, runscript, '-p', '--dir', directory,
+            funcname]
+
+        # scenario_number is only set if we are running in a scenario
+        try:
+            scennum = self.scenario_number
+            procargs.append('-s')
+            procargs.append(str(scennum))
+        except:
+            scennum = 0
+
+        returncode = -1
+        os.makedirs(directory)
+
+        # We cannot put the output/error files in the subdirectory, as
+        # that will be cleared by the run.py script.
+        with open("subprocess.err", "w") as wterr:
+            with open("subprocess.out", "w") as wtout:
+                returncode = subprocess.call(
+                    procargs, stdout=wtout, stderr=wterr)
+                if returncode != 0:
+                    # This is not necessarily an error, the primary reason to
+                    # run in a subprocess is that it may crash.
+                    self.show_outputs(procargs,
+                        "Warning: run_subprocess_function " + funcname + \
+                        " returned error code " + str(returncode),
+                        [ "subprocess.out", "subprocess.err" ])
+
+        new_home_dir = os.path.join(directory,
+            testparts[1] + '.' + str(scennum))
+        return [ returncode, new_home_dir ]
 
     # Run the wt utility.
     def runWt(self, args, infilename=None,
@@ -131,21 +226,43 @@ class suite_subprocess:
         wterrname = errfilename or "wt.err"
         with open(wterrname, "w") as wterr:
             with open(wtoutname, "w") as wtout:
-                procargs = [os.path.join(wt_builddir, "wt")]
+                # Prefer running the actual 'wt' binary rather than the
+                # 'wt' script created by libtool. On OS/X with System Integrity
+                # Protection enabled, running a shell script strips
+                # environment variables needed to run 'wt'. There are
+                # also test environments that work better with the binary.
+                libs_wt = os.path.join(wt_builddir, ".libs", "wt")
+                if os.path.isfile(libs_wt):
+                    wtexe = libs_wt
+                else:
+                    wtexe = os.path.join(wt_builddir, "wt")
+                procargs = [ wtexe ]
                 if self._gdbSubprocess:
-                    procargs = [os.path.join(wt_builddir, "libtool"),
-                                "--mode=execute", "gdb", "--args"] + procargs
+                    procargs = [ "gdb", "--args" ] + procargs
+                elif self._lldbSubprocess:
+                    procargs = [ "lldb", "--" ] + procargs
                 procargs.extend(args)
                 if self._gdbSubprocess:
                     infilepart = ""
                     if infilename != None:
                         infilepart = "<" + infilename + " "
-                    print str(procargs)
-                    print "*********************************************"
-                    print "**** Run 'wt' via: run " + \
+                    print(str(procargs))
+                    print("*********************************************")
+                    print("**** Run 'wt' via: run " + \
                         " ".join(procargs[3:]) + infilepart + \
-                        ">" + wtoutname + " 2>" + wterrname
-                    print "*********************************************"
+                        ">" + wtoutname + " 2>" + wterrname)
+                    print("*********************************************")
+                    returncode = subprocess.call(procargs)
+                elif self._lldbSubprocess:
+                    infilepart = ""
+                    if infilename != None:
+                        infilepart = "<" + infilename + " "
+                    print(str(procargs))
+                    print("*********************************************")
+                    print("**** Run 'wt' via: run " + \
+                        " ".join(procargs[3:]) + infilepart + \
+                        ">" + wtoutname + " 2>" + wterrname)
+                    print("*********************************************")
                     returncode = subprocess.call(procargs)
                 elif infilename:
                     with open(infilename, "r") as wtin:
@@ -155,10 +272,18 @@ class suite_subprocess:
                     returncode = subprocess.call(
                         procargs, stdout=wtout, stderr=wterr)
         if failure:
+            if returncode == 0:
+                self.show_outputs(procargs,
+                    "ERROR: wt command expected failure, got success",
+                    [wtoutname, wterrname])
             self.assertNotEqual(returncode, 0,
                 'expected failure: "' + \
                 str(procargs) + '": exited ' + str(returncode))
         else:
+            if returncode != 0:
+                self.show_outputs(procargs,
+                    "ERROR: wt command expected success, got failure",
+                    [wtoutname, wterrname])
             self.assertEqual(returncode, 0,
                 'expected success: "' + \
                 str(procargs) + '": exited ' + str(returncode))

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,16 +34,16 @@
 #include "mongo/util/uuid.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/util/hex.h"
 
 namespace mongo {
 
 namespace {
 
-stdx::mutex uuidGenMutex;
-auto uuidGen = SecureRandom::create();
+Mutex uuidGenMutex;
+SecureRandom uuidGen;
 
 // Regex to match valid version 4 UUIDs with variant bits set
 std::regex uuidRegex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
@@ -75,7 +76,7 @@ StatusWith<UUID> UUID::parse(const std::string& s) {
         char high = s[j++];
         char low = s[j++];
 
-        uuid[i] = ((fromHex(high) << 4) | fromHex(low));
+        uuid[i] = ((uassertStatusOK(fromHex(high)) << 4) | uassertStatusOK(fromHex(low)));
     }
 
     return UUID{std::move(uuid)};
@@ -96,18 +97,11 @@ bool UUID::isRFC4122v4() const {
 }
 
 UUID UUID::gen() {
-    int64_t randomWords[2];
-
-    {
-        stdx::lock_guard<stdx::mutex> lk(uuidGenMutex);
-
-        // Generate 128 random bits
-        randomWords[0] = uuidGen->nextInt64();
-        randomWords[1] = uuidGen->nextInt64();
-    }
-
     UUIDStorage randomBytes;
-    memcpy(&randomBytes, randomWords, sizeof(randomBytes));
+    {
+        stdx::lock_guard<Latch> lk(uuidGenMutex);
+        uuidGen.fill(&randomBytes, sizeof(randomBytes));
+    }
 
     // Set version in high 4 bits of byte 6 and variant in high 2 bits of byte 8, see RFC 4122,
     // section 4.1.1, 4.1.2 and 4.1.3.
@@ -121,6 +115,10 @@ UUID UUID::gen() {
 
 void UUID::appendToBuilder(BSONObjBuilder* builder, StringData name) const {
     builder->appendBinData(name, sizeof(UUIDStorage), BinDataType::newUUID, &_uuid);
+}
+
+void UUID::appendToArrayBuilder(BSONArrayBuilder* builder) const {
+    builder->appendBinData(sizeof(UUIDStorage), BinDataType::newUUID, &_uuid);
 }
 
 BSONObj UUID::toBSON() const {

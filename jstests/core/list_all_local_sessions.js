@@ -1,9 +1,24 @@
 // Basic tests for the $listLocalSessions {allUsers: true} aggregation stage.
+//
+// @tags: [
+//   # This test attempts to start a session and find it using the $listLocalSessions stage. The
+//   # former operation must be routed to the primary in a replica set, whereas the latter may be
+//   # routed to a secondary.
+//   assumes_read_preference_unchanged,
+//   # Sessions are asynchronously flushed to disk, so a stepdown immediately after calling
+//   # startSession may cause this test to fail to find the returned sessionId.
+//   does_not_support_stepdowns,
+// ]
 
 (function() {
-    'use strict';
+'use strict';
 
-    const admin = db.getSisterDB('admin');
+const admin = db.getSisterDB('admin');
+
+// Get current log level.
+let originalLogLevel = assert.commandWorked(admin.setLogLevel(1)).was.verbosity;
+
+try {
     const listAllLocalSessions = function() {
         return admin.aggregate([{'$listLocalSessions': {allUsers: true}}]);
     };
@@ -23,4 +38,7 @@
                                     return 0 == bsonWoCompare({x: id}, {x: myid});
                                 });
     assert.eq(resultArrayMine.length, 1);
+} finally {
+    admin.setLogLevel(originalLogLevel);
+}
 })();

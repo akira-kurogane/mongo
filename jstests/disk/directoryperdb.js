@@ -5,14 +5,11 @@ var storageEngine = db.serverStatus().storageEngine.name;
 
 // The pattern which matches the names of database files
 var dbFileMatcher;
-if (storageEngine == 'mmapv1') {
-    // Matches mmapv1 *.ns and *.0, *.1, etc files.
-    dbFileMatcher = /\.(ns|\d+)$/;
-} else if (storageEngine == 'wiredTiger') {
+if (storageEngine == 'wiredTiger') {
     // Matches wiredTiger collection-*.wt and index-*.wt files
     dbFileMatcher = /(collection|index)-.+\.wt$/;
 } else {
-    assert(false, 'This test must be run against mmapv1 or wiredTiger');
+    assert(false, 'This test must be run against wiredTiger');
 }
 
 // Set up helper functions.
@@ -27,9 +24,7 @@ assertDocumentCount = function(db, count) {
  * Returns the current connection which gets restarted with wiredtiger.
  */
 checkDBFilesInDBDirectory = function(conn, dbToCheck) {
-    if (storageEngine == 'mmapv1') {
-        conn.adminCommand({fsync: 1});
-    } else if (storageEngine == 'wiredTiger') {
+    if (storageEngine == 'wiredTiger') {
         MongoRunner.stopMongod(conn);
         conn = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: '', restart: true});
     }
@@ -64,9 +59,7 @@ checkDBFilesInDBDirectory = function(conn, dbToCheck) {
  * Returns the restarted connection with wiredtiger.
  */
 checkDBDirectoryNonexistent = function(conn, dbToCheck) {
-    if (storageEngine == 'mmapv1') {
-        conn.adminCommand({fsync: 1});
-    } else if (storageEngine == 'wiredTiger') {
+    if (storageEngine == 'wiredTiger') {
         MongoRunner.stopMongod(conn);
         conn = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: '', restart: true});
     }
@@ -82,14 +75,7 @@ checkDBDirectoryNonexistent = function(conn, dbToCheck) {
     }
 
     // Check db directories to ensure db files in them have been destroyed.
-    // mmapv1 removes the database directory, pending SERVER-1379.
-    if (storageEngine == 'mmapv1') {
-        var files = listFiles(dbpath);
-        var fileNotFound = true;
-        for (f in files) {
-            assert(files[f].name != dbToCheck, 'Directory ' + dbToCheck + ' still exists');
-        }
-    } else if (storageEngine == 'wiredTiger') {
+    if (storageEngine == 'wiredTiger') {
         var dir = dbpath + dbToCheck;
         // The KV catalog escapes non alpha-numeric characters with its UTF-8 byte sequence in
         // decimal when creating the directory on disk.
@@ -141,13 +127,13 @@ if (storageEngine == 'wiredTiger') {
 // Create a database named 'a' repeated 63 times.
 var dbNameAA = Array(64).join('a');
 var dbAA = m.getDB(dbNameAA);
-assert.writeOK(dbAA[baseName].insert({}));
+assert.commandWorked(dbAA[baseName].insert({}));
 assertDocumentCount(dbAA, 1);
 m = checkDBFilesInDBDirectory(m, dbAA);
 
 // Create a database named '&'.
 var dbAnd = m.getDB('&');
-assert.writeOK(dbAnd[baseName].insert({}));
+assert.commandWorked(dbAnd[baseName].insert({}));
 assertDocumentCount(dbAnd, 1);
 m = checkDBFilesInDBDirectory(m, dbAnd);
 
@@ -158,14 +144,15 @@ if (!_isWindows()) {
     // Create a database named '処'.
     var dbNameU = '処';
     var dbU = m.getDB(dbNameU);
-    assert.writeOK(dbU[baseName].insert({}));
+    assert.commandWorked(dbU[baseName].insert({}));
     assertDocumentCount(dbU, 1);
     m = checkDBFilesInDBDirectory(m, dbU);
 
     // Create a database named '処' repeated 21 times.
     var dbNameUU = Array(22).join('処');
     var dbUU = m.getDB(dbNameUU);
-    assert.writeOK(dbUU[baseName].insert({}));
+    assert.commandWorked(dbUU[baseName].insert({}));
     assertDocumentCount(dbUU, 1);
     m = checkDBFilesInDBDirectory(m, dbUU);
 }
+MongoRunner.stopMongod(m);

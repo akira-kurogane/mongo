@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,30 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/count.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/count_command_as_aggregation_command.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/view_response_formatter.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-using std::unique_ptr;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
+
+// Failpoint which causes to hang "count" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeCollectionCount);
 
 /**
  * Implements the MongoD side of the count command.
@@ -58,153 +65,189 @@ class CmdCount : public BasicCommand {
 public:
     CmdCount() : BasicCommand("count") {}
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    std::string help() const override {
+        return "count objects in collection";
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        // ok on --slave setups
-        return repl::getGlobalReplicationCoordinator()->getSettings().isSlave();
-    }
-
-    virtual bool slaveOverrideOk() const {
+    bool canIgnorePrepareConflicts() const override {
         return true;
     }
 
-    virtual bool maintenanceOk() const {
+    AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
+        return Command::AllowedOnSecondary::kOptIn;
+    }
+
+    bool maintenanceOk() const override {
         return false;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return false;
     }
 
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
         return true;
     }
 
-    ReadWriteType getReadWriteType() const {
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
+    }
+
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "count objects in collection";
-    }
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-    }
-
-    virtual Status explain(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
-        const bool isExplain = true;
-        auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
-        if (!request.isOK()) {
-            return request.getStatus();
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        // Acquire the db read lock.
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
-        Collection* collection = ctx.getCollection();
+        const auto hasTerm = false;
+        return authSession->checkAuthForFind(
+            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            hasTerm);
+    }
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& opMsgRequest,
+                   ExplainOptions::Verbosity verbosity,
+                   rpc::ReplyBuilderInterface* result) const override {
+        std::string dbname = opMsgRequest.getDatabase().toString();
+        const BSONObj& cmdObj = opMsgRequest.body;
+        // Acquire locks. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto nss = ctx->getNss();
 
-            auto viewAggregation = request.getValue().asAggregationCommand();
+        CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
+        try {
+            request = CountCommand::parse(IDLParserErrorContext("count"), opMsgRequest);
+        } catch (...) {
+            return exceptionToStatus();
+        }
+
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
+
+            auto viewAggregation = countCommandAsAggregationCommand(request, nss);
             if (!viewAggregation.isOK()) {
                 return viewAggregation.getStatus();
             }
 
-            auto viewAggRequest = AggregationRequest::parseFromBSON(
-                request.getValue().getNs(), viewAggregation.getValue(), verbosity);
+            auto viewAggRequest =
+                AggregationRequest::parseFromBSON(nss, viewAggregation.getValue(), verbosity);
             if (!viewAggRequest.isOK()) {
                 return viewAggRequest.getStatus();
             }
 
+            // An empty PrivilegeVector is acceptable because these privileges are only checked on
+            // getMore and explain will not open a cursor.
             return runAggregate(opCtx,
                                 viewAggRequest.getValue().getNamespaceString(),
                                 viewAggRequest.getValue(),
                                 viewAggregation.getValue(),
-                                *out);
+                                PrivilegeVector(),
+                                result);
         }
+
+        Collection* const collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
         auto rangePreserver =
-            CollectionShardingState::get(opCtx, request.getValue().getNs())->getMetadata();
+            CollectionShardingState::get(opCtx, nss)
+                ->getOwnershipFilter(
+                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       true,  // explain
-                                                       PlanExecutor::YIELD_AUTO);
+        auto expCtx = makeExpressionContextForGetExecutor(
+            opCtx, request.getCollation().value_or(BSONObj()), nss);
+
+        auto statusWithPlanExecutor =
+            getExecutorCount(expCtx, collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
-        Explain::explainStages(exec.get(), collection, verbosity, out);
+        auto bodyBuilder = result->getBodyBuilder();
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        const bool isExplain = false;
-        auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
-        if (!request.isOK()) {
-            return appendCommandStatus(result, request.getStatus());
-        }
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto& nss = ctx->getNss();
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
-        Collection* collection = ctx.getCollection();
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeCollectionCount, opCtx, "hangBeforeCollectionCount", []() {}, false, nss);
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+        auto request = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
 
-            auto viewAggregation = request.getValue().asAggregationCommand();
-            if (!viewAggregation.isOK()) {
-                return appendCommandStatus(result, viewAggregation.getStatus());
-            }
+        // Check whether we are allowed to read from this node after acquiring our locks.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassertStatusOK(replCoord->checkCanServeReadsFor(
+            opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
-            BSONObj aggResult = Command::runCommandDirectly(
+        if (ctx->getView()) {
+            auto viewAggregation = countCommandAsAggregationCommand(request, nss);
+
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
+
+            uassertStatusOK(viewAggregation.getStatus());
+
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
 
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
-                result.appendElements(aggResult);
-                return false;
-            }
-
-            ViewResponseFormatter formatter(aggResult);
-            Status formatStatus = formatter.appendAsCountResponse(&result);
-            if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
-            }
+            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsCountResponse(&result));
             return true;
         }
+
+        Collection* const collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
         auto rangePreserver =
-            CollectionShardingState::get(opCtx, request.getValue().getNs())->getMetadata();
+            CollectionShardingState::get(opCtx, nss)
+                ->getOwnershipFilter(
+                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       false,  // !explain
-                                                       PlanExecutor::YIELD_AUTO);
-        if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
-        }
+        auto statusWithPlanExecutor =
+            getExecutorCount(makeExpressionContextForGetExecutor(
+                                 opCtx, request.getCollation().value_or(BSONObj()), nss),
+                             collection,
+                             request,
+                             false /*explain*/,
+                             nss);
+        uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -216,14 +259,12 @@ public:
         }
 
         Status execPlanStatus = exec->executePlan();
-        if (!execPlanStatus.isOK()) {
-            return appendCommandStatus(result, execPlanStatus);
-        }
+        uassertStatusOK(execPlanStatus);
 
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*exec, &summaryStats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
@@ -234,13 +275,30 @@ public:
         }
 
         // Plan is done executing. We just need to pull the count out of the root stage.
-        invariant(STAGE_COUNT == exec->getRootStage()->stageType());
-        CountStage* countStage = static_cast<CountStage*>(exec->getRootStage());
-        const CountStats* countStats =
-            static_cast<const CountStats*>(countStage->getSpecificStats());
+        invariant(STAGE_COUNT == exec->getRootStage()->stageType() ||
+                  STAGE_RECORD_STORE_FAST_COUNT == exec->getRootStage()->stageType());
+        auto* countStats = static_cast<const CountStats*>(exec->getRootStage()->getSpecificStats());
 
         result.appendNumber("n", countStats->nCounted);
         return true;
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+
+            keyBob.append("count", 1);
+            keyBob.append("query", 1);
+            keyBob.append("skip", 1);
+            keyBob.append("limit", 1);
+            keyBob.append("hint", 1);
+            keyBob.append("collation", 1);
+
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
     }
 
 } cmdCount;

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,14 +32,15 @@
 #include "mongo/rpc/legacy_reply_builder.h"
 
 #include <iterator>
+#include <memory>
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace rpc {
@@ -53,15 +55,19 @@ LegacyReplyBuilder::~LegacyReplyBuilder() {}
 
 LegacyReplyBuilder& LegacyReplyBuilder::setCommandReply(Status nonOKStatus,
                                                         BSONObj extraErrorInfo) {
-    invariant(_state == State::kCommandReply);
+    invariant(!_haveCommandReply);
     if (nonOKStatus == ErrorCodes::StaleConfig) {
         _staleConfigError = true;
+
         // Need to use the special $err format for StaleConfig errors to be backwards
         // compatible.
         BSONObjBuilder err;
+
         // $err must be the first field in object.
         err.append("$err", nonOKStatus.reason());
         err.append("code", nonOKStatus.code());
+        auto const scex = nonOKStatus.extraInfo<StaleConfigInfo>();
+        scex->serialize(&err);
         err.appendElements(extraErrorInfo);
         setRawCommandReply(err.done());
     } else {
@@ -72,50 +78,52 @@ LegacyReplyBuilder& LegacyReplyBuilder::setCommandReply(Status nonOKStatus,
 }
 
 LegacyReplyBuilder& LegacyReplyBuilder::setRawCommandReply(const BSONObj& commandReply) {
-    invariant(_state == State::kCommandReply);
+    invariant(!_haveCommandReply);
+    _bodyOffset = _builder.len();
     commandReply.appendSelfToBufBuilder(_builder);
-    _state = State::kMetadata;
+    _haveCommandReply = true;
     return *this;
 }
 
-BSONObjBuilder LegacyReplyBuilder::getInPlaceReplyBuilder(std::size_t reserveBytes) {
-    invariant(_state == State::kCommandReply);
-    // Eagerly allocate reserveBytes bytes.
-    _builder.reserveBytes(reserveBytes);
-    // Claim our reservation immediately so we can actually write data to it.
-    _builder.claimReservedBytes(reserveBytes);
-    _state = State::kMetadata;
-    return BSONObjBuilder(_builder);
+BSONObjBuilder LegacyReplyBuilder::getBodyBuilder() {
+    if (!_haveCommandReply) {
+        auto bob = BSONObjBuilder(_builder);
+        _bodyOffset = bob.offset();
+        _haveCommandReply = true;
+        return bob;
+    }
+
+    invariant(_bodyOffset);
+    return BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag{}, _builder, _bodyOffset);
 }
 
-LegacyReplyBuilder& LegacyReplyBuilder::setMetadata(const BSONObj& metadata) {
-    invariant(_state == State::kMetadata);
-    BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag(), _builder, sizeof(QueryResult::Value))
-        .appendElements(metadata);
-    _state = State::kOutputDocs;
-    return *this;
-}
 
 Protocol LegacyReplyBuilder::getProtocol() const {
     return rpc::Protocol::kOpQuery;
 }
 
+void LegacyReplyBuilder::reserveBytes(const std::size_t bytes) {
+    _builder.reserveBytes(bytes);
+    _builder.claimReservedBytes(bytes);
+}
+
 void LegacyReplyBuilder::reset() {
     // If we are in State::kMetadata, we are already in the 'start' state, so by
     // immediately returning, we save a heap allocation.
-    if (_state == State::kCommandReply) {
+    if (!_haveCommandReply) {
         return;
     }
     _builder.reset();
     _builder.skip(sizeof(QueryResult::Value));
     _message.reset();
-    _state = State::kCommandReply;
+    _haveCommandReply = false;
     _staleConfigError = false;
+    _bodyOffset = 0;
 }
 
 
 Message LegacyReplyBuilder::done() {
-    invariant(_state == State::kOutputDocs);
+    invariant(_haveCommandReply);
 
     QueryResult::View qr = _builder.buf();
 
@@ -134,7 +142,6 @@ Message LegacyReplyBuilder::done() {
 
     _message.setData(_builder.release());
 
-    _state = State::kDone;
     return std::move(_message);
 }
 

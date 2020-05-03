@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -39,8 +40,8 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/represent_as.h"
+#include "mongo/util/str.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -56,7 +57,7 @@ const JSFunctionSpec NumberLongInfo::methods[6] = {
 
 const char* const NumberLongInfo::className = "NumberLong";
 
-void NumberLongInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void NumberLongInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto numLong = static_cast<int64_t*>(JS_GetPrivate(obj));
 
     if (numLong)
@@ -129,6 +130,13 @@ void NumberLongInfo::Functions::floatApprox::call(JSContext* cx, JS::CallArgs ar
     ValueReader(cx, args.rval()).fromDouble(numLong);
 }
 
+void NumberLongInfo::Functions::exactValueString::call(JSContext* cx, JS::CallArgs args) {
+    str::stream ss;
+    int64_t val = NumberLongInfo::ToNumberLong(cx, args.thisv());
+    ss << val;
+    ValueReader(cx, args.rval()).fromStringData(ss.operator std::string());
+}
+
 void NumberLongInfo::Functions::top::call(JSContext* cx, JS::CallArgs args) {
     auto numULong = static_cast<uint64_t>(NumberLongInfo::ToNumberLong(cx, args.thisv()));
     ValueReader(cx, args.rval()).fromDouble(numULong >> 32);
@@ -172,8 +180,8 @@ void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
             // values to fail rather than return 0 (which is the behavior of ToInt64).
             std::string str = ValueWriter(cx, arg).toString();
 
-            // Call parseNumberFromStringWithBase() function to convert string to a number
-            Status status = parseNumberFromStringWithBase(str, 10, &numLong);
+            // Call NumberParser() function to convert string to a number
+            Status status = NumberParser{}.base(10)(str, &numLong);
             uassert(ErrorCodes::BadValue, "could not convert string to long long", status.isOK());
         } else {
             numLong = ValueWriter(cx, arg).toInt64();
@@ -208,10 +216,9 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::floatApprox),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::floatApprox, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 
@@ -220,10 +227,9 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::top),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::top, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 
@@ -232,10 +238,20 @@ void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::Han
             cx,
             proto,
             getScope(cx)->getInternedStringId(InternedString::bottom),
-            undef,
-            JSPROP_ENUMERATE | JSPROP_SHARED,
             smUtils::wrapConstrainedMethod<Functions::bottom, false, NumberLongInfo>,
-            nullptr)) {
+            nullptr,
+            JSPROP_ENUMERATE)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
+    }
+
+    // exactValueString
+    if (!JS_DefinePropertyById(
+            cx,
+            proto,
+            getScope(cx)->getInternedStringId(InternedString::exactValueString),
+            smUtils::wrapConstrainedMethod<Functions::exactValueString, false, NumberLongInfo>,
+            nullptr,
+            JSPROP_ENUMERATE)) {
         uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
     }
 }

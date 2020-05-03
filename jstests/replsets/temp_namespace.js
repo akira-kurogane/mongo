@@ -1,5 +1,6 @@
 // SERVER-10927
 // This is to make sure that temp collections get cleaned up on promotion to primary
+// @tags: [requires_replication]
 
 var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 var nodes = replTest.nodeList();
@@ -26,26 +27,30 @@ var masterDB = master.getDB('test');
 var secondDB = second.getDB('test');
 
 // set up collections
-masterDB.runCommand({create: 'temp1', temp: true});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "temp1", temp: true}}]}));
 masterDB.temp1.ensureIndex({x: 1});
-masterDB.runCommand({create: 'temp2', temp: 1});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "temp2", temp: 1}}]}));
 masterDB.temp2.ensureIndex({x: 1});
-masterDB.runCommand({create: 'keep1', temp: false});
-masterDB.runCommand({create: 'keep2', temp: 0});
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "keep1", temp: false}}]}));
+assert.commandWorked(masterDB.runCommand(
+    {applyOps: [{op: "c", ns: masterDB.getName() + ".$cmd", o: {create: "keep2", temp: 0}}]}));
 masterDB.runCommand({create: 'keep3'});
-assert.writeOK(masterDB.keep4.insert({}, {writeConcern: {w: 2}}));
+assert.commandWorked(masterDB.keep4.insert({}, {writeConcern: {w: 2}}));
 
 // make sure they exist on primary and secondary
 function countCollection(mydb, nameFilter) {
     var result = mydb.runCommand("listCollections", {filter: {name: nameFilter}});
     assert.commandWorked(result);
-    return new DBCommandCursor(mydb.getMongo(), result).itcount();
+    return new DBCommandCursor(mydb, result).itcount();
 }
 
 function countIndexesFor(mydb, nameFilter) {
     var result = mydb.runCommand("listCollections", {filter: {name: nameFilter}});
     assert.commandWorked(result);
-    var arr = new DBCommandCursor(mydb.getMongo(), result).toArray();
+    var arr = new DBCommandCursor(mydb, result).toArray();
     var total = 0;
     for (var i = 0; i < arr.length; i++) {
         var coll = arr[i];
@@ -81,11 +86,7 @@ assert.eq(countIndexesFor(secondDB, /temp\d$/), 4);  // indexes (2 _id + 2 x)
 assert.eq(countCollection(secondDB, /keep\d$/), 4);
 
 // step down primary and make sure former secondary (now primary) drops collections
-try {
-    master.adminCommand({replSetStepDown: 50, force: true});
-} catch (e) {
-    // ignoring socket errors since they sometimes, but not always, fire after running that command.
-}
+assert.commandWorked(master.adminCommand({replSetStepDown: 50, force: true}));
 
 assert.soon(function() {
     return secondDB.isMaster().ismaster;

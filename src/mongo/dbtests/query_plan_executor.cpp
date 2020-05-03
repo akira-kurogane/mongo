@@ -1,33 +1,36 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
 #include "mongo/platform/basic.h"
+
+#include <memory>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -51,7 +54,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace {
@@ -59,7 +61,6 @@ namespace {
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
-using stdx::make_unique;
 
 static const NamespaceString nss("unittests.QueryPlanExecutor");
 
@@ -99,28 +100,27 @@ public:
         Collection* coll,
         BSONObj& filterObj,
         PlanExecutor::YieldPolicy yieldPolicy = PlanExecutor::YieldPolicy::YIELD_MANUAL,
-        TailableMode tailableMode = TailableMode::kNormal) {
+        TailableModeEnum tailableMode = TailableModeEnum::kNormal) {
         CollectionScanParams csparams;
-        csparams.collection = coll;
         csparams.direction = CollectionScanParams::FORWARD;
         unique_ptr<WorkingSet> ws(new WorkingSet());
 
         // Canonicalize the query.
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(filterObj);
         qr->setTailableMode(tailableMode);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-        verify(NULL != cq.get());
+        verify(nullptr != cq.get());
 
         // Make the stage.
         unique_ptr<PlanStage> root(
-            new CollectionScan(&_opCtx, csparams, ws.get(), cq.get()->root()));
+            new CollectionScan(cq->getExpCtx().get(), coll, csparams, ws.get(), cq.get()->root()));
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(root), std::move(cq), coll, yieldPolicy);
+        auto statusWithPlanExecutor =
+            PlanExecutor::make(std::move(cq), std::move(ws), std::move(root), coll, yieldPolicy);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -141,33 +141,31 @@ public:
                                                                       int start,
                                                                       int end) {
         // Build the index scan stage.
-        IndexScanParams ixparams;
-        ixparams.descriptor = getIndex(db, indexSpec);
+        auto descriptor = getIndex(db, indexSpec);
+        IndexScanParams ixparams(&_opCtx, descriptor);
         ixparams.bounds.isSimpleRange = true;
         ixparams.bounds.startKey = BSON("" << start);
         ixparams.bounds.endKey = BSON("" << end);
         ixparams.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
-        ixparams.direction = 1;
 
-        const Collection* coll = db->getCollection(&_opCtx, nss);
+        const Collection* coll =
+            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
+
 
         unique_ptr<WorkingSet> ws(new WorkingSet());
-        IndexScan* ix = new IndexScan(&_opCtx, ixparams, ws.get(), NULL);
-        unique_ptr<PlanStage> root(new FetchStage(&_opCtx, ws.get(), ix, NULL, coll));
+        auto ixscan = std::make_unique<IndexScan>(_expCtx.get(), ixparams, ws.get(), nullptr);
+        unique_ptr<PlanStage> root =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ixscan), nullptr, coll);
 
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-        verify(NULL != cq.get());
+        verify(nullptr != cq.get());
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor = PlanExecutor::make(&_opCtx,
-                                                         std::move(ws),
-                                                         std::move(root),
-                                                         std::move(cq),
-                                                         coll,
-                                                         PlanExecutor::YIELD_MANUAL);
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            std::move(cq), std::move(ws), std::move(root), coll, PlanExecutor::YIELD_MANUAL);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -176,10 +174,14 @@ protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
 
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
+
 private:
-    IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-        Collection* collection = db->getCollection(&_opCtx, nss);
-        std::vector<IndexDescriptor*> indexes;
+    const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
+        Collection* collection =
+            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
+        std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         ASSERT_LTE(indexes.size(), 1U);
         return indexes.size() == 0 ? nullptr : indexes[0];
@@ -189,55 +191,10 @@ private:
 };
 
 /**
- * Test dropping the collection while the
- * PlanExecutor is doing a collection scan.
- */
-TEST_F(PlanExecutorTest, DropCollScan) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
-    insert(BSON("_id" << 1));
-    insert(BSON("_id" << 2));
-
-    BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
-
-    Collection* coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj);
-
-    BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
-    ASSERT_EQUALS(1, objOut["_id"].numberInt());
-
-    // After dropping the collection, the plan executor should be dead.
-    dropCollection();
-    ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&objOut, NULL));
-}
-
-/**
- * Test dropping the collection while the PlanExecutor is doing an index scan.
- */
-TEST_F(PlanExecutorTest, DropIndexScan) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
-    insert(BSON("_id" << 1 << "a" << 6));
-    insert(BSON("_id" << 2 << "a" << 7));
-    insert(BSON("_id" << 3 << "a" << 8));
-    BSONObj indexSpec = BSON("a" << 1);
-    addIndex(indexSpec);
-
-    auto exec = makeIndexScanExec(ctx.db(), indexSpec, 7, 10);
-
-    BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
-    ASSERT_EQUALS(7, objOut["a"].numberInt());
-
-    // After dropping the collection, the plan executor should be dead.
-    dropCollection();
-    ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&objOut, NULL));
-}
-
-/**
  * Test dropping the collection while an agg PlanExecutor is doing an index scan.
  */
 TEST_F(PlanExecutorTest, DropIndexScanAgg) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
     insert(BSON("_id" << 1 << "a" << 6));
     insert(BSON("_id" << 2 << "a" << 7));
@@ -249,8 +206,6 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
 
     // Create the aggregation pipeline.
     std::vector<BSONObj> rawPipeline = {fromjson("{$match: {a: {$gte: 7, $lte: 10}}}")};
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx =
-        new ExpressionContextForTest(&_opCtx, AggregationRequest(nss, rawPipeline));
 
     // Create an "inner" plan executor and register it with the cursor manager so that it can
     // get notified when the collection is dropped.
@@ -260,15 +215,16 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
     // Wrap the "inner" plan executor in a DocumentSourceCursor and add it as the first source
     // in the pipeline.
     innerExec->saveState();
-    auto cursorSource = DocumentSourceCursor::create(collection, std::move(innerExec), expCtx);
-    auto pipeline = assertGet(Pipeline::create({cursorSource}, expCtx));
+    auto cursorSource = DocumentSourceCursor::create(
+        collection, std::move(innerExec), _expCtx, DocumentSourceCursor::CursorType::kRegular);
+    auto pipeline = Pipeline::create({cursorSource}, _expCtx);
 
     // Create the output PlanExecutor that pulls results from the pipeline.
-    auto ws = make_unique<WorkingSet>();
-    auto proxy = make_unique<PipelineProxyStage>(&_opCtx, std::move(pipeline), ws.get());
+    auto ws = std::make_unique<WorkingSet>();
+    auto proxy = std::make_unique<PipelineProxyStage>(_expCtx.get(), std::move(pipeline), ws.get());
 
     auto statusWithPlanExecutor = PlanExecutor::make(
-        &_opCtx, std::move(ws), std::move(proxy), collection, PlanExecutor::NO_YIELD);
+        _expCtx, std::move(ws), std::move(proxy), collection, PlanExecutor::NO_YIELD);
     ASSERT_OK(statusWithPlanExecutor.getStatus());
     auto outerExec = std::move(statusWithPlanExecutor.getValue());
 
@@ -282,7 +238,7 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -292,12 +248,12 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
     auto exec = makeCollScanExec(coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::DEAD, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
     ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
-TEST_F(PlanExecutorTest, ShouldReportEOFIfExceedsTimeLimitDuringYieldButIsTailableAndAwaitData) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYieldButIsTailableAndAwaitData) {
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -307,14 +263,15 @@ TEST_F(PlanExecutorTest, ShouldReportEOFIfExceedsTimeLimitDuringYieldButIsTailab
     auto exec = makeCollScanExec(coll,
                                  filterObj,
                                  PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT,
-                                 TailableMode::kTailableAndAwaitData);
+                                 TailableModeEnum::kTailableAndAwaitData);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::IS_EOF, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
 TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailableButNotAwaitData) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -322,15 +279,15 @@ TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailabl
 
     Collection* coll = ctx.getCollection();
     auto exec = makeCollScanExec(
-        coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, TailableMode::kTailable);
+        coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, TailableModeEnum::kTailable);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::DEAD, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
     ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -340,7 +297,7 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
     auto exec = makeCollScanExec(coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::DEAD, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
     ASSERT_EQ(ErrorCodes::QueryPlanKilled, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
@@ -379,7 +336,7 @@ protected:
         BSONObj objOut;
         int idcount = 0;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&objOut, NULL))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&objOut, nullptr))) {
             ASSERT_EQUALS(expectedIds[idcount], objOut["_id"].numberInt());
             ++idcount;
         }
@@ -394,7 +351,7 @@ protected:
  * scan.
  */
 TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     setupCollection();
 
     BSONObj filterObj = fromjson("{a: {$gte: 2}}");
@@ -403,7 +360,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
     auto exec = makeCollScanExec(coll, filterObj);
 
     BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));
     ASSERT_EQUALS(2, objOut["a"].numberInt());
 
     forceDocumentMove();
@@ -418,7 +375,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
  * index scan.
  */
 TEST_F(PlanExecutorSnapshotTest, SnapshotTest) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     setupCollection();
     BSONObj indexSpec = BSON("_id" << 1);
     addIndex(indexSpec);
@@ -427,7 +384,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotTest) {
     auto exec = makeIndexScanExec(ctx.db(), indexSpec, 2, 5);
 
     BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
+    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));
     ASSERT_EQUALS(2, objOut["a"].numberInt());
 
     forceDocumentMove();

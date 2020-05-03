@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -60,8 +61,7 @@ TEST(GetMoreRequestTest, parseFromBSONCursorIdNotLongLong) {
     StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON("db",
                                                                       BSON("getMore"
                                                                            << "not a number"
-                                                                           << "collection"
-                                                                           << 123));
+                                                                           << "collection" << 123));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
 }
@@ -116,8 +116,7 @@ TEST(GetMoreRequestTest, parseFromBSONUnrecognizedFieldName) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "unknown_field"
-                                                     << 1));
+                                                     << "unknown_field" << 1));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::FailedToParse, result.getStatus().code());
 }
@@ -127,8 +126,7 @@ TEST(GetMoreRequestTest, parseFromBSONInvalidBatchSize) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "batchSize"
-                                                     << -1));
+                                                     << "batchSize" << -1));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
 }
@@ -138,8 +136,7 @@ TEST(GetMoreRequestTest, parseFromBSONInvalidBatchSizeOfZero) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "batchSize"
-                                                     << 0));
+                                                     << "batchSize" << 0));
     ASSERT_NOT_OK(result.getStatus());
     ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
 }
@@ -160,8 +157,7 @@ TEST(GetMoreRequestTest, parseFromBSONBatchSizeProvided) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "batchSize"
-                                                     << 200));
+                                                     << "batchSize" << 200));
     ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
     ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
     ASSERT(result.getValue().batchSize);
@@ -185,8 +181,7 @@ TEST(GetMoreRequestTest, parseFromBSONHasMaxTimeMS) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "maxTimeMS"
-                                                     << 100));
+                                                     << "maxTimeMS" << 100));
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
     ASSERT(result.getValue().awaitDataTimeout);
@@ -199,8 +194,7 @@ TEST(GetMoreRequestTest, parseFromBSONHasMaxTimeMSOfZero) {
         GetMoreRequest::parseFromBSON("db",
                                       BSON("getMore" << CursorId(123) << "collection"
                                                      << "coll"
-                                                     << "maxTimeMS"
-                                                     << 0));
+                                                     << "maxTimeMS" << 0));
     ASSERT_OK(result.getStatus());
     ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
     ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
@@ -215,8 +209,7 @@ TEST(GetMoreRequestTest, toBSONHasBatchSize) {
     BSONObj requestObj = request.toBSON();
     BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
                                              << "testcoll"
-                                             << "batchSize"
-                                             << 99);
+                                             << "batchSize" << 99);
     ASSERT_BSONOBJ_EQ(requestObj, expectedRequest);
 }
 
@@ -239,10 +232,7 @@ TEST(GetMoreRequestTest, toBSONHasTerm) {
     BSONObj requestObj = request.toBSON();
     BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
                                              << "testcoll"
-                                             << "batchSize"
-                                             << 99
-                                             << "term"
-                                             << 1);
+                                             << "batchSize" << 99 << "term" << 1);
     ASSERT_BSONOBJ_EQ(requestObj, expectedRequest);
 }
 
@@ -254,14 +244,11 @@ TEST(GetMoreRequestTest, toBSONHasCommitLevel) {
                            1,
                            repl::OpTime(Timestamp(0, 10), 2));
     BSONObj requestObj = request.toBSON();
-    BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
-                                             << "testcoll"
-                                             << "batchSize"
-                                             << 99
-                                             << "term"
-                                             << 1
-                                             << "lastKnownCommittedOpTime"
-                                             << BSON("ts" << Timestamp(0, 10) << "t" << 2LL));
+    BSONObj expectedRequest =
+        BSON("getMore" << CursorId(123) << "collection"
+                       << "testcoll"
+                       << "batchSize" << 99 << "term" << 1 << "lastKnownCommittedOpTime"
+                       << BSON("ts" << Timestamp(0, 10) << "t" << 2LL));
     ASSERT_BSONOBJ_EQ(requestObj, expectedRequest);
 }
 
@@ -275,8 +262,7 @@ TEST(GetMoreRequestTest, toBSONHasMaxTimeMS) {
     BSONObj requestObj = request.toBSON();
     BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
                                              << "testcoll"
-                                             << "maxTimeMS"
-                                             << 789);
+                                             << "maxTimeMS" << 789);
     ASSERT_BSONOBJ_EQ(requestObj, expectedRequest);
 }
 

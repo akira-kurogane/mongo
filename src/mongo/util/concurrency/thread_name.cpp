@@ -1,31 +1,33 @@
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +38,7 @@
 #endif
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
-#if !TARGET_OS_TV && !TARGET_OS_IOS
+#if !TARGET_OS_TV && !TARGET_OS_IOS && !TARGET_OS_WATCH
 #include <sys/proc_info.h>
 #else
 #include <mach/thread_info.h>
@@ -49,13 +51,11 @@
 
 #include "mongo/base/init.h"
 #include "mongo/config.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-using std::string;
 
 namespace {
 
@@ -89,7 +89,7 @@ void setWindowsThreadName(DWORD dwThreadID, const char* threadName) {
 }
 #endif
 
-AtomicInt64 nextUnnamedThreadId{1};
+AtomicWord<long long> nextUnnamedThreadId{1};
 
 // It is unsafe to access threadName before its dynamic initialization has completed. Use
 // the execution of mongo initializers (which only happens once we have entered main, and
@@ -104,39 +104,38 @@ MONGO_INITIALIZER(ThreadNameInitializer)(InitializerContext*) {
     return Status::OK();
 }
 
-// TODO consider making threadName std::string and removing the size limit once we get real
-// thread_local.
-constexpr size_t kMaxThreadNameSize = 63;
-thread_local char threadNameStorage[kMaxThreadNameSize + 1];
-
+thread_local std::string threadNameStorage;
 }  // namespace
 
 namespace for_debuggers {
 // This needs external linkage to ensure that debuggers can use it.
 thread_local StringData threadName;
-}
+}  // namespace for_debuggers
 using for_debuggers::threadName;
 
 void setThreadName(StringData name) {
     invariant(mongoInitializersHaveRun);
-    if (name.size() > kMaxThreadNameSize) {
-        // Truncate unreasonably long thread names.
-        name = name.substr(0, kMaxThreadNameSize);
-    }
-    name.copyTo(threadNameStorage, /*null terminate=*/true);
-    threadName = StringData(threadNameStorage, name.size());
+    threadNameStorage = name.toString();
+    threadName = threadNameStorage;
 
 #if defined(_WIN32)
     // Naming should not be expensive compared to thread creation and connection set up, but if
     // testing shows otherwise we should make this depend on DEBUG again.
-    setWindowsThreadName(GetCurrentThreadId(), threadName.rawData());
+    setWindowsThreadName(GetCurrentThreadId(), threadNameStorage.c_str());
 #elif defined(__APPLE__)
     // Maximum thread name length on OS X is MAXTHREADNAMESIZE (64 characters). This assumes
     // OS X 10.6 or later.
-    MONGO_STATIC_ASSERT(MAXTHREADNAMESIZE >= kMaxThreadNameSize + 1);
-    int error = pthread_setname_np(threadName.rawData());
+    std::string threadNameCopy = threadNameStorage;
+    if (threadNameCopy.size() > MAXTHREADNAMESIZE) {
+        threadNameCopy.resize(MAXTHREADNAMESIZE - 4);
+        threadNameCopy += "...";
+    }
+    int error = pthread_setname_np(threadNameCopy.c_str());
     if (error) {
-        log() << "Ignoring error from setting thread name: " << errnoWithDescription(error);
+        LOGV2(23102,
+              "Ignoring error from setting thread name: {error}",
+              "Ignoring error from setting thread name",
+              "error"_attr = errnoWithDescription(error));
     }
 #elif defined(__linux__) && defined(MONGO_CONFIG_HAVE_PTHREAD_SETNAME_NP)
     // Do not set thread name on the main() thread. Setting the name on main thread breaks
@@ -149,15 +148,18 @@ void setThreadName(StringData name) {
         //  limit, it's best to shorten long names.
         int error = 0;
         if (threadName.size() > 15) {
-            std::string shortName = str::stream() << threadName.substr(0, 7) << '.'
-                                                  << threadName.substr(threadName.size() - 7);
+            std::string shortName = str::stream()
+                << threadName.substr(0, 7) << '.' << threadName.substr(threadName.size() - 7);
             error = pthread_setname_np(pthread_self(), shortName.c_str());
         } else {
             error = pthread_setname_np(pthread_self(), threadName.rawData());
         }
 
         if (error) {
-            log() << "Ignoring error from setting thread name: " << errnoWithDescription(error);
+            LOGV2(23103,
+                  "Ignoring error from setting thread name: {error}",
+                  "Ignoring error from setting thread name",
+                  "error"_attr = errnoWithDescription(error));
         }
     }
 #endif

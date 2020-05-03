@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include <algorithm>
 
@@ -34,7 +35,7 @@
 
 #include "mongo/db/geo/r2_region_coverer.h"
 #include "mongo/db/geo/shapes.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -60,7 +61,7 @@ R2RegionCoverer::R2RegionCoverer(GeoHashConverter* hashConverter)
       _minLevel(0u),
       _maxLevel(GeoHash::kMaxBits),
       _maxCells(kDefaultMaxCells),
-      _region(NULL),
+      _region(nullptr),
       _candidateQueue(new CandidateQueue),
       _results(new vector<GeoHash>) {}
 
@@ -107,7 +108,10 @@ void R2RegionCoverer::getCovering(const R2Region& region, vector<GeoHash>* cover
         Candidate* candidate = _candidateQueue->top().second;  // Owned
         _candidateQueue->pop();
         // REDACT?? I think this may have User info, but I'm not sure how to redact
-        LOG(3) << "Pop: " << redact(candidate->cell.toString());
+        LOGV2_DEBUG(20637,
+                    3,
+                    "Pop: {candidate_cell}",
+                    "candidate_cell"_attr = redact(candidate->cell.toString()));
 
         // Try to expand this cell into its children
         if (candidate->cell.getBits() < _minLevel || candidate->numChildren == 1 ||
@@ -122,10 +126,13 @@ void R2RegionCoverer::getCovering(const R2Region& region, vector<GeoHash>* cover
             candidate->isTerminal = true;
             addCandidate(candidate);
         }
-        LOG(3) << "Queue: " << _candidateQueue->size();
+        LOGV2_DEBUG(20638,
+                    3,
+                    "Queue: {candidateQueue_size}",
+                    "candidateQueue_size"_attr = _candidateQueue->size());
     }
 
-    _region = NULL;
+    _region = nullptr;
     cover->swap(*_results);
 }
 
@@ -135,7 +142,7 @@ R2RegionCoverer::Candidate* R2RegionCoverer::newCandidate(const GeoHash& cell) {
     Box box = _hashConverter->unhashToBoxCovering(cell);
 
     if (_region->fastDisjoint(box)) {
-        return NULL;
+        return nullptr;
     }
 
     Candidate* candidate = new Candidate();
@@ -151,7 +158,7 @@ R2RegionCoverer::Candidate* R2RegionCoverer::newCandidate(const GeoHash& cell) {
 
 // Takes ownership of "candidate"
 void R2RegionCoverer::addCandidate(Candidate* candidate) {
-    if (candidate == NULL)
+    if (candidate == nullptr)
         return;
 
     if (candidate->isTerminal) {
@@ -184,7 +191,11 @@ void R2RegionCoverer::addCandidate(Candidate* candidate) {
                          numTerminals);
         _candidateQueue->push(make_pair(priority, candidate));  // queue owns candidate
         // REDACT??
-        LOG(3) << "Push: " << redact(candidate->cell.toString()) << " (" << priority << ") ";
+        LOGV2_DEBUG(20639,
+                    3,
+                    "Push: {candidate_cell} ({priority}) ",
+                    "candidate_cell"_attr = redact(candidate->cell.toString()),
+                    "priority"_attr = priority);
     }
 }
 
@@ -331,7 +342,7 @@ void getDifferenceInternal(GeoHash cellId,
         }
     }
 }
-}
+}  // namespace
 
 void R2CellUnion::getDifference(const R2CellUnion& cellUnion) {
     std::vector<GeoHash> diffCellIds;

@@ -1,28 +1,30 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/util/options_parser/option_section.h"
@@ -42,37 +44,91 @@ using std::shared_ptr;
 
 // Registration interface
 
-// TODO: Make sure the section we are adding does not have duplicate options
-Status OptionSection::addSection(const OptionSection& subSection) {
-    std::list<OptionDescription>::const_iterator oditerator;
-    for (oditerator = subSection._options.begin(); oditerator != subSection._options.end();
-         oditerator++) {
-        if (oditerator->_positionalStart != -1) {
-            StringBuilder sb;
-            sb << "Attempted to add subsection with positional option: " << oditerator->_dottedName;
-            return Status(ErrorCodes::InternalError, sb.str());
+namespace {
+Status checkConflicts(const std::set<std::string>& allDottedNames,
+                      const std::set<std::string>& allSingleNames,
+                      const OptionDescription& option) {
+    // Check for duplication in dotted name(s).
+    if (allDottedNames.count(option._dottedName)) {
+        return {ErrorCodes::InternalError,
+                str::stream() << "Attempted to register option with duplicate dottedName: "
+                              << option._dottedName};
+    }
+
+    for (const auto& name : option._deprecatedDottedNames) {
+        // Deprecated name must not already be registered by previous setting,
+        // must not match non-deprecated name,
+        // and must not match any other single deprecated name.
+        if (allDottedNames.count(name) || (option._dottedName == name) ||
+            (std::count(option._deprecatedDottedNames.begin(),
+                        option._deprecatedDottedNames.end(),
+                        name) > 1)) {
+            return {ErrorCodes::InternalError,
+                    str::stream()
+                        << "Attempted to register option with duplicate deprecated dottedName: "
+                        << name};
         }
     }
-    _subSections.push_back(subSection);
+
+    // Check for duplication in single name(s).
+    if (allSingleNames.count(option._singleName)) {
+        return {ErrorCodes::InternalError,
+                str::stream() << "Attempted to register option with duplicate singleName: "
+                              << option._singleName};
+    }
+
+    for (const auto& name : option._deprecatedSingleNames) {
+        // Deprecated name must not already be registered by previous setting,
+        // must not match non-deprecated name,
+        // and must not match any other single deprecated name.
+        if (allSingleNames.count(name) || (option._singleName == name) ||
+            (std::count(option._deprecatedSingleNames.begin(),
+                        option._deprecatedSingleNames.end(),
+                        name) > 1)) {
+            return {ErrorCodes::InternalError,
+                    str::stream()
+                        << "Attempted to register option with duplicate deprecated singleName: "
+                        << name};
+        }
+    }
+
     return Status::OK();
 }
+}  // namespace
 
-OptionDescription& OptionSection::addOptionChaining(const std::string& dottedName,
-                                                    const std::string& singleName,
-                                                    const OptionType type,
-                                                    const std::string& description) {
-    std::vector<std::string> v;
-    return addOptionChaining(dottedName, singleName, type, description, v);
-}
+Status OptionSection::addSection(const OptionSection& newSection) {
+    if (newSection._subSections.size()) {
+        return {ErrorCodes::InternalError, "Option subsections may not contain nested subsections"};
+    }
 
-OptionDescription& OptionSection::addOptionChaining(const std::string& dottedName,
-                                                    const std::string& singleName,
-                                                    const OptionType type,
-                                                    const std::string& description,
-                                                    const std::string& deprecatedDottedName) {
-    std::vector<std::string> v;
-    v.push_back(deprecatedDottedName);
-    return addOptionChaining(dottedName, singleName, type, description, v);
+    for (const auto& opt : newSection._options) {
+        if (opt._positionalStart != -1) {
+            return {ErrorCodes::InternalError,
+                    str::stream() << "Attempted to add subsection with positional option: "
+                                  << opt._dottedName};
+        }
+        auto status = checkConflicts(_allDottedNames, _allSingleNames, opt);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    _allDottedNames.insert(newSection._allDottedNames.begin(), newSection._allDottedNames.end());
+    _allSingleNames.insert(newSection._allSingleNames.begin(), newSection._allSingleNames.end());
+
+    for (auto& oldSection : _subSections) {
+        if (newSection._name == oldSection._name) {
+            // Matches existing section name, merge options.
+            std::copy(newSection._options.cbegin(),
+                      newSection._options.cend(),
+                      std::back_inserter(oldSection._options));
+            return Status::OK();
+        }
+    }
+
+    // New section name, just adopt it.
+    _subSections.push_back(newSection);
+    return Status::OK();
 }
 
 OptionDescription& OptionSection::addOptionChaining(
@@ -80,51 +136,54 @@ OptionDescription& OptionSection::addOptionChaining(
     const std::string& singleName,
     const OptionType type,
     const std::string& description,
-    const std::vector<std::string>& deprecatedDottedNames) {
-    OptionDescription option(dottedName, singleName, type, description, deprecatedDottedNames);
+    const std::vector<std::string>& deprecatedDottedNames,
+    const std::vector<std::string>& deprecatedSingleNames,
+    OptionParserUsageType) {
 
-    // Verify that single name, the dotted name and deprecated dotted names for this option
-    // conflicts with the names for any options we have already registered.
-    std::list<OptionDescription>::const_iterator oditerator;
-    for (oditerator = _options.begin(); oditerator != _options.end(); oditerator++) {
-        if (option._dottedName == oditerator->_dottedName) {
-            StringBuilder sb;
-            sb << "Attempted to register option with duplicate dottedName: " << option._dottedName;
-            throw DBException(ErrorCodes::InternalError, sb.str());
-        }
-        // Allow options with empty singleName since some options are not allowed on the command
-        // line
-        if (!option._singleName.empty() && option._singleName == oditerator->_singleName) {
-            StringBuilder sb;
-            sb << "Attempted to register option with duplicate singleName: " << option._singleName;
-            throw DBException(ErrorCodes::InternalError, sb.str());
-        }
-        // Deprecated dotted names should not conflict with dotted names or deprecated dotted
-        // names of any other options.
-        if (std::count(option._deprecatedDottedNames.begin(),
-                       option._deprecatedDottedNames.end(),
-                       oditerator->_dottedName)) {
-            StringBuilder sb;
-            sb << "Attempted to register option with duplicate deprecated dotted name "
-               << "(with another option's dotted name): " << option._dottedName;
-            throw DBException(ErrorCodes::BadValue, sb.str());
-        }
-        for (std::vector<std::string>::const_iterator i =
-                 oditerator->_deprecatedDottedNames.begin();
-             i != oditerator->_deprecatedDottedNames.end();
-             ++i) {
-            if (std::count(option._deprecatedDottedNames.begin(),
-                           option._deprecatedDottedNames.end(),
-                           *i)) {
-                StringBuilder sb;
-                sb << "Attempted to register option with duplicate deprecated dotted name " << *i
-                   << " (other option " << oditerator->_dottedName << ")";
-                throw DBException(ErrorCodes::BadValue, sb.str());
-            }
-        }
+    OptionDescription option(
+        dottedName, singleName, type, description, deprecatedDottedNames, deprecatedSingleNames);
+
+    // dottedName must be non-empty.
+    uassert(ErrorCodes::InternalError,
+            "Attempted to register option with empty dottedName",
+            !dottedName.empty());
+
+    // Verify deprecated dotted names.
+    // No empty deprecated dotted names.
+    uassert(ErrorCodes::InternalError,
+            "Attempted to register option with empty string for deprecatedDottedName",
+            std::count(deprecatedDottedNames.begin(), deprecatedDottedNames.end(), "") == 0);
+
+    // Should not be the same as dottedName.
+    uassert(ErrorCodes::InternalError,
+            str::stream() << "Attempted to register option with conflict between dottedName and "
+                          << "deprecatedDottedName: " << dottedName,
+            !std::count(deprecatedDottedNames.begin(), deprecatedDottedNames.end(), dottedName));
+
+    // Verify deprecated single names.
+    // No empty deprecated single names.
+    uassert(ErrorCodes::InternalError,
+            "Attempted to register option with empty string for deprecatedSingleName",
+            std::count(deprecatedSingleNames.begin(), deprecatedSingleNames.end(), "") == 0);
+
+    // Should not be the same as singleName.
+    uassert(ErrorCodes::InternalError,
+            str::stream() << "Attempted to register option with conflict between singleName and "
+                          << "deprecatedSingleName: " << singleName,
+            !std::count(deprecatedSingleNames.begin(), deprecatedSingleNames.end(), singleName));
+
+    // Should not contain any already registered name.
+    uassertStatusOK(checkConflicts(_allDottedNames, _allSingleNames, option));
+
+    _allDottedNames.insert(option._dottedName);
+    _allDottedNames.insert(option._deprecatedDottedNames.begin(),
+                           option._deprecatedDottedNames.end());
+    if (!option._singleName.empty()) {
+        _allSingleNames.insert(option._singleName);
     }
-
-    _options.push_back(option);
+    _allSingleNames.insert(option._deprecatedSingleNames.begin(),
+                           option._deprecatedSingleNames.end());
+    _options.push_back(std::move(option));
 
     return _options.back();
 }
@@ -324,6 +383,24 @@ Status OptionSection::getBoostOptions(po::options_description* boostOptions,
             boostOptions->add_options()(oditerator->_singleName.c_str(),
                                         boostType.release(),
                                         oditerator->_description.c_str());
+
+            if (!visibleOnly) {
+                for (const std::string& depreatedSingleName : oditerator->_deprecatedSingleNames) {
+                    std::unique_ptr<po::value_semantic> boostTypeDep;
+                    Status retDep =
+                        typeToBoostType(&boostTypeDep,
+                                        oditerator->_type,
+                                        includeDefaults ? oditerator->_default : Value(),
+                                        oditerator->_implicit,
+                                        !(sources & SourceCommandLine));
+                    if (!retDep.isOK()) {
+                        return retDep;
+                    }
+                    boostOptions->add_options()(depreatedSingleName.c_str(),
+                                                boostTypeDep.release(),
+                                                oditerator->_description.c_str());
+                }
+            }
         }
     }
 
@@ -457,24 +534,26 @@ Status OptionSection::getBoostPositionalOptions(
 // TODO: should I make this an iterator?
 
 Status OptionSection::getAllOptions(std::vector<OptionDescription>* options) const {
-    std::list<OptionDescription>::const_iterator oditerator;
-    for (oditerator = _options.begin(); oditerator != _options.end(); oditerator++) {
+    for (const auto& opt : _options) {
         // We need to check here that we didn't register an option with an empty single name
         // that is allowed on the command line or in an old style config, since we don't have
         // this information available all at once when the option is registered
-        if (oditerator->_singleName.empty() && oditerator->_sources & SourceAllLegacy) {
+        if (opt._singleName.empty() && (opt._sources & SourceAllLegacy)) {
             StringBuilder sb;
-            sb << "Found option allowed on the command line with an empty singleName: "
-               << oditerator->_dottedName;
-            return Status(ErrorCodes::InternalError, sb.str());
+            return {ErrorCodes::InternalError,
+                    str::stream()
+                        << "Found option allowed on the command line with an empty singleName: "
+                        << opt._dottedName};
         }
 
-        options->push_back(*oditerator);
+        options->push_back(opt);
     }
 
-    std::list<OptionSection>::const_iterator ositerator;
-    for (ositerator = _subSections.begin(); ositerator != _subSections.end(); ositerator++) {
-        ositerator->getAllOptions(options).transitional_ignore();
+    for (const auto& section : _subSections) {
+        auto status = section.getAllOptions(options);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     return Status::OK();
@@ -516,6 +595,10 @@ Status OptionSection::countOptions(int* numOptions, bool visibleOnly, OptionSour
     }
 
     return Status::OK();
+}
+
+size_t OptionSection::countSubSections() const {
+    return _subSections.size();
 }
 
 Status OptionSection::getConstraints(std::vector<std::shared_ptr<Constraint>>* constraints) const {

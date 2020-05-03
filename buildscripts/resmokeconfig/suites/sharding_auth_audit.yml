@@ -8,13 +8,18 @@ test_kind: js_test
 selector:
   roots:
   - jstests/sharding/*.js
+  - jstests/sharding/change_streams/*.js
+  - jstests/sharding/query/*.js
   exclude_files:
   # Skip any tests that run with auth explicitly.
   - jstests/sharding/*[aA]uth*.js
-  - jstests/sharding/aggregation_currentop.js # SERVER-19318
+  - jstests/sharding/query/*[aA]uth*.js
+  - jstests/sharding/change_streams/*[aA]uth*.js
+
+  - jstests/sharding/advance_cluster_time_action_type.js
+  - jstests/sharding/query/aggregation_currentop.js
   - jstests/sharding/kill_sessions.js
   # Skip these additional tests when running with auth enabled.
-  - jstests/sharding/copydb_from_mongos.js  # SERVER-13080
   - jstests/sharding/parallel.js
   # Skip the testcases that do not have auth bypass when running ops in parallel.
   - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js         # SERVER-21713
@@ -30,6 +35,8 @@ selector:
   - jstests/sharding/migration_server_status.js                       # SERVER-21713
   - jstests/sharding/migration_move_chunk_after_receive.js            # SERVER-21713
   - jstests/sharding/migration_critical_section_concurrency.js        # SERVER-21713
+  # Runs with auth enabled.
+  - jstests/sharding/mongod_returns_no_cluster_time_without_keys.js
 
 executor:
   config:
@@ -41,5 +48,6 @@ executor:
           authMechanism: SCRAM-SHA-1
           keyFile: *keyFile
           keyFileData: *keyFileData
+          roleGraphInvalidationIsFatal: true
       nodb: ''
       readMode: commands

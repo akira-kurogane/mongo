@@ -1,6 +1,12 @@
 // Cannot implicitly shard accessed collections because the "limit" option to the "mapReduce"
 // command cannot be used on a sharded collection.
-// @tags: [assumes_unsharded_collection]
+// @tags: [
+//   assumes_unsharded_collection,
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
 t = db.mr_sort;
 t.drop();
@@ -26,17 +32,20 @@ r = function(k, v) {
     return Array.sum(v);
 };
 
-res = t.mapReduce(m, r, "mr_sort_out ");
-x = res.convertToSingleObject();
-res.drop();
-assert.eq({"a": 55}, x, "A1");
+out = db.mr_sort_out;
+assert.commandWorked(t.mapReduce(m, r, out.getName()));
+assert.eq([{_id: "a", value: 55}], out.find().toArray(), "A1");
+out.drop();
 
-res = t.mapReduce(m, r, {out: "mr_sort_out", query: {x: {$lt: 3}}});
-x = res.convertToSingleObject();
-res.drop();
-assert.eq({"a": 3}, x, "A2");
+assert.commandWorked(t.mapReduce(m, r, {out: "mr_sort_out", query: {x: {$lt: 3}}}));
+assert.eq([{_id: "a", value: 3}], out.find().toArray(), "A2");
+out.drop();
 
-res = t.mapReduce(m, r, {out: "mr_sort_out", sort: {x: 1}, limit: 2});
-x = res.convertToSingleObject();
-res.drop();
-assert.eq({"a": 3}, x, "A3");
+assert.commandWorked(t.mapReduce(m, r, {out: "mr_sort_out", sort: {x: 1}, limit: 2}));
+assert.eq([{_id: "a", value: 3}], out.find().toArray(), "A3");
+out.drop();
+
+// Verify that specifying a sort with no limit succeeds.
+assert.commandWorked(t.mapReduce(m, r, {out: "mr_sort_out", sort: {x: 1}}));
+assert.eq([{_id: "a", value: 55}], out.find().toArray());
+assert(out.drop());

@@ -1,7 +1,6 @@
 load("jstests/replsets/rslib.js");
 
 doTest = function(signal) {
-
     var name = "slaveDelay";
     var host = getHostName();
 
@@ -17,7 +16,7 @@ doTest = function(signal) {
     replTest.initiate(config);
 
     var master = replTest.getPrimary().getDB(name);
-    var slaveConns = replTest.liveNodes.slaves;
+    var slaveConns = replTest._slaves;
     var slaves = [];
     for (var i in slaveConns) {
         var d = slaveConns[i].getDB(name);
@@ -27,7 +26,7 @@ doTest = function(signal) {
     waitForAllMembers(master);
 
     // insert a record
-    assert.writeOK(master.foo.insert({x: 1}, {writeConcern: {w: 2}}));
+    assert.commandWorked(master.foo.insert({x: 1}, {writeConcern: {w: 2}}));
 
     var doc = master.foo.findOne();
     assert.eq(doc.x, 1);
@@ -66,7 +65,7 @@ doTest = function(signal) {
     master = reconfig(replTest, config);
     master = master.getSisterDB(name);
 
-    assert.writeOK(master.foo.insert(
+    assert.commandWorked(master.foo.insert(
         {_id: 123, x: 'foo'}, {writeConcern: {w: 2, wtimeout: ReplSetTest.kDefaultTimeoutMS}}));
 
     for (var i = 0; i < 8; i++) {
@@ -108,10 +107,9 @@ doTest = function(signal) {
         sleep(1000);
     }
 
-    // the node should have the document in 15 seconds (20 for some safety against races)
     assert.soon(function() {
         return conn.getDB(name).foo.findOne({_id: 124}) != null;
-    }, 10 * 1000);
+    }, "findOne should complete within default timeout");
 
     replTest.stopSet();
 };

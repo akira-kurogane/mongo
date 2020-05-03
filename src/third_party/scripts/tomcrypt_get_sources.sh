@@ -13,7 +13,7 @@ fi
 
 # how we got the last tom crypt sources
 
-VERSION=1.18.0-rc2
+VERSION=1.18.2
 
 cd `git rev-parse --show-toplevel`/src/third_party/tomcrypt-$VERSION
 
@@ -43,6 +43,7 @@ FILES=(
     hashes/helper/hash_memory.c
     hashes/sha1.c
     hashes/sha2/sha256.c
+    hashes/sha2/sha512.c
     mac/hmac/hmac_done.c
     mac/hmac/hmac_init.c
     mac/hmac/hmac_memory.c

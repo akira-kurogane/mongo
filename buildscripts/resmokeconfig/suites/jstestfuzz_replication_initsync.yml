@@ -5,6 +5,9 @@ selector:
   - jstestfuzz/out/*.js
 
 executor:
+  archive:
+    hooks:
+      - BackgroundInitialSync
   config:
     shell_options:
       readMode: commands
@@ -21,13 +24,13 @@ executor:
   fixture:
     class: ReplicaSetFixture
     mongod_options:
-      oplogSize: 511
       verbose: ''
       set_parameters:
+        disableLogicalSessionCacheRefresh: false
+        enableTestCommands: 1
         logComponentVerbosity:
           replication: 2
-        enableTestCommands: 1
-        numInitialSyncAttempts: 2
-        numInitialSyncConnectAttempts: 60
+        transactionLifetimeLimitSeconds: 1
+        writePeriodicNoops: 1
     num_nodes: 2
     start_initial_sync_node: True

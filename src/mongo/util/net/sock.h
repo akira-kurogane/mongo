@@ -1,30 +1,30 @@
-// @file sock.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -50,28 +50,23 @@
 #include <utility>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/config.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/sockaddr.h"
 
 namespace mongo {
 
 #ifdef MONGO_CONFIG_SSL
 class SSLManagerInterface;
-class SSLConnection;
+class SSLConnectionInterface;
 #endif
 struct SSLPeerInfo;
 
 extern const int portSendFlags;
 extern const int portRecvFlags;
-
-void setSocketKeepAliveParams(int sock,
-                              unsigned int maxKeepIdleSecs = 300,
-                              unsigned int maxKeepIntvlSecs = 300);
-void disableNagle(int sock);
 
 #if !defined(_WIN32)
 
@@ -83,40 +78,18 @@ typedef int SOCKET;
 
 #endif  // _WIN32
 
-std::string makeUnixSockPath(int port);
-
-// If an ip address is passed in, just return that.  If a hostname is passed
-// in, look up its ip and return that.  Returns "" on failure.
-std::string hostbyname(const char* hostname);
-
-void enableIPv6(bool state = true);
-bool IPv6Enabled();
-void setSockTimeouts(int sock, double secs);
-
-/** this is not cache and does a syscall */
-std::string getHostName();
-
-/** this is cached, so if changes during the process lifetime
- * will be stale */
-std::string getHostNameCached();
-
-/** Returns getHostNameCached():<port>. */
-std::string getHostNameCachedAndPort();
-
-/** Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port. */
-std::string prettyHostName();
-
 /**
- * thin wrapped around file descriptor and system calls
+ * thin wrapper around file descriptor and system calls
  * todo: ssl
  */
 class Socket {
-    MONGO_DISALLOW_COPYING(Socket);
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
 
 public:
     static const int errorPollIntervalSecs;
 
-    Socket(int sock, const SockAddr& farEnd);
+    Socket(int sock, const SockAddr& remote);
 
     /** In some cases the timeout will actually be 2x this value - eg we do a partial send,
         then the timeout fires, then we try to send again, then the timeout fires again with
@@ -124,7 +97,7 @@ public:
 
         Generally you don't want a timeout, you should be very prepared for errors if you set one.
     */
-    Socket(double so_timeout = 0, logger::LogSeverity logLevel = logger::LogSeverity::Log());
+    Socket(double so_timeout = 0, logv2::LogSeverity logLevel = logv2::LogSeverity::Log());
 
     ~Socket();
 
@@ -136,7 +109,12 @@ public:
      *  an error, or due to a timeout on connection, or due to the system socket deciding the
      *  socket is invalid.
      */
-    bool connect(SockAddr& farEnd);
+    bool connect(SockAddr& remote, Milliseconds connectTimeoutMillis);
+
+    /**
+     * Connect using a default connect timeout of min(_timeout * 1000, kMaxConnectTimeoutMS)
+     */
+    bool connect(SockAddr& remote);
 
     void close();
     void send(const char* data, int len, const char* context);
@@ -146,10 +124,10 @@ public:
     void recv(char* data, int len);
     int unsafe_recv(char* buf, int max);
 
-    logger::LogSeverity getLogLevel() const {
+    logv2::LogSeverity getLogLevel() const {
         return _logLevel;
     }
-    void setLogLevel(logger::LogSeverity ll) {
+    void setLogLevel(logv2::LogSeverity ll) {
         _logLevel = ll;
     }
 
@@ -224,7 +202,7 @@ public:
      *
      * This function may throw SocketException.
      */
-    SSLPeerInfo doSSLHandshake(const char* firstBytes = NULL, int len = 0);
+    SSLPeerInfo doSSLHandshake(const char* firstBytes = nullptr, int len = 0);
 
     /**
      * @return the time when the socket was opened.
@@ -235,8 +213,6 @@ public:
 
     void handleRecvError(int ret, int len);
     void handleSendError(int ret, const char* context);
-
-    std::string getSNIServerName() const;
 
 private:
     void _init();
@@ -250,7 +226,7 @@ private:
     /** raw recv, same semantics as ::recv */
     int _recv(char* buf, int max);
 
-    int _fd;
+    SOCKET _fd;
     uint64_t _fdCreationMicroSec;
     SockAddr _local;
     SockAddr _remote;
@@ -261,14 +237,13 @@ private:
     time_t _lastValidityCheckAtSecs;
 
 #ifdef MONGO_CONFIG_SSL
-    std::unique_ptr<SSLConnection> _sslConnection;
+    std::unique_ptr<SSLConnectionInterface> _sslConnection;
     SSLManagerInterface* _sslManager;
 #endif
-    logger::LogSeverity _logLevel;  // passed to log() when logging errors
+    logv2::LogSeverity _logLevel;  // passed to log() when logging errors
 
     /** true until the first packet has been received or an outgoing connect has been made */
     bool _awaitingHandshake;
 };
-
 
 }  // namespace mongo

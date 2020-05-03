@@ -1,37 +1,36 @@
-// fts_element_iterator.cpp
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/db/fts/fts_element_iterator.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 #include <stack>
 
@@ -63,9 +62,9 @@ inline bool _matchPrefix(const string& dottedName, const string& weight) {
     if (weight == dottedName) {
         return true;
     }
-    return mongoutils::str::startsWith(weight, dottedName + '.');
+    return str::startsWith(weight, dottedName + '.');
 }
-}
+}  // namespace
 
 bool FTSElementIterator::more() {
     //_currentValue = advance();
@@ -114,9 +113,10 @@ FTSIteratorValue FTSElementIterator::advance() {
         // 1. parent path empty (top level): use the current field name
         // 2. parent path non-empty and obj is an array: use the parent path
         // 3. parent path non-empty and obj is a sub-doc: append field name to parent path
-        string dottedName = (_frame._parentPath.empty() ? fieldName : _frame._isArray
-                                     ? _frame._parentPath
-                                     : _frame._parentPath + '.' + fieldName);
+        string dottedName =
+            (_frame._parentPath.empty()
+                 ? fieldName
+                 : _frame._isArray ? _frame._parentPath : _frame._parentPath + '.' + fieldName);
 
         // Find lower bound of dottedName in _weights.  lower_bound leaves us at the first
         // weight that could possibly match or be a prefix of dottedName.  And if this
@@ -143,7 +143,7 @@ FTSIteratorValue FTSElementIterator::advance() {
 
         // Is the current field an exact match on a weight?
         bool exactMatch = (possibleWeightMatch && i->first == dottedName);
-        double weight = (possibleWeightMatch ? i->second : DEFAULT_WEIGHT);
+        double weight = (exactMatch ? i->second : DEFAULT_WEIGHT);
 
         switch (elem.type()) {
             case String:

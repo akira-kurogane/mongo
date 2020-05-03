@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +43,7 @@ namespace {
 
 using namespace mongo;
 using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
 using executor::TaskExecutor;
 
 using ResponseStatus = TaskExecutor::ResponseStatus;
@@ -101,18 +103,14 @@ FetcherTest::FetcherTest()
     : status(getDetectableErrorStatus()), cursorId(-1), nextAction(Fetcher::NextAction::kInvalid) {}
 
 Fetcher::CallbackFn FetcherTest::makeCallback() {
-    return stdx::bind(&FetcherTest::_callback,
-                      this,
-                      stdx::placeholders::_1,
-                      stdx::placeholders::_2,
-                      stdx::placeholders::_3);
+    return [this](const auto& x, const auto& y, const auto& z) { return this->_callback(x, y, z); };
 }
 
 void FetcherTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
     clear();
     callbackHook = Fetcher::CallbackFn();
-    fetcher = stdx::make_unique<Fetcher>(&getExecutor(), source, "db", findCmdObj, makeCallback());
+    fetcher = std::make_unique<Fetcher>(&getExecutor(), source, "db", findCmdObj, makeCallback());
     launchExecutorThread();
 }
 
@@ -146,7 +144,7 @@ void FetcherTest::processNetworkResponse(const BSONObj& obj,
                                          ReadyQueueState readyQueueStateAfterProcessing,
                                          FetcherState fetcherStateAfterProcessing) {
     executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
-    getNet()->scheduleSuccessfulResponse({obj, {}, elapsed});
+    getNet()->scheduleSuccessfulResponse({obj, elapsed});
     finishProcessingNetworkResponse(readyQueueStateAfterProcessing, fetcherStateAfterProcessing);
 }
 
@@ -255,21 +253,21 @@ TEST_F(FetcherTest, InvalidConstruction) {
 TEST_F(FetcherTest, NonFindCommand) {
     TaskExecutor& executor = getExecutor();
 
-    Fetcher(&executor,
-            source,
-            "db",
-            BSON("listIndexes"
-                 << "coll"),
-            unreachableCallback);
-    Fetcher(&executor, source, "db", BSON("listCollections" << 1), unreachableCallback);
-    Fetcher(&executor, source, "db", BSON("a" << 1), unreachableCallback);
+    Fetcher f1(&executor,
+               source,
+               "db",
+               BSON("listIndexes"
+                    << "coll"),
+               unreachableCallback);
+    Fetcher f2(&executor, source, "db", BSON("listCollections" << 1), unreachableCallback);
+    Fetcher f3(&executor, source, "db", BSON("a" << 1), unreachableCallback);
 }
 
 TEST_F(FetcherTest, RemoteCommandRequestShouldContainCommandParametersPassedToConstructor) {
     auto metadataObj = BSON("x" << 1);
     Milliseconds timeout(8000);
 
-    fetcher = stdx::make_unique<Fetcher>(
+    fetcher = std::make_unique<Fetcher>(
         &getExecutor(), source, "db", findCmdObj, doNothingCallback, metadataObj, timeout);
 
     ASSERT_EQUALS(source, fetcher->getSource());
@@ -407,8 +405,7 @@ TEST_F(FetcherTest, FindCommandFailed2) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("ok" << 0 << "errmsg"
                                      << "bad hint"
-                                     << "code"
-                                     << int(ErrorCodes::BadValue)),
+                                     << "code" << int(ErrorCodes::BadValue)),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
@@ -434,10 +431,8 @@ TEST_F(FetcherTest, CursorIdFieldMissing) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("ns"
                                                  << "db.coll"
-                                                 << "firstBatch"
-                                                 << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                 << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
@@ -448,10 +443,8 @@ TEST_F(FetcherTest, CursorIdNotLongNumber) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 123.1 << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
@@ -471,11 +464,11 @@ TEST_F(FetcherTest, NamespaceFieldMissing) {
 
 TEST_F(FetcherTest, NamespaceNotAString) {
     ASSERT_OK(fetcher->schedule());
-    processNetworkResponse(
-        BSON("cursor" << BSON("id" << 123LL << "ns" << 123 << "firstBatch" << BSONArray()) << "ok"
-                      << 1),
-        ReadyQueueState::kEmpty,
-        FetcherState::kInactive);
+    processNetworkResponse(BSON("cursor"
+                                << BSON("id" << 123LL << "ns" << 123 << "firstBatch" << BSONArray())
+                                << "ok" << 1),
+                           ReadyQueueState::kEmpty,
+                           FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
     ASSERT_STRING_CONTAINS(status.reason(), "'cursor.ns' field must be a string");
 }
@@ -484,10 +477,8 @@ TEST_F(FetcherTest, NamespaceEmpty) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 123LL << "ns"
                                                       << ""
-                                                      << "firstBatch"
-                                                      << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
@@ -498,10 +489,8 @@ TEST_F(FetcherTest, NamespaceMissingCollectionName) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 123LL << "ns"
                                                       << "db."
-                                                      << "firstBatch"
-                                                      << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::BadValue, status.code());
@@ -512,8 +501,7 @@ TEST_F(FetcherTest, FirstBatchFieldMissing) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll")
-                                         << "ok"
-                                         << 1),
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
@@ -524,10 +512,8 @@ TEST_F(FetcherTest, FirstBatchNotAnArray) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << 123)
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << 123)
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
@@ -538,10 +524,8 @@ TEST_F(FetcherTest, FirstBatchArrayContainsNonObject) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(8))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(8))
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
@@ -553,10 +537,8 @@ TEST_F(FetcherTest, FirstBatchEmptyArray) {
     ASSERT_OK(fetcher->schedule());
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_OK(status);
@@ -570,10 +552,8 @@ TEST_F(FetcherTest, FetchOneDocument) {
     const BSONObj doc = BSON("_id" << 1);
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_OK(status);
@@ -598,10 +578,8 @@ TEST_F(FetcherTest, SetNextActionToContinueWhenNextBatchIsNotAvailable) {
     };
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
     ASSERT_OK(status);
@@ -631,10 +609,8 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            Milliseconds(100),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
@@ -652,10 +628,8 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc2))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc2))
+                                         << "ok" << 1),
                            Milliseconds(200),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
@@ -673,10 +647,8 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc3))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc3))
+                                         << "ok" << 1),
                            Milliseconds(300),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
@@ -700,10 +672,8 @@ TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -717,10 +687,8 @@ TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
     const BSONObj doc2 = BSON("_id" << 2);
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc2))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc2))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -763,10 +731,8 @@ TEST_F(FetcherTest, CancelDuringCallbackPutsFetcherInShutdown) {
     const BSONObj doc = BSON("_id" << 1);
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kInactive);
 
@@ -784,10 +750,8 @@ TEST_F(FetcherTest, ScheduleGetMoreButShutdown) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -802,10 +766,8 @@ TEST_F(FetcherTest, ScheduleGetMoreButShutdown) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc2))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc2))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -841,10 +803,8 @@ TEST_F(FetcherTest, EmptyGetMoreRequestAfterFirstBatchMakesFetcherInactiveAndKil
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kInactive);
 
@@ -877,7 +837,7 @@ TEST_F(FetcherTest, EmptyGetMoreRequestAfterFirstBatchMakesFetcherInactiveAndKil
     // killCursors command request will be canceled by executor on shutdown.
     tearDown();
     ASSERT_EQUALS(1,
-                  countLogLinesContaining(
+                  countTextFormatLogLinesContaining(
                       "killCursors command task failed: CallbackCanceled: Callback canceled"));
 }
 
@@ -898,10 +858,8 @@ TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -918,10 +876,8 @@ TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc2))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc2))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kInactive);
 
@@ -950,11 +906,11 @@ TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
         ASSERT_EQUALS(cursorId, cursors.front().numberLong());
 
         // Failed killCursors command response should be logged.
-        getNet()->scheduleSuccessfulResponse(noi, {BSON("ok" << false), {}, Milliseconds(0)});
+        getNet()->scheduleSuccessfulResponse(noi, {BSON("ok" << false), Milliseconds(0)});
         getNet()->runReadyNetworkOperations();
     }
 
-    ASSERT_EQUALS(1, countLogLinesContaining("killCursors command failed: UnknownError"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("killCursors command failed: UnknownError"));
 }
 
 /**
@@ -995,10 +951,8 @@ TEST_F(FetcherTest, ShutdownDuringSecondBatch) {
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
 
@@ -1012,46 +966,38 @@ TEST_F(FetcherTest, ShutdownDuringSecondBatch) {
     const BSONObj doc2 = BSON("_id" << 2);
 
     bool isShutdownCalled = false;
-    callbackHook = stdx::bind(shutdownDuringSecondBatch,
-                              stdx::placeholders::_1,
-                              stdx::placeholders::_2,
-                              stdx::placeholders::_3,
-                              doc2,
-                              &getExecutor(),
-                              &isShutdownCalled);
+    callbackHook = [this, doc2, &isShutdownCalled](const auto& x, const auto& y, const auto& z) {
+        return shutdownDuringSecondBatch(x, y, z, doc2, &this->getExecutor(), &isShutdownCalled);
+    };
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "nextBatch"
-                                                      << BSON_ARRAY(doc2))
-                                         << "ok"
-                                         << 1),
+                                                      << "nextBatch" << BSON_ARRAY(doc2))
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
 
     // Fetcher should attempt (unsuccessfully) to schedule a killCursors command.
     ASSERT_EQUALS(1,
-                  countLogLinesContaining("failed to schedule killCursors command: "
-                                          "ShutdownInProgress: Shutdown in progress"));
+                  countTextFormatLogLinesContaining("failed to schedule killCursors command: "
+                                                    "ShutdownInProgress: Shutdown in progress"));
 
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
 }
 
 TEST_F(FetcherTest, FetcherAppliesRetryPolicyToFirstCommandButNotToGetMoreRequests) {
-    auto policy = RemoteCommandRetryScheduler::makeRetryPolicy(
-        3U,
-        executor::RemoteCommandRequest::kNoTimeout,
-        {ErrorCodes::BadValue, ErrorCodes::InternalError});
+    auto policy = RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::RetriableError>(
+        3U, executor::RemoteCommandRequest::kNoTimeout);
 
-    fetcher = stdx::make_unique<Fetcher>(&getExecutor(),
-                                         source,
-                                         "db",
-                                         findCmdObj,
-                                         makeCallback(),
-                                         rpc::makeEmptyMetadata(),
-                                         executor::RemoteCommandRequest::kNoTimeout,
-                                         executor::RemoteCommandRequest::kNoTimeout,
-                                         std::move(policy));
+    fetcher = std::make_unique<Fetcher>(&getExecutor(),
+                                        source,
+                                        "db",
+                                        findCmdObj,
+                                        makeCallback(),
+                                        rpc::makeEmptyMetadata(),
+                                        executor::RemoteCommandRequest::kNoTimeout,
+                                        executor::RemoteCommandRequest::kNoTimeout,
+                                        std::move(policy));
 
     callbackHook = appendGetMoreRequest;
 
@@ -1059,16 +1005,14 @@ TEST_F(FetcherTest, FetcherAppliesRetryPolicyToFirstCommandButNotToGetMoreReques
 
     // Retry policy is applied to find command.
     const BSONObj doc = BSON("_id" << 1);
-    auto rs = ResponseStatus(ErrorCodes::BadValue, "first", Milliseconds(0));
+    auto rs = ResponseStatus(ErrorCodes::HostUnreachable, "first", Milliseconds(0));
     processNetworkResponse(rs, ReadyQueueState::kHasReadyRequests, FetcherState::kActive);
-    rs = ResponseStatus(ErrorCodes::InternalError, "second", Milliseconds(0));
+    rs = ResponseStatus(ErrorCodes::SocketException, "second", Milliseconds(0));
     processNetworkResponse(rs, ReadyQueueState::kHasReadyRequests, FetcherState::kActive);
     processNetworkResponse(BSON("cursor" << BSON("id" << 1LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSON_ARRAY(doc))
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSON_ARRAY(doc))
+                                         << "ok" << 1),
                            ReadyQueueState::kHasReadyRequests,
                            FetcherState::kActive);
     ASSERT_OK(status);
@@ -1086,7 +1030,8 @@ TEST_F(FetcherTest, FetcherAppliesRetryPolicyToFirstCommandButNotToGetMoreReques
 
 bool sharedCallbackStateDestroyed = false;
 class SharedCallbackState {
-    MONGO_DISALLOW_COPYING(SharedCallbackState);
+    SharedCallbackState(const SharedCallbackState&) = delete;
+    SharedCallbackState& operator=(const SharedCallbackState&) = delete;
 
 public:
     SharedCallbackState() {}
@@ -1099,7 +1044,7 @@ TEST_F(FetcherTest, FetcherResetsInternalFinishCallbackFunctionPointerAfterLastC
     auto sharedCallbackData = std::make_shared<SharedCallbackState>();
     auto callbackInvoked = false;
 
-    fetcher = stdx::make_unique<Fetcher>(
+    fetcher = std::make_unique<Fetcher>(
         &getExecutor(),
         source,
         "db",
@@ -1115,10 +1060,8 @@ TEST_F(FetcherTest, FetcherResetsInternalFinishCallbackFunctionPointerAfterLastC
 
     processNetworkResponse(BSON("cursor" << BSON("id" << 0LL << "ns"
                                                       << "db.coll"
-                                                      << "firstBatch"
-                                                      << BSONArray())
-                                         << "ok"
-                                         << 1),
+                                                      << "firstBatch" << BSONArray())
+                                         << "ok" << 1),
                            ReadyQueueState::kEmpty,
                            FetcherState::kInactive);
 

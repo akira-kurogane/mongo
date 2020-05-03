@@ -1,35 +1,37 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ftdc/ftdc_system_stats.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,7 +40,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/procparser.h"
 
@@ -66,6 +67,23 @@ static const std::vector<StringData> kMemKeys{
     "Inactive(file)"_sd,
 };
 
+static const std::vector<StringData> kNetstatKeys{
+    "Tcp:"_sd,
+    "Ip:"_sd,
+    "TcpExt:"_sd,
+    "IpExt:"_sd,
+};
+
+static const std::vector<StringData> kVMKeys{
+    "balloon_deflate"_sd,
+    "balloon_inflate"_sd,
+    "nr_mlock"_sd,
+    "pgfault"_sd,
+    "pgmajfault"_sd,
+    "pswpin"_sd,
+    "pswpout"_sd,
+};
+
 /**
  *  Collect metrics from the Linux /proc file system.
  */
@@ -83,7 +101,7 @@ public:
 
             // Include the number of cpus to simplify client calculations
             ProcessInfo p;
-            subObjBuilder.append("num_cpus", p.getNumCores());
+            subObjBuilder.append("num_cpus", static_cast<int>(p.getNumAvailableCores()));
 
             processStatusErrors(
                 procparser::parseProcStatFile("/proc/stat"_sd, kCpuKeys, &subObjBuilder),
@@ -99,6 +117,17 @@ public:
             subObjBuilder.doneFast();
         }
 
+        {
+            BSONObjBuilder subObjBuilder(builder.subobjStart("netstat"_sd));
+            processStatusErrors(procparser::parseProcNetstatFile(
+                                    kNetstatKeys, "/proc/net/netstat"_sd, &subObjBuilder),
+                                &subObjBuilder);
+            processStatusErrors(
+                procparser::parseProcNetstatFile(kNetstatKeys, "/proc/net/snmp"_sd, &subObjBuilder),
+                &subObjBuilder);
+            subObjBuilder.doneFast();
+        }
+
         // Skip the disks section if we could not find any disks.
         // This can happen when we do not have permission to /sys/block for instance.
         if (!_disksStringData.empty()) {
@@ -106,6 +135,14 @@ public:
             processStatusErrors(procparser::parseProcDiskStatsFile(
                                     "/proc/diskstats"_sd, _disksStringData, &subObjBuilder),
                                 &subObjBuilder);
+            subObjBuilder.doneFast();
+        }
+
+        {
+            BSONObjBuilder subObjBuilder(builder.subobjStart("vmstat"_sd));
+            processStatusErrors(
+                procparser::parseProcVMStatFile("/proc/vmstat"_sd, kVMKeys, &subObjBuilder),
+                &subObjBuilder);
             subObjBuilder.doneFast();
         }
     }
@@ -121,7 +158,7 @@ private:
 }  // namespace
 
 void installSystemMetricsCollector(FTDCController* controller) {
-    controller->addPeriodicCollector(stdx::make_unique<LinuxSystemMetricsCollector>());
+    controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>());
 }
 
 }  // namespace mongo

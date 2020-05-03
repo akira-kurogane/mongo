@@ -11,77 +11,85 @@
 //   2. We should not see any duplicate documents in any one $sample (this is only guaranteed if
 //      there are no ongoing write operations).
 (function() {
-    "use strict";
+"use strict";
 
-    var coll = db.server21632;
-    coll.drop();
+load('jstests/libs/fixture_helpers.js');  // For isReplSet() and awaitReplication().
 
-    // If there is no collection, or no documents in the collection, we should not get any results
-    // from a sample.
-    assert.eq([], coll.aggregate([{$sample: {size: 1}}]).toArray());
-    assert.eq([], coll.aggregate([{$sample: {size: 10}}]).toArray());
+var coll = db.server21632;
+coll.drop();
 
-    db.createCollection(coll.getName());
+// If there is no collection, or no documents in the collection, we should not get any results
+// from a sample.
+assert.eq([], coll.aggregate([{$sample: {size: 1}}]).toArray());
+assert.eq([], coll.aggregate([{$sample: {size: 10}}]).toArray());
 
-    // Test if we are running WT + LSM and if so, skip the test.
-    // WiredTiger LSM random cursor implementation doesn't currently give random enough
-    // distribution to pass this test case, so disable the test when checking an LSM
-    // configuration for now. We will need revisit this before releasing WiredTiger LSM
-    // as a supported file type. (See: WT-2403 for details on forthcoming changes)
+db.createCollection(coll.getName());
 
-    var storageEngine = jsTest.options().storageEngine || "wiredTiger";
+// If we are performing secondary reads against a replica set, we need to wait for the created
+// collection to replicate to all of the secondaries before we attempt to run coll.stats() on it
+// since coll.stats() is not causally consistent.
+if (FixtureHelpers.isReplSet(db)) {
+    FixtureHelpers.awaitReplication(db);
+}
 
-    if (storageEngine == "wiredTiger" && coll.stats().wiredTiger.type == 'lsm') {
-        return;
-    }
+// Test if we are running WT + LSM and if so, skip the test.
+// WiredTiger LSM random cursor implementation doesn't currently give random enough
+// distribution to pass this test case, so disable the test when checking an LSM
+// configuration for now. We will need revisit this before releasing WiredTiger LSM
+// as a supported file type. (See: WT-2403 for details on forthcoming changes)
 
-    assert.eq([], coll.aggregate([{$sample: {size: 1}}]).toArray());
-    assert.eq([], coll.aggregate([{$sample: {size: 10}}]).toArray());
+var storageEngine = jsTest.options().storageEngine || "wiredTiger";
 
-    // If there is only one document, we should get that document.
-    var paddingStr = "abcdefghijklmnopqrstuvwxyz";
-    var firstDoc = {_id: 0, paddingStr: paddingStr};
-    assert.writeOK(coll.insert(firstDoc));
-    assert.eq([firstDoc], coll.aggregate([{$sample: {size: 1}}]).toArray());
-    assert.eq([firstDoc], coll.aggregate([{$sample: {size: 10}}]).toArray());
+if (storageEngine === "wiredTiger" && coll.stats().wiredTiger.type === 'lsm') {
+    return;
+}
 
-    // Insert a bunch of documents.
-    var bulk = coll.initializeUnorderedBulkOp();
-    var nDocs = 1000;
-    for (var id = 1; id < nDocs; id++) {
-        bulk.insert({_id: id, paddingStr: paddingStr});
-    }
-    bulk.execute();
+assert.eq([], coll.aggregate([{$sample: {size: 1}}]).toArray());
+assert.eq([], coll.aggregate([{$sample: {size: 10}}]).toArray());
 
-    // Will contain a document's _id as a key if we've ever seen that document.
-    var cumulativeSeenIds = {};
-    var sampleSize = 10;
+// If there is only one document, we should get that document.
+var paddingStr = "abcdefghijklmnopqrstuvwxyz";
+var firstDoc = {_id: 0, paddingStr: paddingStr};
+assert.commandWorked(coll.insert(firstDoc));
+assert.eq([firstDoc], coll.aggregate([{$sample: {size: 1}}]).toArray());
+assert.eq([firstDoc], coll.aggregate([{$sample: {size: 10}}]).toArray());
 
-    jsTestLog("About to do repeated samples, explain output: " +
-              tojson(coll.explain().aggregate([{$sample: {size: sampleSize}}])));
+// Insert a bunch of documents.
+var bulk = coll.initializeUnorderedBulkOp();
+var nDocs = 1000;
+for (var id = 1; id < nDocs; id++) {
+    bulk.insert({_id: id, paddingStr: paddingStr});
+}
+bulk.execute();
 
-    // Repeatedly ask for small samples of documents to get a cumulative sample of size 'nDocs'.
-    for (var i = 0; i < nDocs / sampleSize; i++) {
-        var results = coll.aggregate([{$sample: {size: sampleSize}}]).toArray();
+// Will contain a document's _id as a key if we've ever seen that document.
+var cumulativeSeenIds = {};
+var sampleSize = 10;
 
-        assert.eq(
-            results.length, sampleSize, "$sample did not return the expected number of results");
+jsTestLog("About to do repeated samples, explain output: " +
+          tojson(coll.explain().aggregate([{$sample: {size: sampleSize}}])));
 
-        // Check that there are no duplicate documents in the result of any single sample.
-        var idsThisSample = {};
-        results.forEach(function recordId(result) {
-            assert.lte(result._id, nDocs, "$sample returned an unknown document");
-            assert(!idsThisSample[result._id],
-                   "A single $sample returned the same document twice: " + result._id);
+// Repeatedly ask for small samples of documents to get a cumulative sample of size 'nDocs'.
+for (var i = 0; i < nDocs / sampleSize; i++) {
+    var results = coll.aggregate([{$sample: {size: sampleSize}}]).toArray();
 
-            cumulativeSeenIds[result._id] = true;
-            idsThisSample[result._id] = true;
-        });
-    }
+    assert.eq(results.length, sampleSize, "$sample did not return the expected number of results");
 
-    // An implementation would have to be very broken for this assertion to fail.
-    assert.gte(Object.keys(cumulativeSeenIds).length, nDocs / 4);
+    // Check that there are no duplicate documents in the result of any single sample.
+    var idsThisSample = {};
+    results.forEach(function recordId(result) {
+        assert.lte(result._id, nDocs, "$sample returned an unknown document");
+        assert(!idsThisSample[result._id],
+               "A single $sample returned the same document twice: " + result._id);
 
-    // Make sure we can return all documents in the collection.
-    assert.eq(coll.aggregate([{$sample: {size: nDocs}}]).toArray().length, nDocs);
+        cumulativeSeenIds[result._id] = true;
+        idsThisSample[result._id] = true;
+    });
+}
+
+// An implementation would have to be very broken for this assertion to fail.
+assert.gte(Object.keys(cumulativeSeenIds).length, nDocs / 4);
+
+// Make sure we can return all documents in the collection.
+assert.eq(coll.aggregate([{$sample: {size: nDocs}}]).toArray().length, nDocs);
 })();

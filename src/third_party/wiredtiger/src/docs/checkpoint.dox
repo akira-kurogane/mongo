@@ -22,6 +22,10 @@ configuration to ::wiredtiger_open.
 All transactional updates committed before a checkpoint are made durable
 by the checkpoint, therefore the frequency of checkpoints limits the
 volume of data that may be lost due to application or system failure.
+<b>This guarantee has an exception:</b> If a crash occurs when a backup
+cursor is open, then the system will be restored to the most recent
+checkpoint prior to the opening of the backup cursor, even if later
+database checkpoints were completed.
 
 Data sources that are involved in an exclusive operation when the
 checkpoint starts, including bulk load, verify or salvage, will be skipped
@@ -51,11 +55,13 @@ archiving purposes.
 @section checkpoint_cursors Checkpoint cursors
 
 Cursors are normally opened in the most recent version of a data source.
-However, a checkpoint configuration string may be provided to
-WT_SESSION::open_cursor, opening a read-only, static view of the data
-source.  This provides a limited form of time-travel, as the static view
-is not changed by subsequent checkpoints, and will persist until the
-checkpoint cursor is closed.
+However, a checkpoint configuration string may be provided
+to WT_SESSION::open_cursor, opening a read-only, static view of the
+data source.  This provides a limited form of time-travel, as the static
+view is not changed by subsequent checkpoints and will persist until
+the checkpoint cursor is closed. While it is not an error to set a read
+timestamp in a transaction including a checkpoint cursor, it also has no
+effect on the checkpoint cursor's behavior.
 
 @section checkpoint_naming Checkpoint naming
 

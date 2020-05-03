@@ -1,30 +1,33 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +42,7 @@
 #include "mongo/db/repl/idempotency_update_sequence.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -57,9 +61,9 @@ protected:
 
     BSONObj getDoc();
 
-    std::string getStateString(const CollectionState& state1,
-                               const CollectionState& state2,
-                               const std::vector<OplogEntry>& ops) override;
+    std::string getStatesString(const std::vector<CollectionState>& state1,
+                                const std::vector<CollectionState>& state2,
+                                const std::vector<OplogEntry>& ops) override;
 
     Status resetState() override;
 
@@ -110,15 +114,18 @@ std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
     return updateSequence;
 }
 
-std::string RandomizedIdempotencyTest::getStateString(const CollectionState& state1,
-                                                      const CollectionState& state2,
-                                                      const std::vector<OplogEntry>& ops) {
-    unittest::log() << IdempotencyTest::getStateString(state1, state2, ops);
+std::string RandomizedIdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
+                                                       const std::vector<CollectionState>& state2,
+                                                       const std::vector<OplogEntry>& ops) {
+    LOGV2(21157,
+          "{IdempotencyTest_getStatesString_state1_state2_ops}",
+          "IdempotencyTest_getStatesString_state1_state2_ops"_attr =
+              IdempotencyTest::getStatesString(state1, state2, ops));
     StringBuilder sb;
     sb << "Ran update ops: ";
     sb << "[ ";
     bool firstIter = true;
-    for (auto op : ops) {
+    for (const auto& op : ops) {
         if (!firstIter) {
             sb << ", ";
         } else {
@@ -131,8 +138,8 @@ std::string RandomizedIdempotencyTest::getStateString(const CollectionState& sta
     ASSERT_OK(resetState());
 
     sb << "Start: " << getDoc() << "\n";
-    for (auto op : ops) {
-        ASSERT_OK(runOp(op));
+    for (const auto& op : ops) {
+        ASSERT_OK(runOpInitialSync(op));
         sb << "Apply: " << op.getObject() << "\n  ==> " << getDoc() << "\n";
     }
 
@@ -142,12 +149,12 @@ std::string RandomizedIdempotencyTest::getStateString(const CollectionState& sta
 }
 
 Status RandomizedIdempotencyTest::resetState() {
-    Status dropStatus = runOp(dropCollection());
+    Status dropStatus = runOpInitialSync(dropCollection());
     if (!dropStatus.isOK()) {
         return dropStatus;
     }
 
-    return runOps(initOps);
+    return runOpsInitialSync(initOps);
 }
 
 void RandomizedIdempotencyTest::runIdempotencyTestCase() {
@@ -164,7 +171,7 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     const double kDocProbability = 0.375;
     const double kArrProbability = 0.0;
 
-    this->seed = SecureRandom::create()->nextInt64();
+    this->seed = SecureRandom().nextInt64();
     PseudoRandom seedGenerator(this->seed);
     RandomizedScalarGenerator scalarGenerator{PseudoRandom(seedGenerator.nextInt64())};
     UpdateSequenceGenerator updateGenerator(
@@ -183,8 +190,8 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
 
     for (auto doc : enumerator) {
         BSONObj docWithId = (BSONObjBuilder(doc) << "_id" << kDocId).obj();
-        this->initOps = std::vector<OplogEntry>{createCollection(), insert(docWithId)};
         for (size_t i = 0; i < kNumUpdateSequencesPerDoc; i++) {
+            this->initOps = std::vector<OplogEntry>{createCollection(), insert(docWithId)};
             std::vector<OplogEntry> updateSequence =
                 createUpdateSequence(updateGenerator, kUpdateSequenceLength);
             testOpsAreIdempotent(updateSequence, SequenceType::kAnyPrefixOrSuffix);
@@ -192,16 +199,23 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     }
 }
 
-TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotentWhenFCV34) {
-    serverGlobalParams.featureCompatibility.version.store(
-        ServerGlobalParams::FeatureCompatibility::Version::k34);
+TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotent) {
     runIdempotencyTestCase();
 }
 
-TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotentWhenFCV36) {
-    serverGlobalParams.featureCompatibility.version.store(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
-    runIdempotencyTestCase();
+TEST_F(IdempotencyTest, UpdateTwoFields) {
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
+    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, y: [0]}"))));
+
+    auto updateOp1 = update(1, fromjson("{$set: {x: 1}}"));
+    auto updateOp2 = update(1, fromjson("{$set: {x: 2, 'y.0': 2}}"));
+    auto updateOp3 = update(1, fromjson("{$set: {y: 3}}"));
+
+    auto ops = {updateOp1, updateOp2, updateOp3};
+    testOpsAreIdempotent(ops);
 }
 
 }  // namespace

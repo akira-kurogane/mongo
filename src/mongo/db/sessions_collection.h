@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,13 +29,12 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/logical_session_id.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
-class BSONArrayBuilder;
-class BSONObjBuilder;
 class DBClientBase;
 class OperationContext;
 
@@ -45,68 +45,89 @@ class OperationContext;
  * implement their own classes that fulfill this interface.
  */
 class SessionsCollection {
-
 public:
+    static constexpr StringData kSessionsTTLIndex = "lsidTTLIndex"_sd;
+
     virtual ~SessionsCollection();
 
-    static constexpr StringData kSessionsDb = "admin"_sd;
-    static constexpr StringData kSessionsCollection = "system.sessions"_sd;
-    static constexpr StringData kSessionsFullNS = "admin.system.sessions"_sd;
+    /**
+     * Ensures that the sessions collection exists and has the proper indexes. Implementations of
+     * this method must support multiple concurrent invocations.
+     */
+    virtual void setupSessionsCollection(OperationContext* opCtx) = 0;
 
     /**
-     * Updates the last-use times on the given sessions to be greater than
-     * or equal to the given time. Returns an error if a networking issue occurred.
+     * Checks if the sessions collection exists and has the proper indexes.
      */
-    virtual Status refreshSessions(OperationContext* opCtx,
-                                   const LogicalSessionRecordSet& sessions,
-                                   Date_t refreshTime) = 0;
+    virtual void checkSessionsCollectionExists(OperationContext* opCtx) = 0;
+
+    /**
+     * Updates the last-use times on the given sessions to be greater than or equal to the given
+     * time. Throws an exception if a networking issue occurred.
+     */
+    virtual void refreshSessions(OperationContext* opCtx,
+                                 const LogicalSessionRecordSet& sessions) = 0;
 
     /**
      * Removes the authoritative records for the specified sessions.
      *
-     * Implementations should perform authentication checks to ensure that
-     * session records may only be removed if their owner is logged in.
+     * Implementations should perform authentication checks to ensure that session records may only
+     * be removed if their owner is logged in.
      *
-     * Returns an error if the removal fails, for example from a network error.
+     * Throws an exception if the removal fails, for example from a network error.
      */
-    virtual Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
+    virtual void removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
 
     /**
-     * Checks a set of lsids and returns the set that no longer exists
+     * Checks a set of lsids and returns the set that no longer exists.
      *
-     * Returns an error if the fetch cannot occur, for example from a network error.
+     * Throws an exception if the fetch cannot occur, for example from a network error.
      */
-    virtual StatusWith<LogicalSessionIdSet> findRemovedSessions(
-        OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
+    virtual LogicalSessionIdSet findRemovedSessions(OperationContext* opCtx,
+                                                    const LogicalSessionIdSet& sessions) = 0;
+
+    /**
+     * Generates a createIndexes command for the sessions collection TTL index.
+     */
+    static BSONObj generateCreateIndexesCmd();
+
+    /*
+     * Generates a collMod command for the sessions collection TTL index.
+     */
+    static BSONObj generateCollModCmd();
 
 protected:
-    /**
-     * Makes a send function for the given client.
-     */
-    using SendBatchFn = stdx::function<Status(BSONObj batch)>;
-    SendBatchFn makeSendFnForCommand(DBClientBase* client);
-    SendBatchFn makeSendFnForBatchWrite(DBClientBase* client);
-    using FindBatchFn = stdx::function<StatusWith<BSONObj>(BSONObj batch)>;
-    FindBatchFn makeFindFnForCommand(DBClientBase* client);
+    SessionsCollection();
+
+    using SendBatchFn = std::function<void(BSONObj batch)>;
+    static SendBatchFn makeSendFnForCommand(const NamespaceString& ns, DBClientBase* client);
+    static SendBatchFn makeSendFnForBatchWrite(const NamespaceString& ns, DBClientBase* client);
+
+    using FindBatchFn = std::function<BSONObj(BSONObj batch)>;
+    static FindBatchFn makeFindFnForCommand(const NamespaceString& ns, DBClientBase* client);
 
     /**
      * Formats and sends batches of refreshes for the given set of sessions.
      */
-    Status doRefresh(const LogicalSessionRecordSet& sessions, Date_t refreshTime, SendBatchFn send);
-    Status doRefreshExternal(const LogicalSessionRecordSet& sessions,
-                             Date_t refreshTime,
-                             SendBatchFn send);
+    void _doRefresh(const NamespaceString& ns,
+                    const std::vector<LogicalSessionRecord>& sessions,
+                    SendBatchFn send);
 
     /**
      * Formats and sends batches of deletes for the given set of sessions.
      */
-    Status doRemove(const LogicalSessionIdSet& sessions, SendBatchFn send);
-    Status doRemoveExternal(const LogicalSessionIdSet& sessions, SendBatchFn send);
+    void _doRemove(const NamespaceString& ns,
+                   const std::vector<LogicalSessionId>& sessions,
+                   SendBatchFn send);
 
     /**
-     * Formats and sends batches of fetches for the given set of sessions.
+     * Returns those lsids from the input 'sessions' array which are not present in the sessions
+     * collection (essentially performs an inner join of 'sessions' against the sessions
+     * collection).
      */
-    StatusWith<LogicalSessionIdSet> doFetch(const LogicalSessionIdSet& sessions, FindBatchFn send);
+    LogicalSessionIdSet _doFindRemoved(const NamespaceString& ns,
+                                       const std::vector<LogicalSessionId>& sessions,
+                                       FindBatchFn send);
 };
 
 }  // namespace mongo

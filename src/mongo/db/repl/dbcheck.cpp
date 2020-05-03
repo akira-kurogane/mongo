@@ -1,49 +1,49 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/dbcheck.h"
-#include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/dbcheck_gen.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/durable_catalog.h"
 
 namespace mongo {
 
@@ -121,8 +121,8 @@ std::unique_ptr<HealthLogEntry> dbCheckHealthLogEntry(const NamespaceString& nss
                                                       const std::string& msg,
                                                       OplogEntriesEnum operation,
                                                       const BSONObj& data) {
-    auto entry = stdx::make_unique<HealthLogEntry>();
-    entry->setNamespace(nss);
+    auto entry = std::make_unique<HealthLogEntry>();
+    entry->setNss(nss);
     entry->setTimestamp(Date_t::now());
     entry->setSeverity(severity);
     entry->setScope(ScopeEnum::Cluster);
@@ -131,7 +131,7 @@ std::unique_ptr<HealthLogEntry> dbCheckHealthLogEntry(const NamespaceString& nss
     entry->setData(data);
     return entry;
 }
-}
+}  // namespace
 
 /**
  * Get an error message if the check fails.
@@ -160,14 +160,9 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(const NamespaceString& nss,
                                                   const repl::OpTime& optime) {
     auto hashes = expectedFound(expectedHash, foundHash);
 
-    auto data =
-        BSON("success" << true << "count" << count << "bytes" << bytes << "md5" << hashes.second
-                       << "minKey"
-                       << minKey.elem()
-                       << "maxKey"
-                       << maxKey.elem()
-                       << "optime"
-                       << optime);
+    auto data = BSON("success" << true << "count" << count << "bytes" << bytes << "md5"
+                               << hashes.second << "minKey" << minKey.elem() << "maxKey"
+                               << maxKey.elem() << "optime" << optime);
 
     auto severity = hashes.first ? SeverityEnum::Info : SeverityEnum::Error;
     std::string msg =
@@ -188,7 +183,7 @@ DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
     md5_init(&_state);
 
     // Get the _id index.
-    IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(opCtx);
+    const IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(opCtx);
 
     uassert(ErrorCodes::IndexNotFound, "dbCheck needs _id index", desc);
 
@@ -237,6 +232,33 @@ std::string hashCollectionInfo(const DbCheckCollectionInformation& info) {
     return digestToString(digest);
 }
 
+std::pair<boost::optional<UUID>, boost::optional<UUID>> getPrevAndNextUUIDs(
+    OperationContext* opCtx, Collection* collection) {
+    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
+    const UUID uuid = collection->uuid();
+
+    std::vector<CollectionUUID> collectionUUIDs =
+        catalog.getAllCollectionUUIDsFromDb(collection->ns().db());
+    auto uuidIt = std::find(collectionUUIDs.begin(), collectionUUIDs.end(), uuid);
+    invariant(uuidIt != collectionUUIDs.end());
+
+    auto prevIt = std::prev(uuidIt);
+    auto nextIt = std::next(uuidIt);
+
+    boost::optional<UUID> prevUUID;
+    boost::optional<UUID> nextUUID;
+
+    if (prevIt != collectionUUIDs.end()) {
+        prevUUID = *prevIt;
+    }
+
+    if (nextIt != collectionUUIDs.end()) {
+        nextUUID = *nextIt;
+    }
+
+    return std::make_pair(prevUUID, nextUUID);
+}
+
 std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& nss,
                                                        const UUID& uuid,
                                                        const DbCheckCollectionInformation& expected,
@@ -256,19 +278,9 @@ std::unique_ptr<HealthLogEntry> dbCheckCollectionEntry(const NamespaceString& ns
     std::string msg =
         "dbCheck collection " + (match ? std::string("consistent") : std::string("inconsistent"));
     auto data = BSON("success" << true << "uuid" << uuid.toString() << "found" << true << "name"
-                               << names.second
-                               << "prev"
-                               << prevs.second
-                               << "next"
-                               << nexts.second
-                               << "indexes"
-                               << indices.second
-                               << "options"
-                               << options.second
-                               << "md5"
-                               << md5s.second
-                               << "optime"
-                               << optime);
+                               << names.second << "prev" << prevs.second << "next" << nexts.second
+                               << "indexes" << indices.second << "options" << options.second
+                               << "md5" << md5s.second << "optime" << optime);
 
     return dbCheckHealthLogEntry(nss, severity, msg, OplogEntriesEnum::Collection, data);
 }
@@ -346,25 +358,25 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
     std::vector<std::string> names;
 
     // List the indices,
-    const auto* cce = collection->getCatalogEntry();
-    invariant(cce);
-
-    cce->getAllIndexes(opCtx, &names);
+    auto durableCatalog = DurableCatalog::get(opCtx);
+    durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &names);
 
     // and get the info for each one.
     for (const auto& name : names) {
-        result.push_back(cce->getIndexSpec(opCtx, name));
+        result.push_back(durableCatalog->getIndexSpec(opCtx, collection->getCatalogId(), name));
     }
 
-    auto comp = stdx::make_unique<SimpleBSONObjComparator>();
+    auto comp = std::make_unique<SimpleBSONObjComparator>();
 
-    std::sort(result.begin(), result.end(), SimpleBSONObjComparator::LessThan(comp.get()));
+    std::sort(result.begin(), result.end(), SimpleBSONObjComparator::LessThan());
 
     return result;
 }
 
 BSONObj collectionOptions(OperationContext* opCtx, Collection* collection) {
-    return collection->getCatalogEntry()->getCollectionOptions(opCtx).toBSON();
+    return DurableCatalog::get(opCtx)
+        ->getCollectionOptions(opCtx, collection->getCatalogId())
+        .toBSON();
 }
 
 AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const NamespaceString& nss)
@@ -373,10 +385,12 @@ AutoGetDbForDbCheck::AutoGetDbForDbCheck(OperationContext* opCtx, const Namespac
 AutoGetCollectionForDbCheck::AutoGetCollectionForDbCheck(OperationContext* opCtx,
                                                          const NamespaceString& nss,
                                                          const OplogEntriesEnum& type)
-    : _agd(opCtx, nss), _collLock(opCtx->lockState(), nss.ns(), MODE_S) {
+    : _agd(opCtx, nss), _collLock(opCtx, nss, MODE_S) {
     std::string msg;
 
-    _collection = _agd.getDb() ? _agd.getDb()->getCollection(opCtx, nss) : nullptr;
+    _collection = _agd.getDb()
+        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)
+        : nullptr;
 
     // If the collection gets deleted after the check is launched, record that in the health log.
     if (!_collection) {
@@ -451,7 +465,7 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
                                   const DbCheckOplogCollection& entry) {
     // dbCheckCollectionResult-specific stuff.
     auto uuid = uassertStatusOK(UUID::parse(entry.getUuid().toString()));
-    auto collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
 
     if (!collection) {
         Status status(ErrorCodes::NamespaceNotFound, "Could not find collection for dbCheck");
@@ -470,13 +484,15 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
     expected.collectionName = entry.getNss().coll().toString();
     found.collectionName = collection->ns().coll().toString();
 
+    auto prevAndNext = getPrevAndNextUUIDs(opCtx, collection);
+
     // found/expected previous UUID,
     expected.prev = entry.getPrev();
-    found.prev = UUIDCatalog::get(opCtx).prev(db, uuid);
+    found.prev = prevAndNext.first;
 
     // found/expected next UUID,
     expected.next = entry.getNext();
-    found.next = UUIDCatalog::get(opCtx).next(db, uuid);
+    found.next = prevAndNext.second;
 
     // found/expected indices,
     expected.indexes = entry.getIndexes();
@@ -492,29 +508,32 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
 
     return Status::OK();
 }
-}
+}  // namespace
 
 namespace repl {
 
 /*
- * The corresponding command run on the secondary.
+ * The corresponding command run during command application.
  */
 Status dbCheckOplogCommand(OperationContext* opCtx,
-                           const char* ns,
-                           const BSONElement& ui,
-                           BSONObj& cmd,
-                           const repl::OpTime& optime) {
+                           const repl::OplogEntry& entry,
+                           OplogApplication::Mode mode) {
+    const auto& cmd = entry.getObject();
+    OpTime opTime;
+    if (!opCtx->writesAreReplicated()) {
+        opTime = entry.getOpTime();
+    }
     auto type = OplogEntries_parse(IDLParserErrorContext("type"), cmd.getStringField("type"));
     IDLParserErrorContext ctx("o");
 
     switch (type) {
         case OplogEntriesEnum::Batch: {
             auto invocation = DbCheckOplogBatch::parse(ctx, cmd);
-            return dbCheckBatchOnSecondary(opCtx, optime, invocation);
+            return dbCheckBatchOnSecondary(opCtx, opTime, invocation);
         }
         case OplogEntriesEnum::Collection: {
             auto invocation = DbCheckOplogCollection::parse(ctx, cmd);
-            return dbCheckDatabaseOnSecondary(opCtx, optime, invocation);
+            return dbCheckDatabaseOnSecondary(opCtx, opTime, invocation);
         }
     }
 

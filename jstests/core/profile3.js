@@ -1,4 +1,8 @@
-
+// @tags: [
+//   assumes_superuser_permissions,
+//   creates_and_authenticates_user,
+//   requires_profiling,
+// ]
 // special db so that it can be run in parallel tests
 var stddb = db;
 var db = db.getSisterDB("profile3");
@@ -41,10 +45,6 @@ try {
     assert.eq(profileCursor({nMatched: {$exists: 1}}).count(), 3);
     assert.eq(profileCursor({nMatched: 1}).count(), 2);
     assert.eq(profileCursor({nMatched: 0}).count(), 1);
-    if (db.serverStatus().storageEngine.name == "mmapv1") {
-        assert.eq(profileCursor({nmoved: 1}).count(), 1);
-    }
-
     db.system.profile.drop();
 
 } finally {

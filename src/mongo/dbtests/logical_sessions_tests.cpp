@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,22 +31,19 @@
 
 #include <memory>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/index_spec.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/db/sessions_collection_standalone.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/time_support.h"
 
-namespace LogicalSessionTests {
-
+namespace mongo {
 namespace {
-constexpr StringData kTestNS = "admin.system.sessions"_sd;
+
+constexpr StringData kTestNS = "config.system.sessions"_sd;
 
 LogicalSessionRecord makeRecord(Date_t time = Date_t::now()) {
     auto record = makeLogicalSessionRecordForTest();
@@ -72,7 +70,7 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
                                              const LogicalSessionId& lsid) {
     DBDirectClient client(opCtx);
-    auto cursor = client.query(kTestNS.toString(), lsidQuery(lsid), 1);
+    auto cursor = client.query(NamespaceString(kTestNS), lsidQuery(lsid), 1);
     if (!cursor->more()) {
         return {ErrorCodes::NoSuchSession, "No matching record in the sessions collection"};
     }
@@ -85,12 +83,10 @@ StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
     }
 }
 
-}  // namespace
-
 class SessionsCollectionStandaloneTest {
 public:
     SessionsCollectionStandaloneTest()
-        : _collection(stdx::make_unique<SessionsCollectionStandalone>()) {
+        : _collection(std::make_unique<SessionsCollectionStandalone>()) {
         _opCtx = cc().makeOperationContext();
         DBDirectClient db(opCtx());
         db.remove(ns(), BSONObj());
@@ -102,16 +98,16 @@ public:
         _opCtx.reset();
     }
 
-    SessionsCollectionStandalone* collection() {
+    SessionsCollectionStandalone* collection() const {
         return _collection.get();
     }
 
-    OperationContext* opCtx() {
+    OperationContext* opCtx() const {
         return _opCtx.get();
     }
 
-    std::string ns() {
-        return SessionsCollection::kSessionsFullNS.toString();
+    const std::string& ns() const {
+        return NamespaceString::kLogicalSessionsNamespace.ns();
     }
 
 private:
@@ -132,8 +128,7 @@ public:
         ASSERT_OK(res);
 
         // Remove one record, the other stays
-        res = collection()->removeRecords(opCtx(), {record1.getId()});
-        ASSERT_OK(res);
+        collection()->removeRecords(opCtx(), {record1.getId()});
 
         auto swRecord = fetchRecord(opCtx(), record1.getId());
         ASSERT(!swRecord.isOK());
@@ -153,28 +148,25 @@ public:
         auto thePast = now - Minutes(5);
 
         // Attempt to refresh with no active records, should succeed (and do nothing).
-        auto resRefresh = collection()->refreshSessions(opCtx(), LogicalSessionRecordSet{}, now);
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), LogicalSessionRecordSet{});
 
         // Attempt to refresh one active record, should succeed.
         auto record1 = makeRecord(thePast);
         auto res = insertRecord(opCtx(), record1);
         ASSERT_OK(res);
-        resRefresh = collection()->refreshSessions(opCtx(), {record1}, now);
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), {record1});
 
         // The timestamp on the refreshed record should be updated.
         auto swRecord = fetchRecord(opCtx(), record1.getId());
         ASSERT(swRecord.isOK());
-        ASSERT_EQ(swRecord.getValue().getLastUse(), now);
+        ASSERT_GTE(swRecord.getValue().getLastUse(), now);
 
         // Clear the collection.
         db.remove(ns(), BSONObj());
 
         // Attempt to refresh a record that is not present, should upsert it.
         auto record2 = makeRecord(thePast);
-        resRefresh = collection()->refreshSessions(opCtx(), {record2}, now);
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), {record2});
 
         swRecord = fetchRecord(opCtx(), record2.getId());
         ASSERT(swRecord.isOK());
@@ -185,23 +177,25 @@ public:
         // Attempt a refresh of many records, split into batches.
         LogicalSessionRecordSet toRefresh;
         int recordCount = 5000;
+        unsigned int notRefreshed = 0;
         for (int i = 0; i < recordCount; i++) {
-            auto record = makeRecord(thePast);
+            auto record = makeRecord(now);
             res = insertRecord(opCtx(), record);
 
             // Refresh some of these records.
             if (i % 4 == 0) {
                 toRefresh.insert(record);
+            } else {
+                notRefreshed++;
             }
         }
 
         // Run the refresh, should succeed.
-        resRefresh = collection()->refreshSessions(opCtx(), toRefresh, now);
-        ASSERT(resRefresh.isOK());
+        collection()->refreshSessions(opCtx(), toRefresh);
 
         // Ensure that the right number of timestamps were updated.
-        auto n = db.count(ns(), BSON("lastUse" << now));
-        ASSERT_EQ(n, toRefresh.size());
+        auto n = db.count(NamespaceString(ns()), BSON("lastUse" << now));
+        ASSERT_EQ(n, notRefreshed);
     }
 };
 
@@ -220,9 +214,8 @@ public:
             LogicalSessionIdSet lsids{notInsertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 1u);
-            ASSERT(*(response.getValue().begin()) == notInsertedRecord.getId());
+            ASSERT_EQ(response.size(), 1u);
+            ASSERT(*(response.begin()) == notInsertedRecord.getId());
         }
 
         // if a record is there, it hasn't been removed
@@ -230,8 +223,7 @@ public:
             LogicalSessionIdSet lsids{insertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 0u);
+            ASSERT_EQ(response.size(), 0u);
         }
 
         // We can tell the difference with multiple records
@@ -239,9 +231,8 @@ public:
             LogicalSessionIdSet lsids{insertedRecord.getId(), notInsertedRecord.getId()};
 
             auto response = collection()->findRemovedSessions(opCtx(), lsids);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 1u);
-            ASSERT(*(response.getValue().begin()) == notInsertedRecord.getId());
+            ASSERT_EQ(response.size(), 1u);
+            ASSERT(*(response.begin()) == notInsertedRecord.getId());
         }
 
         // Batch logic works
@@ -263,15 +254,15 @@ public:
             }
 
             auto response = collection()->findRemovedSessions(opCtx(), mixedRecords);
-            ASSERT_EQ(response.isOK(), true);
-            ASSERT_EQ(response.getValue().size(), 5000u);
-            ASSERT(response.getValue() == uninsertedRecords);
+            ASSERT_EQ(response.size(), 5000u);
+            ASSERT(response == uninsertedRecords);
         }
     }
 };
-class All : public Suite {
+
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("logical_sessions") {}
+    All() : OldStyleSuiteSpecification("logical_sessions") {}
 
     void setupTests() {
         add<SessionsCollectionStandaloneRemoveTest>();
@@ -280,6 +271,7 @@ public:
     }
 };
 
-SuiteInstance<All> all;
+OldStyleSuiteInitializer<All> all;
 
-}  // namespace LogicalSessionTests
+}  // namespace
+}  // namespace mongo

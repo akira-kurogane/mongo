@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,11 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <tuple>
 
 #include "mongo/base/status_with.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/util/net/op_msg.h"
+#include "mongo/rpc/op_msg.h"
 
 namespace mongo {
 class BSONObj;
@@ -41,8 +42,7 @@ class OperationContext;
 class StringData;
 
 /**
- * Utilities for converting metadata between the legacy OP_QUERY format and the new
- * OP_COMMAND format.
+ * Utilities for dealing with what used to be called metadata.
  */
 namespace rpc {
 
@@ -54,7 +54,7 @@ BSONObj makeEmptyMetadata();
 /**
  * Reads metadata from a metadata object and sets it on this OperationContext.
  */
-void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj);
+void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bool requiresAuth);
 
 /**
  * A legacy command object and a corresponding query flags bitfield. The legacy command object
@@ -74,7 +74,7 @@ OpMsgRequest upconvertRequest(StringData db, BSONObj legacyCmdObj, int queryFlag
  * metadata was written successfully.
  */
 using RequestMetadataWriter =
-    stdx::function<Status(OperationContext* opCtx, BSONObjBuilder* metadataBuilder)>;
+    std::function<Status(OperationContext* opCtx, BSONObjBuilder* metadataBuilder)>;
 
 /**
  * A function type for reading reply metadata. The function takes a a reference to a
@@ -84,7 +84,7 @@ using RequestMetadataWriter =
  *
  * TODO: would it be a layering violation if this hook took an OperationContext* ?
  */
-using ReplyMetadataReader = stdx::function<Status(
+using ReplyMetadataReader = std::function<Status(
     OperationContext* opCtx, const BSONObj& replyMetadata, StringData sourceHost)>;
 
 }  // namespace rpc

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,10 +34,10 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/util/container_size_helper.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -51,21 +52,28 @@ struct SpecificStats {
      * Make a deep copy.
      */
     virtual SpecificStats* clone() const = 0;
+
+    virtual uint64_t estimateObjectSizeInBytes() const = 0;
 };
 
 // Every stage has CommonStats.
 struct CommonStats {
+    CommonStats() = delete;
+
     CommonStats(const char* type)
         : stageTypeStr(type),
           works(0),
           yields(0),
           unyields(0),
-          invalidates(0),
           advanced(0),
           needTime(0),
           needYield(0),
-          executionTimeMillis(0),
+          failed(false),
           isEOF(false) {}
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return filter.objsize() + sizeof(*this);
+    }
     // String giving the type of the stage. Not owned.
     const char* stageTypeStr;
 
@@ -73,7 +81,6 @@ struct CommonStats {
     size_t works;
     size_t yields;
     size_t unyields;
-    size_t invalidates;
 
     // How many times was this state the return value of work(...)?
     size_t advanced;
@@ -84,8 +91,13 @@ struct CommonStats {
     // is no filter affixed, then 'filter' should be an empty BSONObj.
     BSONObj filter;
 
-    // Time elapsed while working inside this stage.
-    long long executionTimeMillis;
+    // Time elapsed while working inside this stage. When this field is set to boost::none,
+    // timing info will not be collected during query execution.
+    //
+    // The field must be populated when running explain or when running with the profiler on. It
+    // must also be populated when multi planning, in order to gather stats stored in the plan
+    // cache.
+    boost::optional<long long> executionTimeMillis;
 
     // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
     // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
@@ -95,11 +107,8 @@ struct CommonStats {
 
     // TODO: keep track of the total yield time / fetch time done for a plan.
 
+    bool failed;
     bool isEOF;
-
-private:
-    // Default constructor is illegal.
-    CommonStats();
 };
 
 // The universal container for a stage's stats.
@@ -121,6 +130,20 @@ struct PlanStageStats {
         return stats;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in 'children' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                children,
+                [](const auto& child) { return child->estimateObjectSizeInBytes(); },
+                true) +
+            // Exclude the size of 'common' object since is being added later.
+            (common.estimateObjectSizeInBytes() - sizeof(common)) +
+            // Add 'specific' object size if exists.
+            (specific ? specific->estimateObjectSizeInBytes() : 0) +
+            // Add size of the object.
+            sizeof(*this);
+    }
+
     // See query/stage_type.h
     StageType stageType;
 
@@ -134,23 +157,21 @@ struct PlanStageStats {
     std::vector<std::unique_ptr<PlanStageStats>> children;
 
 private:
-    MONGO_DISALLOW_COPYING(PlanStageStats);
+    PlanStageStats(const PlanStageStats&) = delete;
+    PlanStageStats& operator=(const PlanStageStats&) = delete;
 };
 
 struct AndHashStats : public SpecificStats {
-    AndHashStats() : flaggedButPassed(0), flaggedInProgress(0), memUsage(0), memLimit(0) {}
+    AndHashStats() = default;
 
     SpecificStats* clone() const final {
         AndHashStats* specific = new AndHashStats(*this);
         return specific;
     }
 
-    // Invalidation counters.
-    // How many results had the AND fully evaluated but were invalidated?
-    size_t flaggedButPassed;
-
-    // How many results were mid-AND but got flagged?
-    size_t flaggedInProgress;
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(mapAfterChild) + sizeof(*this);
+    }
 
     // How many entries are in the map after each child?
     // child 'i' produced children[i].common.advanced RecordIds, of which mapAfterChild[i] were
@@ -161,35 +182,40 @@ struct AndHashStats : public SpecificStats {
     // commonstats.advanced is how many passed.
 
     // What's our current memory usage?
-    size_t memUsage;
+    size_t memUsage = 0u;
 
     // What's our memory limit?
-    size_t memLimit;
+    size_t memLimit = 0u;
 };
 
 struct AndSortedStats : public SpecificStats {
-    AndSortedStats() : flagged(0) {}
+    AndSortedStats() = default;
 
     SpecificStats* clone() const final {
         AndSortedStats* specific = new AndSortedStats(*this);
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(failedAnd) + sizeof(*this);
+    }
+
     // How many results from each child did not pass the AND?
     std::vector<size_t> failedAnd;
-
-    // How many results were flagged via invalidation?
-    size_t flagged;
 };
 
 struct CachedPlanStats : public SpecificStats {
-    CachedPlanStats() : replanned(false) {}
+    CachedPlanStats() = default;
 
     SpecificStats* clone() const final {
         return new CachedPlanStats(*this);
     }
 
-    bool replanned;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+    std::optional<std::string> replanReason;
 };
 
 struct CollectionScanStats : public SpecificStats {
@@ -200,20 +226,39 @@ struct CollectionScanStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+
     // How many documents did we check against our filter?
     size_t docsTested;
 
     // >0 if we're traversing the collection forwards. <0 if we're traversing it
     // backwards.
     int direction;
+
+    bool tailable{false};
+
+    // The start location of the scan. Must only be set on forward oplog scans.
+    boost::optional<Timestamp> minTs;
+
+    // Indicates that the collection scan will stop and return EOF the first time it sees a
+    // document that does not pass the filter and has a "ts" Timestamp field greater than 'maxTs'.
+    // Must only be set on forward oplog scans.
+    boost::optional<Timestamp> maxTs;
 };
 
 struct CountStats : public SpecificStats {
-    CountStats() : nCounted(0), nSkipped(0), recordStoreCount(false) {}
+    CountStats() : nCounted(0), nSkipped(0) {}
 
     SpecificStats* clone() const final {
         CountStats* specific = new CountStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     // The result of the count.
@@ -221,9 +266,6 @@ struct CountStats : public SpecificStats {
 
     // The number of results we skipped over.
     long long nSkipped;
-
-    // True if we computed the count via Collection::numRecords().
-    bool recordStoreCount;
 };
 
 struct CountScanStats : public SpecificStats {
@@ -243,6 +285,18 @@ struct CountScanStats : public SpecificStats {
         specific->startKey = startKey.getOwned();
         specific->endKey = endKey.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + startKey.objsize() + endKey.objsize() +
+            indexName.capacity() + sizeof(*this);
     }
 
     std::string indexName;
@@ -276,17 +330,17 @@ struct CountScanStats : public SpecificStats {
 };
 
 struct DeleteStats : public SpecificStats {
-    DeleteStats() : docsDeleted(0), nInvalidateSkips(0) {}
+    DeleteStats() = default;
 
     SpecificStats* clone() const final {
         return new DeleteStats(*this);
     }
 
-    size_t docsDeleted;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 
-    // Invalidated documents can be force-fetched, causing the now invalid RecordId to
-    // be thrown out. The delete stage skips over any results which do not have a RecordId.
-    size_t nInvalidateSkips;
+    size_t docsDeleted = 0u;
 };
 
 struct DistinctScanStats : public SpecificStats {
@@ -297,6 +351,18 @@ struct DistinctScanStats : public SpecificStats {
         specific->collation = collation.getOwned();
         specific->indexBounds = indexBounds.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + sizeof(*this);
     }
 
     // How many keys did we look at while distinct-ing?
@@ -335,38 +401,31 @@ struct EnsureSortedStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     // The number of out-of-order results that were dropped.
     long long nDropped;
 };
 
 struct FetchStats : public SpecificStats {
-    FetchStats() : alreadyHasObj(0), forcedFetches(0), docsExamined(0) {}
+    FetchStats() = default;
 
     SpecificStats* clone() const final {
         FetchStats* specific = new FetchStats(*this);
         return specific;
     }
 
-    // Have we seen anything that already had an object?
-    size_t alreadyHasObj;
-
-    // How many records were we forced to fetch as the result of an invalidation?
-    size_t forcedFetches;
-
-    // The total number of full documents touched by the fetch stage.
-    size_t docsExamined;
-};
-
-struct GroupStats : public SpecificStats {
-    GroupStats() : nGroups(0) {}
-
-    SpecificStats* clone() const final {
-        GroupStats* specific = new GroupStats(*this);
-        return specific;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
-    // The total number of groups.
-    size_t nGroups;
+    // Have we seen anything that already had an object?
+    size_t alreadyHasObj = 0u;
+
+    // The total number of full documents touched by the fetch stage.
+    size_t docsExamined = 0u;
 };
 
 struct IDHackStats : public SpecificStats {
@@ -377,6 +436,10 @@ struct IDHackStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return indexName.capacity() + sizeof(*this);
+    }
+
     std::string indexName;
 
     // Number of entries retrieved from the index while executing the idhack.
@@ -384,6 +447,16 @@ struct IDHackStats : public SpecificStats {
 
     // Number of documents retrieved from the collection while executing the idhack.
     size_t docsExamined;
+};
+
+struct ReturnKeyStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new ReturnKeyStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 };
 
 struct IndexScanStats : public SpecificStats {
@@ -396,7 +469,6 @@ struct IndexScanStats : public SpecificStats {
           isUnique(false),
           dupsTested(0),
           dupsDropped(0),
-          seenInvalidated(0),
           keysExamined(0),
           seeks(0) {}
 
@@ -407,6 +479,18 @@ struct IndexScanStats : public SpecificStats {
         specific->collation = collation.getOwned();
         specific->indexBounds = indexBounds.getOwned();
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + indexType.capacity() + sizeof(*this);
     }
 
     // Index type being used.
@@ -443,9 +527,6 @@ struct IndexScanStats : public SpecificStats {
     size_t dupsTested;
     size_t dupsDropped;
 
-    size_t seenInvalidated;
-    // TODO: we could track key sizes here.
-
     // Number of entries retrieved from the index during the scan.
     size_t keysExamined;
 
@@ -461,6 +542,10 @@ struct LimitStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t limit;
 };
 
@@ -470,6 +555,10 @@ struct MockStats : public SpecificStats {
     SpecificStats* clone() const final {
         return new MockStats(*this);
     }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 };
 
 struct MultiPlanStats : public SpecificStats {
@@ -478,21 +567,26 @@ struct MultiPlanStats : public SpecificStats {
     SpecificStats* clone() const final {
         return new MultiPlanStats(*this);
     }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 };
 
 struct OrStats : public SpecificStats {
-    OrStats() : dupsTested(0), dupsDropped(0), recordIdsForgotten(0) {}
+    OrStats() = default;
 
     SpecificStats* clone() const final {
         OrStats* specific = new OrStats(*this);
         return specific;
     }
 
-    size_t dupsTested;
-    size_t dupsDropped;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
 
-    // How many calls to invalidate(...) actually removed a RecordId from our deduping map?
-    size_t recordIdsForgotten;
+    size_t dupsTested = 0u;
+    size_t dupsDropped = 0u;
 };
 
 struct ProjectionStats : public SpecificStats {
@@ -503,47 +597,60 @@ struct ProjectionStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return projObj.objsize() + sizeof(*this);
+    }
+
     // Object specifying the projection transformation to apply.
     BSONObj projObj;
 };
 
 struct SortStats : public SpecificStats {
-    SortStats() : forcedFetches(0), memUsage(0), memLimit(0) {}
+    SortStats() = default;
 
     SpecificStats* clone() const final {
         SortStats* specific = new SortStats(*this);
         return specific;
     }
 
-    // How many records were we forced to fetch as the result of an invalidation?
-    size_t forcedFetches;
-
-    // What's our current memory usage?
-    size_t memUsage;
-
-    // What's our memory limit?
-    size_t memLimit;
-
-    // The number of results to return from the sort.
-    size_t limit;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sortPattern.objsize() + sizeof(*this);
+    }
 
     // The pattern according to which we are sorting.
     BSONObj sortPattern;
+
+    // The number of results to return from the sort.
+    uint64_t limit = 0u;
+
+    // The maximum number of bytes of memory we're willing to use during execution of the sort. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The amount of data we've sorted in bytes. At various times this data may be buffered in
+    // memory or disk-resident, depending on the configuration of 'maxMemoryUsageBytes' and whether
+    // disk use is allowed.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // Whether we spilled data to disk during the execution of this query.
+    bool wasDiskUsed = false;
 };
 
 struct MergeSortStats : public SpecificStats {
-    MergeSortStats() : dupsTested(0), dupsDropped(0), forcedFetches(0) {}
+    MergeSortStats() = default;
 
     SpecificStats* clone() const final {
         MergeSortStats* specific = new MergeSortStats(*this);
         return specific;
     }
 
-    size_t dupsTested;
-    size_t dupsDropped;
+    uint64_t estimateObjectSizeInBytes() const {
+        return sortPattern.objsize() + sizeof(*this);
+    }
 
-    // How many records were we forced to fetch as the result of an invalidation?
-    size_t forcedFetches;
+    size_t dupsTested = 0u;
+    size_t dupsDropped = 0u;
 
     // The pattern according to which we are sorting.
     BSONObj sortPattern;
@@ -557,6 +664,10 @@ struct ShardingFilterStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t chunkSkips;
 };
 
@@ -566,6 +677,10 @@ struct SkipStats : public SpecificStats {
     SpecificStats* clone() const final {
         SkipStats* specific = new SkipStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
     }
 
     size_t skip;
@@ -592,6 +707,11 @@ struct NearStats : public SpecificStats {
         return new NearStats(*this);
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return container_size_helper::estimateObjectSizeInBytes(intervalStats) +
+            keyPattern.objsize() + indexName.capacity() + sizeof(*this);
+    }
+
     std::vector<IntervalStats> intervalStats;
     std::string indexName;
     // btree index version, not geo index version
@@ -600,16 +720,14 @@ struct NearStats : public SpecificStats {
 };
 
 struct UpdateStats : public SpecificStats {
-    UpdateStats()
-        : nMatched(0),
-          nModified(0),
-          isDocReplacement(false),
-          fastmodinsert(false),
-          inserted(false),
-          nInvalidateSkips(0) {}
+    UpdateStats() : nMatched(0), nModified(0), isModUpdate(false), inserted(false) {}
 
     SpecificStats* clone() const final {
         return new UpdateStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return objInserted.objsize() + sizeof(*this);
     }
 
     // The number of documents which match the query part of the update.
@@ -618,24 +736,14 @@ struct UpdateStats : public SpecificStats {
     // The number of documents modified by this update.
     size_t nModified;
 
-    // True iff this is a doc-replacement style update, as opposed to a $mod update.
-    bool isDocReplacement;
-
-    // A 'fastmodinsert' is an insert resulting from an {upsert: true} update
-    // which is a doc-replacement style update. It's "fast" because we don't need
-    // to compute the document to insert based on the modifiers.
-    bool fastmodinsert;
+    // True iff this is a $mod update.
+    bool isModUpdate;
 
     // Is this an {upsert: true} update that did an insert?
     bool inserted;
 
     // The object that was inserted. This is an empty document if no insert was performed.
     BSONObj objInserted;
-
-    // Invalidated documents can be force-fetched, causing the now invalid RecordId to
-    // be thrown out. The update stage skips over any results which do not have the
-    // RecordId to update.
-    size_t nInvalidateSkips;
 };
 
 struct TextStats : public SpecificStats {
@@ -644,6 +752,11 @@ struct TextStats : public SpecificStats {
     SpecificStats* clone() const final {
         TextStats* specific = new TextStats(*this);
         return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return parsedTextQuery.objsize() + indexPrefix.objsize() + indexName.capacity() +
+            sizeof(*this);
     }
 
     std::string indexName;
@@ -665,6 +778,10 @@ struct TextMatchStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t docsRejected;
 };
 
@@ -676,7 +793,31 @@ struct TextOrStats : public SpecificStats {
         return specific;
     }
 
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
     size_t fetches;
+};
+
+struct TrialStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        TrialStats* specific = new TrialStats(*this);
+        return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+    size_t trialPeriodMaxWorks = 0;
+    double successThreshold = 0;
+
+    size_t trialWorks = 0;
+    size_t trialAdvanced = 0;
+
+    bool trialCompleted = false;
+    bool trialSucceeded = false;
 };
 
 }  // namespace mongo

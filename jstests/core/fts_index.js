@@ -1,13 +1,22 @@
-// Cannot implicitly shard accessed collections because of collection existing when none
-// expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
-
-// Test that:
-// 1. Text indexes properly validate the index spec used to create them.
-// 2. Text indexes properly enforce a schema on the language_override field.
-// 3. Collections may have at most one text index.
-// 4. Text indexes properly handle large documents.
-// 5. Bad weights test cases.
+/**
+ * Test that:
+ * 1. Text indexes properly validate the index spec used to create them.
+ * 2. Text indexes properly enforce a schema on the language_override field.
+ * 3. Collections may have at most one text index.
+ * 4. Text indexes properly handle large documents.
+ * 5. Bad weights test cases.
+ *
+ * @tags: [
+ *  # Cannot implicitly shard accessed collections because of collection existing when none
+ *  # expected.
+ *  assumes_no_implicit_collection_creation_after_drop,
+ *  # Has operations which may never complete in stepdown/kill/terminate transaction tests.
+ *  operations_longer_than_stepdown_interval_in_txns,
+ *
+ *  # Uses index building in background
+ *  requires_background_index,
+ * ]
+ */
 
 var coll = db.fts_index;
 var indexName = "textIndex";
@@ -95,7 +104,7 @@ coll.drop();
 // Can insert documents with valid language_override into text-indexed collection.
 assert.commandWorked(coll.ensureIndex({a: "text"}));
 coll.insert({a: ""});
-assert.writeOK(coll.insert({a: "", language: "spanish"}));
+assert.commandWorked(coll.insert({a: "", language: "spanish"}));
 coll.drop();
 
 // Can't insert documents with invalid language_override into text-indexed collection.
@@ -116,7 +125,11 @@ assert.commandWorked(coll.ensureIndex({a: 1, b: "text", c: 1}));
 assert.eq(2, coll.getIndexes().length);
 assert.commandWorked(coll.ensureIndex({a: 1, b: "text", c: 1}, {background: true}));
 assert.eq(2, coll.getIndexes().length);
-assert.commandWorked(coll.ensureIndex({a: 1, _fts: "text", _ftsx: 1, c: 1}, {weights: {b: 1}}));
+assert.commandFailedWithCode(coll.ensureIndex({a: 1, b: 1, c: "text"}),
+                             ErrorCodes.CannotCreateIndex);
+assert.commandFailedWithCode(
+    coll.ensureIndex({a: 1, _fts: "text", _ftsx: 1, c: 1}, {weights: {b: 1}}),
+    ErrorCodes.IndexOptionsConflict);
 assert.eq(2, coll.getIndexes().length);
 assert.commandWorked(coll.ensureIndex({a: 1, b: "text", c: 1}, {default_language: "english"}));
 assert.eq(2, coll.getIndexes().length);

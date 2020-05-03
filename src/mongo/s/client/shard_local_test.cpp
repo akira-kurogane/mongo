@@ -1,46 +1,48 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/client/shard_local.h"
 
+#include <memory>
+
 #include "mongo/client/read_preference.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_and_modify_request.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/s/client/shard_registry.h"
 
 namespace mongo {
 namespace {
@@ -80,21 +82,22 @@ private:
 
 void ShardLocalTest::setUp() {
     ServiceContextMongoDTest::setUp();
-    Client::initThreadIfNotAlready();
     _opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
     serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-    _shardLocal = stdx::make_unique<ShardLocal>(ShardId("config"));
+    _shardLocal = std::make_unique<ShardLocal>(ShardRegistry::kConfigServerShardId);
     const repl::ReplSettings replSettings = {};
-    repl::setGlobalReplicationCoordinator(
-        new repl::ReplicationCoordinatorMock(_opCtx->getServiceContext(), replSettings));
-    ASSERT_OK(
-        repl::getGlobalReplicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    repl::ReplicationCoordinator::set(
+        getGlobalServiceContext(),
+        std::unique_ptr<repl::ReplicationCoordinator>(
+            new repl::ReplicationCoordinatorMock(_opCtx->getServiceContext(), replSettings)));
+    ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
+                  ->setFollowerMode(repl::MemberState::RS_PRIMARY));
 }
 
 void ShardLocalTest::tearDown() {
     _opCtx.reset();
     ServiceContextMongoDTest::tearDown();
-    repl::setGlobalReplicationCoordinator(nullptr);
+    repl::ReplicationCoordinator::set(getGlobalServiceContext(), nullptr);
 }
 
 StatusWith<Shard::CommandResponse> ShardLocalTest::runFindAndModifyRunCommand(NamespaceString nss,
@@ -110,7 +113,7 @@ StatusWith<Shard::CommandResponse> ShardLocalTest::runFindAndModifyRunCommand(Na
         _opCtx.get(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         nss.db().toString(),
-        findAndModifyRequest.toBSON(),
+        findAndModifyRequest.toBSON({}),
         Shard::RetryPolicy::kNoRetry);
 }
 

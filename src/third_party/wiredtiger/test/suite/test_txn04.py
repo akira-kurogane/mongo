@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -81,7 +81,7 @@ class test_txn04(wttest.WiredTigerTestCase, suite_subprocess):
         c = session.open_cursor(self.uri, None)
         actual = dict((k, v) for k, v in c if v != 0)
         # Search for the expected items as well as iterating
-        for k, v in expected.iteritems():
+        for k, v in expected.items():
             self.assertEqual(c[k], v)
         c.close()
         if txn_config:
@@ -183,7 +183,6 @@ class test_txn04(wttest.WiredTigerTestCase, suite_subprocess):
         # Backup the target we modified and verify the data.
         # print 'Call hot_backup with ' + self.uri
         self.hot_backup(self.uri, committed)
-
     def test_ops(self):
         self.backup_dir = os.path.join(self.home, "WT_BACKUP")
         self.session2 = self.conn.open_session()

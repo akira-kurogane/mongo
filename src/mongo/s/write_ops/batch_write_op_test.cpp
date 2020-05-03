@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,7 +30,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/owned_pointer_map.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/s/session_catalog_router.h"
+#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/mock_ns_targeter.h"
@@ -39,33 +42,21 @@
 namespace mongo {
 namespace {
 
-void initTargeterFullRange(const NamespaceString& nss,
-                           const ShardEndpoint& endpoint,
-                           MockNSTargeter* targeter) {
-    std::vector<MockRange*> mockRanges;
-    mockRanges.push_back(new MockRange(endpoint, nss, BSON("x" << MINKEY), BSON("x" << MAXKEY)));
-    targeter->init(mockRanges);
+auto initTargeterFullRange(const NamespaceString& nss, const ShardEndpoint& endpoint) {
+    return MockNSTargeter(nss, {MockRange(endpoint, BSON("x" << MINKEY), BSON("x" << MAXKEY))});
 }
 
-void initTargeterSplitRange(const NamespaceString& nss,
+auto initTargeterSplitRange(const NamespaceString& nss,
                             const ShardEndpoint& endpointA,
-                            const ShardEndpoint& endpointB,
-                            MockNSTargeter* targeter) {
-    std::vector<MockRange*> mockRanges;
-    mockRanges.push_back(new MockRange(endpointA, nss, BSON("x" << MINKEY), BSON("x" << 0)));
-    mockRanges.push_back(new MockRange(endpointB, nss, BSON("x" << 0), BSON("x" << MAXKEY)));
-    targeter->init(mockRanges);
+                            const ShardEndpoint& endpointB) {
+    return MockNSTargeter(nss,
+                          {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
+                           MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
 }
 
-void initTargeterHalfRange(const NamespaceString& nss,
-                           const ShardEndpoint& endpoint,
-                           MockNSTargeter* targeter) {
-    std::vector<MockRange*> mockRanges;
-    mockRanges.push_back(new MockRange(endpoint, nss, BSON("x" << MINKEY), BSON("x" << 0)));
-
-    // x >= 0 values untargetable
-
-    targeter->init(mockRanges);
+auto initTargeterHalfRange(const NamespaceString& nss, const ShardEndpoint& endpoint) {
+    // x >= 0 values are untargetable
+    return MockNSTargeter(nss, {MockRange(endpoint, BSON("x" << MINKEY), BSON("x" << 0))});
 }
 
 write_ops::DeleteOpEntry buildDelete(const BSONObj& query, bool multi) {
@@ -93,24 +84,21 @@ write_ops::UpdateOpEntry buildUpdate(const BSONObj& query, const BSONObj& update
 
 void buildResponse(int n, BatchedCommandResponse* response) {
     response->clear();
-    response->setOk(true);
+    response->setStatus(Status::OK());
     response->setN(n);
-    ASSERT(response->isValid(NULL));
+    ASSERT(response->isValid(nullptr));
 }
 
 void buildErrResponse(int code, const std::string& message, BatchedCommandResponse* response) {
     response->clear();
-    response->setOk(false);
     response->setN(0);
-    response->setErrCode(code);
-    response->setErrMessage(message);
-    ASSERT(response->isValid(NULL));
+    response->setStatus({ErrorCodes::Error(code), message});
+    ASSERT(response->isValid(nullptr));
 }
 
 void addError(int code, const std::string& message, int index, BatchedCommandResponse* response) {
     std::unique_ptr<WriteErrorDetail> error(new WriteErrorDetail);
-    error->setErrCode(code);
-    error->setErrMessage(message);
+    error->setStatus({ErrorCodes::Error(code), message});
     error->setIndex(index);
 
     response->addToErrDetails(error.release());
@@ -118,20 +106,15 @@ void addError(int code, const std::string& message, int index, BatchedCommandRes
 
 void addWCError(BatchedCommandResponse* response) {
     std::unique_ptr<WriteConcernErrorDetail> error(new WriteConcernErrorDetail);
-    error->setErrCode(ErrorCodes::WriteConcernFailed);
-    error->setErrMessage("mock wc error");
+    error->setStatus({ErrorCodes::WriteConcernFailed, "mock wc error"});
 
     response->setWriteConcernError(error.release());
 }
 
-class WriteOpTestFixture : public unittest::Test {
+class WriteOpTestFixture : public ServiceContextTest {
 protected:
-    OperationContext* operationContext() {
-        return &_opCtx;
-    }
-
-private:
-    OperationContextNoop _opCtx;
+    const ServiceContext::UniqueOperationContext _opCtxHolder{makeOperationContext()};
+    OperationContext* const _opCtx{_opCtxHolder.get()};
 };
 
 using BatchWriteOpTest = WriteOpTestFixture;
@@ -139,8 +122,8 @@ using BatchWriteOpTest = WriteOpTestFixture;
 TEST_F(BatchWriteOpTest, SingleOp) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, single doc batch write op
     BatchedCommandRequest request([&] {
@@ -149,7 +132,7 @@ TEST_F(BatchWriteOpTest, SingleOp) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -161,7 +144,7 @@ TEST_F(BatchWriteOpTest, SingleOp) {
     BatchedCommandResponse response;
     buildResponse(1, &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -172,8 +155,8 @@ TEST_F(BatchWriteOpTest, SingleOp) {
 TEST_F(BatchWriteOpTest, SingleError) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, single doc batch write op
     BatchedCommandRequest request([&] {
@@ -182,7 +165,7 @@ TEST_F(BatchWriteOpTest, SingleError) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -194,7 +177,7 @@ TEST_F(BatchWriteOpTest, SingleError) {
     BatchedCommandResponse response;
     buildErrResponse(ErrorCodes::UnknownError, "message", &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -202,17 +185,17 @@ TEST_F(BatchWriteOpTest, SingleError) {
 
     ASSERT(clientResponse.getOk());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(), response.getErrCode());
-    ASSERT(clientResponse.getErrDetailsAt(0)->getErrMessage().find(response.getErrMessage()) !=
-           std::string::npos);
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(), response.toStatus().code());
+    ASSERT(clientResponse.getErrDetailsAt(0)->toStatus().reason().find(
+               response.toStatus().reason()) != std::string::npos);
     ASSERT_EQUALS(clientResponse.getN(), 0);
 }
 
 TEST_F(BatchWriteOpTest, SingleTargetError) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterHalfRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterHalfRange(nss, endpoint);
 
     // Do untargetable delete op
     BatchedCommandRequest request([&] {
@@ -221,7 +204,7 @@ TEST_F(BatchWriteOpTest, SingleTargetError) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -246,8 +229,8 @@ TEST_F(BatchWriteOpTest, SingleTargetError) {
 TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -256,7 +239,7 @@ TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
     }());
     request.setWriteConcern(BSON("w" << 3));
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -273,7 +256,7 @@ TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
     addWCError(&response);
 
     // First stale response comes back, we should retry
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -288,8 +271,8 @@ TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
 TEST_F(BatchWriteOpTest, SingleStaleError) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -297,7 +280,7 @@ TEST_F(BatchWriteOpTest, SingleStaleError) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -308,14 +291,14 @@ TEST_F(BatchWriteOpTest, SingleStaleError) {
     addError(ErrorCodes::StaleShardVersion, "mock stale error", 0, &response);
 
     // First stale response comes back, we should retry
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
     ASSERT_OK(batchOp.targetBatch(targeter, false, &targeted));
 
     // Respond again with a stale response
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -324,7 +307,7 @@ TEST_F(BatchWriteOpTest, SingleStaleError) {
     buildResponse(1, &response);
 
     // Respond with an 'ok' response
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -342,8 +325,8 @@ TEST_F(BatchWriteOpTest, SingleStaleError) {
 TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -353,7 +336,7 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
         return updateOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -366,7 +349,7 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
     BatchedCommandResponse response;
     buildResponse(2, &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -379,8 +362,8 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
 TEST_F(BatchWriteOpTest, MultiOpSameShardUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -395,7 +378,7 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardUnordered) {
         return updateOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -408,7 +391,7 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardUnordered) {
     BatchedCommandResponse response;
     buildResponse(2, &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -423,8 +406,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -433,7 +416,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsOrdered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -447,7 +430,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsOrdered) {
     buildResponse(1, &response);
 
     // Respond to first targeted batch
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -459,7 +442,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsOrdered) {
     assertEndpointsEqual(targeted.begin()->second->getEndpoint(), endpointB);
 
     // Respond to second targeted batch
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -490,8 +473,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -505,7 +488,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsUnordered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -520,7 +503,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsUnordered) {
     // Respond to both targeted batches
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(batchOp.isFinished());
 
@@ -536,8 +519,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -547,7 +530,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -562,7 +545,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
     // Respond to both targeted batches for first multi-delete
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(!batchOp.isFinished());
 
@@ -576,7 +559,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
     // Respond to second targeted batches for second multi-delete
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(batchOp.isFinished());
 
@@ -592,8 +575,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
@@ -608,7 +591,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachUnordered) {
         return updateOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -623,7 +606,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachUnordered) {
     // Respond to both targeted batches, each containing two ops
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(batchOp.isFinished());
 
@@ -640,8 +623,8 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Delete deleteOp(nss);
@@ -659,7 +642,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -674,7 +657,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     buildResponse(2, &response);
 
     // Respond to first targeted batch containing the two single-host deletes
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -690,7 +673,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     // Respond to two targeted batches for first multi-delete
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(!batchOp.isFinished());
 
@@ -704,7 +687,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     // Respond to two targeted batches for second multi-delete
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(!batchOp.isFinished());
 
@@ -720,7 +703,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     buildResponse(2, &response);
 
     // Respond to final targeted batch containing the last two single-host deletes
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -735,8 +718,8 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Update updateOp(nss);
@@ -757,7 +740,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsUnordered) {
         return updateOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -773,7 +756,7 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsUnordered) {
     // Respond to first targeted batch containing the two single-host deletes
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(batchOp.isFinished());
 
@@ -789,8 +772,8 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -803,7 +786,7 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -819,7 +802,7 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
     auto targetedIt = targeted.begin();
 
     // No error on first shard
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     buildResponse(0, &response);
@@ -827,7 +810,7 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
 
     // Error on second write on second shard
     ++targetedIt;
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(batchOp.isFinished());
     ASSERT(++targetedIt == targeted.end());
 
@@ -837,10 +820,10 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
     ASSERT_EQUALS(clientResponse.getN(), 1);
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(),
-                  response.getErrDetailsAt(0)->getErrCode());
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrMessage(),
-                  response.getErrDetailsAt(0)->getErrMessage());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  response.getErrDetailsAt(0)->toStatus().code());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().reason(),
+                  response.getErrDetailsAt(0)->toStatus().reason());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 1);
 }
 
@@ -850,8 +833,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -864,7 +847,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -880,7 +863,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
     // Error on first write on first shard and second write on second shard.
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT(!batchOp.isFinished());
-        batchOp.noteBatchResponse(*it->second, response, NULL);
+        batchOp.noteBatchResponse(*it->second, response, nullptr);
     }
     ASSERT(batchOp.isFinished());
 
@@ -890,15 +873,15 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
     ASSERT_EQUALS(clientResponse.getN(), 0);
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 2u);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(),
-                  response.getErrDetailsAt(0)->getErrCode());
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrMessage(),
-                  response.getErrDetailsAt(0)->getErrMessage());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  response.getErrDetailsAt(0)->toStatus().code());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().reason(),
+                  response.getErrDetailsAt(0)->toStatus().reason());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 0);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getErrCode(),
-                  response.getErrDetailsAt(0)->getErrCode());
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getErrMessage(),
-                  response.getErrDetailsAt(0)->getErrMessage());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->toStatus().code(),
+                  response.getErrDetailsAt(0)->toStatus().code());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->toStatus().reason(),
+                  response.getErrDetailsAt(0)->toStatus().reason());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getIndex(), 1);
 }
 
@@ -908,8 +891,8 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Delete deleteOp(nss);
@@ -923,7 +906,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -939,7 +922,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
     buildResponse(2, &response);
 
     // No errors on first shard
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     buildResponse(1, &response);
@@ -947,7 +930,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
 
     // Error on second write on second shard
     ++targetedIt;
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(batchOp.isFinished());
     ASSERT(++targetedIt == targeted.end());
 
@@ -957,10 +940,10 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
     ASSERT_EQUALS(clientResponse.getN(), 3);
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(),
-                  response.getErrDetailsAt(0)->getErrCode());
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrMessage(),
-                  response.getErrDetailsAt(0)->getErrMessage());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  response.getErrDetailsAt(0)->toStatus().code());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().reason(),
+                  response.getErrDetailsAt(0)->toStatus().reason());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 1);
 }
 
@@ -971,8 +954,8 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Delete deleteOp(nss);
@@ -981,7 +964,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
         return deleteOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -997,7 +980,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
     buildResponse(1, &response);
 
     // No errors on first shard
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     buildResponse(0, &response);
@@ -1005,7 +988,7 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
 
     // Error on second write on second shard
     ++targetedIt;
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(batchOp.isFinished());
     ASSERT(++targetedIt == targeted.end());
 
@@ -1015,10 +998,10 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
     ASSERT_EQUALS(clientResponse.getN(), 1);
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(),
-                  response.getErrDetailsAt(0)->getErrCode());
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrMessage(),
-                  response.getErrDetailsAt(0)->getErrMessage());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  response.getErrDetailsAt(0)->toStatus().code());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().reason(),
+                  response.getErrDetailsAt(0)->toStatus().reason());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 0);
 }
 
@@ -1032,8 +1015,8 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
 TEST_F(BatchWriteOpTest, MultiOpErrorAndWriteConcernErrorUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1047,7 +1030,7 @@ TEST_F(BatchWriteOpTest, MultiOpErrorAndWriteConcernErrorUnordered) {
     }());
     request.setWriteConcern(BSON("w" << 3));
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1059,7 +1042,7 @@ TEST_F(BatchWriteOpTest, MultiOpErrorAndWriteConcernErrorUnordered) {
     addWCError(&response);
 
     // First stale response comes back, we should retry
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     // Unordered reports write concern error
@@ -1077,8 +1060,8 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Update updateOp(nss);
@@ -1092,7 +1075,7 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
     }());
     request.setWriteConcern(BSON("w" << 3));
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1106,7 +1089,7 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
     addWCError(&response);
 
     // First response comes back with write concern error
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     buildResponse(0, &response);
@@ -1114,7 +1097,7 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
 
     // Second response comes back with write error
     ++targetedIt;
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(batchOp.isFinished());
     ASSERT(++targetedIt == targeted.end());
 
@@ -1132,8 +1115,8 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
 TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterHalfRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterHalfRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1143,7 +1126,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
 
     // Do single-target, multi-doc batch write op
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1164,7 +1147,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
     buildResponse(1, &response);
 
     // First response ok
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -1187,8 +1170,8 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
 TEST_F(BatchWriteOpTest, MultiOpFailedTargetUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterHalfRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterHalfRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1203,7 +1186,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetUnordered) {
 
     // Do single-target, multi-doc batch write op
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1224,7 +1207,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetUnordered) {
     buildResponse(2, &response);
 
     // Response is ok for first and third write
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -1242,8 +1225,8 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1251,7 +1234,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1261,7 +1244,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
     buildResponse(1, &response);
 
     // First shard batch is ok
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -1270,7 +1253,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
     buildErrResponse(ErrorCodes::UnknownError, "mock error", &response);
 
     // Second shard batch fails
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     // We should have recorded an error for the second write
@@ -1281,7 +1264,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 1);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(), response.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(), response.toStatus().code());
 }
 
 // Batch failure (ok : 0) reported in a multi-op batch (unordered). Expect this gets translated down
@@ -1290,8 +1273,8 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1304,7 +1287,7 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1317,14 +1300,14 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
     buildResponse(1, &response);
 
     // First shard batch is ok
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     buildErrResponse(ErrorCodes::UnknownError, "mock error", &response);
 
     // Second shard batch fails
     ++targetedIt;
-    batchOp.noteBatchResponse(*targetedIt->second, response, NULL);
+    batchOp.noteBatchResponse(*targetedIt->second, response, nullptr);
     ASSERT(batchOp.isFinished());
     ASSERT(++targetedIt == targeted.end());
 
@@ -1336,9 +1319,9 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 2u);
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 1);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(), response.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(), response.toStatus().code());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getIndex(), 2);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getErrCode(), response.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->toStatus().code(), response.toStatus().code());
 }
 
 // Batch aborted (ordered). Expect this gets translated down into write error for first affected
@@ -1347,8 +1330,8 @@ TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1356,7 +1339,7 @@ TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1366,12 +1349,11 @@ TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
     buildResponse(1, &response);
 
     // First shard batch is ok
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     WriteErrorDetail abortError;
-    abortError.setErrCode(ErrorCodes::UnknownError);
-    abortError.setErrMessage("mock abort");
+    abortError.setStatus({ErrorCodes::UnknownError, "mock abort"});
     batchOp.abortBatch(abortError);
     ASSERT(batchOp.isFinished());
 
@@ -1383,7 +1365,8 @@ TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 1u);
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 1);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(), abortError.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  abortError.toStatus().code());
 }
 
 // Batch aborted (unordered). Expect this gets translated down into write errors for all affected
@@ -1392,8 +1375,8 @@ TEST_F(BatchWriteOpTest, MultiOpAbortUnordered) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1406,11 +1389,10 @@ TEST_F(BatchWriteOpTest, MultiOpAbortUnordered) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     WriteErrorDetail abortError;
-    abortError.setErrCode(ErrorCodes::UnknownError);
-    abortError.setErrMessage("mock abort");
+    abortError.setStatus({ErrorCodes::UnknownError, "mock abort"});
     batchOp.abortBatch(abortError);
     ASSERT(batchOp.isFinished());
 
@@ -1422,9 +1404,11 @@ TEST_F(BatchWriteOpTest, MultiOpAbortUnordered) {
     ASSERT(clientResponse.isErrDetailsSet());
     ASSERT_EQUALS(clientResponse.sizeErrDetails(), 2u);
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getIndex(), 0);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->getErrCode(), abortError.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(0)->toStatus().code(),
+                  abortError.toStatus().code());
     ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getIndex(), 1);
-    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->getErrCode(), abortError.getErrCode());
+    ASSERT_EQUALS(clientResponse.getErrDetailsAt(1)->toStatus().code(),
+                  abortError.toStatus().code());
 }
 
 // Multi-op targeting test where each op goes to both shards and both return a write concern error
@@ -1432,8 +1416,8 @@ TEST_F(BatchWriteOpTest, MultiOpTwoWCErrors) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
     ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterSplitRange(nss, endpointA, endpointB, &targeter);
+
+    auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -1442,7 +1426,7 @@ TEST_F(BatchWriteOpTest, MultiOpTwoWCErrors) {
     }());
     request.setWriteConcern(BSON("w" << 3));
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1453,14 +1437,14 @@ TEST_F(BatchWriteOpTest, MultiOpTwoWCErrors) {
     addWCError(&response);
 
     // First shard write write concern fails.
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
     ASSERT_OK(batchOp.targetBatch(targeter, true, &targeted));
 
     // Second shard write write concern fails.
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 
     BatchedCommandResponse clientResponse;
@@ -1481,8 +1465,8 @@ using BatchWriteOpLimitTests = WriteOpTestFixture;
 TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Create a BSONObj (slightly) bigger than the maximum size by including a max-size string
     const std::string bigString(BSONObjMaxUserSize, 'x');
@@ -1499,7 +1483,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
         return insertOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1509,7 +1493,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
     BatchedCommandResponse response;
     buildResponse(1, &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
 }
 
@@ -1517,8 +1501,8 @@ TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
 TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
     NamespaceString nss("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
-    MockNSTargeter targeter;
-    initTargeterFullRange(nss, endpoint, &targeter);
+
+    auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Create a BSONObj (slightly) bigger than the maximum size by including a max-size string
     const std::string bigString(BSONObjMaxUserSize, 'x');
@@ -1530,7 +1514,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
         return updateOp;
     }());
 
-    BatchWriteOp batchOp(operationContext(), request);
+    BatchWriteOp batchOp(_opCtx, request);
 
     OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
     std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
@@ -1541,7 +1525,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
     BatchedCommandResponse response;
     buildResponse(1, &response);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(!batchOp.isFinished());
 
     targetedOwned.clear();
@@ -1549,8 +1533,98 @@ TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
     ASSERT_EQUALS(targeted.size(), 1u);
     ASSERT_EQUALS(targeted.begin()->second->getWrites().size(), 1u);
 
-    batchOp.noteBatchResponse(*targeted.begin()->second, response, NULL);
+    batchOp.noteBatchResponse(*targeted.begin()->second, response, nullptr);
     ASSERT(batchOp.isFinished());
+}
+
+class BatchWriteOpTransactionTest : public ShardingTestFixture {
+public:
+    const TxnNumber kTxnNumber = 5;
+
+    void setUp() override {
+        ShardingTestFixture::setUp();
+
+        operationContext()->setLogicalSessionId(makeLogicalSessionIdForTest());
+        operationContext()->setTxnNumber(kTxnNumber);
+        repl::ReadConcernArgs::get(operationContext()) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
+
+        _scopedSession.emplace(operationContext());
+
+        auto txnRouter = TransactionRouter::get(operationContext());
+        txnRouter.beginOrContinueTxn(
+            operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
+    }
+
+    void tearDown() override {
+        _scopedSession.reset();
+        repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+
+        ShardingTestFixture::tearDown();
+    }
+
+private:
+    boost::optional<RouterOperationContextSession> _scopedSession;
+};
+
+TEST_F(BatchWriteOpTransactionTest, ThrowTargetingErrorsInTransaction_Delete) {
+    NamespaceString nss("foo.bar");
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+
+    auto targeter = initTargeterHalfRange(nss, endpoint);
+
+    // Untargetable delete op.
+    BatchedCommandRequest deleteRequest([&] {
+        write_ops::Delete deleteOp(nss);
+        deleteOp.setDeletes({buildDelete(BSON("x" << 1), false)});
+        return deleteOp;
+    }());
+    BatchWriteOp batchOp(operationContext(), deleteRequest);
+
+    OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
+    std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
+
+    auto status = batchOp.targetBatch(targeter, false, &targeted);
+    batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+
+    ASSERT_EQ(ErrorCodes::UnknownError, status.code());
+
+    BatchedCommandResponse response;
+    batchOp.buildClientResponse(&response);
+
+    ASSERT(response.isErrDetailsSet());
+    ASSERT_GT(response.sizeErrDetails(), 0u);
+    ASSERT_EQ(ErrorCodes::UnknownError, response.getErrDetailsAt(0)->toStatus().code());
+}
+
+TEST_F(BatchWriteOpTransactionTest, ThrowTargetingErrorsInTransaction_Update) {
+    NamespaceString nss("foo.bar");
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+
+    auto targeter = initTargeterHalfRange(nss, endpoint);
+
+    // Untargetable update op.
+    BatchedCommandRequest updateRequest([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setUpdates({buildUpdate(BSON("x" << 1), BSONObj(), false)});
+        return updateOp;
+    }());
+    BatchWriteOp batchOp(operationContext(), updateRequest);
+
+    OwnedPointerMap<ShardId, TargetedWriteBatch> targetedOwned;
+    std::map<ShardId, TargetedWriteBatch*>& targeted = targetedOwned.mutableMap();
+
+    auto status = batchOp.targetBatch(targeter, false, &targeted);
+    batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+
+    ASSERT_EQ(ErrorCodes::UnknownError, status.code());
+
+    BatchedCommandResponse response;
+    batchOp.buildClientResponse(&response);
+
+    ASSERT(response.isErrDetailsSet());
+    ASSERT_GT(response.sizeErrDetails(), 0u);
+    ASSERT_EQ(ErrorCodes::UnknownError, response.getErrDetailsAt(0)->toStatus().code());
 }
 
 }  // namespace

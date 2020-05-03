@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 
+from __future__ import print_function
 import os, re, sys, textwrap
 import api_data
-from dist import compare_srcfile
+from dist import compare_srcfile, format_srcfile
 
 # Temporary file.
 tmp_file = '__tmp'
@@ -110,7 +111,7 @@ for line in open(f, 'r'):
 
     prefix, config_name = m.groups()
     if config_name not in api_data.methods:
-        print >>sys.stderr, "Missing configuration for " + config_name
+        print("Missing configuration for " + config_name, file=sys.stderr)
         tfile.write(line)
         continue
 
@@ -124,22 +125,15 @@ for line in open(f, 'r'):
     tfile.write(prefix + '@configstart{' + config_name +
             ', see dist/api_data.py}\n')
 
-    w = textwrap.TextWrapper(width=80-len(prefix.expandtabs()),
+    w = textwrap.TextWrapper(width=100-len(prefix.expandtabs()),
             break_on_hyphens=False,
+            break_long_words=False,
             replace_whitespace=False,
             fix_sentence_endings=True)
-    lastname = None
-    for c in sorted(api_data.methods[config_name].config):
-        name = c.name
-        if '.' in name:
-            print >>sys.stderr, "Bad config key " + name
-
-        # Deal with duplicates: with complex configurations (like
-        # WT_SESSION::create), it's simpler to deal with duplicates here than
-        # manually in api_data.py.
-        if name == lastname:
-            continue
-        lastname = name
+    # Separate at spaces, and after a set of non-breaking space indicators.
+    w.wordsep_re = w.wordsep_simple_re = \
+        re.compile(r'(\s+|(?<=&nbsp;)[\w_,.;:]*)')
+    for c in api_data.methods[config_name].config:
         if 'undoc' in c.flags:
             continue
         output = parseconfig(c, config_name)
@@ -163,11 +157,13 @@ tfile.write('''/* DO NOT EDIT: automatically built by dist/api_config.py. */
 ''')
 
 # Make a TextWrapper that wraps at commas.
-w = textwrap.TextWrapper(width=64, break_on_hyphens=False)
+w = textwrap.TextWrapper(width=64, break_on_hyphens=False,
+                         break_long_words=False)
 w.wordsep_re = w.wordsep_simple_re = re.compile(r'(,)')
 
 # TextWrapper that wraps at whitespace.
-ws = textwrap.TextWrapper(width=64, break_on_hyphens=False)
+ws = textwrap.TextWrapper(width=64, break_on_hyphens=False,
+                          break_long_words=False)
 
 def checkstr(c):
     '''Generate the function reference and JSON string used by __wt_config_check
@@ -244,8 +240,8 @@ def getsubconfigstr(c):
 # Write structures of arrays of allowable configuration options, including a
 # NULL as a terminator for iteration.
 for name in sorted(api_data.methods.keys()):
-    ctype = api_data.methods[name].config
-    if ctype:
+    config = api_data.methods[name].config
+    if config:
         tfile.write('''
 static const WT_CONFIG_CHECK confchk_%(name)s[] = {
 \t%(check)s
@@ -253,7 +249,7 @@ static const WT_CONFIG_CHECK confchk_%(name)s[] = {
 };
 ''' % {
     'name' : name.replace('.', '_'),
-    'check' : '\n\t'.join(getconfcheck(c) for c in sorted(ctype)),
+    'check' : '\n\t'.join(getconfcheck(c) for c in config),
 })
 
 # Write the initialized list of configuration entry structures.
@@ -263,14 +259,14 @@ tfile.write('static const WT_CONFIG_ENTRY config_entries[] = {')
 slot=-1
 config_defines = ''
 for name in sorted(api_data.methods.keys()):
-    ctype = api_data.methods[name].config
+    config = api_data.methods[name].config
     slot += 1
 
     # Build a list of #defines that reference specific slots in the list (the
     # #defines are used to avoid a list search where we know the correct slot).
     config_defines +=\
         '#define\tWT_CONFIG_ENTRY_' + name.replace('.', '_') + '\t' * \
-            max(1, 6 - (len('WT_CONFIG_ENTRY_' + name) / 8)) + \
+            max(1, 6 - (len('WT_CONFIG_ENTRY_' + name) // 8)) + \
             "%2s" % str(slot) + '\n'
 
     # Write the method name and base.
@@ -279,15 +275,15 @@ for name in sorted(api_data.methods.keys()):
 %(config)s,''' % {
     'config' : '\n'.join('\t  "%s"' % line
         for line in w.wrap(','.join('%s=%s' % (c.name, get_default(c))
-            for c in sorted(ctype))) or [""]),
+            for c in config)) or [""]),
     'name' : name
 })
 
     # Write the checks reference, or NULL if no related checks structure.
     tfile.write('\n\t  ')
-    if ctype:
+    if config:
         tfile.write(
-            'confchk_' + name.replace('.', '_') + ', ' + str(len(ctype)))
+            'confchk_' + name.replace('.', '_') + ', ' + str(len(config)))
     else:
         tfile.write('NULL, 0')
 
@@ -348,6 +344,7 @@ __wt_conn_config_match(const char *method)
 ''')
 
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, f)
 
 # Update the config.h file with the #defines for the configuration entries.
@@ -365,4 +362,5 @@ for line in open('../src/include/config.h', 'r'):
         tfile.write(' */\n')
         tfile.write(config_defines)
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, '../src/include/config.h')

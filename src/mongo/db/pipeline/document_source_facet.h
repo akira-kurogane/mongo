@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -55,35 +56,36 @@ class NamespaceString;
  * stage which will produce a document like the following:
  * {facetA: [<all input documents except the first one>], facetB: [<the first document>]}.
  */
-class DocumentSourceFacet final : public DocumentSourceNeedsMongod,
-                                  public SplittableDocumentSource {
+class DocumentSourceFacet final : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$facet"_sd;
     struct FacetPipeline {
-        FacetPipeline(std::string name, std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline)
+        FacetPipeline(std::string name, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
             : name(std::move(name)), pipeline(std::move(pipeline)) {}
 
         std::string name;
-        std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline;
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     };
 
-    class LiteParsed : public LiteParsedDocumentSource {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(std::vector<LiteParsedPipeline> liteParsedPipelines, PrivilegeVector privileges)
-            : _liteParsedPipelines(std::move(liteParsedPipelines)),
-              _requiredPrivileges(std::move(privileges)) {}
+        LiteParsed(std::string parseTimeName, std::vector<LiteParsedPipeline> pipelines)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), boost::none, std::move(pipelines)) {}
 
-        PrivilegeVector requiredPrivileges(bool isMongos) const final {
-            return _requiredPrivileges;
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override final {
+            PrivilegeVector requiredPrivileges;
+            for (auto&& pipeline : _pipelines) {
+                Privilege::addPrivilegesToPrivilegeVector(
+                    &requiredPrivileges,
+                    pipeline.requiredPrivileges(isMongos, bypassDocumentValidation));
+            }
+            return requiredPrivileges;
         }
-
-        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final;
-
-    private:
-        const std::vector<LiteParsedPipeline> _liteParsedPipelines;
-        const PrivilegeVector _requiredPrivileges;
     };
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -94,11 +96,6 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Blocking call. Will consume all input and produces one output document.
-     */
-    GetNextResult getNext() final;
-
-    /**
      * Optimizes inner pipelines.
      */
     boost::intrusive_ptr<DocumentSource> optimize() final;
@@ -106,10 +103,10 @@ public:
     /**
      * Takes a union of all sub-pipelines, and adds them to 'deps'.
      */
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     const char* getSourceName() const final {
-        return "$facet";
+        return DocumentSourceFacet::kStageName.rawData();
     }
 
     /**
@@ -123,21 +120,31 @@ public:
      * TODO SERVER-24154: Should be smarter about splitting so that parts of the sub-pipelines can
      * potentially be run in parallel on multiple shards.
      */
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return nullptr;
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
+
+    const std::vector<FacetPipeline>& getFacetPipelines() const {
+        return _facets;
+    }
+
+    auto& getFacetPipelines() {
+        return _facets;
     }
 
     // The following are overridden just to forward calls to sub-pipelines.
-    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final;
-    void doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) final;
-    void doDetachFromOperationContext() final;
-    void doReattachToOperationContext(OperationContext* opCtx) final;
-    StageConstraints constraints() const final;
+    void addInvolvedCollections(stdx::unordered_set<NamespaceString>* involvedNssSet) const final;
+    void detachFromOperationContext() final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
+    bool usedDisk() final;
 
 protected:
+    /**
+     * Blocking call. Will consume all input and produces one output document.
+     */
+    GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:

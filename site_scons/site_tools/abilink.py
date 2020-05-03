@@ -1,16 +1,24 @@
-# Copyright 2015 MongoDB Inc.
+# Copyright 2020 MongoDB Inc.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
 
 import SCons
 import subprocess
@@ -20,16 +28,18 @@ import subprocess
 # TODO: Make a variable for the md5sum utility (allow any hasher)
 # TODO: Add an ABILINKCOM variable to the Action, so it can be silenced.
 
+
 def _detect(env):
     try:
-        abidw = env['ABIDW']
+        abidw = env["ABIDW"]
         if not abidw:
             return None
         return abidw
     except KeyError:
         pass
 
-    return env.WhereIs('abidw')
+    return env.WhereIs("abidw")
+
 
 def _add_emitter(builder):
     base_emitter = builder.emitter
@@ -47,6 +57,7 @@ def _add_emitter(builder):
     new_emitter = SCons.Builder.ListEmitter([base_emitter, new_emitter])
     builder.emitter = new_emitter
 
+
 def _add_scanner(builder):
     old_scanner = builder.target_scanner
     path_function = old_scanner.path_function
@@ -59,24 +70,31 @@ def _add_scanner(builder):
             new_results.append(abidw if abidw else base)
         return new_results
 
-    builder.target_scanner = SCons.Scanner.Scanner(function=new_scanner, path_function=path_function)
+    builder.target_scanner = SCons.Scanner.Scanner(
+        function=new_scanner, path_function=path_function
+    )
+
 
 def _add_action(builder):
     actions = builder.action
-    builder.action = actions + SCons.Action.Action("$ABIDW $TARGET | md5sum > ${TARGET}.abidw")
+    builder.action = actions + SCons.Action.Action(
+        "$ABIDW --no-show-locs $TARGET | md5sum > ${TARGET}.abidw"
+    )
+
 
 def exists(env):
     result = _detect(env) != None
     return result
+
 
 def generate(env):
 
     if not exists(env):
         return
 
-    builder = env['BUILDERS']['SharedLibrary']
+    builder = env["BUILDERS"]["SharedLibrary"]
     _add_emitter(builder)
     _add_action(builder)
     _add_scanner(builder)
-    _add_scanner(env['BUILDERS']['Program'])
-    _add_scanner(env['BUILDERS']['LoadableModule'])
+    _add_scanner(env["BUILDERS"]["Program"])
+    _add_scanner(env["BUILDERS"]["LoadableModule"])

@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -34,42 +35,25 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
-
-std::unique_ptr<ServiceContextNoop> makeTestServiceContext() {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
-    service->setTickSource(stdx::make_unique<TickSourceMock>());
-    return service;
-}
-
 namespace {
+
 using boost::intrusive_ptr;
-
-static const char* const ns = "unittests.document_source_sample_tests";
-
-// Stub to avoid including the server environment library.
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(makeTestServiceContext());
-    return Status::OK();
-}
 
 class SampleBasics : public AggregationContextFixture {
 public:
-    SampleBasics() : _mock(DocumentSourceMock::create()) {}
+    SampleBasics() : _mock(DocumentSourceMock::createForTest(getExpCtx())) {}
 
 protected:
     virtual void createSample(long long size) {
@@ -103,9 +87,9 @@ protected:
             auto nextResult = sample()->getNext();
             ASSERT_TRUE(nextResult.isAdvanced());
             auto thisDoc = nextResult.releaseDocument();
-            ASSERT_TRUE(thisDoc.hasRandMetaField());
+            ASSERT_TRUE(thisDoc.metadata().hasRandVal());
             if (prevDoc) {
-                ASSERT_LTE(thisDoc.getRandMetaField(), prevDoc->getRandMetaField());
+                ASSERT_LTE(thisDoc.metadata().getRandVal(), prevDoc->metadata().getRandVal());
             }
             prevDoc = std::move(thisDoc);
         }
@@ -117,7 +101,7 @@ protected:
      */
     void loadDocuments(int nDocs) {
         for (int i = 0; i < nDocs; i++) {
-            _mock->queue.push_back(DOC("_id" << i));
+            _mock->push_back(DOC("_id" << i));
         }
     }
 
@@ -175,24 +159,24 @@ TEST_F(SampleBasics, SampleEOFBeforeSource) {
  */
 TEST_F(SampleBasics, DocsUnmodified) {
     createSample(1);
-    source()->queue.push_back(DOC("a" << 1 << "b" << DOC("c" << 2)));
+    source()->push_back(DOC("a" << 1 << "b" << DOC("c" << 2)));
     auto next = sample()->getNext();
     ASSERT_TRUE(next.isAdvanced());
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["a"].getInt());
     ASSERT_EQUALS(2, doc["b"]["c"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
+    ASSERT_TRUE(doc.metadata().hasRandVal());
     assertEOF();
 }
 
 TEST_F(SampleBasics, ShouldPropagatePauses) {
     createSample(2);
-    source()->queue.push_back(Document());
-    source()->queue.push_back(DocumentSource::GetNextResult::makePauseExecution());
-    source()->queue.push_back(Document());
-    source()->queue.push_back(DocumentSource::GetNextResult::makePauseExecution());
-    source()->queue.push_back(Document());
-    source()->queue.push_back(DocumentSource::GetNextResult::makePauseExecution());
+    source()->push_back(Document());
+    source()->push_back(DocumentSource::GetNextResult::makePauseExecution());
+    source()->push_back(Document());
+    source()->push_back(DocumentSource::GetNextResult::makePauseExecution());
+    source()->push_back(Document());
+    source()->push_back(DocumentSource::GetNextResult::makePauseExecution());
 
     // The $sample stage needs to populate itself, so should propagate all three pauses before
     // returning any results.
@@ -291,13 +275,13 @@ TEST_F(SampleFromRandomCursorBasics, SampleEOFBeforeSource) {
  */
 TEST_F(SampleFromRandomCursorBasics, DocsUnmodified) {
     createSample(1);
-    source()->queue.push_back(DOC("_id" << 1 << "b" << DOC("c" << 2)));
+    source()->push_back(DOC("_id" << 1 << "b" << DOC("c" << 2)));
     auto next = sample()->getNext();
     ASSERT_TRUE(next.isAdvanced());
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["_id"].getInt());
     ASSERT_EQUALS(2, doc["b"]["c"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
+    ASSERT_TRUE(doc.metadata().hasRandVal());
     assertEOF();
 }
 
@@ -306,24 +290,24 @@ TEST_F(SampleFromRandomCursorBasics, DocsUnmodified) {
  */
 TEST_F(SampleFromRandomCursorBasics, IgnoreDuplicates) {
     createSample(2);
-    source()->queue.push_back(DOC("_id" << 1));
-    source()->queue.push_back(DOC("_id" << 1));  // Duplicate, should ignore.
-    source()->queue.push_back(DOC("_id" << 2));
+    source()->push_back(DOC("_id" << 1));
+    source()->push_back(DOC("_id" << 1));  // Duplicate, should ignore.
+    source()->push_back(DOC("_id" << 2));
 
     auto next = sample()->getNext();
     ASSERT_TRUE(next.isAdvanced());
     auto doc = next.releaseDocument();
     ASSERT_EQUALS(1, doc["_id"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
-    double doc1Meta = doc.getRandMetaField();
+    ASSERT_TRUE(doc.metadata().hasRandVal());
+    double doc1Meta = doc.metadata().getRandVal();
 
     // Should ignore the duplicate {_id: 1}, and return {_id: 2}.
     next = sample()->getNext();
     ASSERT_TRUE(next.isAdvanced());
     doc = next.releaseDocument();
     ASSERT_EQUALS(2, doc["_id"].getInt());
-    ASSERT_TRUE(doc.hasRandMetaField());
-    double doc2Meta = doc.getRandMetaField();
+    ASSERT_TRUE(doc.metadata().hasRandVal());
+    double doc2Meta = doc.metadata().getRandVal();
     ASSERT_GTE(doc1Meta, doc2Meta);
 
     // Both stages should be exhausted.
@@ -337,7 +321,7 @@ TEST_F(SampleFromRandomCursorBasics, IgnoreDuplicates) {
 TEST_F(SampleFromRandomCursorBasics, TooManyDups) {
     createSample(2);
     for (int i = 0; i < 1000; i++) {
-        source()->queue.push_back(DOC("_id" << 1));
+        source()->push_back(DOC("_id" << 1));
     }
 
     // First should be successful, it's not a duplicate.
@@ -353,14 +337,14 @@ TEST_F(SampleFromRandomCursorBasics, TooManyDups) {
 TEST_F(SampleFromRandomCursorBasics, MissingIdField) {
     // Once with only a bad document.
     createSample(2);  // _idField is '_id'.
-    source()->queue.push_back(DOC("non_id" << 2));
+    source()->push_back(DOC("non_id" << 2));
     ASSERT_THROWS_CODE(sample()->getNext(), AssertionException, 28793);
 
     // Again, with some regular documents before a bad one.
     createSample(2);  // _idField is '_id'.
-    source()->queue.push_back(DOC("_id" << 1));
-    source()->queue.push_back(DOC("_id" << 1));
-    source()->queue.push_back(DOC("non_id" << 2));
+    source()->push_back(DOC("_id" << 1));
+    source()->push_back(DOC("_id" << 1));
+    source()->push_back(DOC("non_id" << 2));
 
     // First should be successful.
     ASSERT_TRUE(sample()->getNext().isAdvanced());
@@ -382,18 +366,18 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
         _sample = DocumentSourceSampleFromRandomCursor::create(getExpCtx(), 2, "_id", 3);
         sample()->setSource(_mock.get());
 
-        source()->queue.push_back(DOC("_id" << 1));
-        source()->queue.push_back(DOC("_id" << 2));
+        source()->push_back(DOC("_id" << 1));
+        source()->push_back(DOC("_id" << 2));
 
         auto doc = sample()->getNext();
         ASSERT_TRUE(doc.isAdvanced());
-        ASSERT_TRUE(doc.getDocument().hasRandMetaField());
-        firstTotal += doc.getDocument().getRandMetaField();
+        ASSERT_TRUE(doc.getDocument().metadata().hasRandVal());
+        firstTotal += doc.getDocument().metadata().getRandVal();
 
         doc = sample()->getNext();
         ASSERT_TRUE(doc.isAdvanced());
-        ASSERT_TRUE(doc.getDocument().hasRandMetaField());
-        secondTotal += doc.getDocument().getRandMetaField();
+        ASSERT_TRUE(doc.getDocument().metadata().hasRandVal());
+        secondTotal += doc.getDocument().metadata().getRandVal();
     }
     // The average random meta value of the first document should be about 0.75. We assume that
     // 10000 trials is sufficient for us to apply the Central Limit Theorem. Using an error
@@ -406,12 +390,12 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
     ASSERT_LTE(secondTotal / nTrials, 0.52);
 }
 
-DEATH_TEST_F(SampleFromRandomCursorBasics,
-             ShouldFailIfGivenPausedInput,
-             "Invariant failure Hit a MONGO_UNREACHABLE!") {
+DEATH_TEST_REGEX_F(SampleFromRandomCursorBasics,
+                   ShouldFailIfGivenPausedInput,
+                   "Invariant failure.*Hit a MONGO_UNREACHABLE!") {
     createSample(2);
-    source()->queue.push_back(Document{{"_id", 1}});
-    source()->queue.push_back(DocumentSource::GetNextResult::makePauseExecution());
+    source()->push_back(Document{{"_id", 1}});
+    source()->push_back(DocumentSource::GetNextResult::makePauseExecution());
 
     // Should see the first result, then see a pause and fail.
     ASSERT_TRUE(sample()->getNext().isAdvanced());

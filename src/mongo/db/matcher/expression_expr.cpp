@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,20 +31,46 @@
 
 #include "mongo/db/matcher/expression_expr.h"
 
+#include "mongo/util/fail_point.h"
+
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(ExprMatchExpressionMatchesReturnsFalseOnException);
+
+ExprMatchExpression::ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : MatchExpression(MatchType::EXPRESSION), _expCtx(expCtx), _expression(expr) {}
+
 ExprMatchExpression::ExprMatchExpression(BSONElement elem,
                                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : MatchExpression(MatchType::EXPRESSION),
-      _expCtx(expCtx),
-      _expression(Expression::parseOperand(expCtx, elem, expCtx->variablesParseState)) {}
+    : ExprMatchExpression(Expression::parseOperand(expCtx, elem, expCtx->variablesParseState),
+                          expCtx) {}
 
 bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
+    if (_rewriteResult && _rewriteResult->matchExpression() &&
+        !_rewriteResult->matchExpression()->matches(doc, details)) {
+        return false;
+    }
+
     Document document(doc->toBSON());
-    auto value = _expression->evaluate(document);
-    return value.coerceToBool();
+
+    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
+    // processes documents from multiple threads simultaneously. Hence we make a copy of the
+    // 'Variables' object per-caller.
+    Variables variables = _expCtx->variables;
+    try {
+        auto value = _expression->evaluate(document, &variables);
+        return value.coerceToBool();
+    } catch (const DBException&) {
+        if (MONGO_unlikely(ExprMatchExpressionMatchesReturnsFalseOnException.shouldFail())) {
+            return false;
+        }
+
+        throw;
+    }
 }
 
-void ExprMatchExpression::serialize(BSONObjBuilder* out) const {
+void ExprMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
     *out << "$expr" << _expression->serialize(false);
 }
 
@@ -64,6 +91,18 @@ bool ExprMatchExpression::equivalent(const MatchExpression* other) const {
                                       realOther->_expression->serialize(false));
 }
 
+void ExprMatchExpression::_doSetCollator(const CollatorInterface* collator) {
+    // This function is used to give match expression nodes which don't keep a pointer to the
+    // ExpressionContext access to the ExpressionContext's collator. Since the operation only ever
+    // has a single CollatorInterface, and since that collator is kept on the ExpressionContext,
+    // the collator pointer that we're propagating throughout the MatchExpression tree must match
+    // the one inside the ExpressionContext.
+    invariant(collator == _expCtx->getCollator());
+    if (_rewriteResult && _rewriteResult->matchExpression()) {
+        _rewriteResult->matchExpression()->setCollator(collator);
+    }
+}
+
 
 std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     // TODO SERVER-31003: Replace Expression clone via serialization with Expression::clone().
@@ -72,6 +111,38 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     boost::intrusive_ptr<Expression> clonedExpr =
         Expression::parseOperand(_expCtx, bob.obj().firstElement(), _expCtx->variablesParseState);
 
-    return stdx::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
+    auto clone = std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
+    if (_rewriteResult) {
+        clone->_rewriteResult = _rewriteResult->clone();
+    }
+    return std::move(clone);
+}
+
+MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        auto& exprMatchExpr = static_cast<ExprMatchExpression&>(*expression);
+
+        // If '_expression' can be rewritten to a MatchExpression, we will return a $and node with
+        // both the original ExprMatchExpression and the MatchExpression rewrite as children.
+        // Exiting early prevents additional calls to optimize from performing additional rewrites
+        // and adding duplicate MatchExpression sub-trees to the tree.
+        if (exprMatchExpr._rewriteResult) {
+            return expression;
+        }
+
+        exprMatchExpr._expression = exprMatchExpr._expression->optimize();
+        exprMatchExpr._rewriteResult =
+            RewriteExpr::rewrite(exprMatchExpr._expression, exprMatchExpr._expCtx->getCollator());
+
+        if (exprMatchExpr._rewriteResult->matchExpression()) {
+            auto andMatch = std::make_unique<AndMatchExpression>();
+            andMatch->add(exprMatchExpr._rewriteResult->releaseMatchExpression().release());
+            andMatch->add(expression.release());
+            // Re-optimize the new AND in order to make sure that any AND children are absorbed.
+            expression = MatchExpression::optimize(std::move(andMatch));
+        }
+
+        return expression;
+    };
 }
 }  // namespace mongo

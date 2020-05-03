@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +39,7 @@
 
 namespace mongo {
 
-extern bool enableCollectionUUIDs;  // TODO(SERVER-27993) Replace based on upgrade/downgrade state.
+class CollatorFactoryInterface;
 
 /**
  * A CollectionUUID is a 128-bit unique identifier, per RFC 4122, v4. for a database collection.
@@ -70,10 +71,18 @@ struct CollectionOptions {
     Status validateForStorage() const;
 
     /**
-     * Parses the "options" subfield of the collection info object.
+     * Parses the collection 'options' into the appropriate struct fields.
+     *
+     * When 'kind' is set to ParseKind::parseForStorage, the 'uuid' field is parsed,
+     * otherwise the 'uuid' field is not parsed.
+     *
+     * When 'kind' is set to ParseKind::parseForCommand, the 'idIndex' field is parsed,
+     * otherwise the 'idIndex' field is not parsed.
      */
-    Status parse(const BSONObj& obj, ParseKind kind = parseForCommand);
+    static StatusWith<CollectionOptions> parse(const BSONObj& options,
+                                               ParseKind kind = parseForCommand);
 
+    void appendBSON(BSONObjBuilder* builder) const;
     BSONObj toBSON() const;
 
     /**
@@ -82,18 +91,22 @@ struct CollectionOptions {
      */
     static bool validMaxCappedDocs(long long* max);
 
-    // ----
+    /**
+     * Returns true if given options matches to this.
+     *
+     * Uses the collatorFactory to normalize the collation property being compared.
+     *
+     * Note: ignores idIndex property.
+     */
+    bool matchesStorageOptions(const CollectionOptions& other,
+                               CollatorFactoryInterface* collatorFactory) const;
 
-    // Collection UUID. Will exist if featureCompatibilityVersion >= 3.6.
+    // Collection UUID. Present for all CollectionOptions parsed for storage.
     OptionalCollectionUUID uuid;
 
     bool capped = false;
     long long cappedSize = 0;
     long long cappedMaxDocs = 0;
-
-    // (MMAPv1) The following 2 are mutually exclusive, can only have one set.
-    long long initialNumExtents = 0;
-    std::vector<long long> initialExtentSizes;
 
     // The behavior of _id index creation when collection created
     void setNoIdIndex() {
@@ -105,21 +118,17 @@ struct CollectionOptions {
         NO        // do not create _id index
     } autoIndexId = DEFAULT;
 
-    // user flags
-    enum UserFlags {
-        Flag_UsePowerOf2Sizes = 1 << 0,
-        Flag_NoPadding = 1 << 1,
-    };
-    int flags = Flag_UsePowerOf2Sizes;  // a bitvector of UserFlags
-    bool flagsSet = false;
-
     bool temp = false;
+    bool recordPreImages = false;
 
     // Storage engine collection options. Always owned or empty.
     BSONObj storageEngine;
 
     // Default options for indexes created on the collection. Always owned or empty.
     BSONObj indexOptionDefaults;
+
+    // Index specs for the _id index.
+    BSONObj idIndex;
 
     // Always owned or empty.
     BSONObj validator;
@@ -136,4 +145,4 @@ struct CollectionOptions {
     // The aggregation pipeline that defines this view.
     BSONObj pipeline;
 };
-}
+}  // namespace mongo

@@ -1,0 +1,27 @@
+test_kind: js_test
+
+selector:
+  roots:
+  - jstests/sharding/*.js
+  - jstests/sharding/change_streams/*.js
+  - jstests/sharding/query/*.js
+  exclude_with_any_tags:
+  - multiversion_incompatible
+  - requires_fcv_46
+  exclude_files:
+  # Enable when 4.4 becomes last stable
+  - jstests/sharding/killop.js
+  - jstests/sharding/verify_sessions_expiration_sharded.js
+  # TODO SERVER-46040: Enable when SERVER-46040 is backported
+  - jstests/sharding/drop_indexes_with_stale_config_error.js
+executor:
+  config:
+    shell_options:
+      nodb: ''
+      readMode: commands
+      global_vars:
+        TestData:
+          useRandomBinVersionsWithinReplicaSet: true
+          mongosBinVersion: 'last-stable'
+          # TODO: SERVER-45959 remove after v4.4
+          skipCheckOrphans: true

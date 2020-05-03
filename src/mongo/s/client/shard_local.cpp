@@ -1,32 +1,31 @@
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include <boost/none_t.hpp>
 
@@ -37,26 +36,30 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/unique_message.h"
-#include "mongo/util/log.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
+ShardLocal::ShardLocal(const ShardId& id) : Shard(id), _rsLocalClient() {
     // Currently ShardLocal only works for config servers. If we ever start using ShardLocal on
     // shards we'll need to consider how to handle shards.
     invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 }
 
 const ConnectionString ShardLocal::getConnString() const {
-    return repl::getGlobalReplicationCoordinator()->getConfig().getConnectionString();
+    return repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        ->getConfig()
+        .getConnectionString();
 }
 
 std::shared_ptr<RemoteCommandTargeter> ShardLocal::getTargeter() const {
@@ -72,6 +75,14 @@ const ConnectionString ShardLocal::originalConnString() const {
 
 void ShardLocal::updateReplSetMonitor(const HostAndPort& remoteHost,
                                       const Status& remoteCommandStatus) {
+    MONGO_UNREACHABLE;
+}
+
+void ShardLocal::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
+    MONGO_UNREACHABLE;
+}
+
+LogicalTime ShardLocal::getLastCommittedOpTime() const {
     MONGO_UNREACHABLE;
 }
 
@@ -92,55 +103,21 @@ bool ShardLocal::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
     }
 }
 
-void ShardLocal::_updateLastOpTimeFromClient(OperationContext* opCtx,
-                                             const repl::OpTime& previousOpTimeOnClient) {
-    repl::OpTime lastOpTimeFromClient =
-        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-    invariant(lastOpTimeFromClient >= previousOpTimeOnClient);
-    if (lastOpTimeFromClient.isNull() || lastOpTimeFromClient == previousOpTimeOnClient) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (lastOpTimeFromClient >= _lastOpTime) {
-        // It's always possible for lastOpTimeFromClient to be less than _lastOpTime if another
-        // thread started and completed a write through this ShardLocal (updating _lastOpTime)
-        // after this operation had completed its write but before it got here.
-        _lastOpTime = lastOpTimeFromClient;
-    }
-}
-
-repl::OpTime ShardLocal::_getLastOpTime() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _lastOpTime;
-}
-
 StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opCtx,
                                                            const ReadPreferenceSetting& unused,
-                                                           const std::string& dbName,
+                                                           StringData dbName,
                                                            Milliseconds maxTimeMSOverrideUnused,
                                                            const BSONObj& cmdObj) {
-    repl::OpTime currentOpTimeFromClient =
-        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-    ON_BLOCK_EXIT([this, &opCtx, &currentOpTimeFromClient] {
-        _updateLastOpTimeFromClient(opCtx, currentOpTimeFromClient);
-    });
+    return _rsLocalClient.runCommandOnce(opCtx, dbName, cmdObj);
+}
 
-    try {
-        DBDirectClient client(opCtx);
-
-        rpc::UniqueReply commandResponse =
-            client.runCommand(OpMsgRequest::fromDBAndBody(dbName, cmdObj));
-
-        auto result = commandResponse->getCommandReply().getOwned();
-        return Shard::CommandResponse(boost::none,
-                                      result,
-                                      commandResponse->getMetadata().getOwned(),
-                                      getStatusFromCommandResult(result),
-                                      getWriteConcernStatusFromCommandResult(result));
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
+StatusWith<Shard::QueryResponse> ShardLocal::_runExhaustiveCursorCommand(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    StringData dbName,
+    Milliseconds maxTimeMSOverride,
+    const BSONObj& cmdObj) {
+    MONGO_UNREACHABLE;
 }
 
 StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
@@ -151,57 +128,7 @@ StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-
-    if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern) {
-        // Set up operation context with majority read snapshot so correct optime can be retrieved.
-        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-
-        // Wait for any writes performed by this ShardLocal instance to be committed and visible.
-        Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
-            opCtx, repl::ReadConcernArgs{_getLastOpTime(), readConcernLevel});
-        if (!readConcernStatus.isOK()) {
-            return readConcernStatus;
-        }
-
-        // Inform the storage engine to read from the committed snapshot for the rest of this
-        // operation.
-        status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
-        if (!status.isOK()) {
-            return status;
-        }
-    } else {
-        invariant(readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern);
-    }
-
-    DBDirectClient client(opCtx);
-    Query fullQuery(query);
-    if (!sort.isEmpty()) {
-        fullQuery.sort(sort);
-    }
-    fullQuery.readPref(readPref.pref, BSONArray());
-
-    try {
-        std::unique_ptr<DBClientCursor> cursor =
-            client.query(nss.ns().c_str(), fullQuery, limit.get_value_or(0));
-
-        if (!cursor) {
-            return {ErrorCodes::OperationFailed,
-                    str::stream() << "Failed to establish a cursor for reading " << nss.ns()
-                                  << " from local storage"};
-        }
-
-        std::vector<BSONObj> documentVector;
-        while (cursor->more()) {
-            BSONObj document = cursor->nextSafe().getOwned();
-            documentVector.push_back(std::move(document));
-        }
-
-        return Shard::QueryResponse{std::move(documentVector),
-                                    replCoord->getCurrentCommittedSnapshotOpTime()};
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
+    return _rsLocalClient.queryOnce(opCtx, readPref, readConcernLevel, nss, query, sort, limit);
 }
 
 Status ShardLocal::createIndexOnConfig(OperationContext* opCtx,
@@ -211,16 +138,57 @@ Status ShardLocal::createIndexOnConfig(OperationContext* opCtx,
     invariant(ns.db() == "config" || ns.db() == "admin");
 
     try {
-        DBDirectClient client(opCtx);
+        AutoGetOrCreateDb autoDb(opCtx, ns.db(), MODE_IX);
+        AutoGetCollection autoColl(opCtx, ns, MODE_X);
+        auto collection = autoColl.getCollection();
+        if (!collection) {
+            CollectionOptions options;
+            options.uuid = UUID::gen();
+            writeConflictRetry(opCtx, "ShardLocal::createIndexOnConfig", ns.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                auto db = autoDb.getDb();
+                collection = db->createCollection(opCtx, ns, options);
+                invariant(collection,
+                          str::stream() << "Failed to create collection " << ns.ns()
+                                        << " in config database for indexes: " << keys);
+                wunit.commit();
+            });
+        }
+        auto indexCatalog = collection->getIndexCatalog();
         IndexSpec index;
         index.addKeys(keys);
         index.unique(unique);
-        client.createIndex(ns.toString(), index);
+        index.version(int(IndexDescriptor::kLatestIndexVersion));
+        auto removeIndexBuildsToo = false;
+        auto indexSpecs = indexCatalog->removeExistingIndexes(
+            opCtx,
+            uassertStatusOK(
+                collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, {index.toBSON()})),
+            removeIndexBuildsToo);
+
+        if (indexSpecs.empty()) {
+            return Status::OK();
+        }
+
+        writeConflictRetry(opCtx, "ShardLocal::createIndexOnConfig", ns.ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
+            auto fromMigrate = true;
+            IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                opCtx, collection->uuid(), indexSpecs, fromMigrate);
+            wunit.commit();
+        });
     } catch (const DBException& e) {
         return e.toStatus();
     }
 
     return Status::OK();
+}
+
+void ShardLocal::runFireAndForgetCommand(OperationContext* opCtx,
+                                         const ReadPreferenceSetting& readPref,
+                                         const std::string& dbName,
+                                         const BSONObj& cmdObj) {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo

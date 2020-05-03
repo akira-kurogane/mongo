@@ -1,18 +1,24 @@
 // this is to make sure that temp collections get cleaned up on restart.
 //
 // This test requires persistence beacuase it assumes data will survive a restart.
-// @tags: [requires_persistence]
+// @tags: [requires_persistence, requires_replication]
 
 testname = 'temp_namespace_sw';
 
-var conn = MongoRunner.runMongod({smallfiles: "", noprealloc: "", nopreallocj: ""});
+var conn = MongoRunner.runMongod();
 d = conn.getDB('test');
-d.runCommand({create: testname + 'temp1', temp: true});
+assert.commandWorked(d.runCommand({
+    applyOps: [{op: "c", ns: d.getName() + ".$cmd", o: {create: testname + 'temp1', temp: true}}]
+}));
 d[testname + 'temp1'].ensureIndex({x: 1});
-d.runCommand({create: testname + 'temp2', temp: 1});
+assert.commandWorked(d.runCommand(
+    {applyOps: [{op: "c", ns: d.getName() + ".$cmd", o: {create: testname + 'temp2', temp: 1}}]}));
 d[testname + 'temp2'].ensureIndex({x: 1});
-d.runCommand({create: testname + 'keep1', temp: false});
-d.runCommand({create: testname + 'keep2', temp: 0});
+assert.commandWorked(d.runCommand({
+    applyOps: [{op: "c", ns: d.getName() + ".$cmd", o: {create: testname + 'keep1', temp: false}}]
+}));
+assert.commandWorked(d.runCommand(
+    {applyOps: [{op: "c", ns: d.getName() + ".$cmd", o: {create: testname + 'keep2', temp: 0}}]}));
 d.runCommand({create: testname + 'keep3'});
 d[testname + 'keep4'].insert({});
 
@@ -32,9 +38,6 @@ conn = MongoRunner.runMongod({
     restart: true,
     cleanData: false,
     dbpath: conn.dbpath,
-    smallfiles: "",
-    noprealloc: "",
-    nopreallocj: ""
 });
 d = conn.getDB('test');
 assert.eq(countCollectionNames(d, /temp\d$/), 0);

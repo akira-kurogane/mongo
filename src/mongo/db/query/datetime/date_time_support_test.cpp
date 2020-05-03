@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,6 +38,7 @@ namespace mongo {
 namespace {
 
 const TimeZoneDatabase kDefaultTimeZoneDatabase{};
+const TimeZone kDefaultTimeZone = TimeZoneDatabase::utcZone();
 
 TEST(GetTimeZone, DoesReturnKnownTimeZone) {
     // Just asserting that these do not throw exceptions.
@@ -939,23 +941,43 @@ TEST(NewYorkTimeAfterEpoch, DoesOutputFormatDate) {
 }
 
 TEST(DateFormat, ThrowsUserExceptionIfGivenUnrecognizedFormatter) {
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().validateFormat("%x"), AssertionException, 18536);
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().validateToStringFormat("%x"), AssertionException, 18536);
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().validateFromStringFormat("%x"), AssertionException, 18536);
 }
 
 TEST(DateFormat, ThrowsUserExceptionIfGivenUnmatchedPercent) {
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().validateFormat("%"), AssertionException, 18535);
     ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().validateFormat("%%%"), AssertionException, 18535);
+        TimeZoneDatabase::utcZone().validateToStringFormat("%"), AssertionException, 18535);
     ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().validateFormat("blahblah%"), AssertionException, 18535);
+        TimeZoneDatabase::utcZone().validateToStringFormat("%%%"), AssertionException, 18535);
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().validateToStringFormat("blahblah%"), AssertionException, 18535);
+
+    // Repeat the tests with the format map for $dateFromString.
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().validateFromStringFormat("%"), AssertionException, 18535);
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().validateFromStringFormat("%%%"), AssertionException, 18535);
+    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().validateFromStringFormat("blahblah%"),
+                       AssertionException,
+                       18535);
 }
 
 TEST(DateFormat, ThrowsUserExceptionIfGivenDateBeforeYear0) {
     const long long kMillisPerYear = 31556926000;
+
     ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
                            "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
                        AssertionException,
                        18537);
+
+    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
+                           "%G", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
+                       AssertionException,
+                       18537);
+
     ASSERT_EQ("0000",
               TimeZoneDatabase::utcZone().formatDate(
                   "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1970))));
@@ -964,6 +986,173 @@ TEST(DateFormat, ThrowsUserExceptionIfGivenDateBeforeYear0) {
 TEST(DateFormat, ThrowsUserExceptionIfGivenDateAfterYear9999) {
     ASSERT_THROWS_CODE(
         TimeZoneDatabase::utcZone().formatDate("%Y", Date_t::max()), AssertionException, 18537);
+
+    ASSERT_THROWS_CODE(
+        TimeZoneDatabase::utcZone().formatDate("%G", Date_t::max()), AssertionException, 18537);
+}
+
+TEST(DateFromString, CorrectlyParsesStringThatMatchesFormat) {
+    auto input = "2017-07-04T10:56:02Z";
+    auto format = "%Y-%m-%dT%H:%M:%SZ"_sd;
+    auto date = kDefaultTimeZoneDatabase.fromString(input, kDefaultTimeZone, format);
+    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate(format, date), input);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidYearFormat) {
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("201", kDefaultTimeZone, "%Y"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("20i7", kDefaultTimeZone, "%Y"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidMinuteFormat) {
+    // Minute must be 2 digits with leading zero.
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString(
+                           "2017-01-01T00:1:00", kDefaultTimeZone, "%Y-%m-%dT%H%M%S"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString(
+                           "2017-01-01T00:0i:00", kDefaultTimeZone, "%Y-%m-%dT%H%M%S"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidSecondsFormat) {
+    // Seconds must be 2 digits with leading zero.
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString(
+                           "2017-01-01T00:00:1", kDefaultTimeZone, "%Y-%m-%dT%H%M%S"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString(
+                           "2017-01-01T00:00:i0", kDefaultTimeZone, "%Y-%m-%dT%H%M%S"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidMillisecondsFormat) {
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString(
+                           "2017-01-01T00:00:00.i", kDefaultTimeZone, "%Y-%m-%dT%H:%M:%S.%L"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidISOYear) {
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("20i7", kDefaultTimeZone, "%G"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidISOWeekOfYear) {
+    // ISO week of year must be between 1 and 53.
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-55", kDefaultTimeZone, "%G-%V"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-FF", kDefaultTimeZone, "%G-%V"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidISODayOfWeek) {
+    // Day of week must be single digit between 1 and 7.
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-8", kDefaultTimeZone, "%G-%u"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-0", kDefaultTimeZone, "%G-%u"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-a", kDefaultTimeZone, "%G-%u"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("2017-11", kDefaultTimeZone, "%G-%u"_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(
+        kDefaultTimeZoneDatabase.fromString("2017-123", kDefaultTimeZone, "%G-%u"_sd),
+        AssertionException,
+        ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, RejectsStringWithInvalidTimezoneOffset) {
+    // Timezone offset minutes (%Z) requires format +/-mmm.
+    ASSERT_THROWS_CODE(
+        kDefaultTimeZoneDatabase.fromString("2017 500", kDefaultTimeZone, "%G %Z"_sd),
+        AssertionException,
+        ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(
+        kDefaultTimeZoneDatabase.fromString("2017 0500", kDefaultTimeZone, "%G %Z"_sd),
+        AssertionException,
+        ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(
+        kDefaultTimeZoneDatabase.fromString("2017 +i00", kDefaultTimeZone, "%G %Z"_sd),
+        AssertionException,
+        ErrorCodes::ConversionFailure);
+}
+
+TEST(DateFromString, EmptyFormatStringThrowsForAllInputs) {
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("1/1/2017", kDefaultTimeZone, ""_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+    ASSERT_THROWS_CODE(kDefaultTimeZoneDatabase.fromString("", kDefaultTimeZone, ""_sd),
+                       AssertionException,
+                       ErrorCodes::ConversionFailure);
+}
+
+TEST(DayOfWeek, WeekNumber) {
+    long long year = 2019;
+    long long week = 1;
+    long long day = 1;
+    long long hour = 0;
+    long long minute = 0;
+    long long second = 0;
+    long long millisecond = 0;
+
+    Date_t baseline = kDefaultTimeZone.createFromIso8601DateParts(
+        year, week, day, hour, minute, second, millisecond);
+
+    long long weekDurationInMillis = 7 * 24 * 60 * 60 * 1000;
+
+    for (int weekIt = -10000; weekIt < 10000; weekIt++) {
+        // Calculate a date using the ISO 8601 week-numbered year method.
+        Date_t dateFromIso8601 = kDefaultTimeZone.createFromIso8601DateParts(
+            year, weekIt, day, hour, minute, second, millisecond);
+
+        // Calculate the same date by adding 'weekDurationInMillis' to 'baseline' for each week past
+        // the baseline date.
+        Date_t dateFromArithmetic = baseline + Milliseconds(weekDurationInMillis * (weekIt - 1));
+
+        // The two methods should produce the same time.
+        ASSERT_EQ(dateFromIso8601, dateFromArithmetic);
+    }
+}
+
+TEST(DayOfWeek, DayNumber) {
+    long long year = 2019;
+    long long week = 34;
+    long long day = 1;
+    long long hour = 0;
+    long long minute = 0;
+    long long second = 0;
+    long long millisecond = 0;
+
+    Date_t baseline = kDefaultTimeZone.createFromIso8601DateParts(
+        year, week, day, hour, minute, second, millisecond);
+
+    long long dayDurationInMillis = 24 * 60 * 60 * 1000;
+
+    for (int dayIt = -10000; dayIt < 10000; dayIt++) {
+        // Calculate a date using the ISO 8601 week-numbered year method.
+        Date_t dateFromIso8601 = kDefaultTimeZone.createFromIso8601DateParts(
+            year, week, dayIt, hour, minute, second, millisecond);
+
+        // Calculate the same date by adding 'dayDurationInMillis' to 'baseline' for each day past
+        // the baseline date.
+        Date_t dateFromArithmetic = baseline + Milliseconds(dayDurationInMillis * (dayIt - 1));
+
+        // The two methods should produce the same time.
+        ASSERT_EQ(dateFromIso8601, dateFromArithmetic);
+    }
 }
 
 }  // namespace

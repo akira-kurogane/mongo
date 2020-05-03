@@ -1,6 +1,6 @@
 // Check if this build supports the authenticationMechanisms startup parameter.
+load("jstests/libs/logv2_helpers.js");
 var conn = MongoRunner.runMongod({
-    smallfiles: "",
     auth: "",
     sslMode: "requireSSL",
     sslPEMKeyFile: "jstests/libs/server.pem",
@@ -10,19 +10,19 @@ conn.getDB('admin').createUser({user: "root", pwd: "pass", roles: ["root"]});
 conn.getDB('admin').auth("root", "pass");
 var cmdOut = conn.getDB('admin').runCommand({getParameter: 1, authenticationMechanisms: 1});
 if (cmdOut.ok) {
-    TestData.authMechanism = "MONGODB-X509";  // SERVER-10353
+    TestData.authMechanism = "MONGODB-X509,SCRAM-SHA-1";  // SERVER-10353
 }
 conn.getDB('admin').dropAllUsers();
 conn.getDB('admin').logout();
 MongoRunner.stopMongod(conn);
 
-var SERVER_CERT = "jstests/libs/server.pem";
-var CA_CERT = "jstests/libs/ca.pem";
+const SERVER_CERT = "jstests/libs/server.pem";
+const CA_CERT = "jstests/libs/ca.pem";
 
-var SERVER_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=server";
-var INTERNAL_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=internal";
-var CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=client";
-var INVALID_CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=invalid";
+const SERVER_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=server";
+const INTERNAL_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=Kernel,CN=internal";
+const CLIENT_USER = "CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US";
+const INVALID_CLIENT_USER = "C=US,ST=New York,L=New York City,O=MongoDB,OU=KernelUser,CN=invalid";
 
 function authAndTest(mongo) {
     external = mongo.getDB("$external");
@@ -45,7 +45,8 @@ function authAndTest(mongo) {
         user: CLIENT_USER,
         roles: [
             {'role': 'userAdminAnyDatabase', 'db': 'admin'},
-            {'role': 'readWriteAnyDatabase', 'db': 'admin'}
+            {'role': 'readWriteAnyDatabase', 'db': 'admin'},
+            {'role': 'clusterMonitor', 'db': 'admin'},
         ]
     });
 
@@ -70,6 +71,27 @@ function authAndTest(mongo) {
            "runCommand authentication with valid client cert and user field failed");
     assert(external.runCommand({authenticate: 1, mechanism: 'MONGODB-X509'}).ok,
            "runCommand authentication with valid client cert and no user field failed");
+
+    // Check that there's a "Successfully authenticated" message that includes the client IP
+    const log =
+        assert.commandWorked(external.getSiblingDB("admin").runCommand({getLog: "global"})).log;
+
+    if (isJsonLog(mongo)) {
+        function checkAuthSuccess(element, index, array) {
+            const logJson = JSON.parse(element);
+
+            return logJson.id === 20429 && logJson.attr.principalName === CLIENT_USER &&
+                logJson.attr.DB === "$external" &&
+                /(?:\d{1,3}\.){3}\d{1,3}:\d+/.test(logJson.attr.client);
+        }
+        assert(log.some(checkAuthSuccess));
+    } else {
+        const successRegex =
+            new RegExp(`Successfully authenticated as principal ${CLIENT_USER} on ` +
+                       `\\$external from client (?:\\d{1,3}\\.){3}\\d{1,3}:\\d+`);
+
+        assert(log.some((line) => successRegex.test(line)));
+    }
 
     // Check that we can add a user and read data
     test.createUser(
@@ -100,8 +122,9 @@ var st = new ShardingTest({
         configOptions: x509_options,
         mongosOptions: x509_options,
         shardOptions: x509_options,
-        useHostname: false,
+        useHostname: false
     }
 });
 
 authAndTest(new Mongo("localhost:" + st.s0.port));
+st.stop();

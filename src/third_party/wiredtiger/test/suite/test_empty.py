@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -28,7 +28,6 @@
 
 import os
 import wiredtiger, wttest
-from wtdataset import simple_key
 from wtscenario import make_scenarios
 
 # test_empty.py
@@ -46,54 +45,12 @@ class test_empty(wttest.WiredTigerTestCase):
     # Creating an object and then closing it shouldn't write any blocks.
     def test_empty_create(self):
         uri = self.type + self.name
-        self.session.create(uri, 'key_format=' + self.fmt)
+        self.session.create(uri, 'key_format=' + self.fmt + ',value_format=S')
         self.session.close()
         name = self.name
         if self.type == "table:":
             name = name + '.wt'
         self.assertEquals(os.stat(name).st_size, 4*1024)
-
-    # Open a new session, add a few rows to an object and then remove them,
-    # then close the object.  We open/close the object so it's flushed from
-    # the underlying cache each time.
-    def empty(self):
-        uri = self.type + self.name
-        self.session = self.conn.open_session()
-        self.session.create(uri, 'key_format=' + self.fmt)
-
-        # Add a few records to the object and remove them.
-        cursor = self.session.open_cursor(uri, None, None)
-        for i in range(1,5):
-            key = simple_key(cursor, i)
-            cursor[key] = "XXX"
-            del cursor[key]
-
-        # Perform a checkpoint (we shouldn't write any underlying pages because
-        # of a checkpoint, either).
-        self.session.checkpoint("name=ckpt")
-
-        # Open and close a checkpoint cursor.
-        cursor = self.session.open_cursor(uri, None, "checkpoint=ckpt")
-        cursor.close()
-
-        self.session.close()
-
-        # The file should not have grown.
-        name = self.name
-        if self.type == "table:":
-            name = name + '.wt'
-        self.assertEquals(os.stat(name).st_size, 4*1024)
-
-    # Creating an object, inserting and removing records (that is, building an
-    # empty, dirty tree), shouldn't write any blocks.  This doesn't work for
-    # column-store objects, though, because deleting an object modifies the name
-    # space, which requires a write.
-    def test_empty(self):
-        if self.fmt == 'r':
-            return
-
-        for i in range(1,5):
-            self.empty()
 
 if __name__ == '__main__':
     wttest.run()

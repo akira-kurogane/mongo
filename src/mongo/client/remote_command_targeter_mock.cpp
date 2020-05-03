@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -54,18 +55,36 @@ ConnectionString RemoteCommandTargeterMock::connectionString() {
 
 StatusWith<HostAndPort> RemoteCommandTargeterMock::findHost(OperationContext* opCtx,
                                                             const ReadPreferenceSetting& readPref) {
-    return _findHostReturnValue;
+    if (!_findHostReturnValue.isOK()) {
+        return _findHostReturnValue.getStatus();
+    }
+
+    return _findHostReturnValue.getValue()[0];
 }
 
-StatusWith<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
+SemiFuture<HostAndPort> RemoteCommandTargeterMock::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxTime) {
+    if (!_findHostReturnValue.isOK()) {
+        return _findHostReturnValue.getStatus();
+    }
+
+    return _findHostReturnValue.getValue()[0];
+}
+
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterMock::findHostsWithMaxWait(
+    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
 
     return _findHostReturnValue;
 }
 
-void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {}
+void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _hostsMarkedDown.insert(host);
+}
 
 void RemoteCommandTargeterMock::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _hostsMarkedDown.insert(host);
 }
 
 void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionString returnValue) {
@@ -73,7 +92,23 @@ void RemoteCommandTargeterMock::setConnectionStringReturnValue(const ConnectionS
 }
 
 void RemoteCommandTargeterMock::setFindHostReturnValue(StatusWith<HostAndPort> returnValue) {
+    if (!returnValue.isOK()) {
+        _findHostReturnValue = returnValue.getStatus();
+    } else {
+        _findHostReturnValue = std::vector{returnValue.getValue()};
+    }
+}
+
+void RemoteCommandTargeterMock::setFindHostsReturnValue(
+    StatusWith<std::vector<HostAndPort>> returnValue) {
     _findHostReturnValue = std::move(returnValue);
+}
+
+std::set<HostAndPort> RemoteCommandTargeterMock::getAndClearMarkedDownHosts() {
+    stdx::lock_guard<Latch> lg(_mutex);
+    auto hostsMarkedDown = _hostsMarkedDown;
+    _hostsMarkedDown.clear();
+    return hostsMarkedDown;
 }
 
 }  // namespace mongo

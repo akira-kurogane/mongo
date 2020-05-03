@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,6 +33,7 @@
 #include <limits>
 #include <type_traits>
 
+#include <boost/numeric/conversion/cast.hpp>
 #include <boost/optional.hpp>
 
 #include "mongo/base/static_assert.h"
@@ -165,6 +167,17 @@ int compare(T t, U u) {
     return signedCompare(upconvert(t), upconvert(u));
 }
 
+/**
+ * Return true if number can be converted to Output type without underflow or overflow.
+ */
+template <typename Output, typename Input>
+bool inRange(Input i) {
+    const auto floor = std::numeric_limits<Output>::lowest();
+    const auto ceiling = std::numeric_limits<Output>::max();
+
+    return detail::compare(i, floor) >= 0 && detail::compare(i, ceiling) <= 0;
+}
+
 }  // namespace detail
 
 /**
@@ -179,63 +192,93 @@ int compare(T t, U u) {
  *     auto v3 = representAs<int>(10.3);       // v3 is disengaged
  */
 template <typename Output, typename Input>
-boost::optional<Output> representAs(Input number) {
-    if (std::is_same<Input, Output>::value) {
-        return {static_cast<Output>(number)};
-    }
-
-    // If number is NaN and Output can also represent NaN, return NaN
-    // Note: We need to specifically handle NaN here because of the way
-    // detail::compare is implemented.
-    {
-        // We use ADL here to allow types, such as Decimal, to supply their
-        // own definitions of isnan(). If the Input type does not define a
-        // custom isnan(), then we fall back to using std::isnan().
-        using std::isnan;
-        if (std::is_floating_point<Input>::value && isnan(number)) {
-            if (std::is_floating_point<Output>::value) {
+boost::optional<Output> representAs(Input number) try {
+    if constexpr (std::is_same_v<Input, Output>) {
+        return number;
+    } else if constexpr (std::is_same_v<Decimal128, Output>) {
+        // Use Decimal128's ctor taking (u)int64_t or double, if it's safe to cast to one of those.
+        if constexpr (std::is_integral_v<Input>) {
+            if constexpr (std::is_signed_v<Input>) {
+                return Decimal128{boost::numeric_cast<int64_t>(number)};
+            } else {
+                return Decimal128{boost::numeric_cast<uint64_t>(number)};
+            }
+        } else if constexpr (std::is_floating_point_v<Input>) {
+            return Decimal128{boost::numeric_cast<double>(number)};
+        } else {
+            return {};
+        }
+    } else {
+        // If number is NaN and Output can also represent NaN, return NaN
+        // Note: We need to specifically handle NaN here because of the way
+        // detail::compare is implemented.
+        if (std::is_floating_point_v<Input> && std::isnan(number)) {
+            if (std::is_floating_point_v<Output>) {
                 return {static_cast<Output>(number)};
             }
         }
-    }
 
-    // If Output is integral and number is a non-integral floating point value,
-    // return a disengaged optional.
-    if (std::is_floating_point<Input>::value && std::is_integral<Output>::value) {
-        if (!(std::trunc(number) == number)) {
+        // If Output is integral and number is a non-integral floating point value,
+        // return a disengaged optional.
+        if constexpr (std::is_floating_point_v<Input> && std::is_integral_v<Output>) {
+            if (!(std::trunc(number) == number)) {
+                return {};
+            }
+        }
+
+        if (!detail::inRange<Output>(number)) {
             return {};
         }
+
+        Output numberOut(number);
+
+        // Some integers cannot be exactly represented as floating point numbers.
+        // To check, we cast back to the input type if we can, and compare.
+        if constexpr (std::is_integral_v<Input> && std::is_floating_point_v<Output>) {
+            if (!detail::inRange<Input>(numberOut) || static_cast<Input>(numberOut) != number) {
+                return {};
+            }
+        }
+
+        return numberOut;
     }
+} catch (const boost::bad_numeric_cast&) {
+    return {};
+}
 
-    const auto floor = std::numeric_limits<Output>::lowest();
-    const auto ceiling = std::numeric_limits<Output>::max();
+// Overload for converting from Decimal128.
+template <typename Output>
+boost::optional<Output> representAs(const Decimal128& number) try {
+    std::uint32_t flags = 0;
+    Output numberOut;
 
-    // If number is out-of-bounds for Output type, fail.
-    if ((detail::compare(number, floor) < 0) || (detail::compare(number, ceiling) > 0)) {
+    if constexpr (std::is_same_v<Output, Decimal128>) {
+        return number;
+    } else if constexpr (std::is_floating_point_v<Output>) {
+        numberOut = boost::numeric_cast<Output>(number.toDouble(&flags));
+    } else if constexpr (std::is_integral_v<Output>) {
+        if constexpr (std::is_signed_v<Output>) {
+            numberOut = boost::numeric_cast<Output>(number.toLongExact(&flags));
+        } else {
+            numberOut = boost::numeric_cast<Output>(number.toULongExact(&flags));
+        }
+    } else {
+        // Unsupported type.
         return {};
     }
 
-    // Our number is within bounds, safe to perform a static_cast.
-    auto numberOut = static_cast<Output>(number);
-
-    // Some integers cannot be exactly represented as floating point numbers.
-    // To check, we cast back to the input type if we can, and compare.
-    if (std::is_integral<Input>::value && std::is_floating_point<Output>::value) {
-        const auto inputFloor = std::numeric_limits<Input>::lowest();
-        const auto inputCeiling = std::numeric_limits<Input>::max();
-
-        // If it is not safe to cast back to the Input type, fail.
-        if ((detail::compare(numberOut, inputFloor) < 0) ||
-            (detail::compare(numberOut, inputCeiling) > 0)) {
-            return {};
-        }
-
-        if (number != static_cast<Input>(numberOut)) {
-            return {};
-        }
+    // Decimal128::toDouble/toLongExact failed.
+    if (flags & (Decimal128::kUnderflow | Decimal128::kOverflow | Decimal128::kInvalid)) {
+        return {};
     }
 
-    return {static_cast<Output>(numberOut)};
+    if (std::is_integral<Output>() && flags & Decimal128::kInexact) {
+        return {};
+    }
+
+    return numberOut;
+} catch (const boost::bad_numeric_cast&) {
+    return {};
 }
 
 }  // namespace mongo

@@ -1,25 +1,24 @@
-// path.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,35 +39,75 @@ namespace mongo {
 
 class ElementPath {
 public:
-    ElementPath(StringData path, bool traverseNonLeafArr = true, bool traverseLeafArr = true)
-        : _shouldTraverseNonleafArrays(traverseNonLeafArr),
-          _shouldTraverseLeafArray(traverseLeafArr),
+    /**
+     * Controls how the element path interacts with leaf arrays, e.g. how we will handle the path
+     * "a.b" when "b" is an array.
+     */
+    enum class LeafArrayBehavior {
+        // Matches against the elements of arrays at the end of the path (in addition to the array
+        // as a whole).
+        //
+        // For example, for the path "f" and document {f: [1, 2]}, causes the path iterator to
+        // return 1, 2, and [1, 2].
+        kTraverse,
+
+        // Does not traverse arrays at the end of the path. For the path "f" and document {f: [1,
+        // 2]}, the path iterator returns only the entire array [1, 2].
+        kNoTraversal,
+    };
+
+    /**
+     * Controls how the element path interacts with non-leaf arrays, e.g. how we will handle the
+     * path "a.b" when "a" is an array.
+     */
+    enum class NonLeafArrayBehavior {
+        // Path traversal spans non-leaf arrays.
+        kTraverse,
+
+        // Path traversal stops at non-leaf array boundaries. The path iterator will return no
+        // elements.
+        kNoTraversal,
+
+        // Path traversal stops at non-leaf array boundaries. The path iterator will return the
+        // array element.
+        kMatchSubpath,
+    };
+
+    ElementPath(StringData path,
+                LeafArrayBehavior leafArrayBehavior = LeafArrayBehavior::kTraverse,
+                NonLeafArrayBehavior nonLeafArrayBehavior = NonLeafArrayBehavior::kTraverse)
+        : _leafArrayBehavior(leafArrayBehavior),
+          _nonLeafArrayBehavior(nonLeafArrayBehavior),
           _fieldRef(path) {}
 
     // TODO: replace uses of members below with regular construction.
     ElementPath() {}
-    Status init(StringData path);
+    void init(StringData path);
 
-    void setTraverseNonleafArrays(bool b) {
-        _shouldTraverseNonleafArrays = b;
+    void setLeafArrayBehavior(LeafArrayBehavior leafArrBehavior) {
+        _leafArrayBehavior = leafArrBehavior;
     }
-    void setTraverseLeafArray(bool b) {
-        _shouldTraverseLeafArray = b;
+
+    LeafArrayBehavior leafArrayBehavior() const {
+        return _leafArrayBehavior;
+    }
+
+    void setNonLeafArrayBehavior(NonLeafArrayBehavior value) {
+        _nonLeafArrayBehavior = value;
+    }
+
+    NonLeafArrayBehavior nonLeafArrayBehavior() const {
+        return _nonLeafArrayBehavior;
     }
 
     const FieldRef& fieldRef() const {
         return _fieldRef;
     }
-    bool shouldTraverseNonleafArrays() const {
-        return _shouldTraverseNonleafArrays;
-    }
-    bool shouldTraverseLeafArray() const {
-        return _shouldTraverseLeafArray;
-    }
 
 private:
-    bool _shouldTraverseNonleafArrays;
-    bool _shouldTraverseLeafArray;
+    LeafArrayBehavior _leafArrayBehavior;
+    NonLeafArrayBehavior _nonLeafArrayBehavior;
+
     FieldRef _fieldRef;
 };
 
@@ -221,4 +260,4 @@ private:
     std::unique_ptr<ElementIterator> _subCursor;
     std::unique_ptr<ElementPath> _subCursorPath;
 };
-}
+}  // namespace mongo

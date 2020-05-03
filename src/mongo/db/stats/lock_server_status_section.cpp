@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,12 +46,12 @@ public:
         _started = curTimeMillis64();
     }
 
-    virtual bool includeByDefault() const {
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         std::valarray<int> clientStatusCounts(5);
 
         // This returns the blocked lock states
@@ -62,7 +63,7 @@ public:
             const OperationContext* clientOpCtx = client->getOperationContext();
             auto state =
                 clientOpCtx ? clientOpCtx->lockState()->getClientState() : Locker::kInactive;
-            invariant(state < sizeof(clientStatusCounts));
+            invariant(state < clientStatusCounts.size());
             clientStatusCounts[state]++;
         }
 
@@ -85,7 +86,9 @@ public:
         {
             BSONObjBuilder activeClientsBuilder(ret.subobjStart("activeClients"));
 
-            activeClientsBuilder.append("total", clientStatusCounts.sum());
+            activeClientsBuilder.append("total",
+                                        clientStatusCounts[Locker::kActiveReader] +
+                                            clientStatusCounts[Locker::kActiveWriter]);
             activeClientsBuilder.append("readers", clientStatusCounts[Locker::kActiveReader]);
             activeClientsBuilder.append("writers", clientStatusCounts[Locker::kActiveWriter]);
             activeClientsBuilder.done();
@@ -106,12 +109,12 @@ class LockStatsServerStatusSection : public ServerStatusSection {
 public:
     LockStatsServerStatusSection() : ServerStatusSection("locks") {}
 
-    virtual bool includeByDefault() const {
+    bool includeByDefault() const override {
         return true;
     }
 
-    virtual BSONObj generateSection(OperationContext* opCtx,
-                                    const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder ret;
 
         SingleThreadedLockStats stats;

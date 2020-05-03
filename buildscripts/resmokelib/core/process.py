@@ -1,11 +1,8 @@
-"""
-A more reliable way to create and destroy processes.
+"""A more reliable way to create and destroy processes.
 
 Uses job objects when running on Windows to ensure that all created
 processes are terminated.
 """
-
-from __future__ import absolute_import
 
 import atexit
 import logging
@@ -13,30 +10,12 @@ import os
 import os.path
 import sys
 import threading
+import subprocess
 
-# The subprocess32 module resolves the thread-safety issues of the subprocess module in Python 2.x
-# when the _posixsubprocess C extension module is also available. Additionally, the _posixsubprocess
-# C extension module avoids triggering invalid free() calls on Python's internal data structure for
-# thread-local storage by skipping the PyOS_AfterFork() call when the 'preexec_fn' parameter isn't
-# specified to subprocess.Popen(). See SERVER-22219 for more details.
-#
-# The subprocess32 module is untested on Windows and thus isn't recommended for use, even when it's
-# installed. See https://github.com/google/python-subprocess32/blob/3.2.7/README.md#usage.
-if os.name == "posix" and sys.version_info[0] == 2:
-    try:
-        import subprocess32 as subprocess
-    except ImportError:
-        import warnings
-        warnings.warn(("Falling back to using the subprocess module because subprocess32 isn't"
-                       " available. When using the subprocess module, a child process may trigger"
-                       " an invalid free(). See SERVER-22219 for more details."),
-                      RuntimeWarning)
-        import subprocess
-else:
-    import subprocess
-
-from . import pipe
-from .. import utils
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib import errors
+from . import pipe  # pylint: disable=wrong-import-position
+from .. import utils  # pylint: disable=wrong-import-position
 
 # Attempt to avoid race conditions (e.g. hangs caused by a file descriptor being left open) when
 # starting subprocesses concurrently from multiple threads by guarding calls to subprocess.Popen()
@@ -74,8 +53,7 @@ if sys.platform == "win32":
                 win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
         # Update the limits of the job object.
-        win32job.SetInformationJobObject(job_object,
-                                         win32job.JobObjectExtendedLimitInformation,
+        win32job.SetInformationJobObject(job_object, win32job.JobObjectExtendedLimitInformation,
                                          job_info)
 
         return job_object
@@ -89,15 +67,14 @@ if sys.platform == "win32":
 
 
 class Process(object):
-    """
-    Wrapper around subprocess.Popen class.
-    """
+    """Wrapper around subprocess.Popen class."""
 
-    def __init__(self, logger, args, env=None, env_vars=None):
-        """
-        Initializes the process with the specified logger, arguments,
-        and environment.
-        """
+    # pylint: disable=protected-access
+    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, logger, args, env=None, env_vars=None, cwd=None):
+        """Initialize the process with the specified logger, arguments, and environment."""
 
         # Ensure that executable files that don't already have an
         # extension on Windows have a ".exe" extension.
@@ -115,20 +92,18 @@ class Process(object):
         self._process = None
         self._stdout_pipe = None
         self._stderr_pipe = None
+        self._cwd = cwd
 
     def start(self):
-        """
-        Starts the process and the logger pipes for its stdout and
-        stderr.
-        """
+        """Start the process and the logger pipes for its stdout and stderr."""
 
         creation_flags = 0
         if sys.platform == "win32" and _JOB_OBJECT is not None:
             creation_flags |= win32process.CREATE_BREAKAWAY_FROM_JOB
 
-        # Use unbuffered I/O pipes to avoid adding delay between when the subprocess writes output
-        # and when the LoggerPipe thread reads it.
-        buffer_size = 0
+        # Tests fail if a process takes too long to startup and listen to a socket. Use buffered
+        # I/O pipes to give the process some leeway.
+        buffer_size = 1024 * 1024
 
         # Close file descriptors in the child process before executing the program. This prevents
         # file descriptors that were inherited due to multiple calls to fork() -- either within one
@@ -138,13 +113,9 @@ class Process(object):
         close_fds = (sys.platform != "win32")
 
         with _POPEN_LOCK:
-            self._process = subprocess.Popen(self.args,
-                                             bufsize=buffer_size,
-                                             stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE,
-                                             close_fds=close_fds,
-                                             env=self.env,
-                                             creationflags=creation_flags)
+            self._process = subprocess.Popen(
+                self.args, bufsize=buffer_size, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=close_fds, env=self.env, creationflags=creation_flags, cwd=self._cwd)
             self.pid = self._process.pid
 
         self._stdout_pipe = pipe.LoggerPipe(self.logger, logging.INFO, self._process.stdout)
@@ -164,25 +135,28 @@ class Process(object):
                 if return_code == win32con.STILL_ACTIVE:
                     raise
 
-    def stop(self, kill=False):
+    def stop(self, mode=None):  # pylint: disable=too-many-branches
         """Terminate the process."""
+        if mode is None:
+            mode = fixture_interface.TeardownMode.TERMINATE
+
         if sys.platform == "win32":
 
             # Attempt to cleanly shutdown mongod.
-            if not kill and len(self.args) > 0 and self.args[0].find("mongod") != -1:
+            if mode != fixture_interface.TeardownMode.KILL and self.args and self.args[0].find(
+                    "mongod") != -1:
                 mongo_signal_handle = None
                 try:
                     mongo_signal_handle = win32event.OpenEvent(
-                        win32event.EVENT_MODIFY_STATE, False, "Global\\Mongo_" +
-                        str(self._process.pid))
+                        win32event.EVENT_MODIFY_STATE, False,
+                        "Global\\Mongo_" + str(self._process.pid))
 
                     if not mongo_signal_handle:
                         # The process has already died.
                         return
                     win32event.SetEvent(mongo_signal_handle)
                     # Wait 60 seconds for the program to exit.
-                    status = win32event.WaitForSingleObject(
-                        self._process._handle, 60 * 1000)
+                    status = win32event.WaitForSingleObject(self._process._handle, 60 * 1000)
                     if status == win32event.WAIT_OBJECT_0:
                         return
                 except win32process.error as err:
@@ -191,13 +165,13 @@ class Process(object):
                     # ERROR_INVALID_HANDLE (winerror=6)
                     # One of the above errors is received if the process has
                     # already died.
-                    if err[0] not in (2, 5, 6):
+                    if err.winerror not in (2, 5, 6):
                         raise
                 finally:
                     win32api.CloseHandle(mongo_signal_handle)
 
-                print "Failed to cleanly exit the program, calling TerminateProcess() on PID: " +\
-                    str(self._process.pid)
+                print("Failed to cleanly exit the program, calling TerminateProcess() on PID: " +\
+                    str(self._process.pid))
 
             # Adapted from implementation of Popen.terminate() in subprocess.py of Python 2.7
             # because earlier versions do not catch exceptions.
@@ -215,25 +189,29 @@ class Process(object):
                     raise
         else:
             try:
-                if kill:
+                if mode == fixture_interface.TeardownMode.KILL:
                     self._process.kill()
-                else:
+                elif mode == fixture_interface.TeardownMode.TERMINATE:
                     self._process.terminate()
+                elif mode == fixture_interface.TeardownMode.ABORT:
+                    self._process.send_signal(mode.value)
+                else:
+                    raise errors.ProcessError("Process wrapper given unrecognized teardown mode: " +
+                                              mode.value)
+
             except OSError as err:
                 # ESRCH (errno=3) is received when the process has already died.
                 if err.errno != 3:
                     raise
 
     def poll(self):
+        """Poll."""
         return self._process.poll()
 
-    def wait(self):
-        """
-        Waits until the process has terminated and all output has been
-        consumed by the logger pipes.
-        """
+    def wait(self, timeout=None):
+        """Wait until process has terminated and all output has been consumed by the logger pipes."""
 
-        return_code = self._process.wait()
+        return_code = self._process.wait(timeout)
 
         if self._stdout_pipe:
             self._stdout_pipe.wait_until_finished()
@@ -243,9 +221,7 @@ class Process(object):
         return return_code
 
     def as_command(self):
-        """
-        Returns an equivalent command line invocation of the process.
-        """
+        """Return an equivalent command line invocation of the process."""
 
         default_env = os.environ
         env_diff = self.env.copy()

@@ -1,24 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,32 +32,27 @@
 #include <boost/optional.hpp>
 #include <wiredtiger.h>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/snapshot_manager.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
+
+using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 
 class WiredTigerOplogManager;
 
 class WiredTigerSnapshotManager final : public SnapshotManager {
-    MONGO_DISALLOW_COPYING(WiredTigerSnapshotManager);
+    WiredTigerSnapshotManager(const WiredTigerSnapshotManager&) = delete;
+    WiredTigerSnapshotManager& operator=(const WiredTigerSnapshotManager&) = delete;
 
 public:
-    explicit WiredTigerSnapshotManager(WT_CONNECTION* conn) {
-        invariantWTOK(conn->open_session(conn, NULL, NULL, &_session));
-        _conn = conn;
-    }
+    WiredTigerSnapshotManager() = default;
 
-    ~WiredTigerSnapshotManager() {
-        shutdown();
-    }
-
-    Status prepareForCreateSnapshot(OperationContext* opCtx) final;
-    Status createSnapshot(OperationContext* opCtx, const SnapshotName& name) final;
-    void setCommittedSnapshot(const SnapshotName& name, Timestamp ts) final;
-    void cleanupUnneededSnapshots() final;
+    void setCommittedSnapshot(const Timestamp& timestamp) final;
+    void setLocalSnapshot(const Timestamp& timestamp) final;
+    boost::optional<Timestamp> getLocalSnapshot() final;
     void dropAllSnapshots() final;
 
     //
@@ -65,23 +60,24 @@ public:
     //
 
     /**
-     * Prepares for a shutdown of the WT_CONNECTION.
-     */
-    void shutdown();
-
-    void beginTransactionAtTimestamp(SnapshotName pointInTime, WT_SESSION* session) const;
-
-    /**
      * Starts a transaction and returns the SnapshotName used.
      *
      * Throws if there is currently no committed snapshot.
      */
-    SnapshotName beginTransactionOnCommittedSnapshot(WT_SESSION* session) const;
+    Timestamp beginTransactionOnCommittedSnapshot(
+        WT_SESSION* session,
+        PrepareConflictBehavior prepareConflictBehavior,
+        RoundUpPreparedTimestamps roundUpPreparedTimestamps) const;
 
     /**
-     * Starts a transaction on the oplog using an appropriate timestamp for oplog visiblity.
+     * Starts a transaction on the last stable local timestamp, set by setLocalSnapshot.
+     *
+     * Throws if no local snapshot has been set.
      */
-    void beginTransactionOnOplog(WiredTigerOplogManager* oplogManager, WT_SESSION* session) const;
+    Timestamp beginTransactionOnLocalSnapshot(
+        WT_SESSION* session,
+        PrepareConflictBehavior prepareConflictBehavior,
+        RoundUpPreparedTimestamps roundUpPreparedTimestamps) const;
 
     /**
      * Returns lowest SnapshotName that could possibly be used by a future call to
@@ -91,12 +87,17 @@ public:
      * This should not be used for starting a transaction on this SnapshotName since the named
      * snapshot may be deleted by the time you start the transaction.
      */
-    boost::optional<SnapshotName> getMinSnapshotForNextCommittedRead() const;
+    boost::optional<Timestamp> getMinSnapshotForNextCommittedRead() const;
 
 private:
-    mutable stdx::mutex _mutex;  // Guards all members.
-    boost::optional<SnapshotName> _committedSnapshot;
-    WT_SESSION* _session;
-    WT_CONNECTION* _conn;
+    // Snapshot to use for reads at a commit timestamp.
+    mutable Mutex _committedSnapshotMutex =  // Guards _committedSnapshot.
+        MONGO_MAKE_LATCH("WiredTigerSnapshotManager::_committedSnapshotMutex");
+    boost::optional<Timestamp> _committedSnapshot;
+
+    // Snapshot to use for reads at a local stable timestamp.
+    mutable Mutex _localSnapshotMutex =  // Guards _localSnapshot.
+        MONGO_MAKE_LATCH("WiredTigerSnapshotManager::_localSnapshotMutex");
+    boost::optional<Timestamp> _localSnapshot;
 };
-}
+}  // namespace mongo

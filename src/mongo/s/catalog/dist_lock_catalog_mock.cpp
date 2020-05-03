@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +36,7 @@
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -52,14 +53,8 @@ void noGrabLockFuncSet(StringData lockID,
                        Date_t time,
                        StringData why) {
     FAIL(str::stream() << "grabLock not expected to be called. "
-                       << "lockID: "
-                       << lockID
-                       << ", who: "
-                       << who
-                       << ", processId: "
-                       << processId
-                       << ", why: "
-                       << why);
+                       << "lockID: " << lockID << ", who: " << who << ", processId: " << processId
+                       << ", why: " << why);
 }
 
 void noOvertakeLockFuncSet(StringData lockID,
@@ -70,22 +65,13 @@ void noOvertakeLockFuncSet(StringData lockID,
                            Date_t time,
                            StringData why) {
     FAIL(str::stream() << "overtakeLock not expected to be called. "
-                       << "lockID: "
-                       << lockID
-                       << ", currentHolderTS: "
-                       << currentHolderTS
-                       << ", who: "
-                       << who
-                       << ", processId: "
-                       << processId
-                       << ", why: "
-                       << why);
+                       << "lockID: " << lockID << ", currentHolderTS: " << currentHolderTS
+                       << ", who: " << who << ", processId: " << processId << ", why: " << why);
 }
 
 void noUnLockFuncSet(const OID& lockSessionID) {
     FAIL(str::stream() << "unlock not expected to be called. "
-                       << "lockSessionID: "
-                       << lockSessionID);
+                       << "lockSessionID: " << lockSessionID);
 }
 
 void noPingFuncSet(StringData processID, Date_t ping) {
@@ -94,26 +80,22 @@ void noPingFuncSet(StringData processID, Date_t ping) {
 
 void noStopPingFuncSet(StringData processID) {
     FAIL(str::stream() << "stopPing not expected to be called. "
-                       << "processID: "
-                       << processID);
+                       << "processID: " << processID);
 }
 
 void noGetLockByTSSet(const OID& lockSessionID) {
     FAIL(str::stream() << "getLockByTS not expected to be called. "
-                       << "lockSessionID: "
-                       << lockSessionID);
+                       << "lockSessionID: " << lockSessionID);
 }
 
 void noGetLockByNameSet(StringData name) {
     FAIL(str::stream() << "getLockByName not expected to be called. "
-                       << "lockName: "
-                       << name);
+                       << "lockName: " << name);
 }
 
 void noGetPingSet(StringData processId) {
     FAIL(str::stream() << "getPing not expected to be called. "
-                       << "lockName: "
-                       << processId);
+                       << "lockName: " << processId);
 }
 
 void noGetServerInfoSet() {
@@ -150,7 +132,7 @@ StatusWith<LockpingsType> DistLockCatalogMock::getPing(OperationContext* opCtx,
     GetPingFunc checkerFunc = noGetPingSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _getPingReturnValue;
         checkerFunc = _getPingChecker;
     }
@@ -164,7 +146,7 @@ Status DistLockCatalogMock::ping(OperationContext* opCtx, StringData processID, 
     PingFunc checkerFunc = noPingFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _pingReturnValue;
         checkerFunc = _pingChecker;
     }
@@ -185,7 +167,7 @@ StatusWith<LocksType> DistLockCatalogMock::grabLock(OperationContext* opCtx,
     GrabLockFunc checkerFunc = noGrabLockFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _grabLockReturnValue;
         checkerFunc = _grabLockChecker;
     }
@@ -206,7 +188,7 @@ StatusWith<LocksType> DistLockCatalogMock::overtakeLock(OperationContext* opCtx,
     OvertakeLockFunc checkerFunc = noOvertakeLockFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _overtakeLockReturnValue;
         checkerFunc = _overtakeLockChecker;
     }
@@ -220,7 +202,7 @@ Status DistLockCatalogMock::unlock(OperationContext* opCtx, const OID& lockSessi
     UnlockFunc checkerFunc = noUnLockFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _unlockReturnValue;
         checkerFunc = _unlockChecker;
     }
@@ -236,7 +218,7 @@ Status DistLockCatalogMock::unlock(OperationContext* opCtx,
     UnlockFunc checkerFunc = noUnLockFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _unlockReturnValue;
         checkerFunc = _unlockChecker;
     }
@@ -252,7 +234,7 @@ StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogMock::getServerInfo(
     GetServerInfoFunc checkerFunc = noGetServerInfoSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _getServerInfoReturnValue;
         checkerFunc = _getServerInfoChecker;
     }
@@ -267,7 +249,7 @@ StatusWith<LocksType> DistLockCatalogMock::getLockByTS(OperationContext* opCtx,
     GetLockByTSFunc checkerFunc = noGetLockByTSSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _getLockByTSReturnValue;
         checkerFunc = _getLockByTSChecker;
     }
@@ -281,7 +263,7 @@ StatusWith<LocksType> DistLockCatalogMock::getLockByName(OperationContext* opCtx
     GetLockByNameFunc checkerFunc = noGetLockByNameSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _getLockByNameReturnValue;
         checkerFunc = _getLockByNameChecker;
     }
@@ -295,7 +277,7 @@ Status DistLockCatalogMock::stopPing(OperationContext* opCtx, StringData process
     StopPingFunc checkerFunc = noStopPingFuncSet;
 
     {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        stdx::lock_guard<Latch> lk(_mutex);
         ret = _stopPingReturnValue;
         checkerFunc = _stopPingChecker;
     }
@@ -306,67 +288,67 @@ Status DistLockCatalogMock::stopPing(OperationContext* opCtx, StringData process
 
 void DistLockCatalogMock::expectGrabLock(DistLockCatalogMock::GrabLockFunc checkerFunc,
                                          StatusWith<LocksType> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _grabLockChecker = checkerFunc;
     _grabLockReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectNoGrabLock() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _grabLockChecker = noGrabLockFuncSet;
     _grabLockReturnValue = kLocksTypeBadRetValue;
 }
 
 void DistLockCatalogMock::expectUnLock(DistLockCatalogMock::UnlockFunc checkerFunc,
                                        Status returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _unlockChecker = checkerFunc;
     _unlockReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectPing(DistLockCatalogMock::PingFunc checkerFunc, Status returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _pingChecker = checkerFunc;
     _pingReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectStopPing(StopPingFunc checkerFunc, Status returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _stopPingChecker = checkerFunc;
     _stopPingReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectGetLockByTS(GetLockByTSFunc checkerFunc,
                                             StatusWith<LocksType> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _getLockByTSChecker = checkerFunc;
     _getLockByTSReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectGetLockByName(GetLockByNameFunc checkerFunc,
                                               StatusWith<LocksType> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _getLockByNameChecker = checkerFunc;
     _getLockByNameReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectOvertakeLock(OvertakeLockFunc checkerFunc,
                                              StatusWith<LocksType> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _overtakeLockChecker = checkerFunc;
     _overtakeLockReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectGetPing(GetPingFunc checkerFunc,
                                         StatusWith<LockpingsType> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _getPingChecker = checkerFunc;
     _getPingReturnValue = returnThis;
 }
 
 void DistLockCatalogMock::expectGetServerInfo(GetServerInfoFunc checkerFunc,
                                               StatusWith<DistLockCatalog::ServerInfo> returnThis) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::lock_guard<Latch> lk(_mutex);
     _getServerInfoChecker = checkerFunc;
     _getServerInfoReturnValue = returnThis;
 }

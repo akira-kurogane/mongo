@@ -1,34 +1,37 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/bsonobj_comparator.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/platform/decimal128.h"
@@ -185,8 +188,16 @@ TEST(BSONObjCompare, NumberLong_Double) {
         const double equal = -9223372036854775808.0;         // 2**63
         const double closestAbove = -9223372036854774784.0;  // -2**63 + epsilon
 
+// VS2017 Doesn't like the tests below, even though we're using static_cast
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4056)  // warning C4056: overflow in floating-point constant arithmetic
+#endif
         invariant(static_cast<double>(minLL) == equal);
         invariant(static_cast<long long>(equal) == minLL);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
         ASSERT_BSONOBJ_LT(BSON("" << minLL), BSON("" << (minLL + 1)));
 
@@ -525,6 +536,8 @@ TEST(BSONObjCompare, BSONObjHashingIgnoresTopLevelFieldNamesWhenRequested) {
     ASSERT_NE(bsonCmpConsiderFieldNames.hash(obj1), bsonCmpConsiderFieldNames.hash(obj2));
     ASSERT_EQ(bsonCmpIgnoreFieldNames.hash(obj1), bsonCmpIgnoreFieldNames.hash(obj2));
     ASSERT_NE(bsonCmpIgnoreFieldNames.hash(obj1), bsonCmpIgnoreFieldNames.hash(obj3));
+    ASSERT_NE(bsonCmpIgnoreFieldNames.hash(fromjson("{a: {b: 1, c: 1}, d: 1}")),
+              bsonCmpIgnoreFieldNames.hash(fromjson("{a: {b: 1, c: 2}, d: 1}")));
 }
 
 TEST(BSONObjCompare, BSONElementHashingIgnoresEltFieldNameWhenRequested) {
@@ -542,6 +555,50 @@ TEST(BSONObjCompare, BSONElementHashingIgnoresEltFieldNameWhenRequested) {
               bsonCmpIgnoreFieldNames.hash(obj2.firstElement()));
     ASSERT_NE(bsonCmpIgnoreFieldNames.hash(obj1.firstElement()),
               bsonCmpIgnoreFieldNames.hash(obj3.firstElement()));
+}
+
+TEST(BSONObjCompare, WoCompareWithIdxKey) {
+    BSONObj obj = fromjson("{a: 1, b: 1, c: 1}");
+    BSONObj objEq = fromjson("{a: 1, b: 1, c: 1}");
+    BSONObj objGt = fromjson("{a: 2, b: 2, c: 2}");
+    BSONObj objLt = fromjson("{a: 0, b: 0, c: 0}");
+    BSONObj idxKeyAsc = fromjson("{a: 1, b: 1}");
+    BSONObj idxKeyDesc = fromjson("{a: -1, b: 1}");
+    BSONObj idxKeyShort = fromjson("{a: 1}");
+
+    ASSERT_EQ(obj.woCompare(objEq, idxKeyAsc), 0);
+    ASSERT_EQ(obj.woCompare(objEq, idxKeyDesc), 0);
+    ASSERT_EQ(obj.woCompare(objEq, idxKeyShort), 0);
+    ASSERT_EQ(obj.woCompare(objGt, idxKeyAsc), -1);
+    ASSERT_EQ(obj.woCompare(objGt, idxKeyDesc), 1);
+    ASSERT_EQ(obj.woCompare(objGt, idxKeyShort), -1);
+    ASSERT_EQ(obj.woCompare(objLt, idxKeyAsc), 1);
+    ASSERT_EQ(obj.woCompare(objLt, idxKeyDesc), -1);
+    ASSERT_EQ(obj.woCompare(objLt, idxKeyShort), 1);
+}
+
+TEST(BSONObjCompare, UnorderedFieldsBSONObjComparison) {
+    BSONObj obj = fromjson("{a: {b: 1}, c: 1}");
+
+    UnorderedFieldsBSONObjComparator bsonCmp;
+
+    ASSERT_TRUE(bsonCmp.evaluate(obj == fromjson("{c: 1, a: {b: 1}}")));
+    ASSERT_FALSE(bsonCmp.evaluate(obj == fromjson("{a: {b: 1}, c: 1, d: 1}")));
+    ASSERT_FALSE(bsonCmp.evaluate(obj == fromjson("{a: {b: 1}}")));
+    ASSERT_FALSE(bsonCmp.evaluate(obj == fromjson("{a: {b: 2}, c: 1}")));
+}
+
+TEST(BSONObjCompare, UnorderedFieldsBSONObjHashing) {
+    BSONObj obj = fromjson("{a: {b: 1, c: 1}, d: 1}");
+
+    UnorderedFieldsBSONObjComparator bsonCmp;
+
+    ASSERT_EQ(bsonCmp.hash(obj), bsonCmp.hash(obj));
+    ASSERT_EQ(bsonCmp.hash(obj), bsonCmp.hash(fromjson("{d: 1, a: {b: 1, c: 1}}")));
+    ASSERT_EQ(bsonCmp.hash(obj), bsonCmp.hash(fromjson("{a: {c: 1, b: 1}, d: 1}")));
+    ASSERT_NE(bsonCmp.hash(obj), bsonCmp.hash(fromjson("{a: {b: 1, c: 1}}")));
+    ASSERT_NE(bsonCmp.hash(obj), bsonCmp.hash(fromjson("{a: {b: 1, c: 1}, d: 2}")));
+    ASSERT_NE(bsonCmp.hash(obj), bsonCmp.hash(fromjson("{a: {b: 1}, d: 1}")));
 }
 
 TEST(Looping, Cpp11Basic) {
@@ -580,10 +637,7 @@ TEST(BSONObj, getFields) {
 TEST(BSONObj, getFieldsWithDuplicates) {
     auto e = BSON("a" << 2 << "b"
                       << "3"
-                      << "a"
-                      << 9
-                      << "b"
-                      << 10);
+                      << "a" << 9 << "b" << 10);
     std::array<StringData, 2> fieldNames{"a", "b"};
     std::array<BSONElement, 2> fields;
     e.getFields(fieldNames, &fields);
@@ -626,6 +680,48 @@ TEST(BSONObj, addField) {
 
     // Check that after all this obj is unchanged.
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 2));
+}
+
+TEST(BSONObj, sizeChecks) {
+    auto generateBuffer = [](std::int32_t size) {
+        std::vector<char> buffer(size);
+        DataRange bufferRange(&buffer.front(), &buffer.back());
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
+
+        return buffer;
+    };
+
+    {
+        // Implicitly assert that BSONObj constructor does not throw
+        // with standard size buffers.
+        auto normalBuffer = generateBuffer(15 * 1024 * 1024);
+        BSONObj obj(normalBuffer.data());
+    }
+
+    // Large buffers cause an exception to be thrown.
+    ASSERT_THROWS_CODE(
+        [&] {
+            auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+            BSONObj obj(largeBuffer.data());
+        }(),
+        DBException,
+        ErrorCodes::BSONObjectTooLarge);
+
+
+    // Assert that the max size can be increased by passing BSONObj a tag type.
+    {
+        auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+        BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
+    }
+
+    // But a size is in fact being enforced.
+    ASSERT_THROWS_CODE(
+        [&]() {
+            auto hugeBuffer = generateBuffer(70 * 1024 * 1024);
+            BSONObj obj(hugeBuffer.data(), BSONObj::LargeSizeTrait{});
+        }(),
+        DBException,
+        ErrorCodes::BSONObjectTooLarge);
 }
 
 }  // unnamed namespace

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,7 +31,7 @@
 
 #include <memory>
 
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
@@ -47,11 +48,11 @@ class SeekableRecordCursor;
  *
  * Preconditions: Valid RecordId.
  */
-class FetchStage : public PlanStage {
+class FetchStage : public RequiresCollectionStage {
 public:
-    FetchStage(OperationContext* opCtx,
+    FetchStage(ExpressionContext* expCtx,
                WorkingSet* ws,
-               PlanStage* child,
+               std::unique_ptr<PlanStage> child,
                const MatchExpression* filter,
                const Collection* collection);
 
@@ -60,11 +61,8 @@ public:
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
 
-    void doSaveState() final;
-    void doRestoreState() final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_FETCH;
@@ -76,6 +74,11 @@ public:
 
     static const char* kStageType;
 
+protected:
+    void doSaveStateRequiresCollection() final;
+
+    void doRestoreStateRequiresCollection() final;
+
 private:
     /**
      * If the member (with id memberID) passes our filter, set *out to memberID and return that
@@ -83,9 +86,6 @@ private:
      */
     StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
-    // Collection which is used by this stage. Used to resolve record ids retrieved by child
-    // stages. The lifetime of the collection must supersede that of the stage.
-    const Collection* _collection;
     // Used to fetch Records from _collection.
     std::unique_ptr<SeekableRecordCursor> _cursor;
 

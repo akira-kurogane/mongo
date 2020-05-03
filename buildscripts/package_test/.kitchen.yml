@@ -2,11 +2,13 @@
 driver:
   name: ec2
   region: us-east-1
+  vpc_mode: true
+  vpc_id: <%= ENV['KITCHEN_VPC'] %>
   subnet_id: <%= ENV['KITCHEN_SUBNET'] %>
   security_group_ids:
     - <%= ENV['KITCHEN_SECURITY_GROUP'] %>
   aws_ssh_key_id: <%= ENV['KITCHEN_SSH_KEY_ID'] %>
-  interface: dns
+  interface: private
   associate_public_ip: true
   tags:
     name: "server package test"
@@ -27,6 +29,11 @@ platforms:
       image_id: ami-c481fad3
     transport:
       username: ec2-user
+  - name: amazon2
+    driver:
+      image_id: ami-428aa838
+    transport:
+      username: ec2-user
   - name: debian71
     driver:
       image_id: ami-4b124a22
@@ -35,6 +42,16 @@ platforms:
   - name: debian81
     driver:
       image_id: ami-896d85e2
+    transport:
+      username: admin
+  - name: debian92
+    driver:
+      image_id: ami-71b7750b
+    transport:
+      username: admin
+  - name: debian10
+    driver:
+      image_id: ami-02ad06066b040a84b
     transport:
       username: admin
   - name: rhel62
@@ -48,6 +65,11 @@ platforms:
       image_id: ami-60a1e808
     transport:
       username: root
+  - name: rhel80
+    driver:
+      image_id: ami-0c322300a1dd5dc79
+    transport:
+      username: ec2-user
   - name: suse11
     driver:
       image_id: ami-7f2e6015
@@ -56,6 +78,11 @@ platforms:
   - name: suse12
     driver:
       image_id: ami-aeb532c6
+    transport:
+      username: ec2-user
+  - name: suse15
+    driver:
+      image_id: ami-06ea7729e394412c8
     transport:
       username: ec2-user
   - name: ubuntu1204
@@ -71,6 +98,16 @@ platforms:
   - name: ubuntu1604
     driver:
       image_id: ami-64140d0e
+    transport:
+      username: ubuntu
+  - name: ubuntu1804
+    driver:
+      image_id: ami-7ad76705
+    transport:
+      username: ubuntu
+  - name: ubuntu2004
+    driver:
+      image_id: ami-068663a3c619dd892
     transport:
       username: ubuntu
 

@@ -21,10 +21,10 @@ boxBounds = [[0, 0], [0, 10], [10, 10], [10, 0]];
 assert.eq(num, t.find({loc: {"$within": {"$polygon": boxBounds}}}).count(), "Bounding Box Test");
 
 // Make sure we can add object-based polygons
-assert.eq(
-    num, t.find({
-              loc: {$within: {$polygon: {a: [-10, -10], b: [-10, 10], c: [10, 10], d: [10, -10]}}}
-          }).count());
+assert.eq(num,
+          t.find({
+               loc: {$within: {$polygon: {a: [-10, -10], b: [-10, 10], c: [10, 10], d: [10, -10]}}}
+           }).count());
 
 // Look in a box much bigger than the one we have data in
 boxBounds = [[-100, -100], [-100, 100], [100, 100], [100, -100]];
@@ -45,7 +45,7 @@ pacman = [
     [2, 0]  // Bottom
 ];
 
-assert.writeOK(t.save({loc: [1, 3]}));  // Add a point that's in
+assert.commandWorked(t.save({loc: [1, 3]}));  // Add a point that's in
 
 assert.eq(1, t.find({loc: {$within: {$polygon: pacman}}}).count(), "Pacman single point");
 

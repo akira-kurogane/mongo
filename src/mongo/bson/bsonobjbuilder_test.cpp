@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,6 +28,8 @@
  */
 
 #include "mongo/platform/basic.h"
+
+#include <type_traits>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -72,35 +75,18 @@ TEST(BSONObjBuilderTest, AppendInt64T) {
     ASSERT_EQ(obj["b"].Long(), 1ll << 40);
 }
 
-/**
- * current conversion ranges in append(unsigned n)
- * dbl/int max/min in comments refer to max/min encodable constants
- *                  0 <= n <= uint_max          -----> int
- */
+template <typename T, typename = void>
+struct isUnsignedAppendable : std::false_type {};
 
-TEST(BSONObjBuilderTest, AppendUnsignedInt) {
-    struct {
-        unsigned int v;
-        BSONType t;
-    } data[] = {{0, mongo::NumberInt},
-                {100, mongo::NumberInt},
-                {maxEncodableInt, mongo::NumberInt},
-                {maxEncodableInt + 1, mongo::NumberInt},
-                {static_cast<unsigned int>(maxInt), mongo::NumberInt},
-                {static_cast<unsigned int>(maxInt) + 1U, mongo::NumberInt},
-                {(std::numeric_limits<unsigned int>::max)(), mongo::NumberInt},
-                {0, mongo::Undefined}};
-    for (int i = 0; data[i].t != mongo::Undefined; i++) {
-        unsigned int v = data[i].v;
-        BSONObjBuilder b;
-        b.append("a", v);
-        BSONObj o = b.obj();
-        ASSERT_EQUALS(o.nFields(), 1);
-        BSONElement e = o.getField("a");
-        unsigned int n = e.numberLong();
-        ASSERT_EQUALS(n, v);
-        assertBSONTypeEquals(e.type(), data[i].t, v, i);
-    }
+template <typename T>
+struct isUnsignedAppendable<T, std::void_t<decltype(BSONObjAppendFormat<T>::value)>>
+    : std::true_type {};
+
+TEST(BSONObjBuilderTest, AppendUnsignedIsForbidden) {
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned long>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<unsigned long long>::value);
+    MONGO_STATIC_ASSERT(!isUnsignedAppendable<uint64_t>::value);
 }
 
 /**
@@ -300,8 +286,7 @@ TEST(BSONObjBuilderTest, ResumeBuildingWithNesting) {
     ASSERT_BSONOBJ_EQ(obj,
                       BSON("ll" << BSON("f" << BSON("cc"
                                                     << "dd"))
-                                << "a"
-                                << BSON("c" << 3)));
+                                << "a" << BSON("c" << 3)));
 }
 
 TEST(BSONObjBuilderTest, ResetToEmptyResultsInEmptyObj) {
@@ -445,6 +430,67 @@ TEST(BSONObjBuilderTest, SeedingBSONObjBuilderWithNonrootedUnownedBsonWorks) {
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1 << "b" << 1));
     ASSERT_NE(static_cast<const void*>(obj.objdata()), static_cast<const void*>(origObjPtr));
 }
+
+TEST(BSONObjBuilderTest, SizeChecks) {
+    auto generateBuffer = [](std::int32_t size) {
+        std::vector<char> buffer(size);
+        DataRange bufferRange(&buffer.front(), &buffer.back());
+        ASSERT_OK(bufferRange.writeNoThrow(LittleEndian<int32_t>(size)));
+
+        return buffer;
+    };
+
+    {
+        // Implicitly assert that BSONObjBuilder does not throw
+        // with standard size buffers.
+        auto normalBuffer = generateBuffer(15 * 1024 * 1024);
+        BSONObj obj(normalBuffer.data());
+
+        BSONObjBuilder builder;
+        builder.append("a", obj);
+        BSONObj finalObj = builder.obj();
+    }
+
+    // Large buffers cause an exception to be thrown.
+    ASSERT_THROWS_CODE(
+        [&] {
+            auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+            BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
+
+            BSONObjBuilder builder;
+            builder.append("a", obj);
+            BSONObj finalObj = builder.obj();
+        }(),
+        DBException,
+        ErrorCodes::BSONObjectTooLarge);
+
+
+    // Assert that the max size can be increased by passing BSONObj a tag type.
+    {
+        auto largeBuffer = generateBuffer(17 * 1024 * 1024);
+        BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
+
+        BSONObjBuilder builder;
+        builder.append("a", obj);
+        BSONObj finalObj = builder.obj<BSONObj::LargeSizeTrait>();
+    }
+
+    // But a size is in fact being enforced.
+    {
+        auto largeBuffer = generateBuffer(40 * 1024 * 1024);
+        BSONObj obj(largeBuffer.data(), BSONObj::LargeSizeTrait{});
+        BSONObjBuilder builder;
+        ASSERT_THROWS(
+            [&]() {
+                for (StringData character : {"a", "b", "c"}) {
+                    builder.append(character, obj);
+                }
+                BSONObj finalObj = builder.obj<BSONObj::LargeSizeTrait>();
+            }(),
+            DBException);
+    }
+}
+
 
 }  // namespace
 }  // namespace mongo

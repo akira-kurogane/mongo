@@ -1,38 +1,40 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
+#include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 
 namespace mongo {
@@ -52,24 +54,13 @@ class Status;
  * there is an imbalance by checking the difference in chunks between the most and least
  * loaded shards. It would issue a request for a chunk migration per round, if it found so.
  */
-class Balancer {
-    MONGO_DISALLOW_COPYING(Balancer);
+class Balancer : public ReplicaSetAwareServiceConfigSvr<Balancer> {
+    Balancer(const Balancer&) = delete;
+    Balancer& operator=(const Balancer&) = delete;
 
 public:
-    Balancer(ServiceContext* serviceContext);
+    Balancer();
     ~Balancer();
-
-    /**
-     * Instantiates an instance of the balancer and installs it on the specified service context.
-     * This method is not thread-safe and must be called only once when the service is starting.
-     */
-    static void create(ServiceContext* serviceContext);
-
-    /**
-     * Retrieves the per-service instance of the Balancer.
-     */
-    static Balancer* get(ServiceContext* serviceContext);
-    static Balancer* get(OperationContext* operationContext);
 
     /**
      * Invoked when the config server primary enters the 'PRIMARY' state and is invoked while the
@@ -108,7 +99,8 @@ public:
 
     /**
      * Potentially blocking method, which will return immediately if the balancer is not running a
-     * balancer round and will block until the current round completes otherwise.
+     * balancer round and will block until the current round completes otherwise. If the operation
+     * context's deadline is exceeded, it will throw an ExceededTimeLimit exception.
      */
     void joinCurrentRound(OperationContext* opCtx);
 
@@ -133,12 +125,28 @@ public:
                            const ShardId& newShardId,
                            uint64_t maxChunkSizeBytes,
                            const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                           bool waitForDelete);
+                           bool waitForDelete,
+                           bool forceJumbo);
 
     /**
      * Appends the runtime state of the balancer instance to the specified builder.
      */
     void report(OperationContext* opCtx, BSONObjBuilder* builder);
+
+    /**
+     * Informs the balancer that a setting that affects it changed.
+     */
+    void notifyPersistedBalancerSettingsChanged();
+
+    struct BalancerStatus {
+        bool balancerCompliant;
+        boost::optional<std::string> firstComplianceViolation;
+    };
+    /**
+     * Returns if a given collection is draining due to a removed shard, has chunks on an invalid
+     * zone or the number of chunks is imbalanced across the cluster
+     */
+    BalancerStatus getBalancerStatusForNs(OperationContext* opCtx, const NamespaceString& nss);
 
 private:
     /**
@@ -146,9 +154,16 @@ private:
      */
     enum State {
         kStopped,   // kRunning
-        kRunning,   // kStopping
+        kRunning,   // kStopping | kStopped
         kStopping,  // kStopped
     };
+
+    /**
+     * ReplicaSetAwareService entry points.
+     */
+    void onStepUpBegin(OperationContext* opCtx) final;
+    void onStepUpComplete(OperationContext* opCtx) final;
+    void onStepDown() final;
 
     /**
      * The main balancer loop, which runs in a separate thread.
@@ -164,13 +179,13 @@ private:
      * Signals the beginning and end of a balancing round.
      */
     void _beginRound(OperationContext* opCtx);
-    void _endRound(OperationContext* opCtx, Seconds waitTimeout);
+    void _endRound(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Blocks the caller for the specified timeout or until the balancer condition variable is
      * signaled, whichever comes first.
      */
-    void _sleepFor(OperationContext* opCtx, Seconds waitTimeout);
+    void _sleepFor(OperationContext* opCtx, Milliseconds waitTimeout);
 
     /**
      * Returns true if all the servers listed in configdb as being shards are reachable and are
@@ -179,10 +194,15 @@ private:
     bool _checkOIDs(OperationContext* opCtx);
 
     /**
-     * Iterates through all chunks in all collections and ensures that no chunks straddle tag
-     * boundary. If any do, they will be split.
+     * Iterates through all chunks in all collections. If the collection is the sessions collection,
+     * checks if the number of chunks is greater than or equal to the configured minimum number of
+     * chunks for the sessions collection (minNumChunksForSessionsCollection). If it isn't,
+     * calculates split points that evenly partition the key space into N ranges (where N is
+     * minNumChunksForSessionsCollection rounded up the next power of 2), and splits any chunks that
+     * straddle those split points. If the collection is any other collection, splits any chunks
+     * that straddle tag boundaries.
      */
-    Status _enforceTagRanges(OperationContext* opCtx);
+    Status _splitChunksIfNeeded(OperationContext* opCtx);
 
     /**
      * Schedules migrations for the specified set of chunks and returns how many chunks were
@@ -200,13 +220,14 @@ private:
                            const BSONObj& minKey);
 
     // Protects the state below
-    stdx::mutex _mutex;
+    Mutex _mutex = MONGO_MAKE_LATCH("Balancer::_mutex");
 
     // Indicates the current state of the balancer
     State _state{kStopped};
 
     // The main balancer thread
     stdx::thread _thread;
+    stdx::condition_variable _joinCond;
 
     // The operation context of the main balancer thread. This value may only be available in the
     // kRunning state and is used to force interrupt of any blocking calls made by the balancer
@@ -236,11 +257,15 @@ private:
     // Number of moved chunks in last round
     int _balancedLastTime;
 
-    // Source for cluster statistics
+    // Source of randomness when metadata needs to be randomized.
+    BalancerRandomSource _random;
+
+    // Source for cluster statistics. Depends on the source of randomness above so it should be
+    // created after it and destroyed before it.
     std::unique_ptr<ClusterStatistics> _clusterStats;
 
-    // Balancer policy. Depends on the cluster statistics instance above so it should be created
-    // after it and destroyed before it.
+    // Balancer policy. Depends on the cluster statistics instance and source of randomness above so
+    // it should be created after them and destroyed before them.
     std::unique_ptr<BalancerChunkSelectionPolicy> _chunkSelectionPolicy;
 
     // Migration manager used to schedule and manage migrations

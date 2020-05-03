@@ -1,23 +1,24 @@
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,12 +29,11 @@
 
 #pragma once
 
+#include <functional>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -48,7 +48,8 @@ class ScatterGatherAlgorithm;
  * Interface of a scatter-gather behavior.
  */
 class ScatterGatherRunner {
-    MONGO_DISALLOW_COPYING(ScatterGatherRunner);
+    ScatterGatherRunner(const ScatterGatherRunner&) = delete;
+    ScatterGatherRunner& operator=(const ScatterGatherRunner&) = delete;
 
 public:
     /**
@@ -56,9 +57,12 @@ public:
      *
      * "executor" must remain in scope until the runner's destructor completes.
      * "algorithm" is shared between the runner and the caller.
+     * "logMessage" is the process for which this ScatterGatherRunner is used. It will be included
+     * in log lines written by the ScatterGatherRunner for remote command requests.
      */
     explicit ScatterGatherRunner(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
-                                 executor::TaskExecutor* executor);
+                                 executor::TaskExecutor* executor,
+                                 std::string logMessage);
 
     /**
      * Runs the scatter-gather process and blocks until it completes.
@@ -94,7 +98,8 @@ private:
     class RunnerImpl {
     public:
         explicit RunnerImpl(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
-                            executor::TaskExecutor* executor);
+                            executor::TaskExecutor* executor,
+                            std::string logMessage);
 
         /**
          * On success, returns an event handle that will be signaled when the runner has
@@ -125,10 +130,11 @@ private:
 
         executor::TaskExecutor* _executor;  // Not owned here.
         std::shared_ptr<ScatterGatherAlgorithm> _algorithm;
+        std::string _logMessage;
         executor::TaskExecutor::EventHandle _sufficientResponsesReceived;
         std::vector<executor::TaskExecutor::CallbackHandle> _callbacks;
         bool _started = false;
-        stdx::mutex _mutex;
+        Mutex _mutex = MONGO_MAKE_LATCH("RunnerImpl::_mutex");
     };
 
     executor::TaskExecutor* _executor;  // Not owned here.

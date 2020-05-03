@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -47,7 +48,10 @@ struct CollationSpec {
         kLower,
 
         // Use default sorting behavior for the strength.
-        kOff
+        kOff,
+
+        // Update this if you add another value.
+        kMax = kOff,
     };
 
     // Controls the set of characteristics used to compare strings.
@@ -68,7 +72,10 @@ struct CollationSpec {
 
         // Equal Unicode point values.
         // E.g. Hebrew cantillation marks are only distinguished at this level.
-        kIdentical = 5
+        kIdentical = 5,
+
+        // Update this if you add another value.
+        kMax = kIdentical,
     };
 
     // Controls whether spaces and punctuation are considered base characters.
@@ -78,7 +85,10 @@ struct CollationSpec {
 
         // Spaces and punctuation are not considered base characters, and are only distinguished at
         // strength > 3.
-        kShifted
+        kShifted,
+
+        // Update this if you add another value.
+        kMax = kShifted,
     };
 
     // Controls which characters are affected by alternate=shifted.
@@ -87,7 +97,10 @@ struct CollationSpec {
         kPunct,
 
         // Only spaces are affected
-        kSpace
+        kSpace,
+
+        // Update this if you add another value.
+        kMax = kSpace,
     };
 
 

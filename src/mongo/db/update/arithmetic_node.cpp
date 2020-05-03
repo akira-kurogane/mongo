@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -45,28 +46,16 @@ const char* getNameForOp(ArithmeticNode::ArithmeticOp op) {
             MONGO_UNREACHABLE;
     }
 }
-
-const char* getModifierNameForOp(ArithmeticNode::ArithmeticOp op) {
-    switch (op) {
-        case ArithmeticNode::ArithmeticOp::kAdd:
-            return "$inc";
-        case ArithmeticNode::ArithmeticOp::kMultiply:
-            return "$mul";
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
 }  // namespace
 
-Status ArithmeticNode::init(BSONElement modExpr, const CollatorInterface* collator) {
+Status ArithmeticNode::init(BSONElement modExpr,
+                            const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
 
     if (!modExpr.isNumber()) {
         return Status(ErrorCodes::TypeMismatch,
                       str::stream() << "Cannot " << getNameForOp(_op)
-                                    << " with non-numeric argument: {"
-                                    << modExpr
-                                    << "}");
+                                    << " with non-numeric argument: {" << modExpr << "}");
     }
 
     _val = modExpr;
@@ -78,13 +67,11 @@ ModifierNode::ModifyResult ArithmeticNode::updateExistingElement(
     if (!element->isNumeric()) {
         auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "Cannot apply " << getModifierNameForOp(_op)
+                  str::stream() << "Cannot apply " << operatorName()
                                 << " to a value of non-numeric type. {"
                                 << (idElem.ok() ? idElem.toString() : "no id")
-                                << "} has the field '"
-                                << element->getFieldName()
-                                << "' of non-numeric type "
-                                << typeName(element->getType()));
+                                << "} has the field '" << element->getFieldName()
+                                << "' of non-numeric type " << typeName(element->getType()));
     }
 
     SafeNum originalValue = element->getValueSafeNum();
@@ -105,14 +92,12 @@ ModifierNode::ModifyResult ArithmeticNode::updateExistingElement(
     } else if (!valueToSet.isValid()) {
         auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::BadValue,
-                  str::stream() << "Failed to apply " << getModifierNameForOp(_op)
-                                << " operations to current value ("
-                                << originalValue.debugString()
-                                << ") for document {"
-                                << (idElem.ok() ? idElem.toString() : "no id")
+                  str::stream() << "Failed to apply " << operatorName()
+                                << " operations to current value (" << originalValue.debugString()
+                                << ") for document {" << (idElem.ok() ? idElem.toString() : "no id")
                                 << "}");
     } else {
-        invariantOK(element->setValueSafeNum(valueToSet));
+        invariant(element->setValueSafeNum(valueToSet));
         return ModifyResult::kNormalUpdate;
     }
 }

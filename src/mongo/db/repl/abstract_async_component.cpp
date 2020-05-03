@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,7 +32,7 @@
 #include "mongo/db/repl/abstract_async_component.h"
 
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -51,7 +52,7 @@ std::string AbstractAsyncComponent::_getComponentName() const {
 }
 
 bool AbstractAsyncComponent::isActive() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     return _isActive_inlock();
 }
 
@@ -60,7 +61,7 @@ bool AbstractAsyncComponent::_isActive_inlock() noexcept {
 }
 
 bool AbstractAsyncComponent::_isShuttingDown() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     return _isShuttingDown_inlock();
 }
 
@@ -69,7 +70,7 @@ bool AbstractAsyncComponent::_isShuttingDown_inlock() noexcept {
 }
 
 Status AbstractAsyncComponent::startup() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     switch (_state) {
         case State::kPreStart:
             _state = State::kRunning;
@@ -96,7 +97,7 @@ Status AbstractAsyncComponent::startup() noexcept {
 }
 
 void AbstractAsyncComponent::shutdown() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -115,17 +116,17 @@ void AbstractAsyncComponent::shutdown() noexcept {
 }
 
 void AbstractAsyncComponent::join() noexcept {
-    stdx::unique_lock<stdx::mutex> lk(*_getMutex());
+    stdx::unique_lock<Latch> lk(*_getMutex());
     _stateCondition.wait(lk, [this]() { return !_isActive_inlock(); });
 }
 
 AbstractAsyncComponent::State AbstractAsyncComponent::getState_forTest() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     return _state;
 }
 
 void AbstractAsyncComponent::_transitionToComplete() noexcept {
-    stdx::lock_guard<stdx::mutex> lock(*_getMutex());
+    stdx::lock_guard<Latch> lock(*_getMutex());
     _transitionToComplete_inlock();
 }
 
@@ -137,13 +138,13 @@ void AbstractAsyncComponent::_transitionToComplete_inlock() noexcept {
 
 Status AbstractAsyncComponent::_checkForShutdownAndConvertStatus(
     const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message) {
-    stdx::unique_lock<stdx::mutex> lk(*_getMutex());
+    stdx::unique_lock<Latch> lk(*_getMutex());
     return _checkForShutdownAndConvertStatus_inlock(callbackArgs, message);
 }
 
 Status AbstractAsyncComponent::_checkForShutdownAndConvertStatus(const Status& status,
                                                                  const std::string& message) {
-    stdx::unique_lock<stdx::mutex> lk(*_getMutex());
+    stdx::unique_lock<Latch> lk(*_getMutex());
     return _checkForShutdownAndConvertStatus_inlock(status, message);
 }
 
@@ -160,15 +161,11 @@ Status AbstractAsyncComponent::_checkForShutdownAndConvertStatus_inlock(
                       str::stream() << message << ": " << _componentName << " is shutting down");
     }
 
-    if (!status.isOK()) {
-        return Status(status.code(), message + ": " + status.reason());
-    }
-
-    return Status::OK();
+    return status.withContext(message);
 }
 
 Status AbstractAsyncComponent::_scheduleWorkAndSaveHandle_inlock(
-    const executor::TaskExecutor::CallbackFn& work,
+    executor::TaskExecutor::CallbackFn work,
     executor::TaskExecutor::CallbackHandle* handle,
     const std::string& name) {
     invariant(handle);
@@ -177,11 +174,9 @@ Status AbstractAsyncComponent::_scheduleWorkAndSaveHandle_inlock(
                       str::stream() << "failed to schedule work " << name << ": " << _componentName
                                     << " is shutting down");
     }
-    auto result = _executor->scheduleWork(work);
+    auto result = _executor->scheduleWork(std::move(work));
     if (!result.isOK()) {
-        return Status(result.getStatus().code(),
-                      str::stream() << "failed to schedule work " << name << ": "
-                                    << result.getStatus().reason());
+        return result.getStatus().withContext(str::stream() << "failed to schedule work " << name);
     }
     *handle = result.getValue();
     return Status::OK();
@@ -189,23 +184,20 @@ Status AbstractAsyncComponent::_scheduleWorkAndSaveHandle_inlock(
 
 Status AbstractAsyncComponent::_scheduleWorkAtAndSaveHandle_inlock(
     Date_t when,
-    const executor::TaskExecutor::CallbackFn& work,
+    executor::TaskExecutor::CallbackFn work,
     executor::TaskExecutor::CallbackHandle* handle,
     const std::string& name) {
     invariant(handle);
     if (_isShuttingDown_inlock()) {
-        return Status(
-            ErrorCodes::CallbackCanceled,
-            str::stream() << "failed to schedule work " << name << " at " << when.toString() << ": "
-                          << _componentName
-                          << " is shutting down");
+        return Status(ErrorCodes::CallbackCanceled,
+                      str::stream()
+                          << "failed to schedule work " << name << " at " << when.toString() << ": "
+                          << _componentName << " is shutting down");
     }
-    auto result = _executor->scheduleWorkAt(when, work);
+    auto result = _executor->scheduleWorkAt(when, std::move(work));
     if (!result.isOK()) {
-        return Status(
-            result.getStatus().code(),
-            str::stream() << "failed to schedule work " << name << " at " << when.toString() << ": "
-                          << result.getStatus().reason());
+        return result.getStatus().withContext(str::stream() << "failed to schedule work " << name
+                                                            << " at " << when.toString());
     }
     *handle = result.getValue();
     return Status::OK();

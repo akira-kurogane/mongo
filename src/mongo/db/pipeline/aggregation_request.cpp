@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,53 +36,18 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
-
-constexpr StringData AggregationRequest::kCommandName;
-constexpr StringData AggregationRequest::kCursorName;
-constexpr StringData AggregationRequest::kBatchSizeName;
-constexpr StringData AggregationRequest::kFromMongosName;
-constexpr StringData AggregationRequest::kNeedsMergeName;
-constexpr StringData AggregationRequest::kNeedsMerge34Name;
-constexpr StringData AggregationRequest::kPipelineName;
-constexpr StringData AggregationRequest::kCollationName;
-constexpr StringData AggregationRequest::kExplainName;
-constexpr StringData AggregationRequest::kAllowDiskUseName;
-constexpr StringData AggregationRequest::kHintName;
-constexpr StringData AggregationRequest::kCommentName;
-
-constexpr long long AggregationRequest::kDefaultBatchSize;
-
-AggregationRequest::AggregationRequest(NamespaceString nss, std::vector<BSONObj> pipeline)
-    : _nss(std::move(nss)), _pipeline(std::move(pipeline)), _batchSize(kDefaultBatchSize) {}
-
-StatusWith<std::vector<BSONObj>> AggregationRequest::parsePipelineFromBSON(
-    BSONElement pipelineElem) {
-    std::vector<BSONObj> pipeline;
-    if (pipelineElem.eoo() || pipelineElem.type() != BSONType::Array) {
-        return {ErrorCodes::TypeMismatch, "'pipeline' option must be specified as an array"};
-    }
-
-    for (auto elem : pipelineElem.Obj()) {
-        if (elem.type() != BSONType::Object) {
-            return {ErrorCodes::TypeMismatch,
-                    "Each element of the 'pipeline' array must be an object"};
-        }
-        pipeline.push_back(elem.embeddedObject().getOwned());
-    }
-
-    return std::move(pipeline);
-}
 
 StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     const std::string& dbName,
@@ -110,7 +76,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
     bool hasFromMongosElem = false;
     bool hasNeedsMergeElem = false;
-    bool hasNeedsMerge34Elem = false;
 
     // Parse optional parameters.
     for (auto&& elem : cmdObj) {
@@ -151,8 +116,7 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
             if (elem.type() != BSONType::Object) {
                 return {ErrorCodes::TypeMismatch,
                         str::stream() << repl::ReadConcernArgs::kReadConcernFieldName
-                                      << " must be an object, not a "
-                                      << typeName(elem.type())};
+                                      << " must be an object, not a " << typeName(elem.type())};
             }
             request.setReadConcern(elem.embeddedObject().getOwned());
         } else if (kHintName == fieldName) {
@@ -167,13 +131,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                                   << " must be specified as a string representing an index"
                                   << " name, or an object representing an index's key pattern");
             }
-        } else if (kCommentName == fieldName) {
-            if (elem.type() != BSONType::String) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << kCommentName << " must be a string, not a "
-                                      << typeName(elem.type())};
-            }
-            request.setComment(elem.str());
         } else if (kExplainName == fieldName) {
             if (elem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
@@ -203,17 +160,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
             hasNeedsMergeElem = true;
             request.setNeedsMerge(elem.Bool());
-        } else if (kNeedsMerge34Name == fieldName) {
-            if (elem.type() != BSONType::Bool) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << kNeedsMerge34Name << " must be a boolean, not a "
-                                      << typeName(elem.type())};
-            }
-
-            hasNeedsMerge34Elem = true;
-            request.setNeedsMerge(elem.Bool());
-            request.setFromMongos(elem.Bool());
-            request.setFrom34Mongos(elem.Bool());
         } else if (kAllowDiskUseName == fieldName) {
             if (storageGlobalParams.readOnly) {
                 return {ErrorCodes::IllegalOperation,
@@ -225,9 +171,62 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                                       << typeName(elem.type())};
             }
             request.setAllowDiskUse(elem.Bool());
+        } else if (kExchangeName == fieldName) {
+            try {
+                IDLParserErrorContext ctx("internalExchange");
+                request.setExchangeSpec(ExchangeSpec::parse(ctx, elem.Obj()));
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
         } else if (bypassDocumentValidationCommandOption() == fieldName) {
             request.setBypassDocumentValidation(elem.trueValue());
-        } else if (!Command::isGenericArgument(fieldName)) {
+        } else if (WriteConcernOptions::kWriteConcernField == fieldName) {
+            if (elem.type() != BSONType::Object) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << fieldName << " must be an object, not a " << typeName(elem.type())};
+            }
+
+            auto writeConcern = uassertStatusOK(WriteConcernOptions::parse(elem.embeddedObject()));
+            request.setWriteConcern(writeConcern);
+        } else if (kRuntimeConstants == fieldName) {
+            // TODO SERVER-46384: Remove 'runtimeConstants' in 4.5 since it is redundant with 'let'
+            try {
+                IDLParserErrorContext ctx("internalRuntimeConstants");
+                request.setRuntimeConstants(RuntimeConstants::parse(ctx, elem.Obj()));
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        } else if (kLet == fieldName) {
+            if (elem.type() != BSONType::Object)
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << fieldName << " must be an object, not a " << typeName(elem.type())};
+            auto bob = BSONObjBuilder{request.letParameters};
+            bob.appendElementsUnique(elem.embeddedObject());
+            request.letParameters = bob.obj();
+        } else if (fieldName == kUse44SortKeys) {
+            if (elem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << kUse44SortKeys << " must be a boolean, not a "
+                                      << typeName(elem.type())};
+            }
+            // TODO SERVER-47065: A 4.6 node still has to accept the 'use44SortKeys' field, since it
+            // could be included in a command sent from a 4.4 mongos or 4.4 mongod. In 4.7, this
+            // code to tolerate the 'use44SortKeys' field can be deleted.
+        } else if (fieldName == "useNewUpsert"_sd) {
+            // TODO SERVER-46751: we must retain the ability to ingest the 'useNewUpsert' field for
+            // 4.6 upgrade purposes, since a 4.4 mongoS will always send {useNewUpsert:true} to the
+            // shards. We do nothing with it because useNewUpsert will be automatically used in 4.6
+            // when appropriate. Remove this final vestige of useNewUpsert during the 4.7 dev cycle.
+        } else if (fieldName == kIsMapReduceCommand) {
+            if (elem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << kIsMapReduceCommand << " must be a boolean, not a "
+                                      << typeName(elem.type())};
+            }
+            request.setIsMapReduceCommand(elem.boolean());
+        } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "unrecognized field '" << elem.fieldName() << "'"};
         }
@@ -249,51 +248,24 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     if (!hasCursorElem && !hasExplainElem) {
         return {ErrorCodes::FailedToParse,
                 str::stream()
-                    << "The '"
-                    << kCursorName
+                    << "The '" << kCursorName
                     << "' option is required, except for aggregate with the explain argument"};
-    }
-
-    if (request.getExplain() && !request.getReadConcern().isEmpty()) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "Aggregation explain does not support the '"
-                              << repl::ReadConcernArgs::kReadConcernFieldName
-                              << "' option"};
     }
 
     if (request.getExplain() && cmdObj[WriteConcernOptions::kWriteConcernField]) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Aggregation explain does not support the'"
-                              << WriteConcernOptions::kWriteConcernField
-                              << "' option"};
+                              << WriteConcernOptions::kWriteConcernField << "' option"};
     }
 
     if (hasNeedsMergeElem && !hasFromMongosElem) {
         return {ErrorCodes::FailedToParse,
                 str::stream() << "Cannot specify '" << kNeedsMergeName << "' without '"
-                              << kFromMongosName
-                              << "'"};
-    }
-
-    // If 'fromRouter' is specified, the request is from a 3.4 mongos, so we do not expect
-    // 'fromMongos' or 'needsMerge' to be specified.
-    if (hasNeedsMerge34Elem) {
-        if (hasNeedsMergeElem) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "Cannot specify both '" << kNeedsMergeName << "' and '"
-                                  << kNeedsMerge34Name
-                                  << "'"};
-        }
-        if (hasFromMongosElem) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "Cannot specify both '" << kFromMongosName << "' and '"
-                                  << kNeedsMerge34Name
-                                  << "'"};
-        }
+                              << kFromMongosName << "'"};
     }
 
     return request;
-}
+}  // namespace mongo
 
 NamespaceString AggregationRequest::parseNs(const std::string& dbname, const BSONObj& cmdObj) {
     auto firstElement = cmdObj.firstElement();
@@ -322,7 +294,6 @@ NamespaceString AggregationRequest::parseNs(const std::string& dbname, const BSO
 }
 
 Document AggregationRequest::serializeToCommandObj() const {
-    MutableDocument serialized;
     return Document{
         {kCommandName, (_nss.isCollectionlessAggregateNS() ? Value(1) : Value(_nss.coll()))},
         {kPipelineName, _pipeline},
@@ -339,8 +310,6 @@ Document AggregationRequest::serializeToCommandObj() const {
          _explainMode ? Value(Document()) : Value(Document{{kBatchSizeName, _batchSize}})},
         // Only serialize a hint if one was specified.
         {kHintName, _hint.isEmpty() ? Value() : Value(_hint)},
-        // Only serialize a comment if one was specified.
-        {kCommentName, _comment.empty() ? Value() : Value(_comment)},
         // Only serialize readConcern if specified.
         {repl::ReadConcernArgs::kReadConcernFieldName,
          _readConcern.isEmpty() ? Value() : Value(_readConcern)},
@@ -349,7 +318,14 @@ Document AggregationRequest::serializeToCommandObj() const {
          _unwrappedReadPref.isEmpty() ? Value() : Value(_unwrappedReadPref)},
         // Only serialize maxTimeMs if specified.
         {QueryRequest::cmdOptionMaxTimeMS,
-         _maxTimeMS == 0 ? Value() : Value(static_cast<int>(_maxTimeMS))}};
+         _maxTimeMS == 0 ? Value() : Value(static_cast<int>(_maxTimeMS))},
+        {kExchangeName, _exchangeSpec ? Value(_exchangeSpec->toBSON()) : Value()},
+        {WriteConcernOptions::kWriteConcernField,
+         _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
+        // Only serialize runtime constants if any were specified.
+        {kRuntimeConstants, _runtimeConstants ? Value(_runtimeConstants->toBSON()) : Value()},
+        {kIsMapReduceCommand, _isMapReduceCommand ? Value(true) : Value()},
+        {kLet, !letParameters.isEmpty() ? Value(letParameters) : Value()},
+    };
 }
-
 }  // namespace mongo

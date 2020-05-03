@@ -1,28 +1,30 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -42,90 +44,56 @@ namespace po = boost::program_options;
  *  A container for OptionDescription instances as well as other OptionSection instances.
  *  Provides a description of all options that are supported to be passed in to an
  *  OptionsParser.  Has utility functions to support the various formats needed by the parsing
- *  process
+ *  process.
  *
  *  The sections and section names only matter in the help string.  For sections in a JSON
  *  config, look at the dots in the dottedName of the relevant OptionDescription
- *
- *  Usage:
- *
- *  namespace moe = mongo::optionenvironment;
- *
- *  moe::OptionsParser parser;
- *  moe::Environment environment;
- *  moe::OptionSection options;
- *  moe::OptionSection subSection("Section Name");
- *
- *  // Register our allowed option flags with our OptionSection
- *  options.addOptionChaining("help", "help", moe::Switch, "Display Help");
- *
- *  // Register our positional options with our OptionSection
- *  options.addOptionChaining("command", "command", moe::String, "Command").positional(1, 1);
- *
- *  // Add a subsection
- *  subSection.addOptionChaining("port", "port", moe::Int, "Port");
- *  options.addSection(subSection);
- *
- *  // Run the parser
- *  Status ret = parser.run(options, argc, argv, envp, &environment);
- *  if (!ret.isOK()) {
- *      cerr << options.helpString() << std::endl;
- *      exit(EXIT_FAILURE);
- *  }
  */
 
 class OptionSection {
 public:
+    OptionSection() = default;
+
+    /**
+     * This API is not meant to be called directly by hand-written code.
+     * See: docs/idl/configs.md
+     */
     OptionSection(const std::string& name) : _name(name) {}
-    OptionSection() {}
 
     // Construction interface
 
     /**
      * Add a sub section to this section.  Used mainly to keep track of section headers for when
-     * we need generate the help std::string for the command line
+     * we need generate the help std::string for the command line.
+     *
+     * Note that while the structure of this class allows for a nested hierarchy of sections,
+     * our actual use-case enforces a maximum depth of 2.
+     * The base node plus one level of subsections.
+     * This means that subsections being added must not contain subsections of their own.
      */
-    Status addSection(const OptionSection& subSection);
+    Status addSection(const OptionSection& newSection);
 
     /**
      * Add an option to this section, and returns a reference to an OptionDescription to allow
-     * for chaining.
+     * for chaining. This API is normally called by generated code ONLY.
      *
-     * Examples:
+     * The only two exceptions are UnitTest code testing this API,
+     * and two groups of complex options in addBaseServerOptions().
      *
-     * options.addOptionChaining("option", "option", moe::String, "Chaining Registration")
-     *                          .hidden().setDefault(moe::Value("default"))
-     *                          .setImplicit(moe::Value("implicit"));
-     *
-     * This creates a hidden option that has default and implicit values.
-     *
-     * options.addOptionChaining("name", "name", moe::String, "Composing Option")
-     *                          .composing().sources(SourceAllConfig);
-     *
-     * This creates an option that is composing and can be specified only in config files.
-     *
-     * See the OptionDescription class for details on the supported attributes.
-     *
-     * throws DBException on errors, such as attempting to register an option with the same name
-     * as another option.  These represent programming errors that should not happen during
-     * normal operation.
+     * ALL OTHERS must create config options via IDL definiotns.
      */
-    OptionDescription& addOptionChaining(const std::string& dottedName,
-                                         const std::string& singleName,
-                                         const OptionType type,
-                                         const std::string& description);
-
-    OptionDescription& addOptionChaining(const std::string& dottedName,
-                                         const std::string& singleName,
-                                         const OptionType type,
-                                         const std::string& description,
-                                         const std::string& deprecatedDottedName);
-
+    enum class OptionParserUsageType {
+        IDLAutoGeneratedCode,
+        OptionParserTest,
+        BaseServerOptionsException,
+    };
     OptionDescription& addOptionChaining(const std::string& dottedName,
                                          const std::string& singleName,
                                          const OptionType type,
                                          const std::string& description,
-                                         const std::vector<std::string>& deprecatedDottedNames);
+                                         const std::vector<std::string>& deprecatedDottedNames,
+                                         const std::vector<std::string>& deprecatedSingleNames,
+                                         OptionParserUsageType);
 
     // These functions are used by the OptionsParser to make calls into boost::program_options
     Status getBoostOptions(po::options_description* boostOptions,
@@ -143,6 +111,11 @@ public:
 
     // Count the number of options in this section and all subsections
     Status countOptions(int* numOptions, bool visibleOnly, OptionSources sources) const;
+
+    /**
+     * Returns the number of subsections which have been added to this OptionSection.
+     */
+    size_t countSubSections() const;
 
     /**
      * Populates the given map with all the default values for any options in this option
@@ -166,6 +139,17 @@ private:
     std::string _name;
     std::list<OptionSection> _subSections;
     std::list<OptionDescription> _options;
+
+    /**
+     * Internal accumulator of all dotted names (incl. deprecated) in _options and all _subSections.
+     * Used for ensuring duplicate entries don't find their way into different parts of the tree.
+     */
+    std::set<std::string> _allDottedNames;
+
+    /**
+     * Internal accumulator for all single names. See _allDottedNames for further info.
+     */
+    std::set<std::string> _allSingleNames;
 };
 
 }  // namespace optionenvironment

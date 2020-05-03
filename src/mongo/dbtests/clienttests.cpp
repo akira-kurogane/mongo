@@ -1,36 +1,35 @@
-// client.cpp
-
-/*
- *    Copyright (C) 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -41,8 +40,8 @@
 
 namespace ClientTests {
 
-using std::unique_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 class Base {
@@ -63,6 +62,10 @@ public:
         db.dropCollection(_ns);
     }
 
+    const NamespaceString nss() {
+        return NamespaceString(_ns);
+    }
+
     const char* ns() {
         return _ns.c_str();
     }
@@ -79,27 +82,29 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient db(&opCtx);
 
+        const bool includeBuildUUIDs = false;
+        const int options = 0;
+
         db.insert(ns(), BSON("x" << 2));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         db.dropIndex(ns(), BSON("x" << 1));
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1)));
-        ASSERT_EQUALS(2u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         db.dropIndexes(ns());
-        ASSERT_EQUALS(1u, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1u, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
     }
 };
 
 /**
- * Check that nIndexes is incremented correctly when an index builds (and that it is not
- * incremented when an index fails to build), system.indexes has an entry added (or not), and
- * system.namespaces has a doc added (or not).
+ * Check that nIndexes is incremented correctly when an index builds, and that it is not
+ * incremented when an index fails to build.
  */
 class BuildIndex : public Base {
 public:
@@ -108,7 +113,7 @@ public:
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
 
-        OldClientWriteContext ctx(&opCtx, ns());
+        dbtests::WriteContextForTests ctx(&opCtx, ns());
         DBDirectClient db(&opCtx);
 
         db.insert(ns(), BSON("x" << 1 << "y" << 2));
@@ -118,20 +123,23 @@ public:
         ASSERT(collection);
         IndexCatalog* indexCatalog = collection->getIndexCatalog();
 
+        const bool includeBuildUUIDs = false;
+        const int options = 0;
+
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
         // _id index
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_EQUALS(ErrorCodes::DuplicateKey,
                       dbtests::createIndex(&opCtx, ns(), BSON("y" << 1), true));
 
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(1U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("x" << 1), true));
 
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(&opCtx));
-        ASSERT_EQUALS(2U, db.getIndexSpecs(ns()).size());
+        ASSERT_EQUALS(2U, db.getIndexSpecs(nss(), includeBuildUUIDs, options).size());
     }
 };
 
@@ -150,7 +158,8 @@ public:
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("a" << 1 << "b" << 1)));
 
-        unique_ptr<DBClientCursor> c = db.query(ns(), Query().sort(BSON("a" << 1 << "b" << 1)));
+        unique_ptr<DBClientCursor> c =
+            db.query(NamespaceString(ns()), Query().sort(BSON("a" << 1 << "b" << 1)));
         ASSERT_EQUALS(1111, c->itcount());
     }
 };
@@ -167,7 +176,8 @@ public:
             db.insert(ns(), BSON("i" << i));
         }
 
-        unique_ptr<DBClientCursor> c = db.query(ns(), Query().sort(BSON("i" << 1)));
+        unique_ptr<DBClientCursor> c =
+            db.query(NamespaceString(ns()), Query().sort(BSON("i" << 1)));
 
         BSONObj o = c->next();
         ASSERT(c->more());
@@ -209,7 +219,7 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient db(&opCtx);
 
-        db.createCollection("unittests.clienttests.create", 4096, true);
+        db.createCollection("unittests.clienttests.create");
         BSONObj info;
         ASSERT(db.runCommand("unittests",
                              BSON("collstats"
@@ -382,9 +392,9 @@ public:
     }
 };
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("client") {}
+    All() : OldStyleSuiteSpecification("client") {}
 
     void setupTests() {
         add<DropIndex>();
@@ -406,5 +416,5 @@ public:
     }
 };
 
-SuiteInstance<All> all;
-}
+OldStyleSuiteInitializer<All> all;
+}  // namespace ClientTests

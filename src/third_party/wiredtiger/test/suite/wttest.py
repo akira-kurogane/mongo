@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -29,6 +29,7 @@
 # WiredTigerTestCase
 #   parent class for all test cases
 #
+from __future__ import print_function
 
 # If unittest2 is available, use it in preference to (the old) unittest
 try:
@@ -44,6 +45,8 @@ def shortenWithEllipsis(s, maxlen):
     if len(s) > maxlen:
         s = s[0:maxlen-3] + '...'
     return s
+
+_python3 = (sys.version_info >= (3, 0, 0))
 
 class CapturedFd(object):
     """
@@ -92,6 +95,8 @@ class CapturedFd(object):
         file.  If there is, raise it as a test failure.
         This is generally called after 'release' is called.
         """
+        if WiredTigerTestCase._ignoreStdout:
+            return
         if self.file != None:
             self.file.flush()
         filesize = os.path.getsize(self.filename)
@@ -101,7 +106,7 @@ class CapturedFd(object):
                                      ' unexpected ' + self.desc +
                                      ', contains:\n"' + contents + '"')
             testcase.fail('unexpected ' + self.desc + ', contains: "' +
-                      shortenWithEllipsis(contents,100) + '"')
+                      contents + '"')
         self.expectpos = filesize
 
     def checkAdditional(self, testcase, expect):
@@ -126,7 +131,7 @@ class CapturedFd(object):
         """
         if self.file != None:
             self.file.flush()
-        gotstr = self.readFileFrom(self.filename, self.expectpos, 1000)
+        gotstr = self.readFileFrom(self.filename, self.expectpos, 1500)
         if re.search(pat, gotstr) == None:
             testcase.fail('in ' + self.desc +
                           ', expected pattern "' + pat + '", but got "' +
@@ -139,9 +144,9 @@ class TestSuiteConnection(object):
         self._conn = conn
         self._connlist = connlist
 
-    def close(self):
+    def close(self, config=''):
         self._connlist.remove(self._conn)
-        return self._conn.close()
+        return self._conn.close(config)
 
     # Proxy everything except what we explicitly define to the
     # wrapped connection
@@ -155,7 +160,7 @@ class TestSuiteConnection(object):
 class ExtensionList(list):
     skipIfMissing = False
     def extension(self, dirname, name, extarg=None):
-        if name != None and name != 'none':
+        if name and name != 'none':
             ext = '' if extarg == None else '=' + extarg
             self.append(dirname + '/' + name + ext)
 
@@ -167,6 +172,10 @@ class WiredTigerTestCase(unittest.TestCase):
     # Can be a string or a callable function or lambda expression.
     conn_config = ''
 
+    # session_config can be overridden to add to basic session configuration.
+    # Can be a string or a callable function or lambda expression.
+    session_config = ''
+
     # conn_extensions can be overridden to add a list of extensions to load.
     # Each entry is a string (directory and extension name) and optional config.
     # Example:
@@ -176,8 +185,8 @@ class WiredTigerTestCase(unittest.TestCase):
 
     @staticmethod
     def globalSetup(preserveFiles = False, useTimestamp = False,
-                    gdbSub = False, verbose = 1, builddir = None, dirarg = None,
-                    longtest = False):
+                    gdbSub = False, lldbSub = False, verbose = 1, builddir = None, dirarg = None,
+                    longtest = False, ignoreStdout = False):
         WiredTigerTestCase._preserveFiles = preserveFiles
         d = 'WT_TEST' if dirarg == None else dirarg
         if useTimestamp:
@@ -188,10 +197,12 @@ class WiredTigerTestCase(unittest.TestCase):
         WiredTigerTestCase._parentTestdir = d
         WiredTigerTestCase._builddir = builddir
         WiredTigerTestCase._origcwd = os.getcwd()
-        WiredTigerTestCase._resultfile = open(os.path.join(d, 'results.txt'), "w", 0)  # unbuffered
+        WiredTigerTestCase._resultfile = open(os.path.join(d, 'results.txt'), "w", 1)  # line buffered
         WiredTigerTestCase._gdbSubprocess = gdbSub
+        WiredTigerTestCase._lldbSubprocess = lldbSub
         WiredTigerTestCase._longtest = longtest
         WiredTigerTestCase._verbose = verbose
+        WiredTigerTestCase._ignoreStdout = ignoreStdout
         WiredTigerTestCase._dupout = os.dup(sys.stdout.fileno())
         WiredTigerTestCase._stdout = sys.stdout
         WiredTigerTestCase._stderr = sys.stderr
@@ -238,6 +249,9 @@ class WiredTigerTestCase(unittest.TestCase):
     def simpleName(self):
         return "%s.%s.%s" %  (self.__module__,
                               self.className(), self._testMethodName)
+
+    def buildDirectory(self):
+        return self._builddir
 
     # Return the wiredtiger_open extension argument for
     # any needed shared library.
@@ -288,7 +302,7 @@ class WiredTigerTestCase(unittest.TestCase):
             else:
                 extfiles[ext] = complete
         if len(extfiles) != 0:
-            result = ',extensions=[' + ','.join(extfiles.values()) + ']'
+            result = ',extensions=[' + ','.join(list(extfiles.values())) + ']'
         return result
 
     # Can be overridden, but first consider setting self.conn_config
@@ -306,10 +320,10 @@ class WiredTigerTestCase(unittest.TestCase):
         try:
             conn = self.wiredtiger_open(home, conn_param)
         except wiredtiger.WiredTigerError as e:
-            print "Failed wiredtiger_open: dir '%s', config '%s'" % \
-                (home, conn_param)
+            print("Failed wiredtiger_open: dir '%s', config '%s'" % \
+                (home, conn_param))
             raise e
-        self.pr(`conn`)
+        self.pr(repr(conn))
         return conn
 
     # Replacement for wiredtiger.wiredtiger_open that returns
@@ -319,33 +333,41 @@ class WiredTigerTestCase(unittest.TestCase):
         conn = wiredtiger.wiredtiger_open(home, config)
         return TestSuiteConnection(conn, self._connections)
 
-    # Can be overridden
+    # Can be overridden, but first consider setting self.session_config
     def setUpSessionOpen(self, conn):
-        return conn.open_session(None)
+        config = self.session_config
+        if hasattr(config, '__call__'):
+            config = self.session_config()
+        return conn.open_session(config)
 
     # Can be overridden
-    def close_conn(self):
+    def close_conn(self, config=''):
         """
         Close the connection if already open.
         """
         if self.conn != None:
-            self.conn.close()
+            self.conn.close(config)
             self.conn = None
 
-    def open_conn(self, directory="."):
+    def open_conn(self, directory=".", config=None):
         """
         Open the connection if already closed.
         """
         if self.conn == None:
+            if config != None:
+                self._old_config = self.conn_config
+                self.conn_config = config
             self.conn = self.setUpConnectionOpen(directory)
+            if config != None:
+                self.conn_config = self._old_config
             self.session = self.setUpSessionOpen(self.conn)
 
-    def reopen_conn(self, directory="."):
+    def reopen_conn(self, directory=".", config=None):
         """
         Reopen the connection.
         """
         self.close_conn()
-        self.open_conn(directory)
+        self.open_conn(directory, config)
 
     def setUp(self):
         if not hasattr(self.__class__, 'wt_ntests'):
@@ -379,13 +401,29 @@ class WiredTigerTestCase(unittest.TestCase):
             self.tearDown()
             raise
 
+    # Used as part of tearDown determining if there is an error.
+    def list2reason(self, result, fieldname):
+        exc_list = getattr(result, fieldname, None)
+        if exc_list and exc_list[-1][0] is self:
+            return exc_list[-1][1]
+
     def tearDown(self):
-        excinfo = sys.exc_info()
-        passed = (excinfo == (None, None, None))
-        if passed:
-            skipped = False
-        else:
-            skipped = (excinfo[0] == unittest.SkipTest)
+        # This approach works for all our support Python versions and
+        # is suggested by one of the answers in:
+        # https://stackoverflow.com/questions/4414234/getting-pythons-unittest-results-in-a-teardown-method
+        # In addition, check to make sure exc_info is "clean", because
+        # the ConcurrencyTestSuite in Python2 indicates failures using that.
+        if hasattr(self, '_outcome'):  # Python 3.4+
+            result = self.defaultTestResult()  # these 2 methods have no side effects
+            self._feedErrorsToResult(result, self._outcome.errors)
+        else:  # Python 3.2 - 3.3 or 3.0 - 3.1 and 2.7
+            result = getattr(self, '_outcomeForDoCleanups', self._resultForDoCleanups)
+        error = self.list2reason(result, 'errors')
+        failure = self.list2reason(result, 'failures')
+        exc_failure = (sys.exc_info() != (None, None, None))
+
+        passed = not error and not failure and not exc_failure
+
         self.pr('finishing')
 
         # Close all connections that weren't explicitly closed.
@@ -412,26 +450,26 @@ class WiredTigerTestCase(unittest.TestCase):
             os.chdir(self.origcwd)
 
         # Make sure no read-only files or directories were left behind
-        os.chmod(self.testdir, 0777)
+        os.chmod(self.testdir, 0o777)
         for root, dirs, files in os.walk(self.testdir):
             for d in dirs:
-                os.chmod(os.path.join(root, d), 0777)
+                os.chmod(os.path.join(root, d), 0o777)
             for f in files:
-                os.chmod(os.path.join(root, f), 0666)
+                os.chmod(os.path.join(root, f), 0o666)
+        self.pr('passed=' + str(passed))
 
         # Clean up unless there's a failure
-        if (passed or skipped) and not WiredTigerTestCase._preserveFiles:
+        if passed and not WiredTigerTestCase._preserveFiles:
             shutil.rmtree(self.testdir, ignore_errors=True)
         else:
             self.pr('preserving directory ' + self.testdir)
 
         elapsed = time.time() - self.starttime
         if elapsed > 0.001 and WiredTigerTestCase._verbose >= 2:
-            print "%s: %.2f seconds" % (str(self), elapsed)
-        if not passed and not skipped:
-            print "ERROR in " + str(self)
+            print("%s: %.2f seconds" % (str(self), elapsed))
+        if not passed:
+            print("ERROR in " + str(self))
             self.pr('FAIL')
-            self.prexception(excinfo)
             self.pr('preserving directory ' + self.testdir)
         if WiredTigerTestCase._verbose > 2:
             self.prhead('TEST COMPLETED')
@@ -490,6 +528,59 @@ class WiredTigerTestCase(unittest.TestCase):
             with self.expectedStderr(message):
                 self.assertRaises(exceptionType, expr)
 
+    def assertRaisesException(self, exceptionType, expr,
+        exceptionString=None, optional=False):
+        """
+        Like TestCase.assertRaises(), with some additional options.
+        If the exceptionString argument is used, the exception's string
+        must match it, or its pattern if the string starts and ends with
+        a slash. If optional is set, then no assertion occurs if the
+        exception doesn't occur.
+        Returns true if the assertion is raised.
+        """
+        raised = False
+        try:
+            expr()
+        except BaseException as err:
+            self.pr('Exception raised shown as string: "' + \
+                    str(err) + '"')
+            if not isinstance(err, exceptionType):
+                self.fail('Exception of incorrect type raised, got type: ' + \
+                    str(type(err)))
+            if exceptionString != None:
+                # Match either a pattern or an exact string.
+                fail = False
+                self.pr('Expecting string msg: ' + exceptionString)
+                if len(exceptionString) > 2 and \
+                  exceptionString[0] == '/' and exceptionString[-1] == '/' :
+                      if re.search(exceptionString[1:-1], str(err)) == None:
+                        fail = True
+                elif exceptionString != str(err):
+                        fail = True
+                if fail:
+                    self.fail('Exception with incorrect string raised, got: "' + \
+                        str(err) + '" Expected: ' + exceptionString)
+            raised = True
+        if not raised and not optional:
+            self.fail('no assertion raised')
+        return raised
+
+    def raisesBusy(self, expr):
+        """
+        Execute the expression, returning true if a 'Resource busy' exception
+        is raised, returning false if no exception is raised. Some systems
+        report 'Device or resource busy', allow either.
+        Any other exception raises a test suite failure.
+        """
+        return self.assertRaisesException(wiredtiger.WiredTigerError, \
+            expr, exceptionString='/[Rr]esource busy/', optional=True)
+
+    def assertTimestampsEqual(self, ts1, ts2):
+        """
+        TestCase.assertEqual() for timestamps
+        """
+        self.assertEqual(int(ts1, 16), int(ts2, 16))
+
     def exceptionToStderr(self, expr):
         """
         Used by assertRaisesHavingMessage to convert an expression
@@ -498,7 +589,7 @@ class WiredTigerTestCase(unittest.TestCase):
         """
         try:
             expr()
-        except BaseException, err:
+        except BaseException as err:
             sys.stderr.write('Exception: ' + str(err))
             raise
 
@@ -533,6 +624,15 @@ class WiredTigerTestCase(unittest.TestCase):
         msg = '**** ' + myname + ' HAS A KNOWN LIMITATION: ' + name + ' ****'
         self.printOnce(msg)
 
+    def databaseCorrupted(self, directory = None):
+        """
+        Mark this test as having a corrupted database by creating a
+        DATABASE_CORRUPTED file in the home directory.
+        """
+        if directory == None:
+            directory = self.home
+        open(os.path.join(directory, "DATABASE_CORRUPTED"), "a").close()
+
     @staticmethod
     def printVerbose(level, message):
         if level <= WiredTigerTestCase._verbose:
@@ -546,7 +646,7 @@ class WiredTigerTestCase(unittest.TestCase):
 
     @staticmethod
     def prout(s):
-        os.write(WiredTigerTestCase._dupout, s + '\n')
+        os.write(WiredTigerTestCase._dupout, str.encode(s + '\n'))
 
     def pr(self, s):
         """
@@ -570,6 +670,30 @@ class WiredTigerTestCase(unittest.TestCase):
         WiredTigerTestCase._resultfile.write('\n')
         traceback.print_exception(excinfo[0], excinfo[1], excinfo[2], None, WiredTigerTestCase._resultfile)
         WiredTigerTestCase._resultfile.write('\n')
+
+    def recno(self, i):
+        """
+        return a recno key
+        """
+        if _python3:
+            return i
+        else:
+            return long(i)
+
+    def ord_byte(self, b):
+        """
+        return the 'ord' of a single byte.
+        In Python2 a set of bytes is represented as a string, and a single
+        byte is a string of length one.  In Python3, bytes are an array of
+        ints, so no explicit ord() call is needed.
+        """
+        if _python3:
+            return b
+        else:
+            return ord(b)
+
+    def is_python3(self):
+        return _python3
 
     # print directly to tty, useful for debugging
     def tty(self, message):

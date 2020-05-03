@@ -1,25 +1,24 @@
-// expression_algo_test.cpp
-
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +36,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/platform/decimal128.h"
 
@@ -52,7 +52,9 @@ class ParsedMatchExpression {
 public:
     ParsedMatchExpression(const std::string& str, const CollatorInterface* collator = nullptr)
         : _obj(fromjson(str)) {
-        StatusWithMatchExpression result = MatchExpressionParser::parse(_obj, collator);
+        _expCtx = make_intrusive<ExpressionContextForTest>();
+        _expCtx->setCollator(CollatorInterface::cloneCollator(collator));
+        StatusWithMatchExpression result = MatchExpressionParser::parse(_obj, _expCtx);
         ASSERT_OK(result.getStatus());
         _expr = std::move(result.getValue());
     }
@@ -64,15 +66,16 @@ public:
 private:
     const BSONObj _obj;
     std::unique_ptr<MatchExpression> _expr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
 TEST(ExpressionAlgoIsSubsetOf, NullAndOmittedField) {
-    // Verify that ComparisonMatchExpression::init() prohibits creating a match expression with
-    // an Undefined type.
+    // Verify that the ComparisonMatchExpression constructor prohibits creating a match expression
+    // with an Undefined type.
     BSONObj undefined = fromjson("{a: undefined}");
-    const CollatorInterface* collator = nullptr;
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     ASSERT_EQUALS(ErrorCodes::BadValue,
-                  MatchExpressionParser::parse(undefined, collator).getStatus());
+                  MatchExpressionParser::parse(undefined, std::move(expCtx)).getStatus());
 
     ParsedMatchExpression empty("{}");
     ParsedMatchExpression null("{a: null}");
@@ -706,10 +709,27 @@ TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsNoStringComparison) {
     ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
 }
 
+TEST(ExpressionAlgoIsSubsetOf, InternalExprEqIsSubsetOfNothing) {
+    ParsedMatchExpression exprEq("{a: {$_internalExprEq: 0}}");
+    ParsedMatchExpression regularEq("{a: {$eq: 0}}");
+    {
+        ParsedMatchExpression rhs("{a: {$gte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+
+    {
+        ParsedMatchExpression rhs("{a: {$lte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+}
+
 TEST(IsIndependent, AndIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -719,8 +739,9 @@ TEST(IsIndependent, AndIsIndependentOnlyIfChildrenAre) {
 
 TEST(IsIndependent, ElemMatchIsNotIndependent) {
     BSONObj matchPredicate = fromjson("{x: {$elemMatch: {y: 1}}}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -731,8 +752,9 @@ TEST(IsIndependent, ElemMatchIsNotIndependent) {
 
 TEST(IsIndependent, NorIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{$nor: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -742,8 +764,9 @@ TEST(IsIndependent, NorIsIndependentOnlyIfChildrenAre) {
 
 TEST(IsIndependent, NotIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{a: {$not: {$eq: 1}}}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -753,8 +776,9 @@ TEST(IsIndependent, NotIsIndependentOnlyIfChildrenAre) {
 
 TEST(IsIndependent, OrIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{$or: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -764,8 +788,9 @@ TEST(IsIndependent, OrIsIndependentOnlyIfChildrenAre) {
 
 TEST(IsIndependent, AndWithDottedFieldPathsIsNotIndependent) {
     BSONObj matchPredicate = fromjson("{$and: [{'a': 1}, {'a.b': 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -775,8 +800,9 @@ TEST(IsIndependent, AndWithDottedFieldPathsIsNotIndependent) {
 
 TEST(IsIndependent, BallIsIndependentOfBalloon) {
     BSONObj matchPredicate = fromjson("{'a.ball': 4}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     unique_ptr<MatchExpression> expr = std::move(status.getValue());
@@ -787,8 +813,9 @@ TEST(IsIndependent, BallIsIndependentOfBalloon) {
 
 TEST(SplitMatchExpression, AndWithSplittableChildrenIsSplittable) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -796,11 +823,11 @@ TEST(SplitMatchExpression, AndWithSplittableChildrenIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{a: {$eq: 1}}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{b: {$eq: 1}}"));
@@ -808,8 +835,9 @@ TEST(SplitMatchExpression, AndWithSplittableChildrenIsSplittable) {
 
 TEST(SplitMatchExpression, NorWithIndependentChildrenIsSplittable) {
     BSONObj matchPredicate = fromjson("{$nor: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -817,11 +845,11 @@ TEST(SplitMatchExpression, NorWithIndependentChildrenIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$nor: [{a: {$eq: 1}}]}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{$nor: [{b: {$eq: 1}}]}"));
@@ -829,8 +857,9 @@ TEST(SplitMatchExpression, NorWithIndependentChildrenIsSplittable) {
 
 TEST(SplitMatchExpression, NotWithIndependentChildIsSplittable) {
     BSONObj matchPredicate = fromjson("{x: {$not: {$gt: 4}}}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -838,16 +867,17 @@ TEST(SplitMatchExpression, NotWithIndependentChildIsSplittable) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
-    ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$nor: [{$and: [{x: {$gt: 4}}]}]}"));
+    ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$not: {$gt: 4}}}"));
     ASSERT_FALSE(splitExpr.second);
 }
 
 TEST(SplitMatchExpression, OrWithOnlyIndependentChildrenIsNotSplittable) {
     BSONObj matchPredicate = fromjson("{$or: [{a: 1}, {b: 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -855,7 +885,7 @@ TEST(SplitMatchExpression, OrWithOnlyIndependentChildrenIsNotSplittable) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder bob;
-    splitExpr.second->serialize(&bob);
+    splitExpr.second->serialize(&bob, true);
 
     ASSERT_FALSE(splitExpr.first);
     ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$or: [{a: {$eq: 1}}, {b: {$eq: 1}}]}"));
@@ -866,8 +896,9 @@ TEST(SplitMatchExpression, ComplexMatchExpressionSplitsCorrectly) {
         "{$and: [{x: {$not: {$size: 2}}},"
         "{$or: [{'a.b' : 3}, {'a.b.c': 4}]},"
         "{$nor: [{x: {$gt: 4}}, {$and: [{x: {$not: {$eq: 1}}}, {y: 3}]}]}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -875,24 +906,24 @@ TEST(SplitMatchExpression, ComplexMatchExpressionSplitsCorrectly) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{'a.b': {$eq: 3}}, {'a.b.c': {$eq: 4}}]}"));
-    ASSERT_BSONOBJ_EQ(
-        secondBob.obj(),
-        fromjson("{$and: [{$nor: [{$and: [{x: {$size: 2}}]}]}, {$nor: [{x: {$gt: 4}}, {$and: "
-                 "[{$nor: [{$and: [{x: "
-                 "{$eq: 1}}]}]}, {y: {$eq: 3}}]}]}]}"));
+    ASSERT_BSONOBJ_EQ(secondBob.obj(),
+                      fromjson("{$and: [{x: {$not: {$size: 2}}}, {$nor: [{x: {$gt: 4}}, {$and: "
+                               "[{x: {$not: {$eq: 1}}}, {y: {$eq: 3}}]}]}]}"));
 }
+
 
 TEST(SplitMatchExpression, ShouldNotExtractPrefixOfDottedPathAsIndependent) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {'a.b': 1}, {'a.c': 1}]}");
-    const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(status.getStatus());
 
     std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
@@ -900,11 +931,11 @@ TEST(SplitMatchExpression, ShouldNotExtractPrefixOfDottedPathAsIndependent) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
 
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{'a.c': {$eq: 1}}"));
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{$and: [{a: {$eq: 1}}, {'a.b': {$eq: 1}}]}"));
@@ -912,8 +943,8 @@ TEST(SplitMatchExpression, ShouldNotExtractPrefixOfDottedPathAsIndependent) {
 
 TEST(SplitMatchExpression, ShouldMoveIndependentLeafPredicateAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: 1}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "b"}};
@@ -922,7 +953,7 @@ TEST(SplitMatchExpression, ShouldMoveIndependentLeafPredicateAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{b: {$eq: 1}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -930,8 +961,8 @@ TEST(SplitMatchExpression, ShouldMoveIndependentLeafPredicateAcrossRename) {
 
 TEST(SplitMatchExpression, ShouldMoveIndependentAndPredicateAcrossRename) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 2}]}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -940,7 +971,7 @@ TEST(SplitMatchExpression, ShouldMoveIndependentAndPredicateAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$and: [{c: {$eq: 1}}, {b: {$eq: 2}}]}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -948,8 +979,8 @@ TEST(SplitMatchExpression, ShouldMoveIndependentAndPredicateAcrossRename) {
 
 TEST(SplitMatchExpression, ShouldSplitPartiallyDependentAndPredicateAcrossRename) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 2}]}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -958,19 +989,19 @@ TEST(SplitMatchExpression, ShouldSplitPartiallyDependentAndPredicateAcrossRename
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$eq: 1}}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{b: {$eq: 2}}"));
 }
 
 TEST(SplitMatchExpression, ShouldSplitPartiallyDependentComplexPredicateMultipleRenames) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {$or: [{b: 2}, {c: 3}]}]}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"b", "d"}, {"c", "e"}};
@@ -979,20 +1010,20 @@ TEST(SplitMatchExpression, ShouldSplitPartiallyDependentComplexPredicateMultiple
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{d: {$eq: 2}}, {e: {$eq: 3}}]}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$eq: 1}}"));
 }
 
 TEST(SplitMatchExpression,
      ShouldSplitPartiallyDependentComplexPredicateMultipleRenamesDottedPaths) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {$or: [{'d.e.f': 2}, {'e.f.g': 3}]}]}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"d.e.f", "x"}, {"e.f.g", "y"}};
@@ -1001,19 +1032,19 @@ TEST(SplitMatchExpression,
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{$or: [{x: {$eq: 2}}, {y: {$eq: 3}}]}"));
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$eq: 1}}"));
 }
 
 TEST(SplitMatchExpression, ShouldNotMoveElemMatchObjectAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$elemMatch: {b: 3}}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1024,14 +1055,14 @@ TEST(SplitMatchExpression, ShouldNotMoveElemMatchObjectAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$elemMatch: {b: {$eq: 3}}}}"));
 }
 
 TEST(SplitMatchExpression, ShouldNotMoveElemMatchValueAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$elemMatch: {$eq: 3}}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1042,14 +1073,14 @@ TEST(SplitMatchExpression, ShouldNotMoveElemMatchValueAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$elemMatch: {$eq: 3}}}"));
 }
 
 TEST(SplitMatchExpression, ShouldMoveTypeAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$type: 16}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1058,7 +1089,7 @@ TEST(SplitMatchExpression, ShouldMoveTypeAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$type: [16]}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -1066,8 +1097,8 @@ TEST(SplitMatchExpression, ShouldMoveTypeAcrossRename) {
 
 TEST(SplitMatchExpression, ShouldNotMoveSizeAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$size: 3}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1078,14 +1109,14 @@ TEST(SplitMatchExpression, ShouldNotMoveSizeAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$size: 3}}"));
 }
 
 TEST(SplitMatchExpression, ShouldNotMoveMinItemsAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$_internalSchemaMinItems: 3}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1096,14 +1127,14 @@ TEST(SplitMatchExpression, ShouldNotMoveMinItemsAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$_internalSchemaMinItems: 3}}"));
 }
 
 TEST(SplitMatchExpression, ShouldNotMoveMaxItemsAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$_internalSchemaMaxItems: 3}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1114,14 +1145,14 @@ TEST(SplitMatchExpression, ShouldNotMoveMaxItemsAcrossRename) {
 
     ASSERT_TRUE(splitExpr.second.get());
     BSONObjBuilder secondBob;
-    splitExpr.second->serialize(&secondBob);
+    splitExpr.second->serialize(&secondBob, true);
     ASSERT_BSONOBJ_EQ(secondBob.obj(), fromjson("{a: {$_internalSchemaMaxItems: 3}}"));
 }
 
 TEST(SplitMatchExpression, ShouldMoveMinLengthAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$_internalSchemaMinLength: 3}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1130,7 +1161,7 @@ TEST(SplitMatchExpression, ShouldMoveMinLengthAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMinLength: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
@@ -1138,8 +1169,8 @@ TEST(SplitMatchExpression, ShouldMoveMinLengthAcrossRename) {
 
 TEST(SplitMatchExpression, ShouldMoveMaxLengthAcrossRename) {
     BSONObj matchPredicate = fromjson("{a: {$_internalSchemaMaxLength: 3}}");
-    const CollatorInterface* collator = nullptr;
-    auto matcher = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(matcher.getStatus());
 
     StringMap<std::string> renames{{"a", "c"}};
@@ -1148,16 +1179,35 @@ TEST(SplitMatchExpression, ShouldMoveMaxLengthAcrossRename) {
 
     ASSERT_TRUE(splitExpr.first.get());
     BSONObjBuilder firstBob;
-    splitExpr.first->serialize(&firstBob);
+    splitExpr.first->serialize(&firstBob, true);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMaxLength: 3}}"));
+
+    ASSERT_FALSE(splitExpr.second.get());
+}
+
+TEST(SplitMatchExpression, ShouldMoveIndependentPredicateWhenThereAreMultipleRenames) {
+    // Designed to reproduce SERVER-32690.
+    BSONObj matchPredicate = fromjson("{y: 3}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"y", "x"}, {"x", "x"}};
+    std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
+        expression::splitMatchExpressionBy(std::move(matcher.getValue()), {}, renames);
+
+    ASSERT_TRUE(splitExpr.first.get());
+    BSONObjBuilder firstBob;
+    splitExpr.first->serialize(&firstBob, true);
+    ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$eq: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
 }
 
 TEST(MapOverMatchExpression, DoesMapOverLogicalNodes) {
     BSONObj matchPredicate = fromjson("{a: {$not: {$eq: 1}}}");
-    const CollatorInterface* collator = nullptr;
-    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(swMatchExpression.getStatus());
 
     bool hasLogicalNode = false;
@@ -1174,8 +1224,8 @@ TEST(MapOverMatchExpression, DoesMapOverLogicalNodes) {
 
 TEST(MapOverMatchExpression, DoesMapOverLeafNodes) {
     BSONObj matchPredicate = fromjson("{a: {$not: {$eq: 1}}}");
-    const CollatorInterface* collator = nullptr;
-    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(swMatchExpression.getStatus());
 
     bool hasLeafNode = false;
@@ -1192,8 +1242,8 @@ TEST(MapOverMatchExpression, DoesMapOverLeafNodes) {
 
 TEST(MapOverMatchExpression, DoesPassPath) {
     BSONObj matchPredicate = fromjson("{a: {$elemMatch: {b: 1}}}");
-    const CollatorInterface* collator = nullptr;
-    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(swMatchExpression.getStatus());
 
     std::vector<std::string> paths;
@@ -1210,8 +1260,8 @@ TEST(MapOverMatchExpression, DoesPassPath) {
 
 TEST(MapOverMatchExpression, DoesMapOverNodesWithMultipleChildren) {
     BSONObj matchPredicate = fromjson("{$and: [{a: {$gt: 1}}, {b: {$lte: 2}}]}");
-    const CollatorInterface* collator = nullptr;
-    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, collator);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
     ASSERT_OK(swMatchExpression.getStatus());
 
     size_t nodeCount = 0;
@@ -1230,5 +1280,68 @@ TEST(IsPathPrefixOf, ComputesPrefixesCorrectly) {
     ASSERT_FALSE(expression::isPathPrefixOf("a.b", "a"));
 }
 
+TEST(HasExistencePredicateOnPath, IdentifiesLeavesCorrectly) {
+    BSONObj matchPredicate = fromjson("{$and: [{a: {$exists: true}}, {b: {$lte: 2}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "b"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, HandlesMultiplePredicatesWithSamePath) {
+    BSONObj matchPredicate = fromjson("{$and: [{a: {$gt: 5000}}, {a: {$exists: false}}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, DeeperTreeTest) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {a : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, HandlesDottedPathsInDeepTree) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a.b.c.d' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_TRUE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a.b.c.d"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, ReturnsFalseWhenExistsOnlyOnPrefix) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a.b"_sd));
+}
+
+TEST(HasExistencePredicateOnPath, ReturnsFalseWhenExistsOnSubpath) {
+    BSONObj matchPredicate = fromjson(
+        "{$and: [{q: {$gt: 5000}}, {$and: [{z: {$lte: 50}},"
+        "{$or: [{f : {$gte: 4}}, {'a.b' : {$exists : true}}]}]}]}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto swMatchExpression = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(swMatchExpression.getStatus());
+    ASSERT_FALSE(
+        expression::hasExistencePredicateOnPath(*swMatchExpression.getValue().get(), "a"_sd));
+}
 
 }  // namespace mongo

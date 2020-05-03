@@ -3,9 +3,15 @@
 Exhaustive test for authorization of commands with builtin roles.
 
 The test logic implemented here operates on the test cases defined
-in jstests/auth/commands.js.
+in jstests/auth/lib/commands_lib.js
+
+@tags: [requires_sharding]
 
 */
+
+// This test involves killing all sessions, which will not work as expected if the kill command is
+// sent with an implicit session.
+TestData.disableImplicitSessions = true;
 
 load("jstests/auth/lib/commands_lib.js");
 
@@ -48,35 +54,36 @@ function testProperAuthorization(conn, t, testcase, r) {
     var out = "";
 
     var runOnDb = conn.getDB(testcase.runOnDb);
-    authCommandsLib.setup(conn, t, runOnDb);
+    var state = authCommandsLib.setup(conn, t, runOnDb);
     assert(r.db.auth("user|" + r.key, "password"));
     authCommandsLib.authenticatedSetup(t, runOnDb);
-    var res = runOnDb.runCommand(t.command);
+    var command = t.command;
+    if (typeof (command) === "function") {
+        command = t.command(state, testcase.commandArgs);
+    }
+    var res = runOnDb.runCommand(command);
 
     if (testcase.roles[r.key]) {
         if (res.ok == 0 && res.code == authErrCode) {
-            out = "expected authorization success" + " but received " + tojson(res) + " on db " +
-                testcase.runOnDb + " with role " + r.key;
+            out = "expected authorization success" +
+                " but received " + tojson(res) + " on db " + testcase.runOnDb + " with role " +
+                r.key;
         } else if (res.ok == 0 && !testcase.expectFail && res.code != commandNotSupportedCode) {
             // don't error if the test failed with code commandNotSupported since
-            // some storage engines (e.g wiredTiger) don't support some commands (e.g. touch)
+            // some storage engines don't support some commands.
             out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
                 " with role " + r.key;
         }
-        // test can provide a function that will run if
-        // the command completed successfully
-        else if (testcase.onSuccess) {
-            testcase.onSuccess(res);
-        }
     } else {
         if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
-            out = "expected authorization failure" + " but received result " + tojson(res) +
-                " on db " + testcase.runOnDb + " with role " + r.key;
+            out = "expected authorization failure" +
+                " but received result " + tojson(res) + " on db " + testcase.runOnDb +
+                " with role " + r.key;
         }
     }
 
     r.db.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -138,7 +145,13 @@ function checkForNonExistentRoles() {
     }
 }
 
-var opts = {auth: "", enableExperimentalStorageDetailsCmd: ""};
+const dbPath = MongoRunner.toRealDir("$dataDir/commands_built_in_roles/");
+mkdir(dbPath);
+var opts = {
+    auth: "",
+    enableExperimentalStorageDetailsCmd: "",
+    setParameter: "trafficRecordingDirectory=" + dbPath
+};
 var impls = {createUsers: createUsers, runOneTest: runOneTest};
 
 checkForNonExistentRoles();
@@ -149,7 +162,17 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-conn = new ShardingTest(
-    {shards: 2, mongos: 1, keyFile: "jstests/libs/key1", other: {shardOptions: opts}});
+// TODO: SERVER-43897 Make commands_user_defined_roles.js and commands_builtin_roles.js start shards
+// as replica sets.
+conn = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    keyFile: "jstests/libs/key1",
+    other: {
+        shardOptions: opts,
+        shardAsReplicaSet: false,
+        mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}
+    }
+});
 authCommandsLib.runTests(conn, impls);
 conn.stop();

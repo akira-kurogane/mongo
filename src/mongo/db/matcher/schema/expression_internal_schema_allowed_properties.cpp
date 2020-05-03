@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,33 +34,31 @@
 namespace mongo {
 constexpr StringData InternalSchemaAllowedPropertiesMatchExpression::kName;
 
-Status InternalSchemaAllowedPropertiesMatchExpression::init(
-    boost::container::flat_set<StringData> properties,
+InternalSchemaAllowedPropertiesMatchExpression::InternalSchemaAllowedPropertiesMatchExpression(
+    StringDataSet properties,
     StringData namePlaceholder,
     std::vector<PatternSchema> patternProperties,
-    std::unique_ptr<ExpressionWithPlaceholder> otherwise) {
-    _properties = std::move(properties);
-    _namePlaceholder = namePlaceholder;
-    _patternProperties = std::move(patternProperties);
-    _otherwise = std::move(otherwise);
+    std::unique_ptr<ExpressionWithPlaceholder> otherwise)
+    : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ALLOWED_PROPERTIES),
+      _properties(std::move(properties)),
+      _namePlaceholder(namePlaceholder),
+      _patternProperties(std::move(patternProperties)),
+      _otherwise(std::move(otherwise)) {
 
     for (auto&& constraint : _patternProperties) {
         const auto& errorStr = constraint.first.regex->error();
-        if (!errorStr.empty()) {
-            return {ErrorCodes::BadValue,
-                    str::stream() << "Invalid regular expression: " << errorStr};
-        }
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid regular expression: " << errorStr,
+                errorStr.empty());
     }
-
-    return Status::OK();
 }
 
 void InternalSchemaAllowedPropertiesMatchExpression::debugString(StringBuilder& debug,
-                                                                 int level) const {
-    _debugAddSpace(debug, level);
+                                                                 int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder);
+    serialize(&builder, true);
     debug << builder.obj().toString() << "\n";
 
     const auto* tag = getTag();
@@ -127,15 +126,14 @@ bool InternalSchemaAllowedPropertiesMatchExpression::_matchesBSONObj(const BSONO
     return true;
 }
 
-void InternalSchemaAllowedPropertiesMatchExpression::serialize(BSONObjBuilder* builder) const {
+void InternalSchemaAllowedPropertiesMatchExpression::serialize(BSONObjBuilder* builder,
+                                                               bool includePath) const {
     BSONObjBuilder expressionBuilder(
         builder->subobjStart(InternalSchemaAllowedPropertiesMatchExpression::kName));
 
-    BSONArrayBuilder propertiesBuilder(expressionBuilder.subarrayStart("properties"));
-    for (auto&& property : _properties) {
-        propertiesBuilder.append(property);
-    }
-    propertiesBuilder.doneFast();
+    std::vector<StringData> sortedProperties(_properties.begin(), _properties.end());
+    std::sort(sortedProperties.begin(), sortedProperties.end());
+    expressionBuilder.append("properties", sortedProperties);
 
     expressionBuilder.append("namePlaceholder", _namePlaceholder);
 
@@ -145,13 +143,13 @@ void InternalSchemaAllowedPropertiesMatchExpression::serialize(BSONObjBuilder* b
         itemBuilder.appendRegex("regex", item.first.rawRegex);
 
         BSONObjBuilder subexpressionBuilder(itemBuilder.subobjStart("expression"));
-        item.second->getFilter()->serialize(&subexpressionBuilder);
+        item.second->getFilter()->serialize(&subexpressionBuilder, includePath);
         subexpressionBuilder.doneFast();
     }
     patternPropertiesBuilder.doneFast();
 
     BSONObjBuilder otherwiseBuilder(expressionBuilder.subobjStart("otherwise"));
-    _otherwise->getFilter()->serialize(&otherwiseBuilder);
+    _otherwise->getFilter()->serialize(&otherwiseBuilder, includePath);
     otherwiseBuilder.doneFast();
     expressionBuilder.doneFast();
 }
@@ -165,11 +163,26 @@ std::unique_ptr<MatchExpression> InternalSchemaAllowedPropertiesMatchExpression:
                                              constraint.second->shallowClone());
     }
 
-    auto clone = stdx::make_unique<InternalSchemaAllowedPropertiesMatchExpression>();
-    invariantOK(clone->init(_properties,
-                            _namePlaceholder,
-                            std::move(clonedPatternProperties),
-                            _otherwise->shallowClone()));
+    auto clone = std::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
+        _properties,
+        _namePlaceholder,
+        std::move(clonedPatternProperties),
+        _otherwise->shallowClone());
     return {std::move(clone)};
+}
+
+MatchExpression::ExpressionOptimizerFunc
+InternalSchemaAllowedPropertiesMatchExpression::getOptimizer() const {
+    return [](std::unique_ptr<MatchExpression> expression) {
+        auto& allowedPropertiesExpr =
+            static_cast<InternalSchemaAllowedPropertiesMatchExpression&>(*expression);
+
+        for (auto& property : allowedPropertiesExpr._patternProperties) {
+            property.second->optimizeFilter();
+        }
+        allowedPropertiesExpr._otherwise->optimizeFilter();
+
+        return expression;
+    };
 }
 }  // namespace mongo

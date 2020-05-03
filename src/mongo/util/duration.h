@@ -1,33 +1,36 @@
-/*    Copyright 2016 MongoDB, Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <cstdint>
+#include <fmt/format.h>
 #include <iosfwd>
 #include <limits>
 #include <ratio>
@@ -37,9 +40,11 @@
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+
+class BSONObj;
 
 template <typename Allocator>
 class StringBuilderImpl;
@@ -53,6 +58,7 @@ using Milliseconds = Duration<std::milli>;
 using Seconds = Duration<std::ratio<1>>;
 using Minutes = Duration<std::ratio<60>>;
 using Hours = Duration<std::ratio<3600>>;
+using Days = Duration<std::ratio<86400>>;
 
 //
 // Streaming output operators for common duration types. Writes the numerical value followed by
@@ -61,32 +67,6 @@ using Hours = Duration<std::ratio<3600>>;
 // E.g., std::cout << Minutes{5} << std::endl; should produce the following:
 // 5min
 //
-
-std::ostream& operator<<(std::ostream& os, Nanoseconds ns);
-std::ostream& operator<<(std::ostream& os, Microseconds us);
-std::ostream& operator<<(std::ostream& os, Milliseconds ms);
-std::ostream& operator<<(std::ostream& os, Seconds s);
-std::ostream& operator<<(std::ostream& os, Minutes m);
-std::ostream& operator<<(std::ostream& os, Hours h);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Nanoseconds ns);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Microseconds us);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Milliseconds ms);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Seconds s);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Minutes m);
-
-template <typename Allocator>
-StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Hours h);
-
 
 template <typename Duration1, typename Duration2>
 using HigherPrecisionDuration =
@@ -102,20 +82,20 @@ using HigherPrecisionDuration =
  * attempting to cast that value to Milliseconds will throw an exception.
  */
 template <typename ToDuration, typename FromPeriod>
-ToDuration duration_cast(const Duration<FromPeriod>& from) {
+constexpr ToDuration duration_cast(const Duration<FromPeriod>& from) {
     using FromOverTo = std::ratio_divide<FromPeriod, typename ToDuration::period>;
     if (ToDuration::template isHigherPrecisionThan<Duration<FromPeriod>>()) {
-        typename ToDuration::rep toCount;
+        typename ToDuration::rep toCount = 0;
         uassert(ErrorCodes::DurationOverflow,
                 "Overflow casting from a lower-precision duration to a higher-precision duration",
-                !mongoSignedMultiplyOverflow64(from.count(), FromOverTo::num, &toCount));
+                !overflow::mul(from.count(), FromOverTo::num, &toCount));
         return ToDuration{toCount};
     }
     return ToDuration{from.count() / FromOverTo::den};
 }
 
 template <typename ToDuration, typename FromRep, typename FromPeriod>
-inline ToDuration duration_cast(const stdx::chrono::duration<FromRep, FromPeriod>& d) {
+constexpr ToDuration duration_cast(const stdx::chrono::duration<FromRep, FromPeriod>& d) {
     return duration_cast<ToDuration>(Duration<FromPeriod>{d.count()});
 }
 
@@ -148,6 +128,42 @@ inline long long durationCount(const stdx::chrono::duration<RepIn, PeriodIn>& d)
 template <typename Period>
 class Duration {
 public:
+    static constexpr StringData unit_short() {
+        if constexpr (std::is_same_v<Duration, Nanoseconds>) {
+            return "ns"_sd;
+        } else if constexpr (std::is_same_v<Duration, Microseconds>) {
+            return "\xce\xbcs"_sd;
+        } else if constexpr (std::is_same_v<Duration, Milliseconds>) {
+            return "ms"_sd;
+        } else if constexpr (std::is_same_v<Duration, Seconds>) {
+            return "s"_sd;
+        } else if constexpr (std::is_same_v<Duration, Minutes>) {
+            return "min"_sd;
+        } else if constexpr (std::is_same_v<Duration, Hours>) {
+            return "hr"_sd;
+        } else if constexpr (std::is_same_v<Duration, Days>) {
+            return "d"_sd;
+        }
+        return StringData{};
+    }
+    static constexpr StringData mongoUnitSuffix() {
+        if constexpr (std::is_same_v<Duration, Nanoseconds>) {
+            return "Nanos"_sd;
+        } else if constexpr (std::is_same_v<Duration, Microseconds>) {
+            return "Micros"_sd;
+        } else if constexpr (std::is_same_v<Duration, Milliseconds>) {
+            return "Millis"_sd;
+        } else if constexpr (std::is_same_v<Duration, Seconds>) {
+            return "Seconds"_sd;
+        } else if constexpr (std::is_same_v<Duration, Minutes>) {
+            return "Minutes"_sd;
+        } else if constexpr (std::is_same_v<Duration, Hours>) {
+            return "Hours"_sd;
+        } else if constexpr (std::is_same_v<Duration, Days>) {
+            return "Days"_sd;
+        }
+        return StringData{};
+    }
     MONGO_STATIC_ASSERT_MSG(Period::num > 0, "Duration::period's numerator must be positive");
     MONGO_STATIC_ASSERT_MSG(Period::den > 0, "Duration::period's denominator must be positive");
 
@@ -230,16 +246,14 @@ public:
     }
 
     /**
-     * Constructs a higher-precision duration from a lower-precision one, as by duration_cast.
+     * Implicit converting constructor from a lower-precision duration to a higher-precision one, as
+     * by duration_cast.
      *
-     * Throws a AssertionException if "from" is out of the range of this duration type.
-     *
-     * It is a compilation error to attempt a conversion from higher-precision to lower-precision by
-     * this constructor.
+     * It is a compilation error to convert from higher precision to lower, or if the conversion
+     * would cause an integer overflow.
      */
     template <typename FromPeriod>
-    /*implicit*/ Duration(const Duration<FromPeriod>& from)
-        : Duration(duration_cast<Duration>(from)) {
+    constexpr Duration(const Duration<FromPeriod>& from) : Duration(duration_cast<Duration>(from)) {
         MONGO_STATIC_ASSERT_MSG(
             !isLowerPrecisionThan<Duration<FromPeriod>>(),
             "Use duration_cast to convert from higher precision Duration types to lower "
@@ -281,7 +295,7 @@ public:
         }
         using OtherOverThis = std::ratio_divide<OtherPeriod, period>;
         rep otherCount;
-        if (mongoSignedMultiplyOverflow64(other.count(), OtherOverThis::num, &otherCount)) {
+        if (overflow::mul(other.count(), OtherOverThis::num, &otherCount)) {
             return other.count() < 0 ? 1 : -1;
         }
         if (count() < otherCount) {
@@ -329,14 +343,14 @@ public:
     Duration& operator+=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while adding " << other << " to " << *this,
-                !mongoSignedAddOverflow64(count(), other.count(), &_count));
+                !overflow::add(count(), other.count(), &_count));
         return *this;
     }
 
     Duration& operator-=(const Duration& other) {
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while subtracting " << other << " from " << *this,
-                !mongoSignedSubtractOverflow64(count(), other.count(), &_count));
+                !overflow::sub(count(), other.count(), &_count));
         return *this;
     }
 
@@ -347,7 +361,7 @@ public:
             "Durations may only be multiplied by values of signed integral type");
         uassert(ErrorCodes::DurationOverflow,
                 str::stream() << "Overflow while multiplying " << *this << " by " << scale,
-                !mongoSignedMultiplyOverflow64(count(), scale, &_count));
+                !overflow::mul(count(), scale, &_count));
         return *this;
     }
 
@@ -361,6 +375,13 @@ public:
         _count /= scale;
         return *this;
     }
+
+    BSONObj toBSON() const;
+
+    std::string toString() const {
+        return fmt::format("{} {}", count(), unit_short());
+    }
+
 
 private:
     rep _count = {};
@@ -444,6 +465,27 @@ template <typename Period, typename Rep2>
 Duration<Period> operator/(Duration<Period> d, const Rep2& scale) {
     d /= scale;
     return d;
+}
+
+template <typename Stream, typename Period>
+Stream& streamPut(Stream& os, const Duration<Period>& dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return os << dp.count() << dp.unit_short();
+}
+
+template <typename Period>
+std::ostream& operator<<(std::ostream& os, Duration<Period> dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return streamPut(os, dp);
+}
+
+template <typename Allocator, typename Period>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, Duration<Period> dp) {
+    MONGO_STATIC_ASSERT_MSG(!Duration<Period>::unit_short().empty(),
+                            "Only standard Durations can logged");
+    return streamPut(os, dp);
 }
 
 }  // namespace mongo

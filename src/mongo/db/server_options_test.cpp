@@ -1,31 +1,33 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -45,27 +47,41 @@
 
 #include <boost/filesystem.hpp>
 
+#include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_options_helpers.h"
+#include "mongo/db/server_options_base.h"
+#include "mongo/db/server_options_nongeneral_gen.h"
+#include "mongo/db/server_options_server_helpers.h"
 #include "mongo/logger/logger.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/scopeguard.h"
+
 
 namespace {
 
 using mongo::ErrorCodes;
 using mongo::Status;
 
+using mongo::unittest::getMinimumLogSeverity;
+using mongo::unittest::hasMinimumLogSeverity;
+
 namespace moe = mongo::optionenvironment;
+
+MONGO_INITIALIZER(ServerLogRedirection)(mongo::InitializerContext*) {
+    // ssl_options_server.cpp has an initializer which depends on logging.
+    // We can stub that dependency out for unit testing purposes.
+    return Status::OK();
+}
 
 class OptionsParserTester : public moe::OptionsParser {
 public:
-    Status readConfigFile(const std::string& filename, std::string* config) {
+    Status readConfigFile(const std::string& filename, std::string* config, ConfigExpand) {
         if (filename != _filename) {
             ::mongo::StringBuilder sb;
             sb << "Parser using filename: " << filename
@@ -85,14 +101,16 @@ private:
     std::string _config;
 };
 
-TEST(Verbosity, Default) {
+class Verbosity : public mongo::unittest::Test {
+    /** Reset the log level before we test */
+    mongo::unittest::MinimumLoggedSeverityGuard _severityGuard{mongo::logv2::LogComponent::kDefault,
+                                                               mongo::logv2::LogSeverity::Info()};
+};
+
+TEST_F(Verbosity, Default) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -108,18 +126,13 @@ TEST(Verbosity, Default) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     // Make sure the log level didn't change since we didn't specify any verbose options
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Info());
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Info());
 }
 
-TEST(Verbosity, CommandLineImplicit) {
+TEST_F(Verbosity, CommandLineImplicit) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -136,18 +149,13 @@ TEST(Verbosity, CommandLineImplicit) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 1;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, CommandLineString) {
+TEST_F(Verbosity, CommandLineString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -165,18 +173,13 @@ TEST(Verbosity, CommandLineString) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 4;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, CommandLineStringDisguisedLongForm) {
+TEST_F(Verbosity, CommandLineStringDisguisedLongForm) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -194,18 +197,13 @@ TEST(Verbosity, CommandLineStringDisguisedLongForm) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 4;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, CommandLineEmptyString) {
+TEST_F(Verbosity, CommandLineEmptyString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -218,14 +216,10 @@ TEST(Verbosity, CommandLineEmptyString) {
     ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
 }
 
-TEST(Verbosity, CommandLineBadString) {
+TEST_F(Verbosity, CommandLineBadString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -240,14 +234,10 @@ TEST(Verbosity, CommandLineBadString) {
     ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
 }
 
-TEST(Verbosity, CommandLineBadStringOnlyDash) {
+TEST_F(Verbosity, CommandLineBadStringOnlyDash) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -259,14 +249,10 @@ TEST(Verbosity, CommandLineBadStringOnlyDash) {
     ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
 }
 
-TEST(Verbosity, CommandLineBadStringOnlyTwoDashes) {
+TEST_F(Verbosity, CommandLineBadStringOnlyTwoDashes) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -278,14 +264,10 @@ TEST(Verbosity, CommandLineBadStringOnlyTwoDashes) {
     ASSERT_OK(parser.run(options, argv, env_map, &environment));
 }
 
-TEST(Verbosity, INIConfigString) {
+TEST_F(Verbosity, INIConfigString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -305,18 +287,13 @@ TEST(Verbosity, INIConfigString) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 4;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, INIConfigBadString) {
+TEST_F(Verbosity, INIConfigBadString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -333,14 +310,10 @@ TEST(Verbosity, INIConfigBadString) {
     ASSERT_NOT_OK(::mongo::validateServerOptions(environment));
 }
 
-TEST(Verbosity, INIConfigEmptyString) {
+TEST_F(Verbosity, INIConfigEmptyString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -360,18 +333,13 @@ TEST(Verbosity, INIConfigEmptyString) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 0;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, JSONConfigString) {
+TEST_F(Verbosity, JSONConfigString) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -391,18 +359,13 @@ TEST(Verbosity, JSONConfigString) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 4;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, MultipleSourcesMultipleOptions) {
+TEST_F(Verbosity, MultipleSourcesMultipleOptions) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
-
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -424,21 +387,17 @@ TEST(Verbosity, MultipleSourcesMultipleOptions) {
     ASSERT_OK(::mongo::storeServerOptions(environment));
 
     int verbosity = 3;
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
 }
 
-TEST(Verbosity, YAMLConfigStringLogComponent) {
+TEST_F(Verbosity, YAMLConfigStringLogComponent) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
 
-    // Reset the log level before we test
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Info());
     // Log level for Storage will be cleared by config file value.
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogComponent::kStorage, ::mongo::logger::LogSeverity::Debug(1));
+    auto storageSeverityGuard = mongo::unittest::MinimumLoggedSeverityGuard{
+        mongo::logv2::LogComponent::kStorage, mongo::logv2::LogSeverity::Debug(1)};
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 
@@ -470,39 +429,29 @@ TEST(Verbosity, YAMLConfigStringLogComponent) {
     int verbosity = 4;
 
     // Default
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                      ::mongo::logger::LogComponent::kDefault),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(), ::mongo::logv2::LogSeverity::Debug(verbosity));
+    ASSERT_EQUALS(getMinimumLogSeverity(::mongo::logv2::LogComponent::kDefault),
+                  ::mongo::logv2::LogSeverity::Debug(verbosity));
 
     // AccessControl
-    ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-        ::mongo::logger::LogComponent::kAccessControl));
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                      ::mongo::logger::LogComponent::kAccessControl),
-                  ::mongo::logger::LogSeverity::Log());
+    ASSERT_TRUE(hasMinimumLogSeverity(::mongo::logv2::LogComponent::kAccessControl));
+    ASSERT_EQUALS(getMinimumLogSeverity(::mongo::logv2::LogComponent::kAccessControl),
+                  ::mongo::logv2::LogSeverity::Log());
 
     // Query - not mentioned in configuration. should match default.
-    ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-        ::mongo::logger::LogComponent::kStorage));
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                      ::mongo::logger::LogComponent::kStorage),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_FALSE(hasMinimumLogSeverity(::mongo::logv2::LogComponent::kStorage));
+    ASSERT_EQUALS(getMinimumLogSeverity(::mongo::logv2::LogComponent::kStorage),
+                  ::mongo::logv2::LogSeverity::Debug(verbosity));
 
     // Storage - cleared by -1 value in configuration. should match default.
-    ASSERT_FALSE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-        ::mongo::logger::LogComponent::kStorage));
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                      ::mongo::logger::LogComponent::kStorage),
-                  ::mongo::logger::LogSeverity::Debug(verbosity));
+    ASSERT_FALSE(hasMinimumLogSeverity(::mongo::logv2::LogComponent::kStorage));
+    ASSERT_EQUALS(getMinimumLogSeverity(::mongo::logv2::LogComponent::kStorage),
+                  ::mongo::logv2::LogSeverity::Debug(verbosity));
 
     // Journaling - explicitly set to 2 in configuration.
-    ASSERT_TRUE(::mongo::logger::globalLogDomain()->hasMinimumLogSeverity(
-        ::mongo::logger::LogComponent::kJournal));
-    ASSERT_EQUALS(::mongo::logger::globalLogDomain()->getMinimumLogSeverity(
-                      ::mongo::logger::LogComponent::kJournal),
-                  ::mongo::logger::LogSeverity::Debug(2));
+    ASSERT_TRUE(hasMinimumLogSeverity(::mongo::logv2::LogComponent::kJournal));
+    ASSERT_EQUALS(getMinimumLogSeverity(::mongo::logv2::LogComponent::kJournal),
+                  ::mongo::logv2::LogSeverity::Debug(2));
 }
 
 TEST(SetupOptions, Default) {
@@ -555,6 +504,233 @@ TEST(SetupOptions, MissingBinaryName) {
     ASSERT_NOT_OK(::mongo::setupServerOptions(argv));
 }
 
+TEST(SetupOptions, SlowMsCommandLineParamParsesSuccessfully) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--slowms");
+    argv.push_back("300");
+    std::map<std::string, std::string> env_map;
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.slowMS, 300);
+}
+
+TEST(SetupOptions, SlowMsParamInitializedSuccessfullyFromINIConfigFile) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.ini");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.ini", "slowms=300");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.slowMS, 300);
+}
+
+TEST(SetupOptions, SlowMsParamInitializedSuccessfullyFromYAMLConfigFile) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.yaml");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.yaml",
+                     "operationProfiling:\n"
+                     "    slowOpThresholdMs: 300\n");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.slowMS, 300);
+}
+
+TEST(SetupOptions, NonNumericSlowMsCommandLineOptionFailsToParse) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--slowms");
+    argv.push_back("invalid");
+    std::map<std::string, std::string> env_map;
+
+    ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
+}
+
+TEST(SetupOptions, NonNumericSlowMsYAMLConfigOptionFailsToParse) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.yaml");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.yaml",
+                     "operationProfiling:\n"
+                     "    slowOpThresholdMs: invalid\n");
+
+    ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
+}
+
+TEST(SetupOptions, SampleRateCommandLineParamParsesSuccessfully) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--slowOpSampleRate");
+    argv.push_back("0.5");
+    std::map<std::string, std::string> env_map;
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.sampleRate, 0.5);
+}
+
+TEST(SetupOptions, SampleRateParamInitializedSuccessfullyFromINIConfigFile) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.ini");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.ini", "slowOpSampleRate=0.5");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.sampleRate, 0.5);
+}
+
+TEST(SetupOptions, SampleRateParamInitializedSuccessfullyFromYAMLConfigFile) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addGeneralServerOptions(&options));
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.yaml");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.yaml",
+                     "operationProfiling:\n"
+                     "    slowOpSampleRate: 0.5\n");
+
+    ASSERT_OK(parser.run(options, argv, env_map, &environment));
+
+    ASSERT_OK(::mongo::validateServerOptions(environment));
+    ASSERT_OK(::mongo::canonicalizeServerOptions(&environment));
+    ASSERT_OK(::mongo::setupServerOptions(argv));
+    ASSERT_OK(::mongo::storeServerOptions(environment));
+
+    ASSERT_EQ(::mongo::serverGlobalParams.sampleRate, 0.5);
+}
+
+TEST(SetupOptions, NonNumericSampleRateCommandLineOptionFailsToParse) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--slowOpSampleRate");
+    argv.push_back("invalid");
+    std::map<std::string, std::string> env_map;
+
+    ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
+}
+
+TEST(SetupOptions, NonNumericSampleRateYAMLConfigOptionFailsToParse) {
+    OptionsParserTester parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+
+
+    ASSERT_OK(::mongo::addNonGeneralServerOptions(&options));
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back("config.yaml");
+    std::map<std::string, std::string> env_map;
+
+    parser.setConfig("config.yaml",
+                     "operationProfiling:\n"
+                     "    slowOpSampleRate: invalid\n");
+
+    ASSERT_NOT_OK(parser.run(options, argv, env_map, &environment));
+}
+
 #if !defined(_WIN32) && !(defined(__APPLE__) && TARGET_OS_TV)
 
 #define ASSERT_BOOST_SUCCESS(ec) ASSERT_FALSE(ec) << ec.message()
@@ -573,7 +749,7 @@ TEST(SetupOptions, DeepCwd) {
     sb << "/tmp/deepcwd-" << getpid();
     boost::filesystem::path deepBaseDir = sb.str();
 
-    auto cleanup = ::mongo::MakeGuard([&] {
+    auto cleanup = ::mongo::makeGuard([&] {
         boost::filesystem::current_path(cwd, ec);
         boost::filesystem::remove_all(deepBaseDir, ec);
     });
@@ -630,7 +806,7 @@ TEST(SetupOptions, UnlinkedCwd) {
 
     std::string unlinkDir;
 
-    auto cleanup = ::mongo::MakeGuard([&] {
+    auto cleanup = ::mongo::makeGuard([&] {
         boost::filesystem::current_path(cwd, ec);
         if (!unlinkDir.empty()) {
             boost::filesystem::remove(cwd / unlinkDir, ec);

@@ -1,41 +1,42 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <boost/container/flat_set.hpp>
+#include <boost/optional.hpp>
+#include <memory>
 #include <pcrecpp.h>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -94,7 +95,7 @@ public:
      */
     struct Pattern {
         explicit Pattern(StringData pattern)
-            : rawRegex(pattern), regex(stdx::make_unique<pcrecpp::RE>(pattern.toString())) {}
+            : rawRegex(pattern), regex(std::make_unique<pcrecpp::RE>(pattern.toString())) {}
 
         StringData rawRegex;
         std::unique_ptr<pcrecpp::RE> regex;
@@ -108,15 +109,13 @@ public:
 
     static constexpr StringData kName = "$_internalSchemaAllowedProperties"_sd;
 
-    explicit InternalSchemaAllowedPropertiesMatchExpression()
-        : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ALLOWED_PROPERTIES) {}
+    explicit InternalSchemaAllowedPropertiesMatchExpression(
+        StringDataSet properties,
+        StringData namePlaceholder,
+        std::vector<PatternSchema> patternProperties,
+        std::unique_ptr<ExpressionWithPlaceholder> otherwise);
 
-    Status init(boost::container::flat_set<StringData> properties,
-                StringData namePlaceholder,
-                std::vector<PatternSchema> patternProperties,
-                std::unique_ptr<ExpressionWithPlaceholder> otherwise);
-
-    void debugString(StringBuilder& debug, int level) const final;
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
 
     bool equivalent(const MatchExpression* expr) const final;
 
@@ -136,12 +135,12 @@ public:
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final;
     bool matchesSingleElement(const BSONElement& element, MatchDetails* details) const final;
 
-    void serialize(BSONObjBuilder* builder) const final;
+    void serialize(BSONObjBuilder* builder, bool includePath) const final;
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
-    std::vector<MatchExpression*>* getChildVector() final {
-        return nullptr;
+    boost::optional<std::vector<MatchExpression*>&> getChildVector() final {
+        return boost::none;
     }
 
     size_t numChildren() const final {
@@ -159,6 +158,8 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
     /**
      * Helper function for matches() and matchesSingleElement().
      */
@@ -170,7 +171,7 @@ private:
 
     // The names of the properties are owned by the BSONObj used to create this match expression.
     // Since that BSONObj must outlive this object, we can safely store StringData.
-    boost::container::flat_set<StringData> _properties;
+    StringDataSet _properties;
 
     // The placeholder used in both '_patternProperties' and '_otherwise'.
     StringData _namePlaceholder;

@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -36,6 +37,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -47,71 +49,49 @@ class CollatorInterface;
  */
 class BtreeKeyGenerator {
 public:
+    /**
+     * Provides a context to generate keys based on names in 'fieldNames'. The 'fixed' argument
+     * specifies values that have already been identified for their corresponding fields.
+     */
     BtreeKeyGenerator(std::vector<const char*> fieldNames,
                       std::vector<BSONElement> fixed,
-                      bool isSparse);
+                      bool isSparse,
+                      const CollatorInterface* collator,
+                      KeyString::Version keyStringVersion,
+                      Ordering ordering);
 
-    virtual ~BtreeKeyGenerator() {}
-
-    static std::unique_ptr<BtreeKeyGenerator> make(IndexDescriptor::IndexVersion indexVersion,
-                                                   std::vector<const char*> fieldNames,
-                                                   std::vector<BSONElement> fixed,
-                                                   bool isSparse,
-                                                   const CollatorInterface* collator);
-
-    void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const;
-
-protected:
-    // These are used by the getKeysImpl(s) below.
-    std::vector<const char*> _fieldNames;
-    bool _isIdIndex;
-    bool _isSparse;
-    BSONObj _nullKey;  // a full key with all fields null
-    BSONSizeTracker _sizeTracker;
+    /**
+     * Generates the index keys for the document 'obj', and stores them in the set 'keys'.
+     *
+     * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. If this
+     * index type supports tracking path-level multikey information, then this function resizes
+     * 'multikeyPaths' to have the same number of elements as the index key pattern and fills each
+     * element with the prefixes of the indexed field that would cause this index to be multikey as
+     * a result of inserting 'keys'.
+     *
+     * If the caller is certain that the current index is not multikey, and the insertion of 'obj'
+     * will not turn the index into a multikey, then the 'skipMultikey' parameter can be set to
+     * 'true' to be able to use an optimized algorithm for the index key generation. Otherwise,
+     * this parameter must be set to 'false'. In this case a generic algorithm will be used, which
+     * can handle both multikey and non-multikey indexes.
+     */
+    void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                 const BSONObj& obj,
+                 bool skipMultikey,
+                 KeyStringSet* keys,
+                 MultikeyPaths* multikeyPaths,
+                 boost::optional<RecordId> id = boost::none) const;
 
 private:
-    virtual void getKeysImpl(std::vector<const char*> fieldNames,
-                             std::vector<BSONElement> fixed,
-                             const BSONObj& obj,
-                             BSONObjSet* keys,
-                             MultikeyPaths* multikeyPaths) const = 0;
+    const KeyString::Version _keyStringVersion;
+    const Ordering _ordering;
+    // These are used by getKeys below.
+    const std::vector<const char*> _fieldNames;
+    const bool _isIdIndex;
+    const bool _isSparse;
+    const KeyString::Value _nullKeyString;  // A full key with all fields null.
 
     std::vector<BSONElement> _fixed;
-};
-
-class BtreeKeyGeneratorV0 : public BtreeKeyGenerator {
-public:
-    BtreeKeyGeneratorV0(std::vector<const char*> fieldNames,
-                        std::vector<BSONElement> fixed,
-                        bool isSparse);
-
-    virtual ~BtreeKeyGeneratorV0() {}
-
-private:
-    /**
-     * Generates the index keys for the document 'obj' and stores them in the set 'keys'.
-     *
-     * It isn't possible to create a v0 index, so it's unnecessary to track the prefixes of the
-     * indexed fields that cause the index to be mulitkey. This function therefore ignores its
-     * 'multikeyPaths' parameter.
-     */
-    void getKeysImpl(std::vector<const char*> fieldNames,
-                     std::vector<BSONElement> fixed,
-                     const BSONObj& obj,
-                     BSONObjSet* keys,
-                     MultikeyPaths* multikeyPaths) const final;
-};
-
-class BtreeKeyGeneratorV1 : public BtreeKeyGenerator {
-public:
-    BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
-                        std::vector<BSONElement> fixed,
-                        bool isSparse,
-                        const CollatorInterface* collator);
-
-    virtual ~BtreeKeyGeneratorV1() {}
-
-private:
     /**
      * Stores info regarding traversal of a positional path. A path through a document is
      * considered positional if this path element names an array element. Generally this means
@@ -166,37 +146,30 @@ private:
     };
 
     /**
-     * Generates the index keys for the document 'obj' and stores them in the set 'keys'.
-     *
-     * @param fieldNames - fields to index, may be postfixes in recursive calls
-     * @param fixed - values that have already been identified for their index fields
-     * @param obj - object from which keys should be extracted, based on names in fieldNames
-     * @param keys - set where index keys are written
-     *
-     * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. If this
-     * index type supports tracking path-level multikey information, then this function resizes
-     * 'multikeyPaths' to have the same number of elements as the index key pattern and fills each
-     * element with the prefixes of the indexed field that would cause this index to be multikey as
-     * a result of inserting 'keys'.
+     * This recursive method does the heavy-lifting for getKeys().
+     * It will modify 'fieldNames' and 'fixed'.
      */
-    void getKeysImpl(std::vector<const char*> fieldNames,
-                     std::vector<BSONElement> fixed,
-                     const BSONObj& obj,
-                     BSONObjSet* keys,
-                     MultikeyPaths* multikeyPaths) const final;
+    void _getKeysWithArray(std::vector<const char*>* fieldNames,
+                           std::vector<BSONElement>* fixed,
+                           SharedBufferFragmentBuilder& pooledBufferBuilder,
+                           const BSONObj& obj,
+                           KeyStringSet::sequence_type* keys,
+                           unsigned numNotFound,
+                           const std::vector<PositionalPathInfo>& positionalInfo,
+                           MultikeyPaths* multikeyPaths,
+                           boost::optional<RecordId> id) const;
 
     /**
-     * This recursive method does the heavy-lifting for getKeysImpl().
+     * An optimized version of the key generation algorithm to be used when it is known that 'obj'
+     * doesn't contain an array value in any of the fields in the key pattern.
      */
-    void getKeysImplWithArray(std::vector<const char*> fieldNames,
-                              std::vector<BSONElement> fixed,
+    void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
                               const BSONObj& obj,
-                              BSONObjSet* keys,
-                              unsigned numNotFound,
-                              const std::vector<PositionalPathInfo>& positionalInfo,
-                              MultikeyPaths* multikeyPaths) const;
+                              boost::optional<RecordId> id,
+                              KeyStringSet* keys) const;
+
     /**
-     * A call to getKeysImplWithArray() begins by calling this for each field in the key pattern. It
+     * A call to _getKeysWithArray() begins by calling this for each field in the key pattern. It
      * traverses the path '*field' in 'obj' until either reaching the end of the path or an array
      * element.
      *
@@ -223,31 +196,39 @@ private:
      *   to "b.c".
      *
      *   extractNextElement() will then be called from a recursive call to
-     *   getKeysImplWithArray() for each array element. For instance, it will get called with
+     *   _getKeysWithArray() for each array element. For instance, it will get called with
      *   'obj' {b: {c: 98}} and '*field' pointing to "b.c". It will return element 98 and
      *   set '*field' to "". Similarly, it will return elemtn 99 and set '*field' to "" for
      *   the second array element.
      */
-    BSONElement extractNextElement(const BSONObj& obj,
-                                   const PositionalPathInfo& positionalInfo,
-                                   const char** field,
-                                   bool* arrayNestedArray) const;
+    BSONElement _extractNextElement(const BSONObj& obj,
+                                    const PositionalPathInfo& positionalInfo,
+                                    const char** field,
+                                    bool* arrayNestedArray) const;
 
     /**
      * Sets extracted elements in 'fixed' for field paths that we have traversed to the end.
      *
-     * Then calls getKeysImplWithArray() recursively.
+     * fieldNamesTemp and fixedTemp are temporary vectors that will be modified by this method
+     *
+     * Then calls _getKeysWithArray() recursively.
      */
-    void _getKeysArrEltFixed(std::vector<const char*>* fieldNames,
-                             std::vector<BSONElement>* fixed,
+    void _getKeysArrEltFixed(const std::vector<const char*>& fieldNames,
+                             const std::vector<BSONElement>& fixed,
+                             std::vector<const char*>* fieldNamesTemp,
+                             std::vector<BSONElement>* fixedTemp,
+                             SharedBufferFragmentBuilder& pooledBufferBuilder,
                              const BSONElement& arrEntry,
-                             BSONObjSet* keys,
+                             KeyStringSet::sequence_type* keys,
                              unsigned numNotFound,
                              const BSONElement& arrObjElt,
                              const std::set<size_t>& arrIdxs,
                              bool mayExpandArrayUnembedded,
                              const std::vector<PositionalPathInfo>& positionalInfo,
-                             MultikeyPaths* multikeyPaths) const;
+                             MultikeyPaths* multikeyPaths,
+                             boost::optional<RecordId> id) const;
+
+    KeyString::Value _buildNullKeyString() const;
 
     const std::vector<PositionalPathInfo> _emptyPositionalInfo;
 

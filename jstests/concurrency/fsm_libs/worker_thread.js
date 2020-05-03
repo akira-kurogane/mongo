@@ -3,9 +3,9 @@
 load('jstests/concurrency/fsm_libs/assert.js');
 load('jstests/concurrency/fsm_libs/cluster.js');       // for Cluster.isStandalone
 load('jstests/concurrency/fsm_libs/parse_config.js');  // for parseConfig
+load('jstests/libs/specific_secondary_reader_mongo.js');
 
 var workerThread = (function() {
-
     // workloads = list of workload filenames
     // args.tid = the thread identifier
     // args.data = map of workload -> 'this' parameter passed to the FSM state functions
@@ -23,47 +23,136 @@ var workerThread = (function() {
     function main(workloads, args, run) {
         var myDB;
         var configs = {};
+        var connectionString = 'mongodb://' + args.host + '/?appName=tid:' + args.tid;
+        if (typeof args.replSetName !== 'undefined') {
+            connectionString += '&replicaSet=' + args.replSetName;
+        }
 
         globalAssertLevel = args.globalAssertLevel;
 
+        // The global 'TestData' object may still be undefined if the concurrency suite isn't being
+        // run by resmoke.py (e.g. if it is being run via a parallel shell in the backup/restore
+        // tests).
+        TestData = (TestData !== undefined) ? TestData : {};
+
         try {
-            if (Cluster.isStandalone(args.clusterOptions)) {
-                myDB = db.getSiblingDB(args.dbName);
+            if (typeof db !== 'undefined') {
+                // The implicit database connection created within the thread's scope
+                // is unneeded, so forcibly clean it up.
+                db = null;
+                gc();
+            }
+
+            let mongo;
+            if (TestData.pinningSecondary) {
+                mongo = new SpecificSecondaryReaderMongo(connectionString, args.secondaryHost);
             } else {
-                if (typeof db !== 'undefined') {
-                    // The implicit database connection created within the thread's scope
-                    // is unneeded, so forcibly clean it up.
-                    db = null;
-                    gc();
+                mongo = new Mongo(connectionString);
+            }
+
+            // Retry operations that fail due to in-progress background operations. Load this early
+            // so that later overrides can be retried.
+            load('jstests/libs/override_methods/implicitly_retry_on_background_op_in_progress.js');
+
+            if (typeof args.sessionOptions !== 'undefined') {
+                let initialClusterTime;
+                let initialOperationTime;
+
+                // JavaScript objects backed by C++ objects (e.g. BSON values from a command
+                // response) do not serialize correctly when passed through the Thread
+                // constructor. To work around this behavior, we instead pass a stringified form
+                // of the JavaScript object through the Thread constructor and use eval()
+                // to rehydrate it.
+                if (typeof args.sessionOptions.initialClusterTime === 'string') {
+                    initialClusterTime = eval('(' + args.sessionOptions.initialClusterTime + ')');
+
+                    // The initialClusterTime property was removed from SessionOptions in a
+                    // later revision of the Driver's specification, so we remove the property
+                    // and call advanceClusterTime() ourselves.
+                    delete args.sessionOptions.initialClusterTime;
                 }
 
-                if (typeof args.sessionOptions !== 'undefined') {
-                    // TODO SERVER-30912: the shardCollection command hangs when run under a
-                    // session, so for now we don't start a session to enable testing of causal
-                    // consistency.
-                    myDB = new Mongo(args.host).getDB(args.dbName);
+                if (typeof args.sessionOptions.initialOperationTime === 'string') {
+                    initialOperationTime =
+                        eval('(' + args.sessionOptions.initialOperationTime + ')');
 
-                    if (args.sessionOptions.causallyConsistentReads) {
-                        // TODO SERVER-30679: We manually enable causal consistency on the
-                        // connection object so that "afterClusterTime" is injected into the
-                        // readConcern of any command requests through this connection.
-                        myDB.getMongo().setCausalConsistency();
-                    }
-
-                    if (args.sessionOptions.readPreference) {
-                        // TODO SERVER-30912: The shardCollection command hangs when run under a
-                        // session so for now we don't start a session and instead set the read
-                        // preference directly on the connection to test doing reads from
-                        // secondaries. This can be removed once this ticket is resolved.
-                        myDB.getMongo().setReadPref(args.sessionOptions.readPreference.mode,
-                                                    args.sessionOptions.readPreference.tags);
-                    }
-                } else {
-                    myDB = new Mongo(args.host).getDB(args.dbName);
+                    // The initialOperationTime property was removed from SessionOptions in a
+                    // later revision of the Driver's specification, so we remove the property
+                    // and call advanceOperationTime() ourselves.
+                    delete args.sessionOptions.initialOperationTime;
                 }
+
+                const session = mongo.startSession(args.sessionOptions);
+                const readPreference = session.getOptions().getReadPreference();
+                if (readPreference && readPreference.mode === 'secondary') {
+                    // Unset the explicit read preference so set_read_preference_secondary.js can do
+                    // the right thing based on the DB.
+                    session.getOptions().setReadPreference(undefined);
+
+                    // We load() set_read_preference_secondary.js in order to avoid running
+                    // commands against the "admin" and "config" databases via mongos with
+                    // readPreference={mode: "secondary"} when there's only a single node in
+                    // the CSRS.
+                    load('jstests/libs/override_methods/set_read_preference_secondary.js');
+
+                    // Reads after an index build completes on a secondary should be causally
+                    // consistent.
+                    if (session.getOptions().isCausalConsistency()) {
+                        load('jstests/libs/override_methods/causally_consistent_index_builds.js');
+                    }
+                }
+
+                if (typeof initialClusterTime !== 'undefined') {
+                    session.advanceClusterTime(initialClusterTime);
+                }
+
+                if (typeof initialOperationTime !== 'undefined') {
+                    session.advanceOperationTime(initialOperationTime);
+                }
+
+                myDB = session.getDatabase(args.dbName);
+            } else {
+                myDB = mongo.getDB(args.dbName);
+            }
+
+            {
+                let connectionDesc = '';
+                // In sharded environments, mongos is acting as a proxy for the mongo shell and
+                // therefore has a different outbound port than the 'whatsmyuri' command returns.
+                if (!Cluster.isSharded(args.clusterOptions)) {
+                    let res = assert.commandWorked(myDB.runCommand({whatsmyuri: 1}));
+                    const myUri = res.you;
+
+                    res = assert.commandWorked(myDB.adminCommand({currentOp: 1, client: myUri}));
+                    connectionDesc = ', conn:' + res.inprog[0].desc;
+                }
+
+                const printOriginal = print;
+                print = function() {
+                    const printArgs = Array.from(arguments);
+                    const prefix = '[tid:' + args.tid + connectionDesc + ']';
+                    printArgs.unshift(prefix);
+                    return printOriginal.apply(this, printArgs);
+                };
             }
 
             if (Cluster.isReplication(args.clusterOptions)) {
+                if (args.clusterOptions.hasOwnProperty('sharded') &&
+                    args.clusterOptions.sharded.hasOwnProperty('stepdownOptions') &&
+                    args.clusterOptions.sharded.stepdownOptions.shardStepdown) {
+                    const newOptions = {
+                        alwaysInjectTransactionNumber: true,
+                        defaultReadConcernLevel: "majority",
+                        logRetryAttempts: true,
+                        overrideRetryAttempts: 3
+                    };
+                    Object.assign(TestData, newOptions);
+
+                    assert(!TestData.hasOwnProperty('networkErrorAndTxnOverrideConfig'), TestData);
+                    TestData.networkErrorAndTxnOverrideConfig = {retryOnNetworkErrors: true};
+                    load('jstests/libs/override_methods/network_error_and_txn_override.js');
+                }
+
                 // Operations that run after a "dropDatabase" command has been issued may fail with
                 // a "DatabaseDropPending" error response if they would create a new collection on
                 // that database while we're waiting for a majority of nodes in the replica set to
@@ -72,6 +161,10 @@ var workerThread = (function() {
                 // started by the concurrency framework automatically retry their operation in the
                 // face of this particular error response.
                 load('jstests/libs/override_methods/implicitly_retry_on_database_drop_pending.js');
+            }
+
+            if (TestData.defaultReadConcernLevel || TestData.defaultWriteConcern) {
+                load('jstests/libs/override_methods/set_read_and_write_concerns.js');
             }
 
             workloads.forEach(function(workload) {
@@ -96,20 +189,10 @@ var workerThread = (function() {
                 // Object.extend() defines all properties added to the destination object as
                 // configurable, enumerable, and writable. To prevent workloads from changing
                 // the iterations and threadCount properties in their state functions, we redefine
-                // them here as non-configurable, non-enumerable, and non-writable.
+                // them here as non-configurable and non-writable.
                 Object.defineProperties(data, {
-                    'iterations': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.iterations
-                    },
-                    'threadCount': {
-                        configurable: false,
-                        enumerable: false,
-                        writable: false,
-                        value: data.threadCount
-                    }
+                    'iterations': {configurable: false, writable: false, value: data.iterations},
+                    'threadCount': {configurable: false, writable: false, value: data.threadCount}
                 });
 
                 data.tid = args.tid;
@@ -122,6 +205,7 @@ var workerThread = (function() {
                     passConnectionCache: config.passConnectionCache,
                     startState: config.startState,
                     states: config.states,
+                    tid: args.tid,
                     transitions: config.transitions
                 };
             });
@@ -157,5 +241,4 @@ var workerThread = (function() {
     }
 
     return {main: main};
-
 })();

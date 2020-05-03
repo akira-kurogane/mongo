@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 mongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,15 +34,14 @@
 #include "mongo/db/exec/sort.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -49,27 +49,30 @@ using namespace mongo;
 
 namespace {
 
-class SortStageTest : public unittest::Test {
+static const NamespaceString kNss("db.dummy");
+
+class SortStageDefaultTest : public ServiceContextMongoDTest {
 public:
-    SortStageTest() {
-        _service = stdx::make_unique<ServiceContextNoop>();
-        _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
-        _client = _service->makeClient("test");
-        _opCtxNoop = _client->makeOperationContext();
-        _opCtx = _opCtxNoop.get();
-        CollatorFactoryInterface::set(_service.get(), stdx::make_unique<CollatorFactoryMock>());
+    static constexpr uint64_t kMaxMemoryUsageBytes = 1024u * 1024u;
+
+    SortStageDefaultTest() {
+        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+        _opCtx = makeOperationContext();
+        CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
     }
 
-    OperationContext* getOpCtx() {
-        return _opCtx;
+    OperationContext* opCtx() {
+        return _opCtx.get();
     }
 
     /**
-     * Test function to verify sort stage.
-     * SortStageParams will be initialized using patternStr, collator, and limit.
-     * inputStr represents the input data set in a BSONObj.
+     * Test function to verify sort stage. SortStageDefault will be initialized using 'patternStr',
+     * 'collator', and 'limit;.
+     *
+     * 'inputStr' represents the input data set in a BSONObj.
      *     {input: [doc1, doc2, doc3, ...]}
-     * expectedStr represents the expected sorted data set.
+     *
+     * 'expectedStr; represents the expected sorted data set.
      *     {output: [docA, docB, docC, ...]}
      */
     void testWork(const char* patternStr,
@@ -81,8 +84,11 @@ public:
         // so it's fine to declare
         WorkingSet ws;
 
-        // QueuedDataStage will be owned by SortStage.
-        auto queuedDataStage = stdx::make_unique<QueuedDataStage>(getOpCtx(), &ws);
+        auto expCtx = make_intrusive<ExpressionContext>(
+            opCtx(), CollatorInterface::cloneCollator(collator), kNss);
+
+        // QueuedDataStage will be owned by SortStageDefault.
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
         BSONObj inputObj = fromjson(inputStr);
         BSONElement inputElt = inputObj.getField("input");
         ASSERT(inputElt.isABSONObj());
@@ -95,21 +101,23 @@ public:
             // Insert obj from input array into working set.
             WorkingSetID id = ws.allocate();
             WorkingSetMember* wsm = ws.get(id);
-            wsm->obj = Snapshotted<BSONObj>(SnapshotId(), obj);
+            wsm->doc = {SnapshotId(), Document{obj}};
             wsm->transitionToOwnedObj();
             queuedDataStage->pushBack(id);
         }
 
-        // Initialize SortStageParams
-        // Setting limit to 0 means no limit
-        SortStageParams params;
-        params.pattern = fromjson(patternStr);
-        params.limit = limit;
+        auto sortPattern = fromjson(patternStr);
 
-        auto sortKeyGen = stdx::make_unique<SortKeyGeneratorStage>(
-            getOpCtx(), queuedDataStage.release(), &ws, params.pattern, collator);
+        auto sortKeyGen = std::make_unique<SortKeyGeneratorStage>(
+            expCtx, std::move(queuedDataStage), &ws, sortPattern);
 
-        SortStage sort(getOpCtx(), params, &ws, sortKeyGen.release());
+        SortStageDefault sort(expCtx,
+                              &ws,
+                              SortPattern{sortPattern, expCtx},
+                              limit,
+                              kMaxMemoryUsageBytes,
+                              false,  // addSortKeyMetadata
+                              std::move(sortKeyGen));
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state = PlanStage::NEED_TIME;
@@ -129,7 +137,7 @@ public:
         BSONArrayBuilder arr(bob.subarrayStart("output"));
         while (state == PlanStage::ADVANCED) {
             WorkingSetMember* member = ws.get(id);
-            const BSONObj& obj = member->obj.value();
+            BSONObj obj = member->doc.value().toBson();
             arr.append(obj);
             state = sort.work(&id);
         }
@@ -143,7 +151,7 @@ public:
         // Finally, we get to compare the sorted results against what we expect.
         BSONObj expectedObj = fromjson(expectedStr);
         if (SimpleBSONObjComparator::kInstance.evaluate(outputObj != expectedObj)) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             // Even though we have the original string representation of the expected output,
             // we invoke BSONObj::toString() to get a format consistent with outputObj.
             ss << "Unexpected sort result with pattern=" << patternStr << "; limit=" << limit
@@ -155,37 +163,33 @@ public:
     }
 
 private:
-    OperationContext* _opCtx;
-
-    std::unique_ptr<ServiceContextNoop> _service;
-
-    // Members of a class are destroyed in reverse order of declaration.
-    // The UniqueClient must be destroyed before the ServiceContextNoop is destroyed.
-    // The OperationContextNoop must be destroyed before the UniqueClient is destroyed.
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtxNoop;
+    ServiceContext::UniqueOperationContext _opCtx;
 };
 
-TEST_F(SortStageTest, SortEmptyWorkingSet) {
+TEST_F(SortStageDefaultTest, SortEmptyWorkingSet) {
     WorkingSet ws;
 
-    // QueuedDataStage will be owned by SortStage.
-    auto queuedDataStage = stdx::make_unique<QueuedDataStage>(getOpCtx(), &ws);
-    auto sortKeyGen = stdx::make_unique<SortKeyGeneratorStage>(
-        getOpCtx(), queuedDataStage.release(), &ws, BSONObj(), nullptr);
-    SortStageParams params;
-    SortStage sort(getOpCtx(), params, &ws, sortKeyGen.release());
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
+
+    // QueuedDataStage will be owned by SortStageDefault.
+    auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
+    auto sortKeyGen =
+        std::make_unique<SortKeyGeneratorStage>(expCtx, std::move(queuedDataStage), &ws, BSONObj());
+    auto sortPattern = BSON("a" << 1);
+    SortStageDefault sort(expCtx,
+                          &ws,
+                          SortPattern{sortPattern, expCtx},
+                          0u,
+                          kMaxMemoryUsageBytes,
+                          false,  // addSortKeyMetadata
+                          std::move(sortKeyGen));
 
     // Check initial EOF state.
     ASSERT_FALSE(sort.isEOF());
 
-    // First call to work() initializes sort key generator.
+    // First call to work() sorts data in vector.
     WorkingSetID id = WorkingSet::INVALID_ID;
-    PlanStage::StageState state = sort.work(&id);
-    ASSERT_EQUALS(state, PlanStage::NEED_TIME);
-
-    // Second call to work() sorts data in vector.
-    state = sort.work(&id);
+    auto state = sort.work(&id);
     ASSERT_EQUALS(state, PlanStage::NEED_TIME);
 
     // Finally we hit EOF.
@@ -208,7 +212,7 @@ TEST_F(SortStageTest, SortEmptyWorkingSet) {
 // Implementation should keep all items fetched from child.
 //
 
-TEST_F(SortStageTest, SortAscending) {
+TEST_F(SortStageDefaultTest, SortAscending) {
     testWork("{a: 1}",
              nullptr,
              0,
@@ -216,7 +220,7 @@ TEST_F(SortStageTest, SortAscending) {
              "{output: [{a: 1}, {a: 2}, {a: 3}]}");
 }
 
-TEST_F(SortStageTest, SortDescending) {
+TEST_F(SortStageDefaultTest, SortDescending) {
     testWork("{a: -1}",
              nullptr,
              0,
@@ -224,7 +228,7 @@ TEST_F(SortStageTest, SortDescending) {
              "{output: [{a: 3}, {a: 2}, {a: 1}]}");
 }
 
-TEST_F(SortStageTest, SortIrrelevantSortKey) {
+TEST_F(SortStageDefaultTest, SortIrrelevantSortKey) {
     testWork("{b: 1}",
              nullptr,
              0,
@@ -238,12 +242,12 @@ TEST_F(SortStageTest, SortIrrelevantSortKey) {
 // and discard the rest.
 //
 
-TEST_F(SortStageTest, SortAscendingWithLimit) {
+TEST_F(SortStageDefaultTest, SortAscendingWithLimit) {
     testWork(
         "{a: 1}", nullptr, 2, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 1}, {a: 2}]}");
 }
 
-TEST_F(SortStageTest, SortDescendingWithLimit) {
+TEST_F(SortStageDefaultTest, SortDescendingWithLimit) {
     testWork(
         "{a: -1}", nullptr, 2, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 3}, {a: 2}]}");
 }
@@ -254,7 +258,7 @@ TEST_F(SortStageTest, SortDescendingWithLimit) {
 // and discard the rest.
 //
 
-TEST_F(SortStageTest, SortAscendingWithLimitGreaterThanInputSize) {
+TEST_F(SortStageDefaultTest, SortAscendingWithLimitGreaterThanInputSize) {
     testWork("{a: 1}",
              nullptr,
              10,
@@ -262,7 +266,7 @@ TEST_F(SortStageTest, SortAscendingWithLimitGreaterThanInputSize) {
              "{output: [{a: 1}, {a: 2}, {a: 3}]}");
 }
 
-TEST_F(SortStageTest, SortDescendingWithLimitGreaterThanInputSize) {
+TEST_F(SortStageDefaultTest, SortDescendingWithLimitGreaterThanInputSize) {
     testWork("{a: -1}",
              nullptr,
              10,
@@ -275,15 +279,15 @@ TEST_F(SortStageTest, SortDescendingWithLimitGreaterThanInputSize) {
 // Implementation should optimize this into a running maximum.
 //
 
-TEST_F(SortStageTest, SortAscendingWithLimitOfOne) {
+TEST_F(SortStageDefaultTest, SortAscendingWithLimitOfOne) {
     testWork("{a: 1}", nullptr, 1, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 1}]}");
 }
 
-TEST_F(SortStageTest, SortDescendingWithLimitOfOne) {
+TEST_F(SortStageDefaultTest, SortDescendingWithLimitOfOne) {
     testWork("{a: -1}", nullptr, 1, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 3}]}");
 }
 
-TEST_F(SortStageTest, SortAscendingWithCollation) {
+TEST_F(SortStageDefaultTest, SortAscendingWithCollation) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     testWork("{a: 1}",
              &collator,
@@ -292,7 +296,7 @@ TEST_F(SortStageTest, SortAscendingWithCollation) {
              "{output: [{a: 'aa'}, {a: 'ba'}, {a: 'ab'}]}");
 }
 
-TEST_F(SortStageTest, SortDescendingWithCollation) {
+TEST_F(SortStageDefaultTest, SortDescendingWithCollation) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     testWork("{a: -1}",
              &collator,

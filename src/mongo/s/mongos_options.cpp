@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,83 +41,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/server_options_helpers.h"
+#include "mongo/db/server_options_base.h"
+#include "mongo/db/server_options_server_helpers.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/version_mongos.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/startup_test.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 MongosGlobalParams mongosGlobalParams;
-
-Status addMongosOptions(moe::OptionSection* options) {
-    moe::OptionSection general_options("General options");
-
-    Status ret = addGeneralServerOptions(&general_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-#if defined(_WIN32)
-    moe::OptionSection windows_scm_options("Windows Service Control Manager options");
-
-    ret = addWindowsServerOptions(&windows_scm_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-#ifdef MONGO_CONFIG_SSL
-    moe::OptionSection ssl_options("SSL options");
-
-    ret = addSSLServerOptions(&ssl_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-    moe::OptionSection sharding_options("Sharding options");
-
-    sharding_options.addOptionChaining("sharding.configDB",
-                                       "configdb",
-                                       moe::String,
-                                       "Connection string for communicating with config servers:\n"
-                                       "<config replset name>/<host1:port>,<host2:port>,[...]");
-
-    sharding_options.addOptionChaining(
-        "replication.localPingThresholdMs",
-        "localThreshold",
-        moe::Int,
-        "ping time (in ms) for a node to be considered local (default 15ms)");
-
-    sharding_options.addOptionChaining("test", "test", moe::Switch, "just run unit tests")
-        .setSources(moe::SourceAllLegacy);
-
-    sharding_options
-        .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
-        .setSources(moe::SourceAllLegacy);
-
-
-    options->addSection(general_options).transitional_ignore();
-
-#if defined(_WIN32)
-    options->addSection(windows_scm_options).transitional_ignore();
-#endif
-
-    options->addSection(sharding_options).transitional_ignore();
-
-#ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options).transitional_ignore();
-#endif
-
-    return Status::OK();
-}
 
 void printMongosHelp(const moe::OptionSection& options) {
     std::cout << options.helpString() << std::endl;
@@ -129,13 +64,12 @@ bool handlePreValidationMongosOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        printShardingVersionInfo(true);
+        logShardingVersionInfo(&std::cout);
         return false;
     }
     if (params.count("test") && params["test"].as<bool>() == true) {
-        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-            ::mongo::logger::LogSeverity::Debug(5));
-        StartupTest::runTests();
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, ::mongo::logv2::LogSeverity::Debug(5));
         return false;
     }
 
@@ -157,12 +91,20 @@ Status canonicalizeMongosOptions(moe::Environment* params) {
         return ret;
     }
 
-#ifdef MONGO_CONFIG_SSL
-    ret = canonicalizeSSLServerOptions(params);
-    if (!ret.isOK()) {
-        return ret;
+    // "security.javascriptEnabled" comes from the config file, so override it if "noscripting"
+    // is set since that comes from the command line.
+    if (params->count("noscripting")) {
+        auto status = params->set("security.javascriptEnabled",
+                                  moe::Value(!(*params)["noscripting"].as<bool>()));
+        if (!status.isOK()) {
+            return status;
+        }
+
+        status = params->remove("noscripting");
+        if (!status.isOK()) {
+            return status;
+        }
     }
-#endif
 
     return Status::OK();
 }
@@ -180,13 +122,8 @@ Status storeMongosOptions(const moe::Environment& params) {
         }
     }
 
-    if (params.count("replication.localPingThresholdMs")) {
-        serverGlobalParams.defaultLocalThresholdMillis =
-            params["replication.localPingThresholdMs"].as<int>();
-    }
-
-    if (params.count("noscripting")) {
-        // This option currently has no effect for mongos
+    if (params.count("security.javascriptEnabled")) {
+        mongosGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
 
     if (!params.count("sharding.configDB")) {
@@ -218,11 +155,16 @@ Status storeMongosOptions(const moe::Environment& params) {
     }
     if (!resolvedSomeSeedSever) {
         if (!hostbyname(configdbConnectionString.getValue().getSetName().c_str()).empty()) {
-            warning() << "The replica set name \""
-                      << escape(configdbConnectionString.getValue().getSetName())
-                      << "\" resolves as a host name, but none of the servers in the seed list do. "
-                         "Did you reverse the replica set name and the seed list in "
-                      << escape(configdbConnectionString.getValue().toString()) << "?";
+            LOGV2_WARNING(24131,
+                          "The replica set name "
+                          "\"{str_escape_configdbConnectionString_getValue_getSetName}\" resolves "
+                          "as a host name, but none of the servers in the seed list do. "
+                          "Did you reverse the replica set name and the seed list in "
+                          "{str_escape_configdbConnectionString_getValue}?",
+                          "str_escape_configdbConnectionString_getValue_getSetName"_attr =
+                              str::escape(configdbConnectionString.getValue().getSetName()),
+                          "str_escape_configdbConnectionString_getValue"_attr =
+                              str::escape(configdbConnectionString.getValue().toString()));
         }
     }
 
@@ -232,8 +174,9 @@ Status storeMongosOptions(const moe::Environment& params) {
                          configdbConnectionString.getValue().getSetName()};
 
     if (mongosGlobalParams.configdbs.getServers().size() < 3) {
-        warning() << "Running a sharded cluster with fewer than 3 config servers should only be "
-                     "done for testing purposes and is not recommended for production.";
+        LOGV2_WARNING(24132,
+                      "Running a sharded cluster with fewer than 3 config servers should only be "
+                      "done for testing purposes and is not recommended for production.");
     }
 
     return Status::OK();

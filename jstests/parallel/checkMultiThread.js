@@ -3,11 +3,11 @@ load('jstests/libs/parallelTester.js');
 var start = new Date();
 print("start: " + start);
 var func = function() {
-    db.runCommand({$eval: "sleep(10000);", nolock: true});
+    db.runCommand({sleep: 1, seconds: 10000});
     return new Date();
 };
-a = new ScopedThread(func);
-b = new ScopedThread(func);
+a = new Thread(func);
+b = new Thread(func);
 a.start();
 b.start();
 a.join();

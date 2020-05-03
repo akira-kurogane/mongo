@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,12 +32,12 @@
 #include "mongo/db/field_ref_set.h"
 
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::vector;
 using std::string;
+using std::vector;
 
 namespace {
 
@@ -51,13 +52,21 @@ StringData safeFirstPart(const FieldRef* fieldRef) {
         return fieldRef->getPart(0);
     }
 }
-}
+}  // namespace
 
 bool FieldRefSet::FieldRefPtrLessThan::operator()(const FieldRef* l, const FieldRef* r) const {
     return *l < *r;
 }
 
 FieldRefSet::FieldRefSet() {}
+
+FieldRefSet::FieldRefSet(const std::vector<std::unique_ptr<FieldRef>>& paths) {
+    fillFrom(paths);
+}
+
+FieldRefSet::FieldRefSet(const vector<const FieldRef*>& paths) {
+    _fieldSet.insert(paths.begin(), paths.end());
+}
 
 FieldRefSet::FieldRefSet(const vector<FieldRef*>& paths) {
     fillFrom(paths);
@@ -104,6 +113,19 @@ void FieldRefSet::fillFrom(const std::vector<FieldRef*>& fields) {
     _fieldSet.insert(fields.begin(), fields.end());
 }
 
+void FieldRefSet::fillFrom(const std::vector<std::unique_ptr<FieldRef>>& fields) {
+    dassert(_fieldSet.empty());
+    std::transform(fields.begin(),
+                   fields.end(),
+                   std::inserter(_fieldSet, _fieldSet.begin()),
+                   [](const auto& field) { return field.get(); });
+}
+
+bool FieldRefSet::insertNoConflict(const FieldRef* toInsert) {
+    const FieldRef* conflict;
+    return insert(toInsert, &conflict);
+}
+
 bool FieldRefSet::insert(const FieldRef* toInsert, const FieldRef** conflict) {
     // We can determine if two fields conflict by checking their common prefix.
     //
@@ -138,21 +160,21 @@ bool FieldRefSet::insert(const FieldRef* toInsert, const FieldRef** conflict) {
     }
 
     _fieldSet.insert(it, toInsert);
-    *conflict = NULL;
+    *conflict = nullptr;
     return true;
 }
 
 const std::string FieldRefSet::toString() const {
-    str::stream res;
-    res << "Fields:[ ";
-    FieldRefSet::const_iterator where = _fieldSet.begin();
-    const FieldRefSet::const_iterator end = _fieldSet.end();
-    for (; where != end; ++where) {
-        const FieldRef& current = **where;
-        res << current.dottedField() << ",";
+    str::stream ss;
+    ss << "{";
+    const auto last = _fieldSet.rbegin();
+    for (auto path : _fieldSet) {
+        ss << path->dottedField();
+        if (path != *last)
+            ss << ", ";
     }
-    res << "]";
-    return res;
+    ss << "}";
+    return ss;
 }
 
 }  // namespace mongo

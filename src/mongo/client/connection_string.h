@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2009-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,12 +29,15 @@
 
 #pragma once
 
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -117,12 +121,18 @@ public:
     bool operator==(const ConnectionString& other) const;
     bool operator!=(const ConnectionString& other) const;
 
-    DBClientBase* connect(StringData applicationName,
-                          std::string& errmsg,
-                          double socketTimeout = 0,
-                          const MongoURI* uri = nullptr) const;
+    std::unique_ptr<DBClientBase> connect(StringData applicationName,
+                                          std::string& errmsg,
+                                          double socketTimeout = 0,
+                                          const MongoURI* uri = nullptr) const;
 
     static StatusWith<ConnectionString> parse(const std::string& url);
+
+    /**
+     * Deserialize a ConnectionString object from a string. Used by the IDL parser for the
+     * connectionstring type. Essentially just a throwing wrapper around ConnectionString::parse.
+     */
+    static ConnectionString deserialize(StringData url);
 
     static std::string typeToString(ConnectionType type);
 
@@ -137,18 +147,18 @@ public:
         virtual ~ConnectionHook() {}
 
         // Returns an alternative connection object for a string
-        virtual DBClientBase* connect(const ConnectionString& c,
-                                      std::string& errmsg,
-                                      double socketTimeout) = 0;
+        virtual std::unique_ptr<DBClientBase> connect(const ConnectionString& c,
+                                                      std::string& errmsg,
+                                                      double socketTimeout) = 0;
     };
 
     static void setConnectionHook(ConnectionHook* hook) {
-        stdx::lock_guard<stdx::mutex> lk(_connectHookMutex);
+        stdx::lock_guard<Latch> lk(_connectHookMutex);
         _connectHook = hook;
     }
 
     static ConnectionHook* getConnectionHook() {
-        stdx::lock_guard<stdx::mutex> lk(_connectHookMutex);
+        stdx::lock_guard<Latch> lk(_connectHookMutex);
         return _connectHook;
     }
 
@@ -156,6 +166,10 @@ public:
     bool operator<(const ConnectionString& other) const {
         return _string < other._string;
     }
+
+
+    friend std::ostream& operator<<(std::ostream&, const ConnectionString&);
+    friend StringBuilder& operator<<(StringBuilder&, const ConnectionString&);
 
 private:
     /**
@@ -176,7 +190,18 @@ private:
     std::string _string;
     std::string _setName;
 
-    static stdx::mutex _connectHookMutex;
+    static Mutex _connectHookMutex;
     static ConnectionHook* _connectHook;
 };
+
+inline std::ostream& operator<<(std::ostream& ss, const ConnectionString& cs) {
+    ss << cs._string;
+    return ss;
+}
+
+inline StringBuilder& operator<<(StringBuilder& sb, const ConnectionString& cs) {
+    sb << cs._string;
+    return sb;
+}
+
 }  // namespace mongo

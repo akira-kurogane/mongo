@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,6 +36,17 @@ namespace executor {
 
 TaskExecutor::TaskExecutor() = default;
 TaskExecutor::~TaskExecutor() = default;
+
+void TaskExecutor::schedule(OutOfLineExecutor::Task func) {
+    auto cb = CallbackFn([func = std::move(func)](const CallbackArgs& args) { func(args.status); });
+    auto statusWithCallback = scheduleWork(std::move(cb));
+    if (!statusWithCallback.isOK()) {
+        // The callback was not scheduled or moved from, it is still valid. Run it inline to inform
+        // it of the error. Construct a CallbackArgs for it, only CallbackArgs::status matters here.
+        CallbackArgs args(this, {}, statusWithCallback.getStatus(), nullptr);
+        cb(args);
+    }
+}
 
 TaskExecutor::CallbackState::CallbackState() = default;
 TaskExecutor::CallbackState::~CallbackState() = default;
@@ -67,6 +79,20 @@ TaskExecutor::RemoteCommandCallbackArgs::RemoteCommandCallbackArgs(
     const ResponseStatus& theResponse)
     : executor(theExecutor), myHandle(theHandle), request(theRequest), response(theResponse) {}
 
+TaskExecutor::RemoteCommandCallbackArgs::RemoteCommandCallbackArgs(
+    const RemoteCommandOnAnyCallbackArgs& other, size_t idx)
+    : executor(other.executor),
+      myHandle(other.myHandle),
+      request(other.request, idx),
+      response(other.response) {}
+
+TaskExecutor::RemoteCommandOnAnyCallbackArgs::RemoteCommandOnAnyCallbackArgs(
+    TaskExecutor* theExecutor,
+    const CallbackHandle& theHandle,
+    const RemoteCommandRequestOnAny& theRequest,
+    const ResponseOnAnyStatus& theResponse)
+    : executor(theExecutor), myHandle(theHandle), request(theRequest), response(theResponse) {}
+
 TaskExecutor::CallbackState* TaskExecutor::getCallbackFromHandle(const CallbackHandle& cbHandle) {
     return cbHandle.getCallback();
 }
@@ -82,6 +108,29 @@ void TaskExecutor::setEventForHandle(EventHandle* eventHandle, std::shared_ptr<E
 void TaskExecutor::setCallbackForHandle(CallbackHandle* cbHandle,
                                         std::shared_ptr<CallbackState> callback) {
     cbHandle->setCallback(std::move(callback));
+}
+
+
+StatusWith<TaskExecutor::CallbackHandle> TaskExecutor::scheduleRemoteCommand(
+    const RemoteCommandRequest& request,
+    const RemoteCommandCallbackFn& cb,
+    const BatonHandle& baton) {
+    return scheduleRemoteCommandOnAny(request,
+                                      [cb](const RemoteCommandOnAnyCallbackArgs& args) {
+                                          cb({args, 0});
+                                      },
+                                      baton);
+}
+
+StatusWith<TaskExecutor::CallbackHandle> TaskExecutor::scheduleExhaustRemoteCommand(
+    const RemoteCommandRequest& request,
+    const RemoteCommandCallbackFn& cb,
+    const BatonHandle& baton) {
+    return scheduleExhaustRemoteCommandOnAny(request,
+                                             [cb](const RemoteCommandOnAnyCallbackArgs& args) {
+                                                 cb({args, 0});
+                                             },
+                                             baton);
 }
 
 }  // namespace executor

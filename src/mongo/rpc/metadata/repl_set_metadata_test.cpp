@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,17 +38,22 @@ namespace rpc {
 namespace {
 
 using repl::OpTime;
+using repl::OpTimeAndWallTime;
+
+static const OpTime opTime(Timestamp(1234, 100), 5);
+static const OpTime opTime2(Timestamp(7777, 100), 6);
+static const Date_t committedWallTime = Date_t() + Seconds(opTime.getSecs());
+static const ReplSetMetadata metadata(
+    3, {opTime, committedWallTime}, opTime2, 6, 0, OID("abcdefabcdefabcdefabcdef"), -1, false);
 
 TEST(ReplResponseMetadataTest, ReplicaSetIdNotSet) {
-    ASSERT_FALSE(ReplSetMetadata(3, OpTime(), OpTime(), 6, OID(), 12, -1).hasReplicaSetId());
+    ASSERT_FALSE(ReplSetMetadata(3, OpTimeAndWallTime(), OpTime(), 6, 0, OID(), -1, false)
+                     .hasReplicaSetId());
 }
 
 TEST(ReplResponseMetadataTest, Roundtrip) {
-    OpTime opTime(Timestamp(1234, 100), 5);
-    OpTime opTime2(Timestamp(7777, 100), 6);
-    ReplSetMetadata metadata(3, opTime, opTime2, 6, OID::gen(), 12, -1);
-
-    ASSERT_EQ(opTime, metadata.getLastOpCommitted());
+    ASSERT_EQ(opTime, metadata.getLastOpCommitted().opTime);
+    ASSERT_EQ(committedWallTime, metadata.getLastOpCommitted().wallTime);
     ASSERT_EQ(opTime2, metadata.getLastOpVisible());
     ASSERT_TRUE(metadata.hasReplicaSetId());
 
@@ -58,27 +64,29 @@ TEST(ReplResponseMetadataTest, Roundtrip) {
         BSON(kReplSetMetadataFieldName
              << BSON("term" << 3 << "lastOpCommitted"
                             << BSON("ts" << opTime.getTimestamp() << "t" << opTime.getTerm())
-                            << "lastOpVisible"
+                            << "lastCommittedWall" << committedWallTime << "lastOpVisible"
                             << BSON("ts" << opTime2.getTimestamp() << "t" << opTime2.getTerm())
-                            << "configVersion"
-                            << 6
-                            << "replicaSetId"
-                            << metadata.getReplicaSetId()
-                            << "primaryIndex"
-                            << 12
-                            << "syncSourceIndex"
-                            << -1)));
+                            << "configVersion" << 6 << "configTerm" << 0 << "replicaSetId"
+                            << metadata.getReplicaSetId() << "syncSourceIndex" << -1 << "isPrimary"
+                            << false)));
 
     BSONObj serializedObj = builder.obj();
     ASSERT_BSONOBJ_EQ(expectedObj, serializedObj);
 
-    auto cloneStatus = ReplSetMetadata::readFromMetadata(serializedObj);
+    // Verify that we allow unknown fields.
+    BSONObjBuilder bob;
+    bob.appendElements(serializedObj);
+    bob.append("unknownField", 1);
+
+    auto cloneStatus = ReplSetMetadata::readFromMetadata(bob.obj());
     ASSERT_OK(cloneStatus.getStatus());
 
     const auto& clonedMetadata = cloneStatus.getValue();
-    ASSERT_EQ(opTime, clonedMetadata.getLastOpCommitted());
+    ASSERT_EQ(opTime, clonedMetadata.getLastOpCommitted().opTime);
     ASSERT_EQ(opTime2, clonedMetadata.getLastOpVisible());
+    ASSERT_EQ(committedWallTime, clonedMetadata.getLastOpCommitted().wallTime);
     ASSERT_EQ(metadata.getConfigVersion(), clonedMetadata.getConfigVersion());
+    ASSERT_EQ(metadata.getConfigTerm(), clonedMetadata.getConfigTerm());
     ASSERT_EQ(metadata.getReplicaSetId(), clonedMetadata.getReplicaSetId());
 
     BSONObjBuilder clonedBuilder;
@@ -89,19 +97,20 @@ TEST(ReplResponseMetadataTest, Roundtrip) {
 }
 
 TEST(ReplResponseMetadataTest, MetadataCanBeConstructedWhenMissingOplogQueryMetadataFields) {
-    auto id = OID::gen();
-    BSONObj obj(BSON(kReplSetMetadataFieldName
-                     << BSON("term" << 3 << "configVersion" << 6 << "replicaSetId" << id)));
+    BSONObj obj(BSON(kReplSetMetadataFieldName << BSON(
+                         "term" << 3 << "configVersion" << 6 << "configTerm" << 2 << "replicaSetId"
+                                << metadata.getReplicaSetId() << "lastCommittedWall"
+                                << committedWallTime << "isPrimary" << false)));
 
     auto status = ReplSetMetadata::readFromMetadata(obj);
     ASSERT_OK(status.getStatus());
 
     const auto& metadata = status.getValue();
     ASSERT_EQ(metadata.getConfigVersion(), 6);
-    ASSERT_EQ(metadata.getReplicaSetId(), id);
+    ASSERT_EQ(metadata.getConfigTerm(), 2);
+    ASSERT_EQ(metadata.getReplicaSetId(), metadata.getReplicaSetId());
     ASSERT_EQ(metadata.getTerm(), 3);
 }
-
 }  // unnamed namespace
 }  // namespace rpc
 }  // namespace mongo

@@ -1,10 +1,13 @@
-t = db.slice1;
+(function() {
+"use strict";
+
+let t = db.slice1;
 t.drop();
 
 t.insert({_id: 1, a: [0, 1, 2, 3, 4, 5, -5, -4, -3, -2, -1], b: 1, c: 1});
 
 // first three
-out = t.findOne({}, {a: {$slice: 3}});
+let out = t.findOne({}, {a: {$slice: 3}});
 assert.eq(out.a, [0, 1, 2], '1');
 
 // last three
@@ -46,13 +49,20 @@ t.insert({
     title: 'foo'
 });
 
-out = t.findOne({}, {comments: {$slice: 2}, 'comments.id': true});
-assert.eq(out.comments, [{id: 0}, {id: 1}]);
+// $slice in an inclusion projection.
+out = t.findOne({}, {comments: {$slice: 2}, irrelevantField: 1});
+assert.eq(out.comments, [{id: 0, text: 'a'}, {id: 1, text: 'b'}]);
 assert.eq(out.title, undefined);
 
-out = t.findOne({}, {comments: {$slice: 2}, 'comments.id': false});
-assert.eq(out.comments, [{text: 'a'}, {text: 'b'}]);
+// Check that on its own, $slice defaults to an exclusion projection.
+out = t.findOne({}, {comments: {$slice: 2}});
+assert.eq(out.comments, [{id: 0, text: 'a'}, {id: 1, text: 'b'}]);
 assert.eq(out.title, 'foo');
+
+// $slice in an exclusion projection (with explicit exclusions).
+out = t.findOne({}, {comments: {$slice: 2}, title: 0});
+assert.eq(out.comments, [{id: 0, text: 'a'}, {id: 1, text: 'b'}]);
+assert.eq(out.title, undefined);
 
 // nested arrays
 t.drop();
@@ -66,3 +76,4 @@ assert.eq(out.a, [[3, 3, 3]], 'n 2');
 
 out = t.findOne({}, {a: {$slice: [0, 2]}});
 assert.eq(out.a, [[1, 1, 1], [2, 2, 2]], 'n 2');
+})();

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,555 +27,366 @@
  *    it in the license file.
  */
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+#include <algorithm>
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/query/query_yield.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/util/elapsed_tracker.h"
+#include "mongo/db/storage/storage_debug_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 namespace {
-// The number of items we can scan before we must yield.
-static const int kScanLimit = 1000;
+
+const size_t kNumHashBuckets = 1U << 16;
+
+StringSet::hasher hash;
+
+/**
+ * Returns a key for the '_extraIndexEntries' and '_missingIndexEntries' maps. The key is a pair
+ * of index name and the index key represented in KeyString form.
+ * Using the index name is required as the index keys are passed in as KeyStrings which do not
+ * contain field names.
+ *
+ * If we had the following document: { a: 1, b: 1 } with two indexes on keys "a" and "b", then
+ * the KeyStrings for the index keys of the document would be identical as the field name in the
+ * KeyString is not present. The BSON representation of this would look like: { : 1 } for both.
+ * To distinguish these as different index keys, return a pair of index name and index key.
+ */
+std::pair<std::string, std::string> _generateKeyForMap(const IndexInfo& indexInfo,
+                                                       const KeyString::Value& ks) {
+    return std::make_pair(indexInfo.indexName, std::string(ks.getBuffer(), ks.getSize()));
+}
+
 }  // namespace
 
+IndexInfo::IndexInfo(const IndexDescriptor* descriptor)
+    : indexName(descriptor->indexName()),
+      keyPattern(descriptor->keyPattern()),
+      indexNameHash(hash(descriptor->indexName())),
+      ord(Ordering::make(descriptor->keyPattern())) {}
+
 IndexConsistency::IndexConsistency(OperationContext* opCtx,
-                                   Collection* collection,
-                                   NamespaceString nss,
-                                   RecordStore* recordStore,
-                                   std::unique_ptr<Lock::CollectionLock> collLk,
-                                   const bool background)
-    : _opCtx(opCtx),
-      _collection(collection),
-      _nss(nss),
-      _recordStore(recordStore),
-      _collLk(std::move(collLk)),
-      _isBackground(background),
-      _tracker(opCtx->getServiceContext()->getFastClockSource(),
-               internalQueryExecYieldIterations.load(),
-               Milliseconds(internalQueryExecYieldPeriodMS.load())) {
+                                   CollectionValidation::ValidateState* validateState)
+    : _validateState(validateState), _firstPhase(true) {
+    _indexKeyBuckets.resize(kNumHashBuckets);
 
-    IndexCatalog* indexCatalog = _collection->getIndexCatalog();
-    IndexCatalog::IndexIterator indexIterator = indexCatalog->getIndexIterator(_opCtx, false);
-
-    int indexNumber = 0;
-    while (indexIterator.more()) {
-
-        const IndexDescriptor* descriptor = indexIterator.next();
-        std::string indexNs = descriptor->indexNamespace();
-
-        _indexNumber[descriptor->indexNamespace()] = indexNumber;
-
-        IndexInfo indexInfo;
-
-        indexInfo.isReady =
-            _collection->getCatalogEntry()->isIndexReady(opCtx, descriptor->indexName());
-
-        uint32_t indexNsHash;
-        MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
-        indexInfo.indexNsHash = indexNsHash;
-        indexInfo.indexScanFinished = false;
-
-        indexInfo.numKeys = 0;
-        indexInfo.numLongKeys = 0;
-        indexInfo.numRecords = 0;
-        indexInfo.numExtraIndexKeys = 0;
-
-        _indexesInfo[indexNumber] = indexInfo;
-
-        indexNumber++;
+    for (const auto& index : _validateState->getIndexes()) {
+        const IndexDescriptor* descriptor = index->descriptor();
+        _indexesInfo.emplace(descriptor->indexName(), IndexInfo(descriptor));
     }
 }
 
-void IndexConsistency::addDocKey(const KeyString& ks, int indexNumber) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _addDocKey_inlock(ks, indexNumber);
+void IndexConsistency::addMultikeyMetadataPath(const KeyString::Value& ks, IndexInfo* indexInfo) {
+    indexInfo->hashedMultikeyMetadataPaths.emplace(_hashKeyString(ks, indexInfo->indexNameHash));
 }
 
-void IndexConsistency::removeDocKey(const KeyString& ks, int indexNumber) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _removeDocKey_inlock(ks, indexNumber);
+void IndexConsistency::removeMultikeyMetadataPath(const KeyString::Value& ks,
+                                                  IndexInfo* indexInfo) {
+    indexInfo->hashedMultikeyMetadataPaths.erase(_hashKeyString(ks, indexInfo->indexNameHash));
 }
 
-void IndexConsistency::addIndexKey(const KeyString& ks, int indexNumber) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _addIndexKey_inlock(ks, indexNumber);
-}
-
-void IndexConsistency::removeIndexKey(const KeyString& ks, int indexNumber) {
-
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    _removeIndexKey_inlock(ks, indexNumber);
-}
-
-void IndexConsistency::addLongIndexKey(int indexNumber) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    _indexesInfo[indexNumber].numRecords++;
-    _indexesInfo[indexNumber].numLongKeys++;
-}
-
-int64_t IndexConsistency::getNumKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numKeys;
-}
-
-int64_t IndexConsistency::getNumLongKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numLongKeys;
-}
-
-int64_t IndexConsistency::getNumRecords(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numRecords;
+size_t IndexConsistency::getMultikeyMetadataPathCount(IndexInfo* indexInfo) {
+    return indexInfo->hashedMultikeyMetadataPaths.size();
 }
 
 bool IndexConsistency::haveEntryMismatch() const {
+    return std::any_of(_indexKeyBuckets.begin(),
+                       _indexKeyBuckets.end(),
+                       [](const IndexKeyBucket& bucket) -> bool { return bucket.indexKeyCount; });
+}
 
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    for (auto iterator = _indexKeyCount.begin(); iterator != _indexKeyCount.end(); iterator++) {
-        if (iterator->second != 0) {
-            return true;
+void IndexConsistency::setSecondPhase() {
+    invariant(_firstPhase);
+    _firstPhase = false;
+}
+
+void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap,
+                                           ValidateResults* results) {
+    invariant(!_firstPhase);
+
+    // We'll report up to 1MB for extra index entry errors and missing index entry errors.
+    const int kErrorSizeBytes = 1 * 1024 * 1024;
+    long numMissingIndexEntriesSizeBytes = 0;
+    long numExtraIndexEntriesSizeBytes = 0;
+
+    int numMissingIndexEntryErrors = _missingIndexEntries.size();
+    int numExtraIndexEntryErrors = 0;
+    for (const auto& item : _extraIndexEntries) {
+        numExtraIndexEntryErrors += item.second.size();
+    }
+
+    // Inform which indexes have inconsistencies and add the BSON objects of the inconsistent index
+    // entries to the results vector.
+    bool missingIndexEntrySizeLimitWarning = false;
+    for (const auto& missingIndexEntry : _missingIndexEntries) {
+        const BSONObj& entry = missingIndexEntry.second;
+
+        numMissingIndexEntriesSizeBytes += entry.objsize();
+        if (numMissingIndexEntriesSizeBytes <= kErrorSizeBytes) {
+            results->missingIndexEntries.push_back(entry);
+        } else if (!missingIndexEntrySizeLimitWarning) {
+            StringBuilder ss;
+            ss << "Not all missing index entry inconsistencies are listed due to size limitations.";
+            results->errors.push_back(ss.str());
+
+            missingIndexEntrySizeLimitWarning = true;
         }
+
+        std::string indexName = entry["indexName"].String();
+        if (!indexNsResultsMap->at(indexName).valid) {
+            continue;
+        }
+
+        StringBuilder ss;
+        ss << "Index with name '" << indexName << "' has inconsistencies.";
+        results->errors.push_back(ss.str());
+
+        indexNsResultsMap->at(indexName).valid = false;
     }
 
-    return false;
-}
+    bool extraIndexEntrySizeLimitWarning = false;
+    for (const auto& extraIndexEntry : _extraIndexEntries) {
+        const SimpleBSONObjSet& entries = extraIndexEntry.second;
+        for (const auto& entry : entries) {
+            numExtraIndexEntriesSizeBytes += entry.objsize();
+            if (numExtraIndexEntriesSizeBytes <= kErrorSizeBytes) {
+                results->extraIndexEntries.push_back(entry);
+            } else if (!extraIndexEntrySizeLimitWarning) {
+                StringBuilder ss;
+                ss << "Not all extra index entry inconsistencies are listed due to size "
+                      "limitations.";
+                results->errors.push_back(ss.str());
 
-int64_t IndexConsistency::getNumExtraIndexKeys(int indexNumber) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return 0;
-    }
-
-    return _indexesInfo.at(indexNumber).numExtraIndexKeys;
-}
-
-void IndexConsistency::applyChange(const IndexDescriptor* descriptor,
-                                   const boost::optional<IndexKeyEntry>& indexEntry,
-                                   ValidationOperation operation) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-
-    const std::string& indexNs = descriptor->indexNamespace();
-    int indexNumber = getIndexNumber(indexNs);
-    if (indexNumber == -1) {
-        return;
-    }
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const auto& key = descriptor->keyPattern();
-    const Ordering ord = Ordering::make(key);
-    KeyString::Version version = KeyString::kLatestVersion;
-
-    KeyString ks(version, indexEntry->key, ord, indexEntry->loc);
-
-    if (_stage == ValidationStage::DOCUMENT) {
-        _setYieldAtRecord_inlock(indexEntry->loc);
-        if (_isBeforeLastProcessedRecordId_inlock(indexEntry->loc)) {
-            if (operation == ValidationOperation::INSERT) {
-                if (indexEntry->key.objsize() >=
-                    static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
-                    // Index keys >= 1024 bytes are not indexed but are stored in the document key
-                    // set.
-                    _indexesInfo[indexNumber].numRecords++;
-                    _indexesInfo[indexNumber].numLongKeys++;
-                } else {
-                    _addDocKey_inlock(ks, indexNumber);
-                }
-            } else if (operation == ValidationOperation::REMOVE) {
-                if (indexEntry->key.objsize() >=
-                    static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
-                    _indexesInfo[indexNumber].numRecords--;
-                    _indexesInfo[indexNumber].numLongKeys--;
-                } else {
-                    _removeDocKey_inlock(ks, indexNumber);
-                }
+                extraIndexEntrySizeLimitWarning = true;
             }
-        }
-    } else if (_stage == ValidationStage::INDEX) {
 
-        // Index entries with key sizes >= 1024 bytes are not indexed.
-        if (indexEntry->key.objsize() >= static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
+            std::string indexName = entry["indexName"].String();
+            if (!indexNsResultsMap->at(indexName).valid) {
+                continue;
+            }
+
+            StringBuilder ss;
+            ss << "Index with name '" << indexName << "' has inconsistencies.";
+            results->errors.push_back(ss.str());
+
+            indexNsResultsMap->at(indexName).valid = false;
+        }
+    }
+
+    // Inform how many inconsistencies were detected.
+    if (numMissingIndexEntryErrors > 0) {
+        StringBuilder ss;
+        ss << "Detected " << numMissingIndexEntryErrors << " missing index entries.";
+        results->warnings.push_back(ss.str());
+    }
+
+    if (numExtraIndexEntryErrors > 0) {
+        StringBuilder ss;
+        ss << "Detected " << numExtraIndexEntryErrors << " extra index entries.";
+        results->warnings.push_back(ss.str());
+    }
+
+    results->valid = false;
+}
+
+void IndexConsistency::addDocKey(OperationContext* opCtx,
+                                 const KeyString::Value& ks,
+                                 IndexInfo* indexInfo,
+                                 RecordId recordId) {
+    const uint32_t hash = _hashKeyString(ks, indexInfo->indexNameHash);
+
+    if (_firstPhase) {
+        // During the first phase of validation we only keep track of the count for the document
+        // keys encountered.
+        _indexKeyBuckets[hash].indexKeyCount++;
+        _indexKeyBuckets[hash].bucketSizeBytes += ks.getSize();
+        indexInfo->numRecords++;
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(46666002, "[validate](record) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](record)");
+        }
+    } else if (_indexKeyBuckets[hash].indexKeyCount) {
+        // Found a document key for a hash bucket that had mismatches.
+
+        // Get the documents _id index key.
+        auto record = _validateState->getSeekRecordStoreCursor()->seekExact(opCtx, recordId);
+        invariant(record);
+
+        BSONObj data = record->data.toBson();
+        boost::optional<BSONElement> idKey = boost::none;
+        if (data.hasField("_id")) {
+            idKey = data["_id"];
+        }
+
+        auto indexKey =
+            KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+        BSONObj info = _generateInfo(*indexInfo, recordId, indexKey, idKey);
+
+        // Cannot have duplicate KeyStrings during the document scan phase for the same index.
+        IndexKey key = _generateKeyForMap(*indexInfo, ks);
+        invariant(_missingIndexEntries.count(key) == 0);
+        _missingIndexEntries.insert(std::make_pair(key, info));
+    }
+}
+
+void IndexConsistency::addIndexKey(const KeyString::Value& ks,
+                                   IndexInfo* indexInfo,
+                                   RecordId recordId) {
+    const uint32_t hash = _hashKeyString(ks, indexInfo->indexNameHash);
+
+    if (_firstPhase) {
+        // During the first phase of validation we only keep track of the count for the index entry
+        // keys encountered.
+        _indexKeyBuckets[hash].indexKeyCount--;
+        _indexKeyBuckets[hash].bucketSizeBytes += ks.getSize();
+        indexInfo->numKeys++;
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(46666003, "[validate](index) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](index)");
+        }
+    } else if (_indexKeyBuckets[hash].indexKeyCount) {
+        // Found an index key for a bucket that has inconsistencies.
+        // If there is a corresponding document key for the index entry key, we remove the key from
+        // the '_missingIndexEntries' map. However if there was no document key for the index entry
+        // key, we add the key to the '_extraIndexEntries' map.
+        auto indexKey =
+            KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+        BSONObj info = _generateInfo(*indexInfo, recordId, indexKey, boost::none);
+
+        IndexKey key = _generateKeyForMap(*indexInfo, ks);
+        if (_missingIndexEntries.count(key) == 0) {
+            // We may have multiple extra index entries for a given KeyString.
+            auto search = _extraIndexEntries.find(key);
+            if (search == _extraIndexEntries.end()) {
+                SimpleBSONObjSet infoSet = {info};
+                _extraIndexEntries.insert(std::make_pair(key, infoSet));
+                return;
+            }
+
+            search->second.insert(info);
+        } else {
+            _missingIndexEntries.erase(key);
+        }
+    }
+}
+
+bool IndexConsistency::limitMemoryUsageForSecondPhase(ValidateResults* result) {
+    invariant(!_firstPhase);
+
+    const uint32_t maxMemoryUsageBytes = maxValidateMemoryUsageMB.load() * 1024 * 1024;
+    const uint64_t totalMemoryNeededBytes =
+        std::accumulate(_indexKeyBuckets.begin(),
+                        _indexKeyBuckets.end(),
+                        0,
+                        [](uint64_t bytes, const IndexKeyBucket& bucket) {
+                            return bucket.indexKeyCount ? bytes + bucket.bucketSizeBytes : bytes;
+                        });
+
+    if (totalMemoryNeededBytes <= maxMemoryUsageBytes) {
+        // The amount of memory we need is under the limit, so no need to do anything else.
+        return true;
+    }
+
+    bool hasNonZeroBucket = false;
+    uint64_t memoryUsedSoFarBytes = 0;
+    uint32_t smallestBucketBytes = std::numeric_limits<uint32_t>::max();
+    // Zero out any nonzero buckets that would put us over maxMemoryUsageBytes.
+    std::for_each(_indexKeyBuckets.begin(), _indexKeyBuckets.end(), [&](IndexKeyBucket& bucket) {
+        if (bucket.indexKeyCount == 0) {
             return;
         }
 
-        if (_isIndexScanning_inlock(indexNumber)) {
-            _setYieldAtIndexEntry_inlock(ks);
+        smallestBucketBytes = std::min(smallestBucketBytes, bucket.bucketSizeBytes);
+        if (bucket.bucketSizeBytes + memoryUsedSoFarBytes > maxMemoryUsageBytes) {
+            // Including this bucket would put us over the memory limit, so zero
+            // this bucket.
+            bucket.indexKeyCount = 0;
+            return;
         }
+        memoryUsedSoFarBytes += bucket.bucketSizeBytes;
+        hasNonZeroBucket = true;
+    });
 
-        const bool wasIndexScanStarted =
-            _isIndexFinished_inlock(indexNumber) || _isIndexScanning_inlock(indexNumber);
-        const bool isUpcomingChangeToCurrentIndex =
-            _isIndexScanning_inlock(indexNumber) && !_isBeforeLastProcessedIndexEntry_inlock(ks);
+    StringBuilder memoryLimitMessage;
+    memoryLimitMessage << "Memory limit for validation is currently set to "
+                       << maxValidateMemoryUsageMB.load()
+                       << "MB and can be configured via the 'maxValidateMemoryUsageMB' parameter.";
 
-        if (!wasIndexScanStarted || isUpcomingChangeToCurrentIndex) {
+    if (!hasNonZeroBucket) {
+        const uint32_t minMemoryNeededMB = (smallestBucketBytes / (1024 * 1024)) + 1;
+        StringBuilder ss;
+        ss << "Unable to report index entry inconsistencies due to memory limitations. Need at "
+              "least "
+           << minMemoryNeededMB << "MB to report at least one index entry inconsistency. "
+           << memoryLimitMessage.str();
+        result->errors.push_back(ss.str());
+        result->valid = false;
 
-            // We haven't started scanning this index namespace yet so everything
-            // happens after the cursor, OR, we are scanning this index namespace,
-            // and an event occured after our cursor
-            if (operation == ValidationOperation::INSERT) {
-                _removeIndexKey_inlock(ks, indexNumber);
-                _indexesInfo.at(indexNumber).numExtraIndexKeys++;
-            } else if (operation == ValidationOperation::REMOVE) {
-                _addIndexKey_inlock(ks, indexNumber);
-                _indexesInfo.at(indexNumber).numExtraIndexKeys--;
-            }
-        }
-    }
-}
-
-
-void IndexConsistency::nextStage() {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (_stage == ValidationStage::DOCUMENT) {
-        _stage = ValidationStage::INDEX;
-    } else if (_stage == ValidationStage::INDEX) {
-        _stage = ValidationStage::NONE;
-    }
-}
-
-ValidationStage IndexConsistency::getStage() const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    return _stage;
-}
-
-void IndexConsistency::setLastProcessedRecordId(RecordId recordId) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!recordId.isNormal()) {
-        _lastProcessedRecordId = boost::none;
-    } else {
-        _lastProcessedRecordId = recordId;
-    }
-}
-
-void IndexConsistency::setLastProcessedIndexEntry(
-    const IndexDescriptor& descriptor, const boost::optional<IndexKeyEntry>& indexEntry) {
-
-    const auto& key = descriptor.keyPattern();
-    const Ordering ord = Ordering::make(key);
-    KeyString::Version version = KeyString::kLatestVersion;
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!indexEntry) {
-        _lastProcessedIndexEntry.reset();
-    } else {
-        _lastProcessedIndexEntry.reset(
-            new KeyString(version, indexEntry->key, ord, indexEntry->loc));
-    }
-}
-
-void IndexConsistency::notifyStartIndex(int indexNumber) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    _lastProcessedIndexEntry.reset(nullptr);
-    _currentIndex = indexNumber;
-}
-
-void IndexConsistency::notifyDoneIndex(int indexNumber) {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (indexNumber < 0 || indexNumber >= static_cast<int>(_indexesInfo.size())) {
-        return;
-    }
-
-    _lastProcessedIndexEntry.reset(nullptr);
-    _currentIndex = -1;
-    _indexesInfo.at(indexNumber).indexScanFinished = true;
-}
-
-int IndexConsistency::getIndexNumber(const std::string& indexNs) {
-
-    auto search = _indexNumber.find(indexNs);
-    if (search != _indexNumber.end()) {
-        return search->second;
-    }
-
-    return -1;
-}
-
-bool IndexConsistency::shouldGetNewSnapshot(const RecordId recordId) const {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!_yieldAtRecordId) {
         return false;
     }
 
-    return _yieldAtRecordId <= recordId;
+    StringBuilder ss;
+    ss << "Not all index entry inconsistencies are reported due to memory limitations. "
+       << memoryLimitMessage.str();
+    result->errors.push_back(ss.str());
+
+    return true;
 }
 
-bool IndexConsistency::shouldGetNewSnapshot(const KeyString& keyString) const {
+BSONObj IndexConsistency::_generateInfo(const IndexInfo& indexInfo,
+                                        RecordId recordId,
+                                        const BSONObj& indexKey,
+                                        boost::optional<BSONElement> idKey) {
+    const std::string& indexName = indexInfo.indexName;
+    const BSONObj& keyPattern = indexInfo.keyPattern;
 
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-    if (!_yieldAtIndexEntry) {
-        return false;
+    // We need to rehydrate the indexKey for improved readability.
+    // {"": ObjectId(...)} -> {"_id": ObjectId(...)}
+    auto keysIt = keyPattern.begin();
+    auto valuesIt = indexKey.begin();
+
+    BSONObjBuilder b;
+    while (keysIt != keyPattern.end()) {
+        // keysIt and valuesIt must have the same number of elements.
+        invariant(valuesIt != indexKey.end());
+        b.appendAs(*valuesIt, keysIt->fieldName());
+        keysIt++;
+        valuesIt++;
     }
 
-    return *_yieldAtIndexEntry <= keyString;
-}
+    BSONObj rehydratedKey = b.done();
 
-void IndexConsistency::relockCollectionWithMode(LockMode mode) {
-    // Release the lock and grab the provided lock mode.
-    _collLk.reset();
-    _collLk.reset(new Lock::CollectionLock(_opCtx->lockState(), _nss.toString(), mode));
-    invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss.toString(), mode));
-
-    // Check if the operation was killed.
-    _opCtx->checkForInterrupt();
-
-    // Ensure it is safe to continue.
-    uassertStatusOK(_throwExceptionIfError());
-}
-
-bool IndexConsistency::scanLimitHit() {
-
-    stdx::lock_guard<stdx::mutex> lock(_classMutex);
-
-    // We have to yield every so many scans while doing background validation only.
-    return _isBackground && _tracker.intervalHasElapsed();
-}
-
-void IndexConsistency::yield() {
-
-    stdx::unique_lock<stdx::mutex> lock(_classMutex);
-
-    // Reset the yield tracker
-    _tracker.resetLastTime();
-
-    lock.unlock();
-    QueryYield::yieldAllLocks(_opCtx, nullptr, _nss);
-    lock.lock();
-
-    // Check if the operation was killed.
-    _opCtx->checkForInterrupt();
-
-    _yieldAtRecordId = boost::none;
-    _yieldAtIndexEntry.reset();
-
-    // Ensure it is safe to continue.
-    uassertStatusOK(_throwExceptionIfError());
-}
-
-void IndexConsistency::_addDocKey_inlock(const KeyString& ks, int indexNumber) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
-    _indexKeyCount[hash]++;
-    _indexesInfo.at(indexNumber).numRecords++;
-}
-
-void IndexConsistency::_removeDocKey_inlock(const KeyString& ks, int indexNumber) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
-    _indexKeyCount[hash]--;
-    _indexesInfo.at(indexNumber).numRecords--;
-}
-
-void IndexConsistency::_addIndexKey_inlock(const KeyString& ks, int indexNumber) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
-    _indexKeyCount[hash]--;
-    _indexesInfo.at(indexNumber).numKeys++;
-}
-
-void IndexConsistency::_removeIndexKey_inlock(const KeyString& ks, int indexNumber) {
-
-    // Ignore indexes that weren't ready before we started validation.
-    if (!_indexesInfo.at(indexNumber).isReady) {
-        return;
-    }
-
-    const uint32_t hash = _hashKeyString(ks, indexNumber);
-    _indexKeyCount[hash]++;
-    _indexesInfo.at(indexNumber).numKeys--;
-}
-
-bool IndexConsistency::_isIndexFinished_inlock(int indexNumber) const {
-
-    return _indexesInfo.at(indexNumber).indexScanFinished;
-}
-
-bool IndexConsistency::_isIndexScanning_inlock(int indexNumber) const {
-
-    return indexNumber == _currentIndex;
-}
-
-void IndexConsistency::_setYieldAtRecord_inlock(const RecordId recordId) {
-
-    if (_isBeforeLastProcessedRecordId_inlock(recordId)) {
-        return;
-    }
-
-    if (!_yieldAtRecordId || recordId <= _yieldAtRecordId) {
-        _yieldAtRecordId = recordId;
+    if (idKey) {
+        return BSON("indexName" << indexName << "recordId" << recordId.repr() << "idKey" << *idKey
+                                << "indexKey" << rehydratedKey);
+    } else {
+        return BSON("indexName" << indexName << "recordId" << recordId.repr() << "indexKey"
+                                << rehydratedKey);
     }
 }
 
-void IndexConsistency::_setYieldAtIndexEntry_inlock(const KeyString& keyString) {
-
-    if (_isBeforeLastProcessedIndexEntry_inlock(keyString)) {
-        return;
-    }
-
-    if (!_yieldAtIndexEntry || keyString <= *_yieldAtIndexEntry) {
-        KeyString::Version version = KeyString::kLatestVersion;
-        _yieldAtIndexEntry.reset(new KeyString(version));
-        _yieldAtIndexEntry->resetFromBuffer(keyString.getBuffer(), keyString.getSize());
-    }
-}
-
-bool IndexConsistency::_isBeforeLastProcessedRecordId_inlock(RecordId recordId) const {
-
-    if (_lastProcessedRecordId && recordId <= _lastProcessedRecordId) {
-        return true;
-    }
-
-    return false;
-}
-
-bool IndexConsistency::_isBeforeLastProcessedIndexEntry_inlock(const KeyString& keyString) const {
-
-    if (_lastProcessedIndexEntry && keyString <= *_lastProcessedIndexEntry) {
-        return true;
-    }
-
-    return false;
-}
-
-uint32_t IndexConsistency::_hashKeyString(const KeyString& ks, int indexNumber) const {
-
-    uint32_t indexNsHash = _indexesInfo.at(indexNumber).indexNsHash;
-    MurmurHash3_x86_32(
-        ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), indexNsHash, &indexNsHash);
-    MurmurHash3_x86_32(ks.getBuffer(), ks.getSize(), indexNsHash, &indexNsHash);
-    return indexNsHash % (1U << 22);
-}
-
-Status IndexConsistency::_throwExceptionIfError() {
-
-    Database* database = dbHolder().get(_opCtx, _nss.db());
-
-    // Ensure the database still exists.
-    if (!database) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      "The database was dropped during background validation");
-    }
-
-    Collection* collection = database->getCollection(_opCtx, _nss);
-
-    // Ensure the collection still exists.
-    if (!collection) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      "The collection was dropped during background validation");
-    }
-
-    // Ensure no indexes were removed or added.
-    IndexCatalog* indexCatalog = collection->getIndexCatalog();
-    IndexCatalog::IndexIterator indexIterator = indexCatalog->getIndexIterator(_opCtx, false);
-    int numRelevantIndexes = 0;
-
-    while (indexIterator.more()) {
-        const IndexDescriptor* descriptor = indexIterator.next();
-        int indexNumber = getIndexNumber(descriptor->indexNamespace());
-        if (indexNumber == -1) {
-            // Allow the collection scan to finish to verify that all the records are valid BSON.
-            if (_stage != ValidationStage::DOCUMENT) {
-                // An index was added.
-                return Status(ErrorCodes::IndexModified,
-                              "An index was added during background validation");
-            }
-        } else {
-            // Ignore indexes that weren't ready
-            if (_indexesInfo.at(indexNumber).isReady) {
-                numRelevantIndexes++;
-            }
-        }
-    }
-
-    if (numRelevantIndexes != static_cast<int>(_indexesInfo.size())) {
-        // Allow the collection scan to finish to verify that all the records are valid BSON.
-        if (_stage != ValidationStage::DOCUMENT) {
-            // An index was dropped.
-            return Status(ErrorCodes::IndexModified,
-                          "An index was dropped during background validation");
-        }
-    }
-
-    return Status::OK();
+uint32_t IndexConsistency::_hashKeyString(const KeyString::Value& ks,
+                                          uint32_t indexNameHash) const {
+    return ks.hash(indexNameHash) % kNumHashBuckets;
 }
 }  // namespace mongo

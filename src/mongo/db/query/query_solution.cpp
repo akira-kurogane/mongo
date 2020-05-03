@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,18 +31,27 @@
 
 #include "mongo/db/query/query_solution.h"
 
+#include <boost/algorithm/string/join.hpp>
+#include <boost/range/adaptor/transformed.hpp>
+
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/planner_wildcard_helpers.h"
+#include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/query_planner_common.h"
 
 namespace mongo {
 
 namespace {
+
+namespace wcp = ::mongo::wildcard_planning;
 
 // Create an ordred interval list which represents the bounds for all BSON elements of type String,
 // Object, or Array.
@@ -83,109 +93,56 @@ bool rangeCanContainString(const BSONElement& startKey,
     IndexBoundsBuilder::intersectize(rangeOil, &stringBoundsOil);
     return !stringBoundsOil.intervals.empty();
 }
+}  // namespace
 
-// Helper function for IndexScanNode::computeProperties for adding additional sort orders made
-// possible by point bounds on some fields of the sort pattern.
-void addEqualityFieldSorts(const BSONObj& sortPattern,
-                           const std::set<string>& equalityFields,
-                           BSONObjSet* sortsOut) {
-    invariant(sortsOut);
-    // TODO: Each field in equalityFields could be dropped from the sort order since it is
-    // a point interval.  The full set of sort orders is as follows:
-    // For each sort in sortsOut:
-    //    For each drop in powerset(equalityFields):
-    //        Remove fields in 'drop' from 'sort' and add resulting sort to output.
-    //
-    // Since this involves a powerset, we don't generate the full set of possibilities.
-    // Instead, we generate sort orders by removing possible contiguous prefixes of equality
-    // predicates. For example, if the key pattern is {a: 1, b: 1, c: 1, d: 1, e: 1}
-    // and and there are equality predicates on 'a', 'b', and 'c', then here we add the sort
-    // orders {b: 1, c: 1, d: 1, e: 1} and {c: 1, d: 1, e: 1}. (We also end up adding
-    // {d: 1, e: 1} and {d: 1}, but this is done later on.)
-    BSONObjIterator it(sortPattern);
-    BSONObjBuilder suffixBob;
-    while (it.more()) {
-        BSONElement elt = it.next();
-        // TODO: string slowness.  fix when bounds are stringdata not string.
-        if (equalityFields.end() == equalityFields.find(string(elt.fieldName()))) {
-            suffixBob.append(elt);
-            // This field isn't a point interval, can't drop.
-            break;
+bool ProvidedSortSet::contains(BSONObj input) const {
+    auto sortPatternItr = BSONObjIterator(_baseSortPattern);
+    for (auto&& inputElement : input) {
+        // Remove all the fields that are present in '_ignoredFields' from the sort pattern object
+        // since they do not contribute to changing the output order.
+        if (_ignoredFields.count(inputElement.fieldName())) {
+            continue;
         }
-
-        // We add the sort obtained by dropping 'elt' and all preceding elements from the index
-        // key pattern.
-        BSONObjIterator droppedPrefixIt = it;
-        if (!droppedPrefixIt.more()) {
-            // Do not insert an empty sort order.
-            break;
+        if (SimpleBSONElementComparator::kInstance.evaluate(inputElement == *sortPatternItr)) {
+            ++sortPatternItr;
+            continue;
         }
-        BSONObjBuilder droppedPrefixBob;
-        while (droppedPrefixIt.more()) {
-            droppedPrefixBob.append(droppedPrefixIt.next());
-        }
-        sortsOut->insert(droppedPrefixBob.obj());
+        return false;
     }
-
-    while (it.more()) {
-        suffixBob.append(it.next());
-    }
-
-    // We've found the suffix following the contiguous prefix of equality fields.
-    //   Ex. For index {a: 1, b: 1, c: 1, d: 1} and query {a: 3, b: 5}, this suffix
-    //   of the key pattern is {c: 1, d: 1}.
-    //
-    // Now we have to add all prefixes of this suffix as possible sort orders.
-    //   Ex. Continuing the example from above, we have to include sort orders
-    //   {c: 1} and {c: 1, d: 1}.
-    BSONObj filterPointsObj = suffixBob.obj();
-    for (int i = 0; i < filterPointsObj.nFields(); ++i) {
-        // Make obj out of fields [0,i]
-        BSONObjIterator it(filterPointsObj);
-        BSONObjBuilder prefixBob;
-        for (int j = 0; j <= i; ++j) {
-            prefixBob.append(it.next());
-        }
-        sortsOut->insert(prefixBob.obj());
-    }
-}
+    return true;
 }
 
 string QuerySolutionNode::toString() const {
-    mongoutils::str::stream ss;
+    str::stream ss;
     appendToString(&ss, 0);
     return ss;
 }
 
 // static
-void QuerySolutionNode::addIndent(mongoutils::str::stream* ss, int level) {
+void QuerySolutionNode::addIndent(str::stream* ss, int level) {
     for (int i = 0; i < level; ++i) {
         *ss << "---";
     }
 }
 
-void QuerySolutionNode::addCommon(mongoutils::str::stream* ss, int indent) const {
+void QuerySolutionNode::addCommon(str::stream* ss, int indent) const {
     addIndent(ss, indent + 1);
     *ss << "fetched = " << fetched() << '\n';
     addIndent(ss, indent + 1);
     *ss << "sortedByDiskLoc = " << sortedByDiskLoc() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "getSort = [";
-    for (BSONObjSet::const_iterator it = getSort().begin(); it != getSort().end(); it++) {
-        *ss << it->toString() << ", ";
-    }
-    *ss << "]" << '\n';
+    *ss << "providedSorts = {" << providedSorts().debugString() << "}" << '\n';
 }
 
 //
 // TextNode
 //
 
-void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void TextNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "TEXT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addIndent(ss, indent + 1);
@@ -198,9 +155,9 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "diacriticSensitive= " << ftsQuery->getDiacriticSensitive() << '\n';
     addIndent(ss, indent + 1);
     *ss << "indexPrefix = " << indexPrefix.toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
     addCommon(ss, indent);
 }
@@ -220,20 +177,16 @@ QuerySolutionNode* TextNode::clone() const {
 // CollectionScanNode
 //
 
-CollectionScanNode::CollectionScanNode()
-    : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-      tailable(false),
-      direction(1),
-      maxScan(0) {}
+CollectionScanNode::CollectionScanNode() : tailable(false), direction(1) {}
 
-void CollectionScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CollectionScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COLLSCAN\n";
     addIndent(ss, indent + 1);
     *ss << "ns = " << name << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << "filter = " << filter->toString();
+        *ss << "filter = " << filter->debugString();
     }
     addCommon(ss, indent);
 }
@@ -246,7 +199,8 @@ QuerySolutionNode* CollectionScanNode::clone() const {
     copy->name = this->name;
     copy->tailable = this->tailable;
     copy->direction = this->direction;
-    copy->maxScan = this->maxScan;
+    copy->shouldTrackLatestOplogTimestamp = this->shouldTrackLatestOplogTimestamp;
+    copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
 
     return copy;
 }
@@ -255,16 +209,16 @@ QuerySolutionNode* CollectionScanNode::clone() const {
 // AndHashNode
 //
 
-AndHashNode::AndHashNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+AndHashNode::AndHashNode() {}
 
 AndHashNode::~AndHashNode() {}
 
-void AndHashNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void AndHashNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "AND_HASH\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -285,15 +239,13 @@ bool AndHashNode::fetched() const {
     return false;
 }
 
-bool AndHashNode::hasField(const string& field) const {
-    // Any WSM output from this stage came from all children stages.  Therefore we have all
-    // fields covered in our children.
+FieldAvailability AndHashNode::getFieldAvailability(const string& field) const {
+    // A field can be provided by any of the children.
+    auto result = FieldAvailability::kNotProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i]->hasField(field)) {
-            return true;
-        }
+        result = std::max(result, children[i]->getFieldAvailability(field));
     }
-    return false;
+    return result;
 }
 
 QuerySolutionNode* AndHashNode::clone() const {
@@ -309,11 +261,11 @@ QuerySolutionNode* AndHashNode::clone() const {
 // AndSortedNode
 //
 
-AndSortedNode::AndSortedNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+AndSortedNode::AndSortedNode() {}
 
 AndSortedNode::~AndSortedNode() {}
 
-void AndSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void AndSortedNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "AND_SORTED\n";
     addCommon(ss, indent);
@@ -335,15 +287,13 @@ bool AndSortedNode::fetched() const {
     return false;
 }
 
-bool AndSortedNode::hasField(const string& field) const {
-    // Any WSM output from this stage came from all children stages.  Therefore we have all
-    // fields covered in our children.
+FieldAvailability AndSortedNode::getFieldAvailability(const string& field) const {
+    // A field can be provided by any of the children.
+    auto result = FieldAvailability::kNotProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i]->hasField(field)) {
-            return true;
-        }
+        result = std::max(result, children[i]->getFieldAvailability(field));
     }
-    return false;
+    return result;
 }
 
 QuerySolutionNode* AndSortedNode::clone() const {
@@ -359,16 +309,16 @@ QuerySolutionNode* AndSortedNode::clone() const {
 // OrNode
 //
 
-OrNode::OrNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), dedup(true) {}
+OrNode::OrNode() : dedup(true) {}
 
 OrNode::~OrNode() {}
 
-void OrNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void OrNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "OR\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -396,13 +346,12 @@ bool OrNode::fetched() const {
  * we want to guarantee that any output has a certain field, all of our children must
  * have that field.
  */
-bool OrNode::hasField(const string& field) const {
+FieldAvailability OrNode::getFieldAvailability(const string& field) const {
+    auto result = FieldAvailability::kFullyProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (!children[i]->hasField(field)) {
-            return false;
-        }
+        result = std::min(result, children[i]->getFieldAvailability(field));
     }
-    return true;
+    return result;
 }
 
 QuerySolutionNode* OrNode::clone() const {
@@ -419,17 +368,16 @@ QuerySolutionNode* OrNode::clone() const {
 // MergeSortNode
 //
 
-MergeSortNode::MergeSortNode()
-    : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), dedup(true) {}
+MergeSortNode::MergeSortNode() : dedup(true) {}
 
 MergeSortNode::~MergeSortNode() {}
 
-void MergeSortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void MergeSortNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "MERGE_SORT\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString() << '\n';
+        *ss << " filter = " << filter->debugString() << '\n';
     }
     addCommon(ss, indent);
     for (size_t i = 0; i < children.size(); ++i) {
@@ -457,13 +405,12 @@ bool MergeSortNode::fetched() const {
  * we want to guarantee that any output has a certain field, all of our children must
  * have that field.
  */
-bool MergeSortNode::hasField(const string& field) const {
+FieldAvailability MergeSortNode::getFieldAvailability(const string& field) const {
+    auto result = FieldAvailability::kFullyProvided;
     for (size_t i = 0; i < children.size(); ++i) {
-        if (!children[i]->hasField(field)) {
-            return false;
-        }
+        result = std::min(result, children[i]->getFieldAvailability(field));
     }
-    return true;
+    return result;
 }
 
 QuerySolutionNode* MergeSortNode::clone() const {
@@ -481,12 +428,12 @@ QuerySolutionNode* MergeSortNode::clone() const {
 // FetchNode
 //
 
-FetchNode::FetchNode() : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+FetchNode::FetchNode() {}
 
-void FetchNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void FetchNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "FETCH\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
         StringBuilder sb;
         *ss << "filter:\n";
@@ -513,22 +460,21 @@ QuerySolutionNode* FetchNode::clone() const {
 //
 
 IndexScanNode::IndexScanNode(IndexEntry index)
-    : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-      index(std::move(index)),
+    : index(std::move(index)),
       direction(1),
-      maxScan(0),
       addKeyMetadata(false),
+      shouldDedup(index.multikey),
       queryCollator(nullptr) {}
 
-void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void IndexScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "IXSCAN\n";
     addIndent(ss, indent + 1);
-    *ss << "indexName = " << index.name << '\n';
+    *ss << "indexName = " << index.identifier.catalogName << '\n';
     *ss << "keyPattern = " << index.keyPattern << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << "filter = " << filter->toString();
+        *ss << "filter = " << filter->debugString();
     }
     addIndent(ss, indent + 1);
     *ss << "direction = " << direction << '\n';
@@ -537,17 +483,30 @@ void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addCommon(ss, indent);
 }
 
-bool IndexScanNode::hasField(const string& field) const {
+FieldAvailability IndexScanNode::getFieldAvailability(const string& field) const {
+    // A $** index whose bounds overlap the object type bracket cannot provide covering, since the
+    // index only contains the leaf nodes along each of the object's subpaths.
+    if (index.type == IndexType::INDEX_WILDCARD && wcp::isWildcardObjectSubpathScan(this)) {
+        return FieldAvailability::kNotProvided;
+    }
+
     // The index is multikey but does not have any path-level multikeyness information. Such indexes
     // can never provide covering.
     if (index.multikey && index.multikeyPaths.empty()) {
-        return false;
+        return FieldAvailability::kNotProvided;
     }
 
-    // Custom index access methods may return non-exact key data - this function is currently
-    // used for covering exact key data only.
-    if (IndexNames::BTREE != IndexNames::findPluginName(index.keyPattern)) {
-        return false;
+    // Compound hashed indexes can be covered when the projection is not on the hashed field. Other
+    // custom index access methods may return non-exact key data - this function is currently used
+    // for covering exact key data only.
+    auto indexPluginName = IndexNames::findPluginName(index.keyPattern);
+    switch (IndexNames::nameToType(indexPluginName)) {
+        case IndexType::INDEX_BTREE:
+        case IndexType::INDEX_HASHED:
+            break;
+        default:
+            // All other index types provide no fields.
+            return FieldAvailability::kNotProvided;
     }
 
     // If the index has a non-simple collation and we have collation keys inside 'field', then this
@@ -555,23 +514,34 @@ bool IndexScanNode::hasField(const string& field) const {
     if (index.collator) {
         std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, index.keyPattern);
         if (collatedFields.find(field) != collatedFields.end()) {
-            return false;
+            return FieldAvailability::kNotProvided;
         }
     }
 
     size_t keyPatternFieldIndex = 0;
     for (auto&& elt : index.keyPattern) {
+        // For $** indexes, the keyPattern is prefixed by a virtual field, '$_path'. We therefore
+        // skip the first keyPattern field when deciding whether we can provide the requested field.
+        if (index.type == IndexType::INDEX_WILDCARD && !keyPatternFieldIndex) {
+            invariant(elt.fieldNameStringData() == "$_path"_sd);
+            ++keyPatternFieldIndex;
+            continue;
+        }
         // The index can provide this field if the requested path appears in the index key pattern,
         // and that path has no multikey components. We can't cover a field that has multikey
         // components because the index keys contain individual array elements, and we can't
-        // reconstitute the array from the index keys in the right order.
+        // reconstitute the array from the index keys in the right order. In order for the field to
+        // be fully provided by the scan, it must be ascending (1) or descending (-1).
         if (field == elt.fieldName() &&
             (!index.multikey || index.multikeyPaths[keyPatternFieldIndex].empty())) {
-            return true;
+            // We already know that the index is either ascending, descending or hashed. If the
+            // field is hashed, we only provide hashed value.
+            return elt.isNumber() ? FieldAvailability::kFullyProvided
+                                  : FieldAvailability::kHashedValueProvided;
         }
         ++keyPatternFieldIndex;
     }
-    return false;
+    return FieldAvailability::kNotProvided;
 }
 
 bool IndexScanNode::sortedByDiskLoc() const {
@@ -600,15 +570,19 @@ bool IndexScanNode::sortedByDiskLoc() const {
 }
 
 // static
-std::set<StringData> IndexScanNode::getFieldsWithStringBounds(const IndexBounds& bounds,
+std::set<StringData> IndexScanNode::getFieldsWithStringBounds(const IndexBounds& inputBounds,
                                                               const BSONObj& indexKeyPattern) {
-    BSONObjIterator keyPatternIterator = indexKeyPattern.begin();
+    // Produce a copy of the bounds which are all ascending, as we can only compute intersections
+    // of ascending bounds.
+    IndexBounds bounds = inputBounds.forwardize();
+
+    BSONObjIterator keyPatternIterator(indexKeyPattern);
 
     if (bounds.isSimpleRange) {
         // With a simple range, the only cases we can say for sure do not contain strings
         // are those with point bounds.
-        BSONObjIterator startKeyIterator = bounds.startKey.begin();
-        BSONObjIterator endKeyIterator = bounds.endKey.begin();
+        BSONObjIterator startKeyIterator(bounds.startKey);
+        BSONObjIterator endKeyIterator(bounds.endKey);
         while (keyPatternIterator.more() && startKeyIterator.more() && endKeyIterator.more()) {
             BSONElement startKey = startKeyIterator.next();
             BSONElement endKey = endKeyIterator.next();
@@ -666,44 +640,72 @@ std::set<StringData> getMultikeyFields(const BSONObj& keyPattern,
     }
     return multikeyFields;
 }
-}  // namespace
 
-void IndexScanNode::computeProperties() {
-    _sorts.clear();
-
-    // If the index is multikey but does not have path-level multikey metadata, then this index
-    // cannot provide any sorts.
-    if (index.multikey && index.multikeyPaths.empty()) {
-        return;
+/**
+ * Returns true if the index scan described by 'multikeyFields' and 'bounds' can legally provide the
+ * 'sortPatternComponent' field, or false if the sort cannot be provided. A multikey index cannot
+ * provide a sort if either of the following is true: 1) the sort spec includes a multikey field
+ * that has bounds other than [minKey, maxKey], 2) there are bounds other than [minKey, maxKey] over
+ * a multikey field which share a path prefix with a component of the sort pattern. These cases are
+ * further explained in SERVER-31898.
+ */
+bool confirmBoundsProvideSortComponentGivenMultikeyness(
+    StringData sortPatternComponent,
+    const IndexBounds& bounds,
+    const std::set<StringData>& multikeyFields) {
+    // Forwardize the bounds to correctly apply checks to descending sorts and well as ascending
+    // sorts.
+    const auto ascendingBounds = bounds.forwardize();
+    const auto& fields = ascendingBounds.fields;
+    if (multikeyFields.count(sortPatternComponent) == 0) {
+        // If this component of the sort pattern (which must be one of the components of
+        // the index spec) is not multikey, we don't need additional checks.
+        return true;
     }
 
-    BSONObj sortPattern = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
-    if (direction == -1) {
-        sortPattern = QueryPlannerCommon::reverseSortObj(sortPattern);
+    // Return false if the bounds are specified as a simple range. As a future improvement, we could
+    // extend this optimization to allow simple multikey scans to provide a sort.
+    if (ascendingBounds.isSimpleRange) {
+        return false;
     }
 
-    _sorts.insert(sortPattern);
-
-    const int nFields = sortPattern.nFields();
-    if (nFields > 1) {
-        // We're sorted not only by sortPattern but also by all prefixes of it.
-        for (int i = 0; i < nFields; ++i) {
-            // Make obj out of fields [0,i]
-            BSONObjIterator it(sortPattern);
-            BSONObjBuilder prefixBob;
-            for (int j = 0; j <= i; ++j) {
-                prefixBob.append(it.next());
-            }
-            _sorts.insert(prefixBob.obj());
+    // Checks if the 'sortPatternComponent' has [MinKey, MaxKey].
+    for (auto&& intervalList : fields) {
+        if (sortPatternComponent == intervalList.name && !intervalList.isMinToMax()) {
+            return false;
         }
     }
 
-    // If we are using the index {a:1, b:1} to answer the predicate {a: 10}, it's sorted
-    // both by the index key pattern and by the pattern {b: 1}.
+    // Checks if there is a shared path prefix between the bounds and the sort pattern of
+    // multikey fields.
+    FieldRef refName(sortPatternComponent);
+    for (const auto& intervalList : fields) {
+        // Ignores the prefix if the bounds are [MinKey, MaxKey] or if the field is not
+        // multikey.
+        if (intervalList.isMinToMax() ||
+            (multikeyFields.find(intervalList.name) == multikeyFields.end())) {
+            continue;
+        }
+        FieldRef boundsPath(intervalList.name);
+        const auto commonPrefixSize = boundsPath.commonPrefixSize(refName);
+        // The interval list name and the sort pattern name will never be equal at this point.
+        // This is because if they are equal and do not have [minKey, maxKey] bounds, we would
+        // already have bailed out of the function. If they do have [minKey, maxKey] bounds,
+        // they will be skipped in the check for [minKey, maxKey] bounds above.
+        invariant(refName != boundsPath);
+        // Checks if there's a common prefix between the interval list name and the sort pattern
+        // name.
+        if (commonPrefixSize > 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
-    // See if there are any fields with equalities for bounds.  We can drop these
-    // from any sort orders created.
-    std::set<string> equalityFields;
+std::set<std::string> extractEqualityFields(const IndexBounds& bounds, const IndexEntry& index) {
+    std::set<std::string> equalityFields;
+
+    // Find all equality predicate fields.
     if (!bounds.isSimpleRange) {
         // Figure out how many fields are point intervals.
         for (size_t i = 0; i < bounds.fields.size(); ++i) {
@@ -729,51 +731,163 @@ void IndexScanNode::computeProperties() {
             }
         }
     }
+    return equalityFields;
+}
 
-    if (!equalityFields.empty()) {
-        addEqualityFieldSorts(sortPattern, equalityFields, &_sorts);
+/**
+ * Returns a 'ProvidedSortSet' with the sort orders provided by an index scan over 'index',
+ * with the given 'bounds' and 'direction'.
+ */
+ProvidedSortSet computeSortsForScan(const IndexEntry& index,
+                                    int direction,
+                                    const IndexBounds& bounds,
+                                    const CollatorInterface* queryCollator,
+                                    const std::set<StringData>& multikeyFields) {
+    BSONObj sortPatternProvidedByIndex = index.keyPattern;
+
+    // If 'index' is the result of expanding a wildcard index, then its key pattern should look like
+    // {$_path: 1, <field>: 1}. The "$_path" prefix stores the value of the path associated with the
+    // key as opposed to real user data. We shouldn't report any sort orders including "$_path". In
+    // fact, $-prefixed path components are illegal in queries in most contexts, so misinterpreting
+    // this as a path in user-data could trigger subsequent assertions.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        invariant(bounds.fields.size() == 2u);
+
+        // No sorts are provided if the bounds for '$_path' consist of multiple intervals. This can
+        // happen for existence queries. For example, {a: {$exists: true}} results in bounds
+        // [["a","a"], ["a.", "a/")] for '$_path' so that keys from documents where "a" is a nested
+        // object are in bounds.
+        if (bounds.fields[0].intervals.size() != 1u) {
+            return {};
+        }
+
+        // Strip '$_path' out of 'sortPattern' and then proceed with regular sort analysis.
+        BSONObjIterator it{sortPatternProvidedByIndex};
+        invariant(it.more());
+        auto pathElement = it.next();
+        invariant(pathElement.fieldNameStringData() == "$_path"_sd);
+        invariant(it.more());
+        auto secondElement = it.next();
+        invariant(!it.more());
+        sortPatternProvidedByIndex = BSONObjBuilder{}.append(secondElement).obj();
     }
 
+    //
+    // There are two buckets of field names "equality fields" and "unsupported fields". The
+    // "equality fields" are those over which we have an equality predicate. These fields can
+    // optionally be ignored when checking whether a pattern is provided or not. The "unsupported
+    // fields" are fields for which we cannot provide a sort. Currently we cannot provide sort when
+    // the field is collated or multikey.
+    //
+    // The intersection of the "equality fields" and "unsupported fields" (called 'ignoreFields')
+    // can simply be ignored. The index scan does not provide these fields in sorted order (e.g.
+    // because of a mismatched collation), but due to the point bounds in the index scan, this
+    // doesn't affect our ability to provide a sort on any subsequent fields. Fields in this
+    // intersection set can simply be dropped when constructing the "base sort pattern".
+    //
+    // The remaining are 'unsupportedFields', which we get when we do a set subtraction of
+    // the initial "unsupported fields" minus 'ignoreFields'. The index scan will never provide a
+    // sort order on this field or any subsequent fields. When we encounter such a field in the
+    // index key pattern, we truncate it and any later fields to form the "base sort pattern".
+    //
+    // Example, consider an index pattern {a: 1, b: 1, c: 1, d: 1},
+    // - If the query predicate is {a: 1} and 'c' is a multikey field then, unsupportedFields = {c},
+    // equalityFields = {a}, ignoreFields = {} and baseSortPattern = {b: 1}. Field 'a' is dropped
+    // from the base sort pattern because it is an equality field. Fields 'c' and 'd' are truncted
+    // from the base sort pattern because 'c' is an unsupported field.
+    // - If the query predicate is {} and 'a' is a multikey field then, unsupportedFields = {a},
+    // equalityFields = {}, ignoreFields = {} and baseSortPattern = {}. The entire sort pattern is
+    // truncated since the first field 'a' is an unsupported field.
+    // - If the query predicate is {b: 1} with 'b' is a multikey field then, unsupportedFields = {},
+    // equalityFields = {}, ignoreFields = {b} and baseSortPattern = {a: 1, c: 1, d: 1}. Field 'b'
+    // has to be dropped from the base sort pattern, since although we are not sorted by 'b', we
+    // have point bounds on it.
+    // - If the query predicate is {b: 1, c: 1} and 'b' is a multikey field then, unsupportedFields
+    // = {}, equalityFields = {c}, ignoreFields = {b} and baseSortPattern = {a: 1, d: 1}. Field 'b'
+    // has to be dropped from the base sort pattern, since although we are not sorted by 'b', we
+    // have point bounds on it. Field 'c' is removed because of the presence of equality predicate.
+    // So we can provide sorts {a: 1, d: 1}, {a: 1, c: 1, d: 1} but not sort patterns that include
+    // field 'b'.
+    //
+    std::set<std::string> equalityFields = extractEqualityFields(bounds, index);
+    std::set<StringData> unsupportedFields;
+    std::set<StringData> ignoreFields;
     if (!CollatorInterface::collatorsMatch(queryCollator, index.collator)) {
-        // Prune sorts containing fields that don't match the collation.
-        std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, index.keyPattern);
-        auto sortsIt = _sorts.begin();
-        while (sortsIt != _sorts.end()) {
-            bool matched = false;
-            for (const BSONElement& el : *sortsIt) {
-                if (collatedFields.find(el.fieldNameStringData()) != collatedFields.end()) {
-                    sortsIt = _sorts.erase(sortsIt);
-                    matched = true;
-                    break;
-                }
-            }
-
-            if (!matched) {
-                sortsIt++;
-            }
-        }
-    }
-
-    // We cannot provide a sort which involves a multikey field. Prune such sort orders, if the
-    // index is multikey.
-    if (index.multikey) {
-        auto multikeyFields = getMultikeyFields(index.keyPattern, index.multikeyPaths);
-        for (auto sortsIt = _sorts.begin(); sortsIt != _sorts.end();) {
-            bool foundMultikeyField = false;
-            for (auto&& elt : *sortsIt) {
-                if (multikeyFields.find(elt.fieldNameStringData()) != multikeyFields.end()) {
-                    foundMultikeyField = true;
-                    break;
-                }
-            }
-
-            if (foundMultikeyField) {
-                sortsIt = _sorts.erase(sortsIt);
+        for (auto&& collatedField :
+             IndexScanNode::getFieldsWithStringBounds(bounds, index.keyPattern)) {
+            if (equalityFields.count(collatedField.toString())) {
+                ignoreFields.insert(collatedField);
+                equalityFields.erase(collatedField.toString());
             } else {
-                ++sortsIt;
+                unsupportedFields.insert(collatedField);
             }
         }
     }
+    if (index.multikey) {
+        for (auto&& multikeyField : multikeyFields) {
+            if (!confirmBoundsProvideSortComponentGivenMultikeyness(
+                    multikeyField, bounds, multikeyFields)) {
+                if (equalityFields.count(multikeyField.toString())) {
+                    ignoreFields.insert(multikeyField);
+                    equalityFields.erase(multikeyField.toString());
+                } else {
+                    unsupportedFields.insert(multikeyField);
+                }
+            }
+        }
+    }
+    // Remove all equality predicates from sort object since they do not contribute in changing the
+    // sort order.
+    sortPatternProvidedByIndex = QueryPlannerAnalysis::getSortPattern(
+        sortPatternProvidedByIndex.removeFields(equalityFields));
+    if (direction == -1) {
+        sortPatternProvidedByIndex = QueryPlannerCommon::reverseSortObj(sortPatternProvidedByIndex);
+    }
+
+    BSONObjBuilder prefixBob;
+    for (auto&& elem : sortPatternProvidedByIndex) {
+        if (ignoreFields.count(elem.fieldNameStringData())) {
+            continue;
+        }
+        // Once a multi-key/collator field is encountered we cannot provide sort the the later
+        // fields.
+        if (unsupportedFields.find(elem.fieldNameStringData()) != unsupportedFields.end()) {
+            break;
+        }
+        prefixBob.append(elem);
+    }
+    return ProvidedSortSet(prefixBob.obj(), std::move(equalityFields));
+}
+
+/**
+ * Computes sort orders for index scans, including DISTINCT_SCAN. Returns a pair where the first
+ * field is 'ProvidedSortSet', which contains all the sort orders that can be provided by the index
+ * scan. The second field is a set populated with the names of all fields that the index indicates
+ * are multikey.
+ */
+std::pair<ProvidedSortSet, std::set<StringData>> computeSortsAndMultikeyPathsForScan(
+    const IndexEntry& index,
+    int direction,
+    const IndexBounds& bounds,
+    const CollatorInterface* queryCollator) {
+    // If the index is multikey but does not have path-level multikey metadata, then this index
+    // cannot provide any sorts and we need not populate 'multikeyFieldsOut'.
+    if (index.multikey && index.multikeyPaths.empty()) {
+        return {};
+    }
+
+    std::set<StringData> multikeyFieldsOut;
+    if (index.multikey) {
+        multikeyFieldsOut = getMultikeyFields(index.keyPattern, index.multikeyPaths);
+    }
+    return {computeSortsForScan(index, direction, bounds, queryCollator, multikeyFieldsOut),
+            std::move(multikeyFieldsOut)};
+}
+}  // namespace
+
+void IndexScanNode::computeProperties() {
+    std::tie(_sorts, multikeyFields) =
+        computeSortsAndMultikeyPathsForScan(index, direction, bounds, queryCollator);
 }
 
 QuerySolutionNode* IndexScanNode::clone() const {
@@ -782,7 +896,6 @@ QuerySolutionNode* IndexScanNode::clone() const {
 
     copy->_sorts = this->_sorts;
     copy->direction = this->direction;
-    copy->maxScan = this->maxScan;
     copy->addKeyMetadata = this->addKeyMetadata;
     copy->bounds = this->bounds;
     copy->queryCollator = this->queryCollator;
@@ -806,28 +919,48 @@ bool filtersAreEquivalent(const MatchExpression* lhs, const MatchExpression* rhs
 
 bool IndexScanNode::operator==(const IndexScanNode& other) const {
     return filtersAreEquivalent(filter.get(), other.filter.get()) && index == other.index &&
-        direction == other.direction && maxScan == other.maxScan &&
-        addKeyMetadata == other.addKeyMetadata && bounds == other.bounds;
+        direction == other.direction && addKeyMetadata == other.addKeyMetadata &&
+        bounds == other.bounds;
+}
+
+//
+// ReturnKeyNode
+//
+
+void ReturnKeyNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "RETURN_KEY\n";
+    addIndent(ss, indent + 1);
+
+    *ss << "sortKeyMetaFields = ["
+        << boost::algorithm::join(
+               sortKeyMetaFields |
+                   boost::adaptors::transformed([](const auto& field) { return field.fullPath(); }),
+               ", ");
+    *ss << "]\n";
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* ReturnKeyNode::clone() const {
+    auto copy = std::make_unique<ReturnKeyNode>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), std::vector(sortKeyMetaFields));
+    return copy.release();
 }
 
 //
 // ProjectionNode
 //
 
-void ProjectionNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void ProjectionNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "PROJ\n";
     addIndent(ss, indent + 1);
-    *ss << "proj = " << projection.toString() << '\n';
+    *ss << "proj = " << projection_ast::astToDebugBSON(proj.root()).toString() << '\n';
     addIndent(ss, indent + 1);
-    if (DEFAULT == projType) {
-        *ss << "type = DEFAULT\n";
-    } else if (COVERED_ONE_INDEX == projType) {
-        *ss << "type = COVERED_ONE_INDEX\n";
-    } else {
-        invariant(SIMPLE_DOC == projType);
-        *ss << "type = SIMPLE_DOC\n";
-    }
+    *ss << "type = " << projectionImplementationTypeToString() << '\n';
     addCommon(ss, indent);
     addIndent(ss, indent + 1);
     *ss << "Child:" << '\n';
@@ -838,46 +971,57 @@ void ProjectionNode::computeProperties() {
     invariant(children.size() == 1U);
     children[0]->computeProperties();
 
-    _sorts.clear();
-
-    const BSONObjSet& inputSorts = children[0]->getSort();
-
     // Our input sort is not necessarily maintained if we project some fields that are part of the
     // sort out.
-    for (auto&& sort : inputSorts) {
-        bool sortCompatible = true;
-        for (auto&& key : sort) {
-            if (!parsed.isFieldRetainedExactly(key.fieldNameStringData())) {
-                sortCompatible = false;
-                break;
-            }
+    BSONObjBuilder prefixBob;
+    const auto& inputSorts = children[0]->providedSorts();
+    for (auto&& key : inputSorts.getBaseSortPattern()) {
+        if (!proj.isFieldRetainedExactly(key.fieldNameStringData())) {
+            break;
         }
-        if (sortCompatible) {
-            _sorts.insert(sort);
-        }
+        prefixBob.append(key);
     }
+    _sorts = ProvidedSortSet(prefixBob.obj(), inputSorts.getIgnoredFields());
 }
 
-QuerySolutionNode* ProjectionNode::clone() const {
-    ProjectionNode* copy = new ProjectionNode(parsed);
-    cloneBaseData(copy);
+void ProjectionNode::cloneProjectionData(ProjectionNode* copy) const {
+    // ProjectionNode should not populate filter. This should be a no-op.
+    if (this->filter)
+        copy->filter = this->filter->shallowClone();
 
     copy->_sorts = this->_sorts;
-
-    // This MatchExpression* is owned by the canonical query, not by the
-    // ProjectionNode. Just copying the pointer is fine.
-    copy->fullExpression = this->fullExpression;
-
-    copy->projection = this->projection;
-
-    return copy;
 }
+
+ProjectionNode* ProjectionNodeDefault::clone() const {
+    auto copy = std::make_unique<ProjectionNodeDefault>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), fullExpression, proj);
+    ProjectionNode::cloneProjectionData(copy.get());
+    return copy.release();
+}
+
+ProjectionNode* ProjectionNodeCovered::clone() const {
+    auto copy = std::make_unique<ProjectionNodeCovered>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()),
+        fullExpression,
+        proj,
+        coveredKeyObj);
+    ProjectionNode::cloneProjectionData(copy.get());
+    return copy.release();
+}
+
+ProjectionNode* ProjectionNodeSimple::clone() const {
+    auto copy = std::make_unique<ProjectionNodeSimple>(
+        std::unique_ptr<QuerySolutionNode>(children[0]->clone()), fullExpression, proj);
+    ProjectionNode::cloneProjectionData(copy.get());
+    return copy.release();
+}
+
 
 //
 // SortKeyGeneratorNode
 //
 
-void SortKeyGeneratorNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SortKeyGeneratorNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SORT_KEY_GENERATOR\n";
     addIndent(ss, indent + 1);
@@ -899,9 +1043,11 @@ QuerySolutionNode* SortKeyGeneratorNode::clone() const {
 // SortNode
 //
 
-void SortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SortNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SORT\n";
+    addIndent(ss, indent + 1);
+    *ss << "type = " << sortImplementationTypeToString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "pattern = " << pattern.toString() << '\n';
     addIndent(ss, indent + 1);
@@ -912,15 +1058,24 @@ void SortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     children[0]->appendToString(ss, indent + 2);
 }
 
-QuerySolutionNode* SortNode::clone() const {
-    SortNode* copy = new SortNode();
+void SortNode::cloneSortData(SortNode* copy) const {
     cloneBaseData(copy);
-
     copy->_sorts = this->_sorts;
     copy->pattern = this->pattern;
     copy->limit = this->limit;
+    copy->addSortKeyMetadata = this->addSortKeyMetadata;
+}
 
-    return copy;
+QuerySolutionNode* SortNodeDefault::clone() const {
+    auto copy = std::make_unique<SortNodeDefault>();
+    cloneSortData(copy.get());
+    return copy.release();
+}
+
+QuerySolutionNode* SortNodeSimple::clone() const {
+    auto copy = std::make_unique<SortNodeSimple>();
+    cloneSortData(copy.get());
+    return copy.release();
 }
 
 //
@@ -928,7 +1083,7 @@ QuerySolutionNode* SortNode::clone() const {
 //
 
 
-void LimitNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void LimitNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "LIMIT\n";
     addIndent(ss, indent + 1);
@@ -953,7 +1108,7 @@ QuerySolutionNode* LimitNode::clone() const {
 // SkipNode
 //
 
-void SkipNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void SkipNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SKIP\n";
     addIndent(ss, indent + 1);
@@ -977,18 +1132,18 @@ QuerySolutionNode* SkipNode::clone() const {
 // GeoNear2DNode
 //
 
-void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void GeoNear2DNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2D\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
     *ss << "nearQuery = " << nq->toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
 }
 
@@ -1009,20 +1164,20 @@ QuerySolutionNode* GeoNear2DNode::clone() const {
 // GeoNear2DSphereNode
 //
 
-void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void GeoNear2DSphereNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2DSPHERE\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
     *ss << "baseBounds = " << baseBounds.toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "nearQuery = " << nq->toString() << '\n';
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
-        *ss << " filter = " << filter->toString();
+        *ss << " filter = " << filter->debugString();
     }
 }
 
@@ -1043,10 +1198,10 @@ QuerySolutionNode* GeoNear2DSphereNode::clone() const {
 // ShardingFilterNode
 //
 
-void ShardingFilterNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void ShardingFilterNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SHARDING_FILTER\n";
-    if (NULL != filter) {
+    if (nullptr != filter) {
         addIndent(ss, indent + 1);
         StringBuilder sb;
         *ss << "filter:\n";
@@ -1066,43 +1221,14 @@ QuerySolutionNode* ShardingFilterNode::clone() const {
 }
 
 //
-// KeepMutationsNode
-//
-
-void KeepMutationsNode::appendToString(mongoutils::str::stream* ss, int indent) const {
-    addIndent(ss, indent);
-    *ss << "KEEP_MUTATIONS\n";
-    if (NULL != filter) {
-        addIndent(ss, indent + 1);
-        StringBuilder sb;
-        *ss << "filter:\n";
-        filter->debugString(sb, indent + 2);
-        *ss << sb.str();
-    }
-    addCommon(ss, indent);
-    addIndent(ss, indent + 1);
-    *ss << "Child:" << '\n';
-    children[0]->appendToString(ss, indent + 2);
-}
-
-QuerySolutionNode* KeepMutationsNode::clone() const {
-    KeepMutationsNode* copy = new KeepMutationsNode();
-    cloneBaseData(copy);
-
-    copy->sorts = this->sorts;
-
-    return copy;
-}
-
-//
 // DistinctNode
 //
 
-void DistinctNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void DistinctNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "DISTINCT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);
@@ -1118,20 +1244,27 @@ QuerySolutionNode* DistinctNode::clone() const {
     copy->sorts = this->sorts;
     copy->direction = this->direction;
     copy->bounds = this->bounds;
+    copy->queryCollator = this->queryCollator;
     copy->fieldNo = this->fieldNo;
 
     return copy;
+}
+
+void DistinctNode::computeProperties() {
+    // Note that we don't need to save the returned multikey fields for a DISTINCT_SCAN. They are
+    // only needed for explodeForSort(), which works on IXSCAN but not DISTINCT_SCAN.
+    sorts = computeSortsAndMultikeyPathsForScan(index, direction, bounds, queryCollator).first;
 }
 
 //
 // CountScanNode
 //
 
-void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CountScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);
@@ -1157,7 +1290,7 @@ QuerySolutionNode* CountScanNode::clone() const {
 // EnsureSortedNode
 //
 
-void EnsureSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void EnsureSortedNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "ENSURE_SORTED\n";
     addIndent(ss, indent + 1);

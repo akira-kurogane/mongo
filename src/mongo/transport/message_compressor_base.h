@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,6 +41,7 @@ enum class MessageCompressor : uint8_t {
     kNoop = 0,
     kSnappy = 1,
     kZlib = 2,
+    kZstd = 3,
     kExtended = 255,
 };
 
@@ -47,13 +49,14 @@ StringData getMessageCompressorName(MessageCompressor id);
 using MessageCompressorId = std::underlying_type<MessageCompressor>::type;
 
 class MessageCompressorBase {
-    MONGO_DISALLOW_COPYING(MessageCompressorBase);
+    MessageCompressorBase(const MessageCompressorBase&) = delete;
+    MessageCompressorBase& operator=(const MessageCompressorBase&) = delete;
 
 public:
     virtual ~MessageCompressorBase() = default;
 
     /*
-     * Returns the name for subclass compressors (e.g. "snappy", "zlib", or "noop")
+     * Returns the name for subclass compressors (e.g. "snappy", "zlib", "zstd" or "noop")
      */
     const std::string& getName() const {
         return _name;
@@ -89,28 +92,28 @@ public:
     /*
      * This returns the number of bytes passed in the input for compressData
      */
-    int64_t getCompressedBytesIn() const {
+    int64_t getCompressorBytesIn() const {
         return _compressBytesIn.loadRelaxed();
     }
 
     /*
      * This returns the number of bytes written to output for compressData
      */
-    int64_t getCompressedBytesOut() const {
+    int64_t getCompressorBytesOut() const {
         return _compressBytesOut.loadRelaxed();
     }
 
     /*
      * This returns the number of bytes passed in the input for decompressData
      */
-    int64_t getDecompressedBytesIn() const {
+    int64_t getDecompressorBytesIn() const {
         return _decompressBytesIn.loadRelaxed();
     }
 
     /*
      * This returns the number of bytes written to output for decompressData
      */
-    int64_t getDecompressedBytesOut() const {
+    int64_t getDecompressorBytesOut() const {
         return _decompressBytesOut.loadRelaxed();
     }
 
@@ -143,10 +146,10 @@ private:
     const MessageCompressorId _id;
     const std::string _name;
 
-    AtomicInt64 _compressBytesIn;
-    AtomicInt64 _compressBytesOut;
+    AtomicWord<long long> _compressBytesIn;
+    AtomicWord<long long> _compressBytesOut;
 
-    AtomicInt64 _decompressBytesIn;
-    AtomicInt64 _decompressBytesOut;
+    AtomicWord<long long> _decompressBytesIn;
+    AtomicWord<long long> _decompressBytesOut;
 };
 }  // namespace mongo

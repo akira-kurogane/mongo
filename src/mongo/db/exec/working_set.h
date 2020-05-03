@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,144 +29,28 @@
 
 #pragma once
 
+#include "boost/optional.hpp"
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/snapshot.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
 class IndexAccessMethod;
-class RecordFetcher;
 class WorkingSetMember;
 
 typedef size_t WorkingSetID;
 
 /**
- * All data in use by a query.  Data is passed through the stage tree by referencing the ID of
- * an element of the working set.  Stages can add elements to the working set, delete elements
- * from the working set, or mutate elements in the working set.
- *
- * Concurrency Notes:
- * flagForReview() can only be called with a write lock covering the collection this WorkingSet
- * is for. All other methods should only be called by the thread owning this WorkingSet while
- * holding the read lock covering the collection.
+ * A type used to identify indexes that have been registered with the WorkingSet. A WorkingSetMember
+ * can be associated with a particular index via this id.
  */
-class WorkingSet {
-    MONGO_DISALLOW_COPYING(WorkingSet);
-
-public:
-    static const WorkingSetID INVALID_ID = WorkingSetID(-1);
-
-    WorkingSet();
-    ~WorkingSet();
-
-    /**
-     * Allocate a new query result and return the ID used to get and free it.
-     */
-    WorkingSetID allocate();
-
-    /**
-     * Get the i-th mutable query result. The pointer will be valid for this id until freed.
-     * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
-     * release it.
-     */
-    WorkingSetMember* get(WorkingSetID i) const {
-        dassert(i < _data.size());              // ID has been allocated.
-        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
-        return _data[i].member;
-    }
-
-    /**
-     * Returns true if WorkingSetMember with id 'i' is free.
-     */
-    bool isFree(WorkingSetID i) const {
-        return _data[i].nextFreeOrSelf != i;
-    }
-
-    /**
-     * Deallocate the i-th query result and release its resources.
-     */
-    void free(WorkingSetID i);
-
-    /**
-     * The RecordId in WSM 'i' was invalidated while being processed.  Any predicates over the
-     * WSM could not be fully evaluated, so the WSM may or may not satisfy them.  As such, if we
-     * wish to output the WSM, we must do some clean-up work later.  Adds the WSM with id 'i' to
-     * the list of flagged WSIDs.
-     *
-     * The WSM must be in the state OWNED_OBJ.
-     */
-    void flagForReview(WorkingSetID i);
-
-    /**
-     * Return true if the provided ID is flagged.
-     */
-    bool isFlagged(WorkingSetID id) const;
-
-    /**
-     * Return the set of all WSIDs passed to flagForReview.
-     */
-    const unordered_set<WorkingSetID>& getFlagged() const;
-
-    /**
-     * Removes and deallocates all members of this working set.
-     */
-    void clear();
-
-    //
-    // WorkingSetMember state transitions
-    //
-
-    void transitionToRecordIdAndIdx(WorkingSetID id);
-    void transitionToRecordIdAndObj(WorkingSetID id);
-    void transitionToOwnedObj(WorkingSetID id);
-
-    /**
-     * Returns the list of working set ids that have transitioned into the RID_AND_IDX or
-     * RID_AND_OBJ state since the last yield. The members corresponding to these ids may have since
-     * transitioned to a different state or been freed, so these cases must be handled by the
-     * caller. The list may also contain duplicates.
-     *
-     * Execution stages are *not* responsible for managing this list, as working set ids are added
-     * to the set automatically by WorkingSet::transitionToRecordIdAndIdx() and
-     * WorkingSet::transitionToRecordIdAndObj().
-     *
-     * As a side effect, calling this method clears the list of flagged ids kept by the working set.
-     */
-    std::vector<WorkingSetID> getAndClearYieldSensitiveIds();
-
-private:
-    struct MemberHolder {
-        MemberHolder();
-        ~MemberHolder();
-
-        // Free list link if freed. Points to self if in use.
-        WorkingSetID nextFreeOrSelf;
-
-        // Owning pointer
-        WorkingSetMember* member;
-    };
-
-    // All WorkingSetIDs are indexes into this, except for INVALID_ID.
-    // Elements are added to _freeList rather than removed when freed.
-    std::vector<MemberHolder> _data;
-
-    // Index into _data, forming a linked-list using MemberHolder::nextFreeOrSelf as the next
-    // link. INVALID_ID is the list terminator since 0 is a valid index.
-    // If _freeList == INVALID_ID, the free list is empty and all elements in _data are in use.
-    WorkingSetID _freeList;
-
-    // An insert-only set of WorkingSetIDs that have been flagged for review.
-    stdx::unordered_set<WorkingSetID> _flagged;
-
-    // Contains ids of WSMs that may need to be adjusted when we next yield.
-    std::vector<WorkingSetID> _yieldSensitiveIds;
-};
+using WorkingSetRegisteredIndexId = unsigned int;
 
 /**
  * The key data extracted from an index.  Keeps track of both the key (currently a BSONObj) and
@@ -173,8 +58,34 @@ private:
  * the key.
  */
 struct IndexKeyDatum {
-    IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key, const IndexAccessMethod* index)
-        : indexKeyPattern(keyPattern), keyData(key), index(index) {}
+    IndexKeyDatum(const BSONObj& keyPattern,
+                  const BSONObj& key,
+                  WorkingSetRegisteredIndexId indexId,
+                  SnapshotId snapshotId)
+        : indexKeyPattern(keyPattern), keyData(key), indexId(indexId), snapshotId(snapshotId) {}
+
+    /**
+     * getFieldDotted produces the field with the provided name based on index keyData. The return
+     * object is populated if the element is in a provided index key.  Returns none otherwise.
+     * Returning none indicates a query planning error.
+     */
+    static boost::optional<BSONElement> getFieldDotted(const std::vector<IndexKeyDatum>& keyData,
+                                                       const std::string& field) {
+        for (size_t i = 0; i < keyData.size(); ++i) {
+            BSONObjIterator keyPatternIt(keyData[i].indexKeyPattern);
+            BSONObjIterator keyDataIt(keyData[i].keyData);
+
+            while (keyPatternIt.more()) {
+                BSONElement keyPatternElt = keyPatternIt.next();
+                verify(keyDataIt.more());
+                BSONElement keyDataElt = keyDataIt.next();
+
+                if (field == keyPatternElt.fieldName())
+                    return boost::make_optional(keyDataElt);
+            }
+        }
+        return boost::none;
+    }
 
     // This is not owned and points into the IndexDescriptor's data.
     BSONObj indexKeyPattern;
@@ -182,51 +93,12 @@ struct IndexKeyDatum {
     // This is the BSONObj for the key that we put into the index.  Owned by us.
     BSONObj keyData;
 
-    const IndexAccessMethod* index;
-};
+    // Associates this index key with an index that has been registered with the WorkingSet. Can be
+    // used to recover pointers to catalog objects for this index from the WorkingSet.
+    WorkingSetRegisteredIndexId indexId;
 
-/**
- * What types of computed data can we have?
- */
-enum WorkingSetComputedDataType {
-    // What's the score of the document retrieved from a $text query?
-    WSM_COMPUTED_TEXT_SCORE = 0,
-
-    // What's the distance from a geoNear query point to the document?
-    WSM_COMPUTED_GEO_DISTANCE = 1,
-
-    // The index key used to retrieve the document, for returnKey query option.
-    WSM_INDEX_KEY = 2,
-
-    // What point (of several possible points) was used to compute the distance to the document
-    // via geoNear?
-    WSM_GEO_NEAR_POINT = 3,
-
-    // Comparison key for sorting.
-    WSM_SORT_KEY = 4,
-
-    // Must be last.
-    WSM_COMPUTED_NUM_TYPES,
-};
-
-/**
- * Data that is a computed function of a WSM.
- */
-class WorkingSetComputedData {
-    MONGO_DISALLOW_COPYING(WorkingSetComputedData);
-
-public:
-    WorkingSetComputedData(const WorkingSetComputedDataType type) : _type(type) {}
-    virtual ~WorkingSetComputedData() {}
-
-    WorkingSetComputedDataType type() const {
-        return _type;
-    }
-
-    virtual WorkingSetComputedData* clone() const = 0;
-
-private:
-    WorkingSetComputedDataType _type;
+    // Identifies the storage engine snapshot from which this index key was obtained.
+    SnapshotId snapshotId;
 };
 
 /**
@@ -239,17 +111,7 @@ private:
  * A WorkingSetMember may have any of the data above.
  */
 class WorkingSetMember {
-    MONGO_DISALLOW_COPYING(WorkingSetMember);
-
 public:
-    WorkingSetMember();
-    ~WorkingSetMember();
-
-    /**
-     * Reset to an "empty" state.
-     */
-    void clear();
-
     enum MemberState {
         // Initial state.
         INVALID,
@@ -261,16 +123,26 @@ public:
         // BSONObj might be owned or unowned.
         RID_AND_OBJ,
 
-        // RecordId has been invalidated, or the obj doesn't correspond to an on-disk document
-        // anymore (e.g. is a computed expression).
+        // The WSM doesn't correspond to an on-disk document anymore (e.g. is a computed
+        // expression). Since it doesn't correspond to a stored document, a WSM in this state has an
+        // owned BSONObj, but no record id.
         OWNED_OBJ,
     };
+
+    static WorkingSetMember deserialize(BufReader& buf);
+
+    /**
+     * Reset to an "empty" state.
+     */
+    void clear();
 
     //
     // Member state and state transitions
     //
 
     MemberState getState() const;
+
+    void transitionToRecordIdAndObj();
 
     void transitionToOwnedObj();
 
@@ -279,12 +151,8 @@ public:
     //
 
     RecordId recordId;
-    Snapshotted<BSONObj> obj;
+    Snapshotted<Document> doc;
     std::vector<IndexKeyDatum> keyData;
-
-    // True if this WSM has survived a yield in RID_AND_IDX state.
-    // TODO consider replacing by tracking SnapshotIds for IndexKeyDatums.
-    bool isSuspicious = false;
 
     bool hasRecordId() const;
     bool hasObj() const;
@@ -294,26 +162,10 @@ public:
      * Ensures that 'obj' of a WSM in the RID_AND_OBJ state is owned BSON. It is a no-op if the WSM
      * is in a different state or if 'obj' is already owned.
      *
-     * It is also a no-op if the active storage engine doesn't support document-level concurrency.
+     * It is illegal for unowned BSON to survive a yield, so this must be called on any working set
+     * members which may stay alive across yield points.
      */
     void makeObjOwnedIfNeeded();
-
-    //
-    // Computed data
-    //
-
-    bool hasComputed(const WorkingSetComputedDataType type) const;
-    const WorkingSetComputedData* getComputed(const WorkingSetComputedDataType type) const;
-    void addComputed(WorkingSetComputedData* data);
-
-    //
-    // Fetching
-    //
-
-    void setFetcher(RecordFetcher* fetcher);
-    // Transfers ownership to the caller.
-    RecordFetcher* releaseFetcher();
-    bool hasFetcher() const;
 
     /**
      * getFieldDotted uses its state (obj or index data) to produce the field with the provided
@@ -331,14 +183,232 @@ public:
      */
     size_t getMemUsage() const;
 
+    /**
+     * Returns a const reference to an object housing the metadata fields associated with this
+     * WorkingSetMember.
+     */
+    const DocumentMetadataFields& metadata() const {
+        return _metadata;
+    }
+
+    /**
+     * Returns a non-const reference to an object housing the metadata fields associated with this
+     * WorkingSetMember.
+     */
+    DocumentMetadataFields& metadata() {
+        return _metadata;
+    }
+
+    /**
+     * Clears all metadata fields inside this WorkingSetMember, and returns a structure containing
+     * that extracted metadata to the caller. The metadata can then be attached to a new
+     * WorkingSetMember or to another data structure that houses metadata.
+     */
+    DocumentMetadataFields releaseMetadata() {
+        return std::move(_metadata);
+    }
+
+    /**
+     * Transfers metadata fields to this working set member. By pairs of calls to releaseMetadata()
+     * and setMetadata(), callers can cheaply transfer metadata between WorkingSetMembers.
+     */
+    void setMetadata(DocumentMetadataFields&& metadata) {
+        _metadata = std::move(metadata);
+    }
+
+    /**
+     * Resets the underlying BSONObj in the doc field. This avoids unnecessary allocation/
+     * deallocation of Document/DocumentStorage objects.
+     */
+    void resetDocument(SnapshotId snapshot, const BSONObj& obj);
+
+    void serialize(BufBuilder& buf) const;
+
 private:
     friend class WorkingSet;
 
     MemberState _state = WorkingSetMember::INVALID;
 
-    std::unique_ptr<WorkingSetComputedData> _computed[WSM_COMPUTED_NUM_TYPES];
+    DocumentMetadataFields _metadata;
+};
 
-    std::unique_ptr<RecordFetcher> _fetcher;
+/**
+ * A variant of WorkingSetMember that is designed to be compatible with the SortExecutor. Objects of
+ * this type are small, acting only as a handle to the underlying WorkingSetMember. This means that
+ * they can be efficiently copied or moved during the sorting process while the actual
+ * WorkingSetMember data remains in place.
+ *
+ * A SortableWorkingSetMember supports serialization and deserialization so that objects of this
+ * type can be flushed to disk and later recovered.
+ */
+class SortableWorkingSetMember {
+public:
+    struct SorterDeserializeSettings {};
+
+    static SortableWorkingSetMember deserializeForSorter(BufReader& buf,
+                                                         const SorterDeserializeSettings&) {
+        return WorkingSetMember::deserialize(buf);
+    }
+
+    /**
+     * Constructs an empty SortableWorkingSetMember.
+     */
+    SortableWorkingSetMember() = default;
+
+    /**
+     * Constructs a SortableWorkingSetMember from a regular WorkingSetMember. Supports implicit
+     * conversion from WorkingSetMember.
+     */
+    /* implicit */ SortableWorkingSetMember(WorkingSetMember&& wsm)
+        : _holder(std::make_shared<WorkingSetMember>(std::move(wsm))) {}
+
+    void serializeForSorter(BufBuilder& buf) const {
+        _holder->serialize(buf);
+    }
+
+    int memUsageForSorter() const {
+        return _holder->getMemUsage();
+    }
+
+    /**
+     * Extracts and returns the underlying WorkingSetMember held by this SortableWorkingSetMember.
+     */
+    WorkingSetMember extract() {
+        return std::move(*_holder);
+    }
+
+    /**
+     * Returns a reference to the underlying WorkingSetMember.
+     */
+    WorkingSetMember* operator->() const {
+        return _holder.get();
+    }
+
+    WorkingSetMember& operator*() const {
+        return *_holder;
+    }
+
+    SortableWorkingSetMember getOwned() const;
+
+private:
+    std::shared_ptr<WorkingSetMember> _holder;
+};
+
+/**
+ * All data in use by a query.  Data is passed through the stage tree by referencing the ID of
+ * an element of the working set.  Stages can add elements to the working set, delete elements
+ * from the working set, or mutate elements in the working set.
+ */
+class WorkingSet {
+    WorkingSet(const WorkingSet&) = delete;
+    WorkingSet& operator=(const WorkingSet&) = delete;
+
+public:
+    static const WorkingSetID INVALID_ID = WorkingSetID(-1);
+
+    WorkingSet();
+
+    ~WorkingSet() = default;
+
+    /**
+     * Allocate a new query result and return the ID used to get and free it.
+     */
+    WorkingSetID allocate();
+
+    /**
+     * Get the i-th mutable query result. The pointer will be valid for this id until freed.
+     * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
+     * release it.
+     */
+    WorkingSetMember* get(WorkingSetID i) {
+        dassert(i < _data.size());              // ID has been allocated.
+        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
+        return &_data[i].member;
+    }
+
+    const WorkingSetMember* get(WorkingSetID i) const {
+        dassert(i < _data.size());              // ID has been allocated.
+        dassert(_data[i].nextFreeOrSelf == i);  // ID currently in use.
+        return &_data[i].member;
+    }
+
+    /**
+     * Returns true if WorkingSetMember with id 'i' is free.
+     */
+    bool isFree(WorkingSetID i) const {
+        return _data[i].nextFreeOrSelf != i;
+    }
+
+    /**
+     * Deallocate the i-th query result and release its resources.
+     */
+    void free(WorkingSetID i);
+
+    /**
+     * Removes and deallocates all members of this working set.
+     */
+    void clear();
+
+    //
+    // WorkingSetMember state transitions
+    //
+
+    void transitionToRecordIdAndIdx(WorkingSetID id);
+    void transitionToRecordIdAndObj(WorkingSetID id);
+    void transitionToOwnedObj(WorkingSetID id);
+
+    /**
+     * Registers an IndexAccessMethod pointer with the WorkingSet, and returns a handle that can be
+     * used to recover the IndexAccessMethod.
+     */
+    WorkingSetRegisteredIndexId registerIndexAccessMethod(const IndexAccessMethod* indexAccess);
+
+    /**
+     * Returns the IndexAccessMethod for an index that has previously been registered with the
+     * WorkingSet using 'registerIndexAccessMethod()'.
+     */
+    const IndexAccessMethod* retrieveIndexAccessMethod(WorkingSetRegisteredIndexId indexId) const {
+        return _registeredIndexes[indexId];
+    }
+
+    /**
+     * Returns the WorkingSetMember with the given id after removing it from this WorkingSet. The
+     * WSM can be reinstated in the WorkingSet by calling 'emplace()'.
+     *
+     * WorkingSetMembers typically only temporarily live free of their WorkingSet, so calls to
+     * 'extract()' and 'emplace()' should come in pairs.
+     */
+    WorkingSetMember extract(WorkingSetID);
+
+    /**
+     * Puts the given WorkingSetMember into this WorkingSet. Assigns the WorkingSetMember an id and
+     * returns it. This id can be used later to obtain a pointer to the WSM using 'get()'.
+     *
+     * WorkingSetMembers typically only temporarily live free of their WorkingSet, so calls to
+     * 'extract()' and 'emplace()' should come in pairs.
+     */
+    WorkingSetID emplace(WorkingSetMember&&);
+
+private:
+    struct MemberHolder {
+        // Free list link if freed. Points to self if in use.
+        WorkingSetID nextFreeOrSelf;
+
+        WorkingSetMember member;
+    };
+
+    // All WorkingSetIDs are indexes into this, except for INVALID_ID.
+    // Elements are added to _freeList rather than removed when freed.
+    std::vector<MemberHolder> _data;
+
+    // Index into _data, forming a linked-list using MemberHolder::nextFreeOrSelf as the next
+    // link. INVALID_ID is the list terminator since 0 is a valid index.
+    // If _freeList == INVALID_ID, the free list is empty and all elements in _data are in use.
+    WorkingSetID _freeList;
+
+    // Holds IndexAccessMethods that have been registered with 'registerIndexAccessMethod()`. The
+    // WorkingSetRegisteredIndexId is the offset into the vector.
+    std::vector<const IndexAccessMethod*> _registeredIndexes;
 };
 
 }  // namespace mongo

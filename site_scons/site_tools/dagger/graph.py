@@ -1,13 +1,33 @@
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 import sys
 import logging
 import abc
 import json
 import copy
 
-import graph_consts
+from . import graph_consts
 
-if sys.version_info >= (3, 0):
-    basestring = str
 
 class Graph(object):
     """Graph class for storing the build dependency graph. The graph stores the
@@ -20,9 +40,9 @@ class Graph(object):
         """
         A graph can be initialized with a .json file, graph object, or with no args
         """
-        if isinstance(input, basestring):
-            if input.endswith('.json'):
-                with open(input, 'r') as f:
+        if isinstance(input, str):
+            if input.endswith(".json"):
+                with open(input, "r") as f:
                     data = json.load(f, encoding="ascii")
                 nodes = {}
                 should_fail = False
@@ -30,8 +50,9 @@ class Graph(object):
                 for node in data["nodes"]:
                     id = str(node["id"])
                     try:
-                        nodes[id] = node_factory(id, int(node["node"]["type"]),
-                                                 dict_source=node["node"])
+                        nodes[id] = node_factory(
+                            id, int(node["node"]["type"]), dict_source=node["node"]
+                        )
                     except Exception as e:
                         logging.warning("Malformed Data: " + id)
                         should_fail = True
@@ -72,7 +93,7 @@ class Graph(object):
 
     @nodes.setter
     def nodes(self, value):
-        if isinstance(value,dict):
+        if isinstance(value, dict):
             self._nodes = value
         else:
             raise TypeError("Nodes must be a dict")
@@ -119,7 +140,9 @@ class Graph(object):
         if from_node not in self._edges[relationship]:
             self._edges[relationship][from_node] = set()
 
-        if any(item is None for item in (from_node, to_node, from_node_obj, to_node_obj)):
+        if any(
+            item is None for item in (from_node, to_node, from_node_obj, to_node_obj)
+        ):
             raise ValueError
 
         self._edges[relationship][from_node].add(to_node)
@@ -141,7 +164,7 @@ class Graph(object):
             node_dict["id"] = id
             node_dict["node"] = {}
 
-            for property, value in vars(node).iteritems():
+            for property, value in vars(node).items():
                 if isinstance(value, set):
                     node_dict["node"][property] = list(value)
                 else:
@@ -151,29 +174,35 @@ class Graph(object):
 
         for edge_type in graph_consts.RELATIONSHIP_TYPES:
             edges_dict = self._edges[edge_type]
-            for node in edges_dict.keys():
+            for node in list(edges_dict.keys()):
                 to_nodes = list(self._edges[edge_type][node])
-                to_nodes_dicts = [{"index": node_index[to_node], "id": to_node}
-                                  for to_node in to_nodes]
+                to_nodes_dicts = [
+                    {"index": node_index[to_node], "id": to_node}
+                    for to_node in to_nodes
+                ]
 
-                data["edges"].append({"type": edge_type,
-                                      "from_node": {"id": node,
-                                                    "index": node_index[node]},
-                                      "to_node": to_nodes_dicts})
+                data["edges"].append(
+                    {
+                        "type": edge_type,
+                        "from_node": {"id": node, "index": node_index[node]},
+                        "to_node": to_nodes_dicts,
+                    }
+                )
 
-        with open(filename, 'w') as outfile:
-            json.dump(data, outfile, indent=4, encoding="ascii")
+        with open(filename, "w", encoding="ascii") as outfile:
+            json.dump(data, outfile, indent=4)
 
     def __str__(self):
-        return ("<Number of Nodes : {0}, Number of Edges : {1}, "
-                "Hash: {2}>").format(len(self._nodes.keys()),
-                sum(len(x) for x in self._edges.values()), hash(self))
+        return ("<Number of Nodes : {0}, Number of Edges : {1}, " "Hash: {2}>").format(
+            len(list(self._nodes.keys())),
+            sum(len(x) for x in list(self._edges.values())),
+            hash(self),
+        )
 
 
-class NodeInterface(object):
+class NodeInterface(object, metaclass=abc.ABCMeta):
     """Abstract base class for all Node Objects - All nodes must have an id and name
     """
-    __metaclass__ = abc.ABCMeta
 
     @abc.abstractproperty
     def id(self):
@@ -187,10 +216,11 @@ class NodeInterface(object):
 class NodeLib(NodeInterface):
     """NodeLib class which represents a library within the graph
     """
+
     def __init__(self, id, name, input=None):
         if isinstance(input, dict):
             should_fail = False
-            for k, v in input.iteritems():
+            for k, v in input.items():
                 try:
                     if isinstance(v, list):
                         setattr(self, k, set(v))
@@ -287,10 +317,13 @@ class NodeLib(NodeInterface):
 
     def __eq__(self, other):
         if isinstance(other, NodeLib):
-            return (self._id == other._id and self._defined_symbols == other._defined_symbols and
-                    self._defined_files == other._defined_files and
-                    self._dependent_libs == other._dependent_libs and
-                    self._dependent_files == other._dependent_files)
+            return (
+                self._id == other._id
+                and self._defined_symbols == other._defined_symbols
+                and self._defined_files == other._defined_files
+                and self._dependent_libs == other._dependent_libs
+                and self._dependent_files == other._dependent_files
+            )
 
         else:
             return False
@@ -310,7 +343,7 @@ class NodeSymbol(NodeInterface):
         if isinstance(input, dict):
             should_fail = False
 
-            for k, v in input.iteritems():
+            for k, v in input.items():
                 try:
                     if isinstance(v, list):
                         setattr(self, k, set(v))
@@ -413,11 +446,13 @@ class NodeSymbol(NodeInterface):
 
     def __eq__(self, other):
         if isinstance(other, NodeSymbol):
-            return (self.id == other.id and self._libs == other._libs and
-                    self._files == other._files and
-                    self._dependent_libs == other._dependent_libs and
-                    self._dependent_files == other._dependent_files
-                    )
+            return (
+                self.id == other.id
+                and self._libs == other._libs
+                and self._files == other._files
+                and self._dependent_libs == other._dependent_libs
+                and self._dependent_files == other._dependent_files
+            )
         else:
             return False
 
@@ -435,7 +470,7 @@ class NodeFile(NodeInterface):
     def __init__(self, id, name, input=None):
         if isinstance(input, dict):
             should_fail = False
-            for k, v in input.iteritems():
+            for k, v in input.items():
                 try:
                     if isinstance(v, list):
                         setattr(self, k, set(v))
@@ -526,16 +561,19 @@ class NodeFile(NodeInterface):
                 self.add_dependent_lib(from_node.library)
                 g.add_edge(graph_consts.LIB_FIL, from_node.library, self.id)
                 if lib_node is not None:
-                        lib_node.add_dependent_file(from_node.id)
-                        lib_node.add_dependent_lib(from_node.library)
-                        g.add_edge(graph_consts.FIL_LIB, from_node.id, lib_node.id)
+                    lib_node.add_dependent_file(from_node.id)
+                    lib_node.add_dependent_lib(from_node.library)
+                    g.add_edge(graph_consts.FIL_LIB, from_node.id, lib_node.id)
 
     def __eq__(self, other):
         if isinstance(other, NodeSymbol):
-            return (self.id == other.id and self._lib == other._lib and
-                    self._dependent_libs == other._dependent_libs and
-                    self._dependent_files == other._dependent_files and
-                    self._defined_symbols == other._defined_symbols)
+            return (
+                self.id == other.id
+                and self._lib == other._lib
+                and self._dependent_libs == other._dependent_libs
+                and self._dependent_files == other._dependent_files
+                and self._defined_symbols == other._defined_symbols
+            )
 
         else:
             return False
@@ -551,7 +589,7 @@ class NodeExe(NodeInterface):
     def __init__(self, id, name, input=None):
         if isinstance(input, dict):
             should_fail = False
-            for k, v in input.iteritems():
+            for k, v in input.items():
                 try:
                     if isinstance(v, list):
                         setattr(self, k, set(v))
@@ -580,10 +618,12 @@ class NodeExe(NodeInterface):
         return self.id
 
 
-types = {graph_consts.NODE_LIB: NodeLib,
-         graph_consts.NODE_SYM: NodeSymbol,
-         graph_consts.NODE_FILE: NodeFile,
-         graph_consts.NODE_EXE: NodeExe,}
+types = {
+    graph_consts.NODE_LIB: NodeLib,
+    graph_consts.NODE_SYM: NodeSymbol,
+    graph_consts.NODE_FILE: NodeFile,
+    graph_consts.NODE_EXE: NodeExe,
+}
 
 
 def node_factory(id, nodetype, dict_source=None):

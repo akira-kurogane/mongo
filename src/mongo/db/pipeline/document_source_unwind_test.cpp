@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,17 +38,16 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
-#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -68,7 +68,7 @@ static const char* const ns = "unittests.document_source_group_tests";
 class CheckResultsBase {
 public:
     CheckResultsBase()
-        : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
+        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()),
           _ctx(new ExpressionContextForTest(_opCtx.get(),
                                             AggregationRequest(NamespaceString(ns), {}))) {}
@@ -163,8 +163,7 @@ private:
     void createUnwind(bool preserveNullAndEmptyArrays, bool includeArrayIndex) {
         auto specObj =
             DOC("$unwind" << DOC("path" << unwindFieldPath() << "preserveNullAndEmptyArrays"
-                                        << preserveNullAndEmptyArrays
-                                        << "includeArrayIndex"
+                                        << preserveNullAndEmptyArrays << "includeArrayIndex"
                                         << (includeArrayIndex ? Value(indexPath()) : Value())));
         _unwind = static_cast<DocumentSourceUnwind*>(
             DocumentSourceUnwind::createFromBson(specObj.toBson().firstElement(), ctx()).get());
@@ -178,7 +177,7 @@ private:
      * '_unwind' must be initialized before calling this method.
      */
     void assertResultsMatch(BSONObj expectedResults) {
-        auto source = DocumentSourceMock::create(inputData());
+        auto source = DocumentSourceMock::createForTest(inputData(), ctx());
         _unwind->setSource(source.get());
         // Load the results from the DocumentSourceUnwind.
         vector<Document> resultSet;
@@ -474,8 +473,9 @@ class SeveralMoreDocuments : public CheckResultsBase {
     deque<DocumentSource::GetNextResult> inputData() override {
         return {DOC("_id" << 0 << "a" << BSONNULL),
                 DOC("_id" << 1),
-                DOC("_id" << 2 << "a" << DOC_ARRAY("a"_sd
-                                                   << "b"_sd)),
+                DOC("_id" << 2 << "a"
+                          << DOC_ARRAY("a"_sd
+                                       << "b"_sd)),
                 DOC("_id" << 3),
                 DOC("_id" << 4 << "a" << DOC_ARRAY(1 << 2 << 3)),
                 DOC("_id" << 5 << "a" << DOC_ARRAY(4 << 5 << 6)),
@@ -676,23 +676,11 @@ TEST_F(UnwindStageTest, AddsUnwoundPathToDependencies) {
     auto unwind =
         DocumentSourceUnwind::create(getExpCtx(), "x.y.z", false, boost::optional<string>("index"));
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::SEE_NEXT, unwind->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, unwind->getDependencies(&dependencies));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(1U, dependencies.fields.count("x.y.z"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
-}
-
-TEST_F(UnwindStageTest, TruncatesOutputSortAtUnwoundPath) {
-    auto unwind = DocumentSourceUnwind::create(getExpCtx(), "x.y", false, boost::none);
-    auto source = DocumentSourceMock::create();
-    source->sorts = {BSON("a" << 1 << "x.y" << 1 << "b" << 1)};
-
-    unwind->setSource(source.get());
-
-    BSONObjSet outputSort = unwind->getOutputSorts();
-    ASSERT_EQUALS(1U, outputSort.size());
-    ASSERT_EQUALS(1U, outputSort.count(BSON("a" << 1)));
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(UnwindStageTest, ShouldPropagatePauses) {
@@ -701,9 +689,10 @@ TEST_F(UnwindStageTest, ShouldPropagatePauses) {
     auto unwind = DocumentSourceUnwind::create(
         getExpCtx(), "array", includeNullIfEmptyOrMissing, includeArrayIndex);
     auto source =
-        DocumentSourceMock::create({Document{{"array", vector<Value>{Value(1), Value(2)}}},
-                                    DocumentSource::GetNextResult::makePauseExecution(),
-                                    Document{{"array", vector<Value>{Value(1), Value(2)}}}});
+        DocumentSourceMock::createForTest({Document{{"array", vector<Value>{Value(1), Value(2)}}},
+                                           DocumentSource::GetNextResult::makePauseExecution(),
+                                           Document{{"array", vector<Value>{Value(1), Value(2)}}}},
+                                          getExpCtx());
 
     unwind->setSource(source.get());
 
@@ -775,8 +764,7 @@ TEST_F(UnwindStageTest, ShouldRejectNonDollarPrefixedPath) {
 TEST_F(UnwindStageTest, ShouldRejectNonBoolPreserveNullAndEmptyArrays) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays"
-                                                           << 2))),
+                                                           << "preserveNullAndEmptyArrays" << 2))),
                        AssertionException,
                        28809);
 }
@@ -784,8 +772,7 @@ TEST_F(UnwindStageTest, ShouldRejectNonBoolPreserveNullAndEmptyArrays) {
 TEST_F(UnwindStageTest, ShouldRejectNonStringIncludeArrayIndex) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "includeArrayIndex"
-                                                           << 2))),
+                                                           << "includeArrayIndex" << 2))),
                        AssertionException,
                        28810);
 }
@@ -817,23 +804,21 @@ TEST_F(UnwindStageTest, ShoudlRejectDollarPrefixedIncludeArrayIndex) {
 TEST_F(UnwindStageTest, ShouldRejectUnrecognizedOption) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays"
-                                                           << true
-                                                           << "foo"
-                                                           << 3))),
+                                                           << "preserveNullAndEmptyArrays" << true
+                                                           << "foo" << 3))),
                        AssertionException,
                        28811);
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "foo"
-                                                           << 3))),
+                                                           << "foo" << 3))),
                        AssertionException,
                        28811);
 }
 
-class All : public Suite {
+class All : public OldStyleSuiteSpecification {
 public:
-    All() : Suite("DocumentSourceUnwindTests") {}
+    All() : OldStyleSuiteSpecification("DocumentSourceUnwindTests") {}
+
     void setupTests() {
         add<Empty>();
         add<EmptyArray>();
@@ -857,7 +842,7 @@ public:
     }
 };
 
-SuiteInstance<All> myall;
+OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

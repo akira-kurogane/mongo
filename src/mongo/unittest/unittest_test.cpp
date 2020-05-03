@@ -1,42 +1,46 @@
 /**
-*    Copyright (C) 2012 MongoDB, Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 /**
  * Unit tests of the unittest framework itself.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
+#include <functional>
 #include <limits>
 #include <string>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -49,13 +53,13 @@ bool containsPattern(const std::string& pattern, const std::string& value) {
 }
 
 #define ASSERT_TEST_FAILS(TEST_STMT) \
-    ASSERT_THROWS(TEST_STMT, mongo::unittest::TestAssertionFailureException)
+    ASSERT_THROWS([&] { TEST_STMT; }(), mongo::unittest::TestAssertionFailureException)
 
-#define ASSERT_TEST_FAILS_MATCH(TEST_STMT, PATTERN)                                       \
-    ASSERT_THROWS_WITH_CHECK(                                                             \
-        TEST_STMT, mongo::unittest::TestAssertionFailureException, ([&](const auto& ex) { \
-            ASSERT_STRING_CONTAINS(ex.getMessage(), (PATTERN));                           \
-        }))
+#define ASSERT_TEST_FAILS_MATCH(TEST_STMT, PATTERN)     \
+    ASSERT_THROWS_WITH_CHECK(                           \
+        [&] { TEST_STMT; }(),                           \
+        mongo::unittest::TestAssertionFailureException, \
+        ([&](const auto& ex) { ASSERT_STRING_CONTAINS(ex.getMessage(), (PATTERN)); }))
 
 TEST(UnitTestSelfTest, DoNothing) {}
 
@@ -121,6 +125,27 @@ TEST(UnitTestSelfTest, TestStringComparisons) {
 
     ASSERT_TEST_FAILS(ASSERT_EQUALS(std::string("hello"), "good bye!"));
     ASSERT_TEST_FAILS(ASSERT_EQUALS("hello", std::string("good bye!")));
+}
+
+TEST(UnitTestSelfTest, TestAssertStringContains) {
+    ASSERT_STRING_CONTAINS("abcdef", "bcd");
+    ASSERT_TEST_FAILS(ASSERT_STRING_CONTAINS("abcdef", "AAA"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_CONTAINS("abcdef", "AAA") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertStringOmits) {
+    ASSERT_STRING_OMITS("abcdef", "AAA");
+    ASSERT_TEST_FAILS(ASSERT_STRING_OMITS("abcdef", "bcd"));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_STRING_OMITS("abcdef", "bcd") << "XmsgX", "XmsgX");
+}
+
+TEST(UnitTestSelfTest, TestAssertIdentity) {
+    auto intIdentity = [](int x) { return x; };
+    ASSERT_IDENTITY(123, intIdentity);
+    ASSERT_IDENTITY(123, [](int x) { return x; });
+    auto zero = [](auto) { return 0; };
+    ASSERT_TEST_FAILS(ASSERT_IDENTITY(1, zero));
+    ASSERT_TEST_FAILS_MATCH(ASSERT_IDENTITY(1, zero) << "XmsgX", "XmsgX");
 }
 
 TEST(UnitTestSelfTest, TestStreamingIntoFailures) {
@@ -240,7 +265,7 @@ TEST(UnitTestSelfTest, BSONElementGTE) {
     ASSERT_BSONELT_GTE(obj2.firstElement(), obj1.firstElement());
 }
 
-DEATH_TEST(DeathTestSelfTest, TestDeath, "Invariant failure false") {
+DEATH_TEST_REGEX(DeathTestSelfTest, TestDeath, "Invariant failure.*false") {
     invariant(false);
 }
 
@@ -248,10 +273,58 @@ class DeathTestSelfTestFixture : public ::mongo::unittest::Test {
 public:
     void setUp() override {}
     void tearDown() override {
-        mongo::unittest::log() << "Died in tear-down";
+        LOGV2(24148, "Died in tear-down");
         invariant(false);
     }
 };
 
 DEATH_TEST_F(DeathTestSelfTestFixture, DieInTearDown, "Died in tear-down") {}
+
+TEST(UnitTestSelfTest, StackTraceForAssertion) {
+    bool threw = false;
+    std::string stacktrace;
+    try {
+        ASSERT_EQ(0, 1);
+    } catch (mongo::unittest::TestAssertionFailureException& ae) {
+        stacktrace = ae.getStacktrace();
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+    ASSERT_STRING_CONTAINS(stacktrace, "printStackTrace");
+}
+
+TEST(UnitTestSelfTest, ComparisonAssertionOverloadResolution) {
+    using namespace mongo;
+
+    char xBuf[] = "x";  // Guaranteed different address than "x".
+    const char* x = xBuf;
+
+    // At least one StringData, compare contents:
+    ASSERT_EQ("x"_sd, "x"_sd);
+    ASSERT_EQ("x"_sd, "x");
+    ASSERT_EQ("x"_sd, xBuf);
+    ASSERT_EQ("x"_sd, x);
+    ASSERT_EQ("x", "x"_sd);
+    ASSERT_EQ(xBuf, "x"_sd);
+    ASSERT_EQ(x, "x"_sd);
+
+    // Otherwise, compare pointers:
+    ASSERT_EQ(x, x);
+    ASSERT_EQ(xBuf, xBuf);
+    ASSERT_EQ(x, xBuf);
+    ASSERT_NE("x", xBuf);
+    ASSERT_NE("x", x);
+    ASSERT_NE(xBuf, "x");
+    ASSERT_NE(x, "x");
+}
+
+ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char>());
+ASSERT_DOES_NOT_COMPILE(bool B = false, std::enable_if_t<B, int>{});
+
+// Uncomment to check that it fails when it is supposed to. Unfortunately we can't check in a test
+// that this fails when it is supposed to, only that it passes when it should.
+//
+// ASSERT_DOES_NOT_COMPILE(typename Char = char, *std::declval<Char*>());
+// ASSERT_DOES_NOT_COMPILE(bool B = true, std::enable_if_t<B, int>{});
+
 }  // namespace

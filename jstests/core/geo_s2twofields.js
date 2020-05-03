@@ -1,5 +1,9 @@
 // Verify that we can index multiple geo fields with 2dsphere, and that
 // performance is what we expect it to be with indexing both fields.
+//
+// @tags: [requires_fastcount, operations_longer_than_stepdown_interval_in_txns]
+
+(function() {
 var t = db.geo_s2twofields;
 t.drop();
 
@@ -27,7 +31,7 @@ for (var i = 0; i < maxPoints; ++i) {
         {from: {type: "Point", coordinates: fromCoord}, to: {type: "Point", coordinates: toCoord}});
 }
 res = t.insert(arr);
-assert.writeOK(res);
+assert.commandWorked(res);
 assert.eq(t.count(), maxPoints);
 
 function semiRigorousTime(func) {
@@ -79,3 +83,4 @@ var smallQuery = timeWithoutAndWithAnIndex({from: "2dsphere"}, {
 });
 print("Indexed time " + smallQuery[1] + " unindexed " + smallQuery[0]);
 // assert(smallQuery[0] > smallQuery[1]);
+}());

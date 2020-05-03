@@ -4,7 +4,17 @@
 // so cannot be run on the ephemeralForTest storage engine, as it accepts all journaled writes.
 // @tags: [SERVER-21420]
 
+(function() {
+
 jsTest.log("Starting bulk api write concern tests...");
+
+// Skip this test if running with the "wiredTiger" storage engine, since it requires
+// using 'nojournal' in a replica set, which is not supported when using WT.
+if (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger") {
+    // WT is currently the default engine so it is used when 'storageEngine' is not set.
+    jsTest.log("Skipping test because it is not applicable for the wiredTiger storage engine");
+    return;
+}
 
 // Start a 2-node replica set with no journal
 // Allows testing immediate write concern failures and wc application failures
@@ -15,8 +25,8 @@ var mongod = rst.getPrimary();
 var coll = mongod.getCollection("test.bulk_api_wc");
 
 var executeTests = function() {
-
-    // Create a unique index, legacy writes validate too early to use invalid documents for write
+    // Create a unique index, legacy writes validate too early to use invalid documents for
+    // write
     // error testing
     coll.ensureIndex({a: 1}, {unique: true});
 
@@ -49,7 +59,8 @@ var executeTests = function() {
               'unexpected error message: ' + tojson(result));
 
     //
-    // Fail with write error, no write concern error even though it would fail on apply for ordered
+    // Fail with write error, no write concern error even though it would fail on apply for
+    // ordered
     coll.remove({});
     var bulk = coll.initializeOrderedBulkOp();
     bulk.insert({a: 1});
@@ -84,7 +95,8 @@ var executeTests = function() {
 
     //
     // Fail with write error, write concern timeout reported when unordered
-    // Note that wtimeout:true can only be reported when the batch is all the same, so there's not
+    // Note that wtimeout:true can only be reported when the batch is all the same, so there's
+    // not
     // multiple wc errors
     coll.remove({});
     var bulk = coll.initializeUnorderedBulkOp();
@@ -133,3 +145,4 @@ executeTests();
 
 jsTest.log("DONE bulk api wc tests");
 rst.stopSet();
+})();

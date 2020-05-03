@@ -1,3 +1,6 @@
+// Multiple users cannot be authenticated on one connection within a session.
+TestData.disableImplicitSessions = true;
+
 var replTest = new ReplSetTest({nodes: 3, useHostName: false, keyFile: 'jstests/libs/key1'});
 replTest.startSet({oplogSize: 10});
 replTest.initiate();
@@ -33,7 +36,7 @@ priTestDB.createUser({user: 'a', pwd: 'a', roles: jsTest.basicUserRoles},
 assert.eq(1, testDB.auth('a', 'a'));
 
 jsTest.log('Sending an authorized query that should be ok');
-assert.writeOK(testColl.insert({x: 1}, {writeConcern: {w: nodeCount}}));
+assert.commandWorked(testColl.insert({x: 1}, {writeConcern: {w: nodeCount}}));
 
 conn.setSlaveOk(true);
 doc = testColl.findOne();

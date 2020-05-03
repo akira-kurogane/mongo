@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,24 +29,30 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <functional>
+#include <list>
+#include <memory>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/keys_collection_manager.h"
+#include "mongo/base/global_initializer_registerer.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/tick_source.h"
+#include "mongo/util/uuid.h"
+
+#include <iostream>
 
 namespace mongo {
 
@@ -66,6 +73,9 @@ class TransportLayer;
  * including limitations on the lifetime of registered listeners.
  */
 class KillOpListenerInterface {
+    KillOpListenerInterface(const KillOpListenerInterface&) = delete;
+    KillOpListenerInterface& operator=(const KillOpListenerInterface&) = delete;
+
 public:
     /**
      * Will be called *after* ops have been told they should die.
@@ -75,21 +85,58 @@ public:
     virtual void interruptAll() = 0;
 
 protected:
+    KillOpListenerInterface() = default;
+
     // Should not delete through a pointer of this type
-    virtual ~KillOpListenerInterface() {}
+    virtual ~KillOpListenerInterface() = default;
 };
 
-class StorageFactoriesIterator {
-    MONGO_DISALLOW_COPYING(StorageFactoriesIterator);
-
+/**
+ * A simple container type to pass around a client and a lock on said client
+ */
+class LockedClient {
 public:
-    virtual ~StorageFactoriesIterator() {}
-    virtual bool more() const = 0;
-    virtual const StorageEngine::Factory* next() = 0;
+    LockedClient() = default;
+    explicit LockedClient(Client* client);
 
-protected:
-    StorageFactoriesIterator() {}
+    Client* client() const noexcept {
+        return _client;
+    }
+
+    Client* operator->() const noexcept {
+        return client();
+    }
+
+    explicit operator bool() const noexcept {
+        return client();
+    }
+
+    operator WithLock() const noexcept {
+        return WithLock(_lk);
+    }
+
+private:
+    // Technically speaking, _lk holds a Client* and _client is a superfluous variable. That said,
+    // LockedClients will likely be optimized away and the extra variable is a cheap price to pay
+    // for better developer comprehension.
+    stdx::unique_lock<Client> _lk;
+    Client* _client = nullptr;
 };
+
+/**
+ * Every OperationContext is expected to have a unique OperationId within the domain of its
+ * ServiceContext. Generally speaking, OperationId is used for forming maps of OperationContexts and
+ * directing metaoperations like killop.
+ */
+using OperationId = uint32_t;
+
+/**
+ * Users may provide an OperationKey when sending a command request as a stable token by which to
+ * refer to an operation (and thus an OperationContext). An OperationContext is not required to have
+ * an OperationKey. The presence of an OperationKey implies that the client is either closely
+ * tracking or speculative executing its command.
+ */
+using OperationKey = UUID;
 
 /**
  * Class representing the context of a service, such as a MongoD database service or
@@ -98,19 +145,11 @@ protected:
  * A ServiceContext is the root of a hierarchy of contexts.  A ServiceContext owns
  * zero or more Clients, which in turn each own OperationContexts.
  */
-class ServiceContext : public Decorable<ServiceContext> {
-    MONGO_DISALLOW_COPYING(ServiceContext);
+class ServiceContext final : public Decorable<ServiceContext> {
+    ServiceContext(const ServiceContext&) = delete;
+    ServiceContext& operator=(const ServiceContext&) = delete;
 
 public:
-    /**
-     * Special deleter used for cleaning up Client objects owned by a ServiceContext.
-     * See UniqueClient, below.
-     */
-    class ClientDeleter {
-    public:
-        void operator()(Client* client) const;
-    };
-
     /**
      * Observer interface implemented to hook client and operation context creation and
      * destruction.
@@ -154,7 +193,7 @@ public:
         virtual void onDestroyOperationContext(OperationContext* opCtx) = 0;
     };
 
-    using ClientSet = unordered_set<Client*>;
+    using ClientSet = stdx::unordered_set<Client*>;
 
     /**
      * Cursor for enumerating the live Client objects belonging to a ServiceContext.
@@ -175,10 +214,35 @@ public:
         Client* next();
 
     private:
-        stdx::unique_lock<stdx::mutex> _lock;
+        stdx::unique_lock<Latch> _lock;
         ClientSet::const_iterator _curr;
         ClientSet::const_iterator _end;
     };
+
+    /**
+     * Special deleter used for cleaning up ServiceContext objects.
+     * See UniqueServiceContext, below.
+     */
+    class ServiceContextDeleter {
+    public:
+        void operator()(ServiceContext* service) const;
+    };
+
+    using UniqueServiceContext = std::unique_ptr<ServiceContext, ServiceContextDeleter>;
+
+    /**
+     * Special deleter used for cleaning up Client objects owned by a ServiceContext.
+     * See UniqueClient, below.
+     */
+    class ClientDeleter {
+    public:
+        void operator()(Client* client) const;
+    };
+
+    /**
+     * This is the unique handle type for Clients created by a ServiceContext.
+     */
+    using UniqueClient = std::unique_ptr<Client, ClientDeleter>;
 
     /**
      * Special deleter used for cleaning up OperationContext objects owned by a ServiceContext.
@@ -190,16 +254,104 @@ public:
     };
 
     /**
-     * This is the unique handle type for Clients created by a ServiceContext.
-     */
-    using UniqueClient = std::unique_ptr<Client, ClientDeleter>;
-
-    /**
      * This is the unique handle type for OperationContexts created by a ServiceContext.
      */
     using UniqueOperationContext = std::unique_ptr<OperationContext, OperationContextDeleter>;
 
-    virtual ~ServiceContext();
+    /**
+     * Register a function of this type using  an instance of ConstructorActionRegisterer,
+     * below, to cause the function to be executed on new ServiceContext instances.
+     */
+    using ConstructorAction = std::function<void(ServiceContext*)>;
+
+    /**
+     * Register a function of this type using an instance of ConstructorActionRegisterer,
+     * below, to cause the function to be executed on ServiceContext instances before they
+     * are destroyed.
+     */
+    using DestructorAction = std::function<void(ServiceContext*)>;
+
+    /**
+     * Representation of a paired ConstructorAction and DestructorAction.
+     */
+    class ConstructorDestructorActions {
+    public:
+        ConstructorDestructorActions(ConstructorAction constructor, DestructorAction destructor)
+            : _constructor(std::move(constructor)), _destructor(std::move(destructor)) {}
+
+        void onCreate(ServiceContext* service) const {
+            _constructor(service);
+        }
+        void onDestroy(ServiceContext* service) const {
+            _destructor(service);
+        }
+
+    private:
+        ConstructorAction _constructor;
+        DestructorAction _destructor;
+    };
+
+    /**
+     * Registers a function to execute on new service contexts when they are created, and optionally
+     * also register a function to execute before those contexts are destroyed.
+     *
+     * Construct instances of this type during static initialization only, as they register
+     * MONGO_INITIALIZERS.
+     */
+    class ConstructorActionRegisterer {
+    public:
+        /**
+         * This constructor registers a constructor and optional destructor with the given
+         * "name" and no prerequisite constructors or mongo initializers.
+         */
+        ConstructorActionRegisterer(std::string name,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+        /**
+         * This constructor registers a constructor and optional destructor with the given
+         * "name", and a list of names of prerequisites, "prereqs".
+         *
+         * The named constructor will run after all of its prereqs successfully complete,
+         * and the corresponding destructor, if provided, will run before any of its
+         * prerequisites execute.
+         */
+        ConstructorActionRegisterer(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+        /**
+         * This constructor registers a constructor and optional destructor with the given
+         * "name", a list of names of prerequisites, "prereqs", and a list of names of dependents,
+         * "dependents".
+         *
+         * The named constructor will run after all of its prereqs successfully complete,
+         * and the corresponding destructor, if provided, will run before any of its
+         * prerequisites execute. The dependents will run after this constructor and
+         * the corresponding destructor, if provided, will run after any of its
+         * dependents execute.
+         */
+        ConstructorActionRegisterer(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    std::vector<std::string> dependents,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+    private:
+        using ConstructorActionListIterator = std::list<ConstructorDestructorActions>::iterator;
+        ConstructorActionListIterator _iter;
+        boost::optional<GlobalInitializerRegisterer> _registerer;
+    };
+
+    /**
+     * Factory function for making instances of ServiceContext. It is the only means by which they
+     * should be created.
+     */
+    static UniqueServiceContext make();
+
+    ServiceContext();
+    ~ServiceContext();
 
     /**
      * Registers an observer of lifecycle events on Clients created by this ServiceContext.
@@ -235,59 +387,16 @@ public:
     //
 
     /**
-     * Register a storage engine.  Called from a MONGO_INIT that depends on initializiation of
-     * the global environment.
-     * Ownership of 'factory' is transferred to global environment upon registration.
+     * Sets the storage engine for this instance. May be called up to once per instance.
      */
-    virtual void registerStorageEngine(const std::string& name,
-                                       const StorageEngine::Factory* factory) = 0;
-
-    /**
-     * Returns true if "name" refers to a registered storage engine.
-     */
-    virtual bool isRegisteredStorageEngine(const std::string& name) = 0;
-
-    /**
-     * Produce an iterator over all registered storage engine factories.
-     * Caller owns the returned object and is responsible for deleting when finished.
-     *
-     * Never returns nullptr.
-     */
-    virtual StorageFactoriesIterator* makeStorageFactoriesIterator() = 0;
-
-    virtual void initializeGlobalStorageEngine() = 0;
-
-    /**
-     * Shuts down storage engine cleanly and releases any locks on mongod.lock.
-     */
-    virtual void shutdownGlobalStorageEngineCleanly() = 0;
+    void setStorageEngine(std::unique_ptr<StorageEngine> engine);
 
     /**
      * Return the storage engine instance we're using.
      */
-    virtual StorageEngine* getGlobalStorageEngine() = 0;
-
-    //
-    // Key manager, for HMAC keys.
-    //
-
-    /**
-     * Sets the key manager on this service context.
-     */
-    void setKeyManager(std::shared_ptr<KeysCollectionManager> keyManager) & {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _keyManager = std::move(keyManager);
+    StorageEngine* getStorageEngine() {
+        return _storageEngine.get();
     }
-
-    /**
-     * Returns a pointer to the keys collection manager owned by this service context.
-     */
-    std::shared_ptr<KeysCollectionManager> getKeyManager() & {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _keyManager;
-    }
-
-    std::shared_ptr<KeysCollectionManager> getKeyManager() && = delete;
 
     //
     // Global operation management.  This may not belong here and there may be too many methods
@@ -315,17 +424,11 @@ public:
     /**
      * Kills the operation "opCtx" with the code "killCode", if opCtx has not already been killed.
      * Caller must own the lock on opCtx->getClient, and opCtx->getServiceContext() must be the same
-     *as
-     * this service context.
+     * as this service context. WithLock expects that the client lock be passed in.
      **/
-    void killOperation(OperationContext* opCtx,
+    void killOperation(WithLock,
+                       OperationContext* opCtx,
                        ErrorCodes::Error killCode = ErrorCodes::Interrupted);
-
-    /**
-     * Kills all operations that have a Client that is associated with an incoming user
-     * connection, except for the one associated with opCtx.
-     */
-    void killAllUserOperations(const OperationContext* opCtx, ErrorCodes::Error killCode);
 
     /**
      * Registers a listener to be notified each time an op is killed.
@@ -392,35 +495,45 @@ public:
      */
     void notifyStartupComplete();
 
-    //
-    // Global OpObserver.
-    //
+    /*
+     * Returns the number of active client operations
+     */
+    int getActiveClientOperations();
 
     /**
      * Set the OpObserver.
      */
-    virtual void setOpObserver(std::unique_ptr<OpObserver> opObserver) = 0;
+    void setOpObserver(std::unique_ptr<OpObserver> opObserver);
 
     /**
-     * Return the OpObserver instance we're using.
+     * Return the OpObserver instance we're using. This may be an OpObserverRegistry that in fact
+     * contains multiple observers.
      */
-    virtual OpObserver* getOpObserver() = 0;
+    OpObserver* getOpObserver() const {
+        return _opObserver.get();
+    }
 
     /**
      * Returns the tick/clock source set in this context.
      */
-    TickSource* getTickSource() const;
+    TickSource* getTickSource() const {
+        return _tickSource.get();
+    }
 
     /**
      * Get a ClockSource implementation that may be less precise than the _preciseClockSource but
      * may be cheaper to call.
      */
-    ClockSource* getFastClockSource() const;
+    ClockSource* getFastClockSource() const {
+        return _fastClockSource.get();
+    }
 
     /**
      * Get a ClockSource implementation that is very precise but may be expensive to call.
      */
-    ClockSource* getPreciseClockSource() const;
+    ClockSource* getPreciseClockSource() const {
+        return _preciseClockSource.get();
+    }
 
     /**
      * Replaces the current tick/clock source with a new one. In other words, the old source will be
@@ -458,32 +571,44 @@ public:
      */
     void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
 
-protected:
-    ServiceContext();
-
     /**
-     * Mutex used to synchronize access to mutable state of this ServiceContext instance,
-     * including possibly by its subclasses.
+     * Creates a delayed execution baton with basic functionality
      */
-    stdx::mutex _mutex;
+    BatonHandle makeBaton(OperationContext* opCtx) const;
+
+    uint64_t getCatalogGeneration() const {
+        return _catalogGeneration.load();
+    }
+
+    void incrementCatalogGeneration() {
+        _catalogGeneration.fetchAndAdd(1);
+    }
+
+    LockedClient getLockedClient(OperationId id);
 
 private:
-    /**
-     * Returns a new OperationContext. Private, for use by makeOperationContext.
-     */
-    virtual std::unique_ptr<OperationContext> _newOpCtx(Client* client, unsigned opId) = 0;
+    class ClientObserverHolder {
+    public:
+        explicit ClientObserverHolder(std::unique_ptr<ClientObserver> observer)
+            : _observer(std::move(observer)) {}
+        void onCreate(Client* client) const {
+            _observer->onCreateClient(client);
+        }
+        void onDestroy(Client* client) const {
+            _observer->onDestroyClient(client);
+        }
+        void onCreate(OperationContext* opCtx) const {
+            _observer->onCreateOperationContext(opCtx);
+        }
+        void onDestroy(OperationContext* opCtx) const {
+            _observer->onDestroyOperationContext(opCtx);
+        }
 
-    /**
-     * Kills the given operation.
-     *
-     * Caller must own the service context's _mutex.
-     */
-    void _killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode);
+    private:
+        std::unique_ptr<ClientObserver> _observer;
+    };
 
-    /**
-     * The key manager.
-     */
-    std::shared_ptr<KeysCollectionManager> _keyManager;
+    Mutex _mutex = MONGO_MAKE_LATCH(/*HierarchicalAcquisitionLevel(2), */ "ServiceContext::_mutex");
 
     /**
      * The periodic runner.
@@ -506,10 +631,22 @@ private:
     std::unique_ptr<transport::ServiceExecutor> _serviceExecutor;
 
     /**
+     * The storage engine, if any.
+     */
+    std::unique_ptr<StorageEngine> _storageEngine;
+
+    /**
      * Vector of registered observers.
      */
-    std::vector<std::unique_ptr<ClientObserver>> _clientObservers;
+    std::vector<ClientObserverHolder> _clientObservers;
     ClientSet _clients;
+
+    stdx::unordered_map<OperationId, Client*> _clientByOperationId;
+
+    /**
+     * The registered OpObserver.
+     */
+    std::unique_ptr<OpObserver> _opObserver;
 
     std::unique_ptr<TickSource> _tickSource;
 
@@ -531,7 +668,10 @@ private:
     std::vector<KillOpListenerInterface*> _killOpListeners;
 
     // Counter for assigning operation ids.
-    AtomicUInt32 _nextOpId{1};
+    AtomicWord<OperationId> _nextOpId{1};
+
+    // When the catalog is restarted, the generation goes up by one each time.
+    AtomicWord<uint64_t> _catalogGeneration{0};
 
     bool _startupComplete = false;
     stdx::condition_variable _startupCompleteCondVar;
@@ -552,15 +692,13 @@ bool hasGlobalServiceContext();
 ServiceContext* getGlobalServiceContext();
 
 /**
- * Warning - This function is temporary. Do not introduce new uses of this API.
+ * Returns the ServiceContext associated with the current Client.
  *
- * Returns the singleton ServiceContext for this server process.
- *
- * Waits until there is a valid global ServiceContext.
+ * Returns a nullptr if there is not a current Client
  *
  * Caller does not own pointer.
  */
-ServiceContext* waitAndGetGlobalServiceContext();
+ServiceContext* getCurrentServiceContext();
 
 /**
  * Sets the global ServiceContext.  If 'serviceContext' is NULL, un-sets and deletes
@@ -568,7 +706,7 @@ ServiceContext* waitAndGetGlobalServiceContext();
  *
  * Takes ownership of 'serviceContext'.
  */
-void setGlobalServiceContext(std::unique_ptr<ServiceContext>&& serviceContext);
+void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceContext);
 
 /**
  * Shortcut for querying the storage engine about whether it supports document-level locking.
@@ -576,35 +714,5 @@ void setGlobalServiceContext(std::unique_ptr<ServiceContext>&& serviceContext);
  * fetch the storage engine every time.
  */
 bool supportsDocLocking();
-
-/**
- * Returns true if the storage engine in use is MMAPV1.
- */
-bool isMMAPV1();
-
-/*
- * Extracts the storageEngine bson from the CollectionOptions provided.  Loops through each
- * provided storageEngine and asks the matching registered storage engine if the
- * collection/index options are valid.  Returns an error if the collection/index options are
- * invalid.
- * If no matching registered storage engine is found, return an error.
- * Validation function 'func' must be either:
- * - &StorageEngine::Factory::validateCollectionStorageOptions; or
- * - &StorageEngine::Factory::validateIndexStorageOptions
- */
-Status validateStorageOptions(
-    const BSONObj& storageEngineOptions,
-    stdx::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc);
-
-/*
- * Returns a BSONArray containing the names of available storage engines, or an empty
- * array if there is no global ServiceContext
- */
-BSONArray storageEngineList();
-
-/*
- * Appends a the list of available storage engines to a BSONObjBuilder for reporting purposes.
- */
-void appendStorageEngineList(BSONObjBuilder* result);
 
 }  // namespace mongo

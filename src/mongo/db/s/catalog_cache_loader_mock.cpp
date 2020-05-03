@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -81,6 +82,8 @@ void CatalogCacheLoaderMock::onStepUp() {
     MONGO_UNREACHABLE;
 }
 
+void CatalogCacheLoaderMock::shutDown() {}
+
 void CatalogCacheLoaderMock::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
@@ -90,14 +93,17 @@ void CatalogCacheLoaderMock::waitForCollectionFlush(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
-    const NamespaceString& nss,
-    ChunkVersion version,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
+void CatalogCacheLoaderMock::waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) {
+    MONGO_UNREACHABLE;
+}
 
+std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
+    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ this, notify, callbackFn ]() noexcept {
+    _threadPool.schedule([ this, notify, callbackFn ](auto status) noexcept {
+        invariant(status);
+
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
@@ -105,12 +111,19 @@ std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
                 uassertStatusOK(_swCollectionReturnValue);
                 uassertStatusOK(_swChunksReturnValue);
 
-                return CollectionAndChangedChunks{
+                // We swap the chunks out of _swChunksReturnValue to ensure if this task is
+                // scheduled multiple times that we don't inform the ChunkManager about a chunk it
+                // has already updated.
+                std::vector<ChunkType> chunks;
+                _swChunksReturnValue.getValue().swap(chunks);
+
+                return CollectionAndChangedChunks(
+                    _swCollectionReturnValue.getValue().getUUID(),
                     _swCollectionReturnValue.getValue().getEpoch(),
                     _swCollectionReturnValue.getValue().getKeyPattern().toBSON(),
                     _swCollectionReturnValue.getValue().getDefaultCollation(),
                     _swCollectionReturnValue.getValue().getUnique(),
-                    _swChunksReturnValue.getValue()};
+                    std::move(chunks));
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -118,9 +131,34 @@ std::shared_ptr<Notification<void>> CatalogCacheLoaderMock::getChunksSince(
 
         callbackFn(opCtx.get(), std::move(swCollAndChunks));
         notify->set();
-    }));
+    });
 
     return notify;
+}
+
+void CatalogCacheLoaderMock::getDatabase(
+    StringData dbName,
+    std::function<void(OperationContext*, StatusWith<DatabaseType>)> callbackFn) {
+    _threadPool.schedule([ this, callbackFn ](auto status) noexcept {
+        invariant(status);
+
+        auto opCtx = Client::getCurrent()->makeOperationContext();
+
+        auto swDatabase = [&]() -> StatusWith<DatabaseType> {
+            try {
+                uassertStatusOK(_swDatabaseReturnValue);
+
+                return DatabaseType(_swDatabaseReturnValue.getValue().getName(),
+                                    _swDatabaseReturnValue.getValue().getPrimary(),
+                                    _swDatabaseReturnValue.getValue().getSharded(),
+                                    _swDatabaseReturnValue.getValue().getVersion());
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }();
+
+        callbackFn(opCtx.get(), std::move(swDatabase));
+    });
 }
 
 void CatalogCacheLoaderMock::setCollectionRefreshReturnValue(
@@ -131,6 +169,10 @@ void CatalogCacheLoaderMock::setCollectionRefreshReturnValue(
 void CatalogCacheLoaderMock::setChunkRefreshReturnValue(
     StatusWith<std::vector<ChunkType>> statusWithChunks) {
     _swChunksReturnValue = std::move(statusWithChunks);
+}
+
+void CatalogCacheLoaderMock::setDatabaseRefreshReturnValue(StatusWith<DatabaseType> swDatabase) {
+    _swDatabaseReturnValue = std::move(swDatabase);
 }
 
 }  // namespace mongo

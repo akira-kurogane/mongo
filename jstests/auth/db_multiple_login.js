@@ -3,7 +3,7 @@
 // authentication.
 //
 // Regression test for SERVER-8144.
-var conn = MongoRunner.runMongod({auth: "", smallfiles: ""});
+var conn = MongoRunner.runMongod({auth: ""});
 var admin = conn.getDB("admin");
 var test = conn.getDB("test");
 
@@ -21,10 +21,11 @@ assert.throws(function() {
 
 // Writer logged in, can read and write.
 test.auth('writer', 'a');
-assert.writeOK(test.docs.insert({value: 1}));
+assert.commandWorked(test.docs.insert({value: 1}));
 test.foo.findOne();
 
 // Reader logged in, replacing writer, can only read.
 test.auth('reader', 'a');
 assert.writeError(test.docs.insert({value: 2}));
 test.foo.findOne();
+MongoRunner.stopMongod(conn, null, {user: 'admin', pwd: 'a'});

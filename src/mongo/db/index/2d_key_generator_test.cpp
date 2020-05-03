@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,49 +40,56 @@
 #include "mongo/db/index/2d_common.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/json.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 using namespace mongo;
 
 namespace {
 
-std::string dumpKeyset(const BSONObjSet& objs) {
+std::string dumpKeyset(const KeyStringSet& keyStrings) {
     std::stringstream ss;
     ss << "[ ";
-    for (BSONObjSet::iterator i = objs.begin(); i != objs.end(); ++i) {
-        ss << i->toString() << " ";
+    for (auto& keyString : keyStrings) {
+        auto key = KeyString::toBson(keyString, Ordering::make(BSONObj()));
+        ss << key.toString() << " ";
     }
     ss << "]";
 
     return ss.str();
 }
 
-bool assertKeysetsEqual(const BSONObjSet& expectedKeys, const BSONObjSet& actualKeys) {
+bool assertKeysetsEqual(const KeyStringSet& expectedKeys, const KeyStringSet& actualKeys) {
     if (expectedKeys.size() != actualKeys.size()) {
-        log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
-              << "Actual: " << dumpKeyset(actualKeys);
+        LOGV2(20645,
+              "Expected: {dumpKeyset_expectedKeys}, Actual: {dumpKeyset_actualKeys}",
+              "dumpKeyset_expectedKeys"_attr = dumpKeyset(expectedKeys),
+              "dumpKeyset_actualKeys"_attr = dumpKeyset(actualKeys));
         return false;
     }
 
-    if (!std::equal(expectedKeys.begin(),
-                    expectedKeys.end(),
-                    actualKeys.begin(),
-                    SimpleBSONObjComparator::kInstance.makeEqualTo())) {
-        log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
-              << "Actual: " << dumpKeyset(actualKeys);
+    if (!std::equal(expectedKeys.begin(), expectedKeys.end(), actualKeys.begin())) {
+        LOGV2(20646,
+              "Expected: {dumpKeyset_expectedKeys}, Actual: {dumpKeyset_actualKeys}",
+              "dumpKeyset_expectedKeys"_attr = dumpKeyset(expectedKeys),
+              "dumpKeyset_actualKeys"_attr = dumpKeyset(actualKeys));
         return false;
     }
 
     return true;
 }
 
-BSONObj make2DKey(const TwoDIndexingParams& params, int x, int y, BSONElement trailingFields) {
+KeyString::Value make2DKey(const TwoDIndexingParams& params,
+                           int x,
+                           int y,
+                           BSONElement trailingFields) {
     BSONObjBuilder bob;
     BSONObj locObj = BSON_ARRAY(x << y);
     params.geoHashConverter->hash(locObj, nullptr).appendHashMin(&bob, "");
     bob.append(trailingFields);
-    return bob.obj();
+    KeyString::HeapBuilder keyString(
+        KeyString::Version::kLatestVersion, bob.obj(), Ordering::make(BSONObj()));
+    return keyString.release();
 }
 
 TEST(2dKeyGeneratorTest, TrailingField) {
@@ -89,11 +97,11 @@ TEST(2dKeyGeneratorTest, TrailingField) {
     BSONObj infoObj = fromjson("{key: {a: '2d', b: 1}}");
     TwoDIndexingParams params;
     ExpressionParams::parseTwoDParams(infoObj, &params);
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    std::vector<BSONObj> locs;
-    ExpressionKeysPrivate::get2DKeys(obj, params, &actualKeys, &locs);
+    KeyStringSet actualKeys;
+    ExpressionKeysPrivate::get2DKeys(
+        obj, params, &actualKeys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet expectedKeys;
     BSONObj trailingFields = BSON("" << 5);
     expectedKeys.insert(make2DKey(params, 0, 0, trailingFields.firstElement()));
 
@@ -105,11 +113,11 @@ TEST(2dKeyGeneratorTest, ArrayTrailingField) {
     BSONObj infoObj = fromjson("{key: {a: '2d', b: 1}}");
     TwoDIndexingParams params;
     ExpressionParams::parseTwoDParams(infoObj, &params);
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    std::vector<BSONObj> locs;
-    ExpressionKeysPrivate::get2DKeys(obj, params, &actualKeys, &locs);
+    KeyStringSet actualKeys;
+    ExpressionKeysPrivate::get2DKeys(
+        obj, params, &actualKeys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet expectedKeys;
     BSONObj trailingFields = BSON("" << BSON_ARRAY(5 << 6));
     expectedKeys.insert(make2DKey(params, 0, 0, trailingFields.firstElement()));
 
@@ -121,11 +129,11 @@ TEST(2dKeyGeneratorTest, ArrayOfObjectsTrailingField) {
     BSONObj infoObj = fromjson("{key: {a: '2d', 'b.c': 1}}");
     TwoDIndexingParams params;
     ExpressionParams::parseTwoDParams(infoObj, &params);
-    BSONObjSet actualKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    std::vector<BSONObj> locs;
-    ExpressionKeysPrivate::get2DKeys(obj, params, &actualKeys, &locs);
+    KeyStringSet actualKeys;
+    ExpressionKeysPrivate::get2DKeys(
+        obj, params, &actualKeys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
 
-    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    KeyStringSet expectedKeys;
     BSONObj trailingFields = BSON("" << BSON_ARRAY(5 << 6));
     expectedKeys.insert(make2DKey(params, 0, 0, trailingFields.firstElement()));
 

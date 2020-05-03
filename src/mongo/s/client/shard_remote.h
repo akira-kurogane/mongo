@@ -1,29 +1,30 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,7 +33,8 @@
 
 #include "mongo/s/client/shard.h"
 
-#include "mongo/base/disallow_copying.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -41,7 +43,8 @@ namespace mongo {
  * the shard (if replica set).
  */
 class ShardRemote : public Shard {
-    MONGO_DISALLOW_COPYING(ShardRemote);
+    ShardRemote(const ShardRemote&) = delete;
+    ShardRemote& operator=(const ShardRemote&) = delete;
 
 public:
     /**
@@ -75,7 +78,21 @@ public:
                                const BSONObj& keys,
                                bool unique) override;
 
+    void updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) final;
+
+    LogicalTime getLastCommittedOpTime() const final;
+
+    void runFireAndForgetCommand(OperationContext* opCtx,
+                                 const ReadPreferenceSetting& readPref,
+                                 const std::string& dbName,
+                                 const BSONObj& cmdObj) final;
+
 private:
+    struct AsyncCmdHandle {
+        HostAndPort hostTargetted;
+        executor::TaskExecutor::CallbackHandle handle;
+    };
+
     /**
      * Returns the metadata that should be used when running commands against this shard with
      * the given read preference.
@@ -85,9 +102,16 @@ private:
 
     StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,
                                                    const ReadPreferenceSetting& readPref,
-                                                   const std::string& dbname,
+                                                   StringData dbName,
                                                    Milliseconds maxTimeMSOverride,
                                                    const BSONObj& cmdObj) final;
+
+    StatusWith<Shard::QueryResponse> _runExhaustiveCursorCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        StringData dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj) final;
 
     StatusWith<QueryResponse> _exhaustiveFindOnConfig(
         OperationContext* opCtx,
@@ -97,6 +121,27 @@ private:
         const BSONObj& query,
         const BSONObj& sort,
         boost::optional<long long> limit) final;
+
+    StatusWith<AsyncCmdHandle> _scheduleCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        StringData dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj,
+        const executor::TaskExecutor::RemoteCommandCallbackFn& cb);
+
+    /**
+     * Protects _lastCommittedOpTime.
+     */
+    mutable Mutex _lastCommittedOpTimeMutex =
+        MONGO_MAKE_LATCH("ShardRemote::_lastCommittedOpTimeMutex");
+
+    /**
+     * Logical time representing the latest opTime timestamp known to be in this shard's majority
+     * committed snapshot. Only the latest time is kept because lagged secondaries may return
+     * earlier times.
+     */
+    LogicalTime _lastCommittedOpTime;
 
     /**
      * Connection string for the shard at the creation time.

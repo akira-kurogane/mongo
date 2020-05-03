@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -128,11 +129,10 @@ TEST(ClockSourceMockTest, AlarmScheudlesExpiredAlarmWhenSignaled) {
     ClockSourceMock cs;
     const auto beginning = cs.now();
     int alarmFiredCount = 0;
-    ASSERT_OK(cs.setAlarm(beginning + Seconds{1},
-                          [&] {
-                              ++alarmFiredCount;
-                              ASSERT_OK(cs.setAlarm(beginning, [&] { ++alarmFiredCount; }));
-                          }));
+    ASSERT_OK(cs.setAlarm(beginning + Seconds{1}, [&] {
+        ++alarmFiredCount;
+        ASSERT_OK(cs.setAlarm(beginning, [&] { ++alarmFiredCount; }));
+    }));
     ASSERT_EQ(0, alarmFiredCount);
     cs.advance(Seconds{1});
     ASSERT_EQ(2, alarmFiredCount);
@@ -153,17 +153,15 @@ TEST(ClockSourceMockTest, AlarmScheudlesAlarmWhenSignaled) {
     ClockSourceMock cs;
     const auto beginning = cs.now();
     int alarmFiredCount = 0;
-    ASSERT_OK(cs.setAlarm(beginning + Seconds{1},
-                          [&] {
-                              ++alarmFiredCount;
-                              ASSERT_OK(
-                                  cs.setAlarm(beginning + Seconds{2}, [&] { ++alarmFiredCount; }));
-                          }));
+    ASSERT_OK(cs.setAlarm(beginning + Seconds{1}, [&] {
+        ++alarmFiredCount;
+        ASSERT_OK(cs.setAlarm(beginning + Seconds{2}, [&] { ++alarmFiredCount; }));
+    }));
     ASSERT_EQ(0, alarmFiredCount);
     cs.advance(Seconds{1});
     ASSERT_EQ(1, alarmFiredCount);
     cs.advance(Seconds{1});
     ASSERT_EQ(2, alarmFiredCount);
 }
-}
+}  // namespace
 }  // namespace mongo

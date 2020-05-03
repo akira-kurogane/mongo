@@ -1,61 +1,59 @@
 /**
-*    Copyright (C) 2017 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include <string>
 
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/resize_oplog_gen.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/storage/durable_catalog.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
+namespace {
 
 class CmdReplSetResizeOplog : public BasicCommand {
 public:
     CmdReplSetResizeOplog() : BasicCommand("replSetResizeOplog") {}
 
-    virtual bool slaveOk() const final {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const final {
@@ -66,13 +64,13 @@ public:
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "resize oplog size in MB";
+    std::string help() const override {
+        return "Resize oplog using size (in MBs) and optionally, retention (in terms of hours)";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                            ActionType::replSetResizeOplog)) {
@@ -82,47 +80,45 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
-        const NamespaceString nss("local", "oplog.rs");
-        Lock::GlobalWrite global(opCtx);
-        Database* database = dbHolder().get(opCtx, nss.db());
-        if (!database) {
-            return appendCommandStatus(
-                result, Status(ErrorCodes::NamespaceNotFound, "database local does not exist"));
-        }
-        Collection* coll = database->getCollection(opCtx, nss);
-        if (!coll) {
-            return appendCommandStatus(
-                result, Status(ErrorCodes::NamespaceNotFound, "oplog does not exist"));
-        }
-        if (!coll->isCapped()) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::IllegalOperation, "oplog isn't capped"));
-        }
-        if (!jsobj["size"].isNumber()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::InvalidOptions, "invalid size field, size should be a number"));
-        }
+        AutoGetCollection autoColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
+        Database* database = autoColl.getDb();
+        uassert(ErrorCodes::NamespaceNotFound, "database local does not exist", database);
+        Collection* coll = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
+        uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
 
-        long long sizeMb = jsobj["size"].numberLong();
-        long long size = sizeMb * 1024 * 1024;
-        if (sizeMb < 990L) {
-            return appendCommandStatus(
-                result, Status(ErrorCodes::InvalidOptions, "oplog size should be 990MB at least"));
-        }
-        WriteUnitOfWork wunit(opCtx);
-        Status status = coll->getRecordStore()->updateCappedSize(opCtx, size);
-        if (!status.isOK()) {
-            return appendCommandStatus(result, status);
-        }
-        CollectionCatalogEntry* entry = coll->getCatalogEntry();
-        entry->updateCappedSize(opCtx, size);
-        wunit.commit();
-        LOG(0) << "replSetResizeOplog success, currentSize:" << size;
-        return appendCommandStatus(result, Status::OK());
+        auto params =
+            ReplSetResizeOplogRequest::parse(IDLParserErrorContext("replSetResizeOplog"), jsobj);
+
+        return writeConflictRetry(opCtx, "replSetResizeOplog", coll->ns().ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
+
+            if (auto sizeMB = params.getSize()) {
+                const long long sizeBytes = *sizeMB * 1024 * 1024;
+                uassertStatusOK(coll->getRecordStore()->updateCappedSize(opCtx, sizeBytes));
+                DurableCatalog::get(opCtx)->updateCappedSize(
+                    opCtx, coll->getCatalogId(), sizeBytes);
+            }
+
+            if (auto minRetentionHoursOpt = params.getMinRetentionHours()) {
+                storageGlobalParams.oplogMinRetentionHours.store(*minRetentionHoursOpt);
+            }
+            wunit.commit();
+
+            LOGV2(20497,
+                  "replSetResizeOplog success.",
+                  "size"_attr = DurableCatalog::get(opCtx)
+                                    ->getCollectionOptions(opCtx, coll->getCatalogId())
+                                    .cappedSize,
+                  "minRetentionHours"_attr = storageGlobalParams.oplogMinRetentionHours.load());
+            return true;
+        });
     }
+
 } cmdReplSetResizeOplog;
-}
+
+}  // namespace
+}  // namespace mongo

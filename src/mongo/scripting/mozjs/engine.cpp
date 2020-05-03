@@ -1,32 +1,33 @@
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,10 +36,10 @@
 #include <js/Initialization.h>
 
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_parameters.h"
+#include "mongo/logv2/log.h"
+#include "mongo/scripting/mozjs/engine_gen.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/proxyscope.h"
-#include "mongo/util/log.h"
 
 namespace js {
 void DisableExtraThreads();
@@ -46,19 +47,11 @@ void DisableExtraThreads();
 
 namespace mongo {
 
-namespace {
-
-MONGO_EXPORT_SERVER_PARAMETER(disableJavaScriptJIT, bool, false);
-MONGO_EXPORT_SERVER_PARAMETER(javascriptProtection, bool, false);
-MONGO_EXPORT_SERVER_PARAMETER(jsHeapLimitMB, int, 1100);
-
-}  // namespace
-
-void ScriptEngine::setup() {
+void ScriptEngine::setup(bool disableLoadStored) {
     if (getGlobalScriptEngine())
         return;
 
-    setGlobalScriptEngine(new mozjs::MozJSScriptEngine());
+    setGlobalScriptEngine(new mozjs::MozJSScriptEngine(disableLoadStored));
 
     if (hasGlobalServiceContext()) {
         getGlobalServiceContext()->registerKillOpListener(getGlobalScriptEngine());
@@ -66,12 +59,12 @@ void ScriptEngine::setup() {
 }
 
 std::string ScriptEngine::getInterpreterVersionString() {
-    return "MozJS-38";
+    return "MozJS-" BOOST_PP_STRINGIZE(MOZJS_MAJOR_VERSION);
 }
 
 namespace mozjs {
 
-MozJSScriptEngine::MozJSScriptEngine() {
+MozJSScriptEngine::MozJSScriptEngine(bool disableLoadStored) : ScriptEngine(disableLoadStored) {
     uassert(ErrorCodes::JSInterpreterFailure, "Failed to JS_Init()", JS_Init());
     js::DisableExtraThreads();
 }
@@ -84,27 +77,35 @@ mongo::Scope* MozJSScriptEngine::createScope() {
     return new MozJSProxyScope(this);
 }
 
-mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread() {
-    return new MozJSImplScope(this);
+mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+    return new MozJSImplScope(this, jsHeapLimitMB);
 }
 
 void MozJSScriptEngine::interrupt(unsigned opId) {
-    stdx::lock_guard<stdx::mutex> intLock(_globalInterruptLock);
+    stdx::lock_guard<Latch> intLock(_globalInterruptLock);
     OpIdToScopeMap::iterator iScope = _opToScopeMap.find(opId);
     if (iScope == _opToScopeMap.end()) {
         // got interrupt request for a scope that no longer exists
-        LOG(1) << "received interrupt request for unknown op: " << opId << printKnownOps_inlock();
+        LOGV2_DEBUG(22783,
+                    1,
+                    "received interrupt request for unknown op: {opId}{printKnownOps_inlock}",
+                    "opId"_attr = opId,
+                    "printKnownOps_inlock"_attr = printKnownOps_inlock());
         return;
     }
 
-    LOG(1) << "interrupting op: " << opId << printKnownOps_inlock();
+    LOGV2_DEBUG(22784,
+                1,
+                "interrupting op: {opId}{printKnownOps_inlock}",
+                "opId"_attr = opId,
+                "printKnownOps_inlock"_attr = printKnownOps_inlock());
     iScope->second->kill();
 }
 
 std::string MozJSScriptEngine::printKnownOps_inlock() {
     str::stream out;
 
-    if (shouldLog(logger::LogSeverity::Debug(2))) {
+    if (shouldLog(logv2::LogSeverity::Debug(2))) {
         out << "  known ops: \n";
 
         for (auto&& iSc : _opToScopeMap) {
@@ -116,7 +117,7 @@ std::string MozJSScriptEngine::printKnownOps_inlock() {
 }
 
 void MozJSScriptEngine::interruptAll() {
-    stdx::lock_guard<stdx::mutex> interruptLock(_globalInterruptLock);
+    stdx::lock_guard<Latch> interruptLock(_globalInterruptLock);
 
     for (auto&& iScope : _opToScopeMap) {
         iScope.second->kill();
@@ -124,37 +125,41 @@ void MozJSScriptEngine::interruptAll() {
 }
 
 void MozJSScriptEngine::enableJIT(bool value) {
-    disableJavaScriptJIT.store(!value);
+    gDisableJavaScriptJIT.store(!value);
 }
 
 bool MozJSScriptEngine::isJITEnabled() const {
-    return !disableJavaScriptJIT.load();
+    return !gDisableJavaScriptJIT.load();
 }
 
 void MozJSScriptEngine::enableJavaScriptProtection(bool value) {
-    javascriptProtection.store(value);
+    gJavascriptProtection.store(value);
 }
 
 bool MozJSScriptEngine::isJavaScriptProtectionEnabled() const {
-    return javascriptProtection.load();
+    return gJavascriptProtection.load();
 }
 
 int MozJSScriptEngine::getJSHeapLimitMB() const {
-    return jsHeapLimitMB.load();
+    return gJSHeapLimitMB.load();
 }
 
 void MozJSScriptEngine::setJSHeapLimitMB(int limit) {
-    jsHeapLimitMB.store(limit);
+    gJSHeapLimitMB.store(limit);
 }
 
 void MozJSScriptEngine::registerOperation(OperationContext* opCtx, MozJSImplScope* scope) {
-    stdx::lock_guard<stdx::mutex> giLock(_globalInterruptLock);
+    stdx::lock_guard<Latch> giLock(_globalInterruptLock);
 
     auto opId = opCtx->getOpID();
 
     _opToScopeMap[opId] = scope;
 
-    LOG(2) << "SMScope " << static_cast<const void*>(scope) << " registered for op " << opId;
+    LOGV2_DEBUG(22785,
+                2,
+                "SMScope {reinterpret_cast_uint64_t_scope} registered for op {opId}",
+                "reinterpret_cast_uint64_t_scope"_attr = reinterpret_cast<uint64_t>(scope),
+                "opId"_attr = opId);
     Status status = opCtx->checkForInterruptNoAssert();
     if (!status.isOK()) {
         scope->kill();
@@ -162,9 +167,13 @@ void MozJSScriptEngine::registerOperation(OperationContext* opCtx, MozJSImplScop
 }
 
 void MozJSScriptEngine::unregisterOperation(unsigned int opId) {
-    stdx::lock_guard<stdx::mutex> giLock(_globalInterruptLock);
+    stdx::lock_guard<Latch> giLock(_globalInterruptLock);
 
-    LOG(2) << "ImplScope " << static_cast<const void*>(this) << " unregistered for op " << opId;
+    LOGV2_DEBUG(22786,
+                2,
+                "ImplScope {reinterpret_cast_uint64_t_this} unregistered for op {opId}",
+                "reinterpret_cast_uint64_t_this"_attr = reinterpret_cast<uint64_t>(this),
+                "opId"_attr = opId);
 
     if (opId != 0) {
         // scope is currently associated with an operation id

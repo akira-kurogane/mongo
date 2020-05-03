@@ -1,46 +1,45 @@
-// processinfo.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/util/processinfo.h"
 
+#include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <fstream>
 #include <iostream>
 
-#include "mongo/util/log.h"
-
-using namespace std;
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -51,22 +50,39 @@ public:
             return;
         }
 
-        ofstream out(path.c_str(), ios_base::out);
+        std::ofstream out(path.c_str(), std::ios_base::out);
         out.close();
     }
 
     bool write(const boost::filesystem::path& p) {
         path = p;
-        ofstream out(path.c_str(), ios_base::out);
-        out << ProcessId::getCurrent() << endl;
+        std::ofstream out(path.c_str(), std::ios_base::out);
+        out << ProcessId::getCurrent() << std::endl;
         if (!out.good()) {
             auto errAndStr = errnoAndDescription();
             if (errAndStr.first == 0) {
-                log() << "ERROR: Cannot write pid file to " << path.string()
-                      << ": Unable to determine OS error";
+                LOGV2(23329,
+                      "ERROR: Cannot write pid file to {path_string}: Unable to determine OS error",
+                      "path_string"_attr = path.string());
             } else {
-                log() << "ERROR: Cannot write pid file to " << path.string() << ": "
-                      << errAndStr.second;
+                LOGV2(23330,
+                      "ERROR: Cannot write pid file to {path_string}: {errAndStr_second}",
+                      "path_string"_attr = path.string(),
+                      "errAndStr_second"_attr = errAndStr.second);
+            }
+        } else {
+            boost::system::error_code ec;
+            boost::filesystem::permissions(
+                path,
+                boost::filesystem::owner_read | boost::filesystem::owner_write |
+                    boost::filesystem::group_read | boost::filesystem::others_read,
+                ec);
+            if (ec) {
+                LOGV2(23331,
+                      "Could not set permissions on pid file {path_string}: {ec_message}",
+                      "path_string"_attr = path.string(),
+                      "ec_message"_attr = ec.message());
+                return false;
             }
         }
         return out.good();
@@ -76,25 +92,7 @@ private:
     boost::filesystem::path path;
 } pidFileWiper;
 
-bool writePidFile(const string& path) {
+bool writePidFile(const std::string& path) {
     return pidFileWiper.write(path);
 }
-
-ProcessInfo::SystemInfo* ProcessInfo::systemInfo = NULL;
-
-void ProcessInfo::initializeSystemInfo() {
-    if (systemInfo == NULL) {
-        systemInfo = new SystemInfo();
-    }
-}
-
-/**
- * We need this get the system page size for the secure allocator, which the enterprise modules need
- * for storage for command line parameters.
- */
-MONGO_INITIALIZER_GENERAL(SystemInfo, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS)
-(InitializerContext* context) {
-    ProcessInfo::initializeSystemInfo();
-    return Status::OK();
-}
-}
+}  // namespace mongo

@@ -1,15 +1,6 @@
-// SERVER-16498 d_migrate.cpp should not rely on system.namespaces
-//
 // This test creates a sharded collection with wiredtiger options.
 // When the chunks of this collection get migrated to the other shard,
 // the other shard should create the collection with the same options.
-// However, before SERVER-16498, the receiver relies on checking
-// system.namespaces on the donor, which is empty on wiredtiger.
-// As a result, the new collection created on receiver has different
-// options.
-//
-// P.S. wiredtiger options are not valid for MMAPv1, but MMAPv1 will
-// keep and ignore them.
 
 var st = new ShardingTest({shards: 2});
 
@@ -39,7 +30,7 @@ if (Array.contains(storageEngines, "wiredTiger")) {
     checkCollectionOptions(db);
 
     assert.commandWorked(db.adminCommand({enableSharding: 'test'}));
-    st.ensurePrimaryShard('test', 'shard0001');
+    st.ensurePrimaryShard('test', st.shard1.shardName);
     assert.commandWorked(db.adminCommand({shardCollection: coll + '', key: {x: 1}}));
 
     coll.insert({x: 0});
@@ -60,3 +51,4 @@ if (Array.contains(storageEngines, "wiredTiger")) {
 } else {
     print("Skipping test. wiredTiger engine not supported by mongod binary.");
 }
+st.stop();

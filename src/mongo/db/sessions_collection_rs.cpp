@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,134 +32,210 @@
 #include "mongo/db/sessions_collection_rs.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 #include <utility>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
-#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-namespace {
-
-BSONObj lsidQuery(const LogicalSessionId& lsid) {
-    return BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON());
-}
-
-Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbConnection>* conn) {
-    auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
-    auto config = coord->getConfig();
-    if (!config.isInitialized()) {
-        return {ErrorCodes::NotYetInitialized, "Replication has not yet been configured"};
-    }
-
+auto SessionsCollectionRS::_makePrimaryConnection(OperationContext* opCtx) {
     // Find the primary
-    RemoteCommandTargeterFactoryImpl factory;
-    auto targeter = factory.create(config.getConnectionString());
-    auto res = targeter->findHost(opCtx, ReadPreferenceSetting(ReadPreference::PrimaryOnly));
-    if (!res.isOK()) {
-        return res.getStatus();
+    if (stdx::lock_guard lk(_mutex); !_targeter) {
+        // There is an assumption here that for the lifetime of a given process, the
+        // ReplicationCoordiation will only return configs for a single replica set
+        auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
+        auto config = coord->getConfig();
+        uassert(ErrorCodes::NotYetInitialized,
+                "Replication has not yet been configured",
+                config.isInitialized());
+
+        RemoteCommandTargeterFactoryImpl factory;
+        _targeter = factory.create(config.getConnectionString());
     }
 
-    auto hostname = res.getValue().toString();
+    auto res = uassertStatusOK(
+        _targeter->findHost(opCtx, ReadPreferenceSetting(ReadPreference::PrimaryOnly)));
+
+    auto conn = std::make_unique<ScopedDbConnection>(res.toString());
 
     // Make a connection to the primary, auth, then send
-    try {
-        conn->emplace(hostname);
-        if (isInternalAuthSet()) {
-            (*conn)->get()->auth(getInternalUserAuthParams());
-        }
-        return Status::OK();
-    } catch (...) {
-        return exceptionToStatus();
+    if (auth::isInternalAuthSet()) {
+        uassertStatusOK(conn->get()->authenticateInternalUser());
     }
+
+    return conn;
 }
 
-template <typename Callback>
-auto runIfStandaloneOrPrimary(OperationContext* opCtx, Callback callback)
-    -> boost::optional<decltype(std::declval<Callback>()())> {
-    Lock::DBLock lk(opCtx, SessionsCollection::kSessionsDb, MODE_IX);
-    Lock::CollectionLock lock(opCtx->lockState(), SessionsCollection::kSessionsFullNS, MODE_IX);
+bool SessionsCollectionRS::_isStandaloneOrPrimary(const NamespaceString& ns,
+                                                  OperationContext* opCtx) {
+    ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
+    Lock::DBLock lk(opCtx, ns.db(), MODE_IS);
+    Lock::CollectionLock lock(opCtx, NamespaceString::kLogicalSessionsNamespace, MODE_IS);
 
     auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
-    if (coord->canAcceptWritesForDatabase(opCtx, SessionsCollection::kSessionsDb)) {
-        return callback();
-    }
 
-    return boost::none;
-}
-
-template <typename Callback>
-auto sendToPrimary(OperationContext* opCtx, Callback callback)
-    -> decltype(std::declval<Callback>()(static_cast<DBClientBase*>(nullptr))) {
-    boost::optional<ScopedDbConnection> conn;
-    auto res = makePrimaryConnection(opCtx, &conn);
-    if (!res.isOK()) {
-        return res;
-    }
-
-    return callback(conn->get());
+    return coord->canAcceptWritesForDatabase(opCtx, ns.db());
 }
 
 template <typename LocalCallback, typename RemoteCallback>
-auto dispatch(OperationContext* opCtx, LocalCallback localCallback, RemoteCallback remoteCallback)
-    -> decltype(std::declval<RemoteCallback>()(static_cast<DBClientBase*>(nullptr))) {
-    // If we are the primary, write directly to ourself.
-    auto result = runIfStandaloneOrPrimary(opCtx, [&] { return localCallback(); });
-
-    if (result) {
-        return *result;
+auto SessionsCollectionRS::_dispatch(const NamespaceString& ns,
+                                     OperationContext* opCtx,
+                                     LocalCallback&& localCallback,
+                                     RemoteCallback&& remoteCallback)
+    -> CommonResultT<LocalCallback, RemoteCallback> {
+    if (_isStandaloneOrPrimary(ns, opCtx)) {
+        return std::forward<LocalCallback>(localCallback)();
     }
 
-    return sendToPrimary(opCtx, remoteCallback);
+    // There is a window here where we may transition from Primary to Secondary after we release
+    // the locks we take in _isStandaloneOrPrimary(). In this case, the callback we run below
+    // may throw a NotMaster error, or a stale read. However, this is preferable to running the
+    // callback while we hold locks, since that can lead to a deadlock.
+
+    auto conn = _makePrimaryConnection(opCtx);
+    DBClientBase* client = conn->get();
+    auto guard = makeGuard([&] { conn->done(); });
+    try {
+        return std::forward<RemoteCallback>(remoteCallback)(client);
+    } catch (...) {
+        guard.dismiss();
+        conn->kill();
+        throw;
+    }
 }
 
-}  // namespace
+void SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
+    _dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
+        opCtx,
+        [&] {
+            try {
+                checkSessionsCollectionExists(opCtx);
+            } catch (const DBException& ex) {
 
-Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
-                                             const LogicalSessionRecordSet& sessions,
-                                             Date_t refreshTime) {
-    return dispatch(opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doRefresh(sessions, refreshTime, makeSendFnForBatchWrite(&client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doRefreshExternal(
-                            sessions, refreshTime, makeSendFnForCommand(client));
-                    });
+                DBDirectClient client(opCtx);
+                BSONObj cmd;
+
+                if (ex.code() == ErrorCodes::IndexOptionsConflict) {
+                    cmd = generateCollModCmd();
+                } else {
+                    // Creating the TTL index will auto-generate the collection.
+                    cmd = generateCreateIndexesCmd();
+                }
+
+                BSONObj info;
+                if (!client.runCommand(
+                        NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
+                    uassertStatusOK(getStatusFromCommandResult(info));
+                }
+            }
+        },
+        [&](DBClientBase*) { checkSessionsCollectionExists(opCtx); });
 }
 
-Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
-                                           const LogicalSessionIdSet& sessions) {
-    return dispatch(opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doRemove(sessions, makeSendFnForBatchWrite(&client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doRemoveExternal(sessions, makeSendFnForCommand(client));
-                    });
+void SessionsCollectionRS::checkSessionsCollectionExists(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+
+    const bool includeBuildUUIDs = false;
+    const int options = 0;
+    auto indexes = client.getIndexSpecs(
+        NamespaceString::kLogicalSessionsNamespace, includeBuildUUIDs, options);
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace << " does not exist",
+            indexes.size() != 0u);
+
+    auto index = std::find_if(indexes.begin(), indexes.end(), [](const BSONObj& index) {
+        return index.getField("name").String() == kSessionsTTLIndex;
+    });
+
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " does not have the required TTL index",
+            index != indexes.end());
+
+    uassert(ErrorCodes::IndexOptionsConflict,
+            str::stream() << NamespaceString::kLogicalSessionsNamespace
+                          << " currently has the incorrect timeout for the TTL index",
+            index->hasField("expireAfterSeconds") &&
+                index->getField("expireAfterSeconds").Int() ==
+                    (localLogicalSessionTimeoutMinutes * 60));
 }
 
-StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
-    OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    return dispatch(
+void SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
+                                           const LogicalSessionRecordSet& sessions) {
+    const std::vector<LogicalSessionRecord> sessionsVector(sessions.begin(), sessions.end());
+
+    _dispatch(NamespaceString::kLogicalSessionsNamespace,
+              opCtx,
+              [&] {
+                  DBDirectClient client(opCtx);
+                  _doRefresh(
+                      NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
+              },
+              [&](DBClientBase* client) {
+                  _doRefresh(
+                      NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, client));
+              });
+}
+
+void SessionsCollectionRS::removeRecords(OperationContext* opCtx,
+                                         const LogicalSessionIdSet& sessions) {
+    const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
+
+    _dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);
-            return doFetch(sessions, makeFindFnForCommand(&client));
+            _doRemove(NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
         },
-        [&](DBClientBase* client) { return doFetch(sessions, makeFindFnForCommand(client)); });
+        [&](DBClientBase* client) {
+            _doRemove(NamespaceString::kLogicalSessionsNamespace,
+                      sessionsVector,
+                      makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, client));
+        });
+}
+
+LogicalSessionIdSet SessionsCollectionRS::findRemovedSessions(OperationContext* opCtx,
+                                                              const LogicalSessionIdSet& sessions) {
+    const std::vector<LogicalSessionId> sessionsVector(sessions.begin(), sessions.end());
+
+    return _dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
+        opCtx,
+        [&] {
+            DBDirectClient client(opCtx);
+            return _doFindRemoved(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessionsVector,
+                makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, &client));
+        },
+        [&](DBClientBase* client) {
+            return _doFindRemoved(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessionsVector,
+                makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, client));
+        });
 }
 
 }  // namespace mongo

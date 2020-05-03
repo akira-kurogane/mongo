@@ -1,3 +1,9 @@
+// @tags: [
+//   requires_fastcount,
+//   uses_multiple_connections,
+//   uses_parallel_shell,
+// ]
+
 function f() {
     throw Error("intentional_throw_to_test_assert_throws");
 }

@@ -1,3 +1,5 @@
+// @tags: [requires_non_retryable_commands, requires_replication]
+
 orig = 'rename_stayTemp_orig';
 dest = 'rename_stayTemp_dest';
 
@@ -11,12 +13,13 @@ function ns(coll) {
 function istemp(name) {
     var result = db.runCommand("listCollections", {filter: {name: name}});
     assert(result.ok);
-    var collections = new DBCommandCursor(db.getMongo(), result).toArray();
+    var collections = new DBCommandCursor(db, result).toArray();
     assert.eq(1, collections.length);
     return collections[0].options.temp ? true : false;
 }
 
-db.runCommand({create: orig, temp: 1});
+assert.commandWorked(
+    db.runCommand({applyOps: [{op: "c", ns: db.getName() + ".$cmd", o: {create: orig, temp: 1}}]}));
 assert(istemp(orig));
 
 db.adminCommand({renameCollection: ns(orig), to: ns(dest)});
@@ -24,7 +27,8 @@ assert(!istemp(dest));
 
 db[dest].drop();
 
-db.runCommand({create: orig, temp: 1});
+assert.commandWorked(
+    db.runCommand({applyOps: [{op: "c", ns: db.getName() + ".$cmd", o: {create: orig, temp: 1}}]}));
 assert(istemp(orig));
 
 db.adminCommand({renameCollection: ns(orig), to: ns(dest), stayTemp: true});

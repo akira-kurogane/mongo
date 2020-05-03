@@ -8,6 +8,7 @@ noinst_PROGRAMS = \
 	ex_all \
 	ex_async \
 	ex_backup \
+	ex_backup_block \
 	ex_call_center \
 	ex_config_parse \
 	ex_cursor \
@@ -39,4 +40,4 @@ AM_TESTS_ENVIRONMENT = WIREDTIGER_HOME=`mktemp -d WT_HOME.XXXX` ; export WIREDTI
 LOG_COMPILER = $(TEST_WRAPPER)
 
 clean-local:
-	rm -rf WT_HOME* *.core backup_full.* backup_incr.*
+	rm -rf WT_HOME* core.* *.core backup_full.* backup_incr.*

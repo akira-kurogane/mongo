@@ -1,33 +1,33 @@
-// processinfo_linux2.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,9 @@
 #include <sys/time.h>
 #include <sys/utsname.h>
 #include <unistd.h>
-#ifdef __UCLIBC__
+#ifdef __BIONIC__
+#include <android/api-level.h>
+#elif __UCLIBC__
 #include <features.h>
 #else
 #include <gnu/libc-version.h>
@@ -51,11 +53,10 @@
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <pcrecpp.h>
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
-
-using namespace std;
 
 #define KLONG long
 #define KLF "l"
@@ -70,9 +71,9 @@ public:
 
         FILE* f = fopen(name, "r");
         if (!f) {
-            stringstream ss;
+            std::stringstream ss;
             ss << "couldn't open [" << name << "] " << errnoWithDescription();
-            string s = ss.str();
+            std::string s = ss.str();
             msgasserted(13538, s.c_str());
         }
         int found = fscanf(f,
@@ -132,9 +133,9 @@ public:
                              &_exit_signal, &_processor,
                              &_rtprio, &_sched
                            */
-                           );
+        );
         if (found == 0) {
-            cout << "system error: reading proc info" << endl;
+            std::cout << "system error: reading proc info" << std::endl;
         }
         fclose(f);
     }
@@ -244,19 +245,88 @@ public:
     // The current EIP (instruction pointer).
 };
 
+namespace {
+
+// As described in the /proc/[pid]/mountinfo section of `man 5 proc`:
+//
+// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+// |  |  |    |     |     |          |          |      |     |
+// (1)(2)(3:4)(5)   (6)   (7)        (8)        (9)   (10)   (11)
+struct MountRecord {
+    bool parseLine(const std::string& line) {
+        static const pcrecpp::RE kRe{
+            //   (1)   (2)   (3)   (4)   (5)   (6)   (7)   (8)                (9)   (10)  (11)
+            R"re((\d+) (\d+) (\d+):(\d+) (\S+) (\S+) (\S+) ((?:\S+:\S+ ?)*) - (\S+) (\S+) (\S+))re"};
+        return kRe.FullMatch(line,
+                             &mountId,
+                             &parentId,
+                             &major,
+                             &minor,
+                             &root,
+                             &mountPoint,
+                             &options,
+                             &fields,
+                             &type,
+                             &source,
+                             &superOpt);
+    }
+
+    void appendBSON(BSONObjBuilder& bob) const {
+        bob.append("mountId", mountId)
+            .append("parentId", parentId)
+            .append("major", major)
+            .append("minor", minor)
+            .append("root", root)
+            .append("mountPoint", mountPoint)
+            .append("options", options)
+            .append("fields", fields)
+            .append("type", type)
+            .append("source", source)
+            .append("superOpt", superOpt);
+    }
+
+    int mountId;             //  (1) unique ID for the mount
+    int parentId;            //  (2) the ID of the parent mount (self for the root mount)
+    int major;               //  (3) major block device number (see stat(2))
+    int minor;               //  (4) minor block device number
+    std::string root;        //  (5) path in filesystem forming the root
+    std::string mountPoint;  //  (6) the mount point relative to the process's root
+    std::string options;     //  (7) per-mount options (see mount(2)).
+    std::string fields;      //  (8) zero or more: "tag[:value]" fields
+    std::string type;        //  (9) filesystem type: "type[.subtype]"
+    std::string source;      //  (10) fs-specific information or "none"
+    std::string superOpt;    //  (11) per-superblock options (see mount(2))
+};
+
+void appendMountInfo(BSONObjBuilder& bob) {
+    std::ifstream ifs("/proc/self/mountinfo");
+    if (!ifs)
+        return;
+    BSONArrayBuilder arr = bob.subarrayStart("mountInfo");
+    std::string line;
+    MountRecord rec;
+    while (ifs && getline(ifs, line)) {
+        if (rec.parseLine(line)) {
+            auto bob = BSONObjBuilder(arr.subobjStart());
+            rec.appendBSON(bob);
+        }
+    }
+}
+
+}  // namespace
 
 class LinuxSysHelper {
 public:
     /**
-    * Read the first 1023 bytes from a file
-    */
-    static string readLineFromFile(const char* fname) {
+     * Read the first 1023 bytes from a file
+     */
+    static std::string readLineFromFile(const char* fname) {
         FILE* f;
         char fstr[1024] = {0};
 
         f = fopen(fname, "r");
-        if (f != NULL) {
-            if (fgets(fstr, 1023, f) != NULL)
+        if (f != nullptr) {
+            if (fgets(fstr, 1023, f) != nullptr)
                 fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
             fclose(f);
         }
@@ -264,18 +334,18 @@ public:
     }
 
     /**
-    * Get some details about the CPU
-    */
-    static void getCpuInfo(int& procCount, string& freq, string& features) {
+     * Get some details about the CPU
+     */
+    static void getCpuInfo(int& procCount, std::string& freq, std::string& features) {
         FILE* f;
         char fstr[1024] = {0};
         procCount = 0;
 
         f = fopen("/proc/cpuinfo", "r");
-        if (f == NULL)
+        if (f == nullptr)
             return;
 
-        while (fgets(fstr, 1023, f) != NULL && !feof(f)) {
+        while (fgets(fstr, 1023, f) != nullptr && !feof(f)) {
             // until the end of the file
             fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
             if (strncmp(fstr, "processor ", 10) == 0 || strncmp(fstr, "processor\t:", 11) == 0)
@@ -290,9 +360,9 @@ public:
     }
 
     /**
-    * Determine linux distro and version
-    */
-    static void getLinuxDistro(string& name, string& version) {
+     * Determine linux distro and version
+     */
+    static void getLinuxDistro(std::string& name, std::string& version) {
         char buf[4096] = {0};
 
         // try lsb file first
@@ -305,23 +375,24 @@ public:
 
             // find the distribution name and version in the contents.
             // format:  KEY=VAL\n
-            string contents = buf;
+            std::string contents = buf;
             unsigned lineCnt = 0;
             try {
                 while (lineCnt < contents.length() - 1 &&
-                       contents.substr(lineCnt).find('\n') != string::npos) {
+                       contents.substr(lineCnt).find('\n') != std::string::npos) {
                     // until we hit the last newline or eof
-                    string line = contents.substr(lineCnt, contents.substr(lineCnt).find('\n'));
+                    std::string line =
+                        contents.substr(lineCnt, contents.substr(lineCnt).find('\n'));
                     lineCnt += contents.substr(lineCnt).find('\n') + 1;
                     size_t delim = line.find('=');
-                    string key = line.substr(0, delim);
-                    string val = line.substr(delim + 1);  // 0-based offset of delim
+                    std::string key = line.substr(0, delim);
+                    std::string val = line.substr(delim + 1);  // 0-based offset of delim
                     if (key.compare("DISTRIB_ID") == 0)
                         name = val;
-                    if (string(key).compare("DISTRIB_RELEASE") == 0)
+                    if (std::string(key).compare("DISTRIB_RELEASE") == 0)
                         version = val;
                 }
-            } catch (const std::out_of_range& e) {
+            } catch (const std::out_of_range&) {
                 // attempted to get invalid substr
             }
             // return with lsb-release data if we found both the name and version
@@ -333,7 +404,7 @@ public:
         // try known flat-text file locations
         // format: Slackware-x86_64 13.0, Red Hat Enterprise Linux Server release 5.6 (Tikanga),
         // etc.
-        typedef vector<string> pathvec;
+        typedef std::vector<std::string> pathvec;
         pathvec paths;
         pathvec::const_iterator i;
         bool found = false;
@@ -373,22 +444,25 @@ public:
             buf[len] = '\0';
             name = buf;
             size_t nl = 0;
-            if ((nl = name.find('\n', nl)) != string::npos)
+            if ((nl = name.find('\n', nl)) != std::string::npos)
                 // stop at first newline
                 name.erase(nl);
-            // no standard format for name and version.  use kernel version
-            version = "Kernel ";
-            version += LinuxSysHelper::readLineFromFile("/proc/sys/kernel/osrelease");
+        } else {
+            name = "unknown";
         }
+
+        // There is no standard format for name and version so use the kernel version.
+        version = "Kernel ";
+        version += LinuxSysHelper::readLineFromFile("/proc/sys/kernel/osrelease");
     }
 
     /**
-    * Get system memory total
-    */
+     * Get system memory total
+     */
     static unsigned long long getSystemMemorySize() {
-        string meminfo = readLineFromFile("/proc/meminfo");
+        std::string meminfo = readLineFromFile("/proc/meminfo");
         size_t lineOff = 0;
-        if (!meminfo.empty() && (lineOff = meminfo.find("MemTotal")) != string::npos) {
+        if (!meminfo.empty() && (lineOff = meminfo.find("MemTotal")) != std::string::npos) {
             // found MemTotal line.  capture everything between 'MemTotal:' and ' kB'.
             lineOff = meminfo.substr(lineOff).find(':') + 1;
             meminfo = meminfo.substr(lineOff, meminfo.substr(lineOff).find("kB") - 1);
@@ -400,12 +474,28 @@ public:
             meminfo = meminfo.substr(lineOff);
 
             unsigned long long systemMem = 0;
-            if (mongo::parseNumberFromString(meminfo, &systemMem).isOK()) {
+            if (mongo::NumberParser{}(meminfo, &systemMem).isOK()) {
                 return systemMem * 1024;  // convert from kB to bytes
             } else
-                log() << "Unable to collect system memory information";
+                LOGV2(23338, "Unable to collect system memory information");
         }
         return 0;
+    }
+
+    /**
+     * Get memory limit for the process.
+     * If memory is being limited by the applied control group and it's less
+     * than the OS system memory (default cgroup limit is ulonglong max) let's
+     * return the actual memory we'll have available to the process.
+     */
+    static unsigned long long getMemorySizeLimit() {
+        unsigned long long systemMemBytes = getSystemMemorySize();
+        unsigned long long cgroupMemBytes = 0;
+        std::string cgmemlimit = readLineFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+        if (!cgmemlimit.empty() && mongo::NumberParser{}(cgmemlimit, &cgroupMemBytes).isOK()) {
+            return std::min(systemMemBytes, cgroupMemBytes);
+        }
+        return systemMemBytes;
     }
 };
 
@@ -419,7 +509,7 @@ bool ProcessInfo::supported() {
 }
 
 // get the number of CPUs available to the current process
-boost::optional<unsigned long> ProcessInfo::getNumAvailableCores() {
+boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     cpu_set_t set;
 
     if (sched_getaffinity(0, sizeof(cpu_set_t), &set) == 0) {
@@ -455,33 +545,62 @@ double ProcessInfo::getSystemMemoryPressurePercentage() {
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
-    if (ru.ru_majflt <= std::numeric_limits<long long>::max())
-        info.appendNumber("page_faults", static_cast<long long>(ru.ru_majflt));
-    else
-        info.appendNumber("page_faults", static_cast<double>(ru.ru_majflt));
+
+    /*
+     * The actual rusage struct only works in terms of longs and time_ts.
+     * Since both are system dependent, I am converting to int64_t and taking a small hit from the
+     * FP processor and the BSONBuilder compression. At worst, this calls 100x/sec.
+     */
+    auto appendTime = [&info](StringData fieldName, struct timeval tv) {
+        auto value = (static_cast<int64_t>(tv.tv_sec) * 1000 * 1000) + tv.tv_usec;
+        info.append(fieldName, value);
+    };
+
+    auto appendNumber = [&info](StringData fieldName, auto value) {
+        info.append(fieldName, static_cast<int64_t>(value));
+    };
+
+    appendTime("user_time_us", ru.ru_utime);
+    appendTime("system_time_us", ru.ru_stime);
+
+    // ru_maxrss is duplicated in getResidentSizeInPages
+    // (/proc may or may not use getrusage(2) as well)
+    appendNumber("maximum_resident_set_kb", ru.ru_maxrss);
+
+    appendNumber("input_blocks", ru.ru_inblock);
+    appendNumber("output_blocks", ru.ru_oublock);
+
+    appendNumber("page_reclaims", ru.ru_minflt);
+    appendNumber("page_faults", ru.ru_majflt);
+
+    appendNumber("voluntary_context_switches", ru.ru_nvcsw);
+    appendNumber("involuntary_context_switches", ru.ru_nivcsw);
 }
 
 /**
-* Save a BSON obj representing the host system's details
-*/
+ * Save a BSON obj representing the host system's details
+ */
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     utsname unameData;
-    string distroName, distroVersion;
-    string cpuFreq, cpuFeatures;
+    std::string distroName, distroVersion;
+    std::string cpuFreq, cpuFeatures;
     int cpuCount;
 
-    string verSig = LinuxSysHelper::readLineFromFile("/proc/version_signature");
+    std::string verSig = LinuxSysHelper::readLineFromFile("/proc/version_signature");
     LinuxSysHelper::getCpuInfo(cpuCount, cpuFreq, cpuFeatures);
     LinuxSysHelper::getLinuxDistro(distroName, distroVersion);
 
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno);
+        LOGV2(23339,
+              "Unable to collect detailed system information: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     osType = "Linux";
     osName = distroName;
     osVersion = distroVersion;
     memSize = LinuxSysHelper::getSystemMemorySize();
+    memLimit = LinuxSysHelper::getMemorySizeLimit();
     addrSize = sizeof(void*) * CHAR_BIT;
     numCores = cpuCount;
     pageSize = static_cast<unsigned long long>(sysconf(_SC_PAGESIZE));
@@ -490,8 +609,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 
     BSONObjBuilder bExtra;
     bExtra.append("versionString", LinuxSysHelper::readLineFromFile("/proc/version"));
-#ifdef __UCLIBC__
-    stringstream ss;
+#ifdef __BIONIC__
+    std::stringstream ss;
+    ss << "bionic (android api " << __ANDROID_API__ << ")";
+    bExtra.append("libcVersion", ss.str());
+#elif __UCLIBC__
+    std::stringstream ss;
     ss << "uClibc-" << __UCLIBC_MAJOR__ << "." << __UCLIBC_MINOR__ << "." << __UCLIBC_SUBLEVEL__;
     bExtra.append("libcVersion", ss.str());
 #else
@@ -508,12 +631,14 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     bExtra.append("numPages", static_cast<int>(sysconf(_SC_PHYS_PAGES)));
     bExtra.append("maxOpenFiles", static_cast<int>(sysconf(_SC_OPEN_MAX)));
 
+    appendMountInfo(bExtra);
+
     _extraStats = bExtra.obj();
 }
 
 /**
-* Determine if the process is running with (cc)NUMA
-*/
+ * Determine if the process is running with (cc)NUMA
+ */
 bool ProcessInfo::checkNumaEnabled() {
     bool hasMultipleNodes = false;
     bool hasNumaMaps = false;
@@ -522,8 +647,11 @@ bool ProcessInfo::checkNumaEnabled() {
         hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
         hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
     } catch (boost::filesystem::filesystem_error& e) {
-        log() << "WARNING: Cannot detect if NUMA interleaving is enabled. "
-              << "Failed to probe \"" << e.path1().string() << "\": " << e.code().message();
+        LOGV2(23340,
+              "WARNING: Cannot detect if NUMA interleaving is enabled. Failed to probe "
+              "\"{e_path1_string}\": {e_code_message}",
+              "e_path1_string"_attr = e.path1().string(),
+              "e_code_message"_attr = e.code().message());
         return false;
     }
 
@@ -532,9 +660,10 @@ bool ProcessInfo::checkNumaEnabled() {
 
         // read the second column of first line to determine numa state
         // ('default' = enabled, 'interleave' = disabled).  Logic from version.cpp's warnings.
-        string line = LinuxSysHelper::readLineFromFile("/proc/self/numa_maps").append(" \0");
+        std::string line = LinuxSysHelper::readLineFromFile("/proc/self/numa_maps").append(" \0");
         size_t pos = line.find(' ');
-        if (pos != string::npos && line.substr(pos + 1, 10).find("interleave") == string::npos)
+        if (pos != std::string::npos &&
+            line.substr(pos + 1, 10).find("interleave") == std::string::npos)
             // interleave not found;
             return true;
     }
@@ -548,18 +677,22 @@ bool ProcessInfo::blockCheckSupported() {
 bool ProcessInfo::blockInMemory(const void* start) {
     unsigned char x = 0;
     if (mincore(const_cast<void*>(alignToStartOfPage(start)), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23341,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return 1;
     }
     return x & 0x1;
 }
 
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>* out) {
+bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
     out->resize(numPages);
     if (mincore(const_cast<void*>(alignToStartOfPage(start)),
                 numPages * getPageSize(),
                 reinterpret_cast<unsigned char*>(&out->front()))) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23342,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
     for (size_t i = 0; i < numPages; ++i) {
@@ -567,4 +700,4 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>
     }
     return true;
 }
-}
+}  // namespace mongo

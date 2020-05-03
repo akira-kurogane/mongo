@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,7 +53,7 @@ void LockStats<CounterType>::report(BSONObjBuilder* builder) const {
 
 template <typename CounterType>
 void LockStats<CounterType>::_report(BSONObjBuilder* builder,
-                                     const char* sectionName,
+                                     const char* resourceTypeName,
                                      const PerModeLockStatCounters& stat) const {
     std::unique_ptr<BSONObjBuilder> section;
 
@@ -63,11 +64,12 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> numAcquires;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            const long long value = CounterOps::get(stat.modeStats[mode].numAcquisitions);
+            long long value = CounterOps::get(stat.modeStats[mode].numAcquisitions);
+
             if (value > 0) {
                 if (!numAcquires) {
                     if (!section) {
-                        section.reset(new BSONObjBuilder(builder->subobjStart(sectionName)));
+                        section.reset(new BSONObjBuilder(builder->subobjStart(resourceTypeName)));
                     }
 
                     numAcquires.reset(new BSONObjBuilder(section->subobjStart("acquireCount")));
@@ -81,11 +83,11 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> numWaits;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            const long long value = CounterOps::get(stat.modeStats[mode].numWaits);
+            long long value = CounterOps::get(stat.modeStats[mode].numWaits);
             if (value > 0) {
                 if (!numWaits) {
                     if (!section) {
-                        section.reset(new BSONObjBuilder(builder->subobjStart(sectionName)));
+                        section.reset(new BSONObjBuilder(builder->subobjStart(resourceTypeName)));
                     }
 
                     numWaits.reset(new BSONObjBuilder(section->subobjStart("acquireWaitCount")));
@@ -99,35 +101,17 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> timeAcquiring;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            const long long value = CounterOps::get(stat.modeStats[mode].combinedWaitTimeMicros);
+            long long value = CounterOps::get(stat.modeStats[mode].combinedWaitTimeMicros);
             if (value > 0) {
                 if (!timeAcquiring) {
                     if (!section) {
-                        section.reset(new BSONObjBuilder(builder->subobjStart(sectionName)));
+                        section.reset(new BSONObjBuilder(builder->subobjStart(resourceTypeName)));
                     }
 
                     timeAcquiring.reset(
                         new BSONObjBuilder(section->subobjStart("timeAcquiringMicros")));
                 }
                 timeAcquiring->append(legacyModeName(static_cast<LockMode>(mode)), value);
-            }
-        }
-    }
-
-    // Deadlocks
-    {
-        std::unique_ptr<BSONObjBuilder> deadlockCount;
-        for (int mode = 1; mode < LockModesCount; mode++) {
-            const long long value = CounterOps::get(stat.modeStats[mode].numDeadlocks);
-            if (value > 0) {
-                if (!deadlockCount) {
-                    if (!section) {
-                        section.reset(new BSONObjBuilder(builder->subobjStart(sectionName)));
-                    }
-
-                    deadlockCount.reset(new BSONObjBuilder(section->subobjStart("deadlockCount")));
-                }
-                deadlockCount->append(legacyModeName(static_cast<LockMode>(mode)), value);
             }
         }
     }
@@ -147,8 +131,8 @@ void LockStats<CounterType>::reset() {
 }
 
 
-// Ensures that there are instances compiled for LockStats for AtomicInt64 and int64_t
+// Ensures that there are instances compiled for LockStats for AtomicWord<long long> and int64_t
 template class LockStats<int64_t>;
-template class LockStats<AtomicInt64>;
+template class LockStats<AtomicWord<long long>>;
 
 }  // namespace mongo

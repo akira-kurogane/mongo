@@ -1,32 +1,34 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/base/data_builder.h"
+#include "mongo/base/data_type_terminated.h"
 
 #include "mongo/platform/endian.h"
 #include "mongo/unittest/unittest.h"
@@ -65,11 +67,10 @@ TEST(DataBuilder, Basic) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(static_cast<uint32_t>(2),
-                  cdrc.readAndAdvance<LittleEndian<uint32_t>>().getValue());
-    ASSERT_EQUALS(static_cast<uint64_t>(3), cdrc.readAndAdvance<BigEndian<uint64_t>>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(static_cast<uint32_t>(2), cdrc.readAndAdvance<LittleEndian<uint32_t>>());
+    ASSERT_EQUALS(static_cast<uint64_t>(3), cdrc.readAndAdvance<BigEndian<uint64_t>>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, ResizeDown) {
@@ -84,8 +85,8 @@ TEST(DataBuilder, ResizeDown) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, ResizeUp) {
@@ -100,9 +101,9 @@ TEST(DataBuilder, ResizeUp) {
 
     ConstDataRangeCursor cdrc = db.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(static_cast<uint64_t>(2), cdrc.readAndAdvance<uint64_t>().getValue());
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(static_cast<uint64_t>(2), cdrc.readAndAdvance<uint64_t>());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, Reserve) {
@@ -146,11 +147,11 @@ TEST(DataBuilder, Clear) {
     ASSERT_EQUALS(0u, db.size());
 
     ConstDataRangeCursor cdrc = db.getCursor();
-    ASSERT_EQUALS(false, cdrc.readAndAdvance<char>().isOK());
+    ASSERT_NOT_OK(cdrc.readAndAdvanceNoThrow<char>());
 }
 
 TEST(DataBuilder, Move) {
-    DataBuilder db(1);
+    DataBuilder db(42);
 
     ASSERT_EQUALS(true, db.writeAndAdvance<uint16_t>(1).isOK());
 
@@ -158,13 +159,24 @@ TEST(DataBuilder, Move) {
 
     ConstDataRangeCursor cdrc = db2.getCursor();
 
-    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>().getValue());
-    ASSERT_EQUALS(2u, db2.capacity());
+    ASSERT_EQUALS(static_cast<uint16_t>(1), cdrc.readAndAdvance<uint16_t>());
+    ASSERT_EQUALS(42u, db2.capacity());
     ASSERT_EQUALS(2u, db2.size());
 
     ASSERT_EQUALS(0u, db.capacity());
     ASSERT_EQUALS(0u, db.size());
     ASSERT(!db.getCursor().data());
+}
+
+TEST(DataBuilder, TerminatedStringDatas) {
+    DataBuilder db{10};
+    StringData sample{"abcdefgh"};
+
+    auto status2 = db.writeAndAdvance<Terminated<'\0', StringData>>(sample);
+    ASSERT_EQUALS(true, status2.isOK());
+
+    auto status3 = db.writeAndAdvance<Terminated<'\0', StringData>>(sample);
+    ASSERT_EQUALS(true, status3.isOK());
 }
 
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,30 +34,30 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/fsync_locked.h"
 #include "mongo/db/commands/run_aggregate.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/stats/fill_locker_info.h"
 
 namespace mongo {
 
 class CurrentOpCommand final : public CurrentOpCommandBase {
-    MONGO_DISALLOW_COPYING(CurrentOpCommand);
+    CurrentOpCommand(const CurrentOpCommand&) = delete;
+    CurrentOpCommand& operator=(const CurrentOpCommand&) = delete;
 
 public:
     CurrentOpCommand() = default;
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbName,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                            ActionType::inprog)) {
             return Status::OK();
         }
 
-        bool isAuthenticated = authzSession->getAuthenticatedUserNames().more();
-        if (isAuthenticated && cmdObj["$ownOps"].trueValue()) {
+        if (authzSession->isAuthenticated() && cmdObj["$ownOps"].trueValue()) {
             return Status::OK();
         }
 
@@ -67,18 +68,29 @@ public:
         OperationContext* opCtx, const AggregationRequest& request) const final {
         auto aggCmdObj = request.serializeToCommandObj().toBson();
 
-        BSONObjBuilder responseBuilder;
+        rpc::OpMsgReplyBuilder replyBuilder;
 
-        auto status = runAggregate(
-            opCtx, request.getNamespaceString(), request, std::move(aggCmdObj), responseBuilder);
+        PrivilegeVector privileges;
+        if (!aggCmdObj["$ownOps"].trueValue()) {
+            privileges = {Privilege(ResourcePattern::forClusterResource(), ActionType::inprog)};
+        }
+
+        auto status = runAggregate(opCtx,
+                                   request.getNamespaceString(),
+                                   request,
+                                   std::move(aggCmdObj),
+                                   privileges,
+                                   &replyBuilder);
 
         if (!status.isOK()) {
             return status;
         }
 
-        appendCommandStatus(responseBuilder, Status::OK());
+        auto bodyBuilder = replyBuilder.getBodyBuilder();
+        CommandHelpers::appendSimpleCommandStatus(bodyBuilder, true);
+        bodyBuilder.doneFast();
 
-        return CursorResponse::parseFromBSON(responseBuilder.obj());
+        return CursorResponse::parseFromBSON(replyBuilder.releaseBody());
     }
 
     virtual void appendToResponse(BSONObjBuilder* result) const final {

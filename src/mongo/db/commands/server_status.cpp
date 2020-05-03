@@ -1,61 +1,45 @@
-// server_status.cpp
-
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/config.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_internal.h"
-#include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/platform/process_id.h"
-#include "mongo/transport/message_compressor_registry.h"
-#include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
-#include "mongo/util/net/hostname_canonicalization.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/ssl_manager.h"
-#include "mongo/util/processinfo.h"
-#include "mongo/util/ramlog.h"
-#include "mongo/util/time_support.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/net/http_client.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -65,6 +49,10 @@ using std::map;
 using std::string;
 using std::stringstream;
 
+namespace {
+constexpr auto kTimingSection = "timing"_sd;
+}  // namespace
+
 class CmdServerStatus : public BasicCommand {
 public:
     CmdServerStatus() : BasicCommand("serverStatus"), _started(Date_t::now()), _runCalled(false) {}
@@ -72,16 +60,18 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
-
-    virtual void help(stringstream& help) const {
-        help << "returns lots of administrative server statistics";
+    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
+        return false;
+    }
+    std::string help() const override {
+        return "returns lots of administrative server statistics";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::serverStatus);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -105,7 +95,7 @@ public:
         result.append("version", VersionInfoInterface::instance().version());
         result.append("process", serverGlobalParams.binaryName);
         result.append("pid", ProcessId::getCurrent().asLongLong());
-        result.append("uptime", (double)(time(0) - serverGlobalParams.started));
+        result.append("uptime", (double)(time(nullptr) - serverGlobalParams.started));
         auto uptime = clock->now() - _started;
         result.append("uptimeMillis", durationCount<Milliseconds>(uptime));
         result.append("uptimeEstimate", durationCount<Seconds>(uptime));
@@ -141,7 +131,7 @@ public:
         }
 
         // --- counters
-        bool includeMetricTree = MetricTree::theMetricTree != NULL;
+        bool includeMetricTree = MetricTree::theMetricTree != nullptr;
         if (cmdObj["metrics"].type() && !cmdObj["metrics"].trueValue())
             includeMetricTree = false;
 
@@ -151,29 +141,29 @@ public:
 
         // --- some hard coded global things hard to pull out
 
-        {
-            RamLog::LineIterator rl(RamLog::get("warnings"));
-            if (rl.lastWrite() >= time(0) - (10 * 60)) {  // only show warnings from last 10 minutes
-                BSONArrayBuilder arr(result.subarrayStart("warnings"));
-                while (rl.more()) {
-                    arr.append(rl.next());
-                }
-                arr.done();
-            }
-        }
-
         auto runElapsed = clock->now() - runStart;
         timeBuilder.appendNumber("at end", durationCount<Milliseconds>(runElapsed));
         if (runElapsed > Milliseconds(1000)) {
             BSONObj t = timeBuilder.obj();
-            log() << "serverStatus was very slow: " << t;
-            result.append("timing", t);
+            LOGV2(20499, "serverStatus was very slow: {t}", "t"_attr = t);
+
+            bool include_timing = true;
+            const auto& elem = cmdObj[kTimingSection];
+            if (!elem.eoo()) {
+                include_timing = elem.trueValue();
+            }
+
+            if (include_timing) {
+                result.append(kTimingSection, t);
+            }
         }
 
         return true;
     }
 
     void addSection(ServerStatusSection* section) {
+        // Disallow adding a section named "timing" as it is reserved for the server status command.
+        dassert(section->getSectionName() != kTimingSection);
         verify(!_runCalled);
         _sections[section->getSectionName()] = section;
     }
@@ -224,36 +214,16 @@ namespace {
 
 // some universal sections
 
-class Connections : public ServerStatusSection {
-public:
-    Connections() : ServerStatusSection("connections") {}
-    virtual bool includeByDefault() const {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        BSONObjBuilder bb;
-
-        auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
-        invariant(serviceEntryPoint);
-
-        auto stats = serviceEntryPoint->sessionStats();
-        bb.append("current", static_cast<int>(stats.numOpenSessions));
-        bb.append("available", static_cast<int>(stats.numAvailableSessions));
-        bb.append("totalCreated", static_cast<int>(stats.numCreatedSessions));
-        return bb.obj();
-    }
-
-} connections;
-
 class ExtraInfo : public ServerStatusSection {
 public:
     ExtraInfo() : ServerStatusSection("extra_info") {}
-    virtual bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder bb;
 
         bb.append("note", "fields vary by platform");
@@ -265,65 +235,26 @@ public:
 
 } extraInfo;
 
-
 class Asserts : public ServerStatusSection {
 public:
     Asserts() : ServerStatusSection("asserts") {}
-    virtual bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder asserts;
-        asserts.append("regular", assertionCount.regular);
-        asserts.append("warning", assertionCount.warning);
-        asserts.append("msg", assertionCount.msg);
-        asserts.append("user", assertionCount.user);
-        asserts.append("rollovers", assertionCount.rollovers);
+        asserts.append("regular", assertionCount.regular.loadRelaxed());
+        asserts.append("warning", assertionCount.warning.loadRelaxed());
+        asserts.append("msg", assertionCount.msg.loadRelaxed());
+        asserts.append("user", assertionCount.user.loadRelaxed());
+        asserts.append("rollovers", assertionCount.rollovers.loadRelaxed());
         return asserts.obj();
     }
 
 } asserts;
-
-
-class Network : public ServerStatusSection {
-public:
-    Network() : ServerStatusSection("network") {}
-    virtual bool includeByDefault() const {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        BSONObjBuilder b;
-        networkCounter.append(b);
-        appendMessageCompressionStats(&b);
-        auto executor = opCtx->getServiceContext()->getServiceExecutor();
-        if (executor)
-            executor->appendStats(&b);
-
-        return b.obj();
-    }
-
-} network;
-
-#ifdef MONGO_CONFIG_SSL
-class Security : public ServerStatusSection {
-public:
-    Security() : ServerStatusSection("security") {}
-    virtual bool includeByDefault() const {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        BSONObj result;
-        if (getSSLManager()) {
-            result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
-        }
-
-        return result;
-    }
-} security;
-#endif
 
 class MemBase : public ServerStatusMetric {
 public:
@@ -345,22 +276,21 @@ public:
     }
 } memBase;
 
-class AdvisoryHostFQDNs final : public ServerStatusSection {
+class HttpClientServerStatus : public ServerStatusSection {
 public:
-    AdvisoryHostFQDNs() : ServerStatusSection("advisoryHostFQDNs") {}
+    HttpClientServerStatus() : ServerStatusSection("http_client") {}
 
-    bool includeByDefault() const override {
+    bool includeByDefault() const final {
         return false;
     }
 
-    void appendSection(OperationContext* opCtx,
-                       const BSONElement& configElement,
-                       BSONObjBuilder* out) const override {
-        out->append(
-            "advisoryHostFQDNs",
-            getHostFQDNs(getHostNameCached(), HostnameCanonicalizationMode::kForwardAndReverse));
+    void addRequiredPrivileges(std::vector<Privilege>* out) final {}
+
+    BSONObj generateSection(OperationContext*, const BSONElement& configElement) const final {
+        return HttpClient::getServerStatus();
     }
-} advisoryHostFQDNs;
+} httpClientServerStatus;
+
 }  // namespace
 
 }  // namespace mongo

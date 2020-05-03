@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,11 +33,13 @@
 #include <initializer_list>
 #include <memory>
 
-#include "mongo/base/disallow_copying.h"
+#include <fmt/format.h>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -57,20 +60,11 @@ namespace mongo {
  *     - list of error codes, if present in the response, should stop the scheduler.
  */
 class RemoteCommandRetryScheduler {
-    MONGO_DISALLOW_COPYING(RemoteCommandRetryScheduler);
+    RemoteCommandRetryScheduler(const RemoteCommandRetryScheduler&) = delete;
+    RemoteCommandRetryScheduler& operator=(const RemoteCommandRetryScheduler&) = delete;
 
 public:
     class RetryPolicy;
-
-    /**
-     * List of not master error codes.
-     */
-    static const std::initializer_list<ErrorCodes::Error> kNotMasterErrors;
-
-    /**
-     * List of retriable error codes.
-     */
-    static const std::initializer_list<ErrorCodes::Error> kAllRetriableErrors;
 
     /**
      * Generates a retry policy that will send the remote command request to the source at most
@@ -80,15 +74,12 @@ public:
 
     /**
      * Creates a retry policy that will send the remote command request at most "maxAttempts".
-     * This policy will also direct the scheduler to stop retrying if it encounters any of the
-     * errors in "nonRetryableErrors".
      * (Requires SERVER-24067) The scheduler will also stop retrying if the total elapsed time
      * of all failed requests exceeds "maxResponseElapsedTotal".
      */
-    static std::unique_ptr<RetryPolicy> makeRetryPolicy(
-        std::size_t maxAttempts,
-        Milliseconds maxResponseElapsedTotal,
-        const std::initializer_list<ErrorCodes::Error>& retryableErrors);
+    template <ErrorCategory kCategory>
+    static std::unique_ptr<RetryPolicy> makeRetryPolicy(std::size_t maxAttempts,
+                                                        Milliseconds maxResponseElapsedTotal);
 
     /**
      * Creates scheduler but does not schedule any remote command request.
@@ -104,6 +95,7 @@ public:
      * Returns true if we have scheduled a remote command and are waiting for the response.
      */
     bool isActive() const;
+    bool _isActive_inlock() const;
 
     /**
      * Schedules remote command request.
@@ -126,6 +118,10 @@ public:
     std::string toString() const;
 
 private:
+    class NoRetryPolicy;
+    template <ErrorCategory kCategory>
+    class RetryPolicyForCategory;
+
     /**
      * Schedules remote command to be run by the executor.
      * "requestCount" is number of requests scheduled before calling this function.
@@ -149,18 +145,24 @@ private:
     executor::TaskExecutor* _executor;
 
     const executor::RemoteCommandRequest _request;
-    const executor::TaskExecutor::RemoteCommandCallbackFn _callback;
+    executor::TaskExecutor::RemoteCommandCallbackFn _callback;
     std::unique_ptr<RetryPolicy> _retryPolicy;
     std::size_t _currentAttempt{0};
     Milliseconds _currentUsedMillis{0};
 
     // Protects member data of this scheduler declared after mutex.
-    mutable stdx::mutex _mutex;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(2), "RemoteCommandRetryScheduler::_mutex");
 
     mutable stdx::condition_variable _condition;
 
-    // _active is true when remote command is scheduled to be run by the executor.
-    bool _active = false;
+    // State transitions:
+    // PreStart --> Running --> ShuttingDown --> Complete
+    // It is possible to skip intermediate states. For example,
+    // Calling shutdown() when the scheduler has not started will transition from PreStart directly
+    // to Complete.
+    enum class State { kPreStart, kRunning, kShuttingDown, kComplete };
+    State _state = State::kPreStart;  // (M)
 
     // Callback handle to the scheduled remote command.
     executor::TaskExecutor::CallbackHandle _remoteCommandCallbackHandle;
@@ -199,5 +201,72 @@ public:
 
     virtual std::string toString() const = 0;
 };
+
+class RemoteCommandRetryScheduler::NoRetryPolicy final
+    : public RemoteCommandRetryScheduler::RetryPolicy {
+public:
+    std::size_t getMaximumAttempts() const override {
+        return 1U;
+    }
+
+    Milliseconds getMaximumResponseElapsedTotal() const override {
+        return executor::RemoteCommandRequest::kNoTimeout;
+    }
+
+    bool shouldRetryOnError(ErrorCodes::Error error) const override {
+        return false;
+    }
+
+    std::string toString() const override {
+        return R"!({type: "NoRetryPolicy"})!";
+    }
+};
+
+inline auto RemoteCommandRetryScheduler::makeNoRetryPolicy() -> std::unique_ptr<RetryPolicy> {
+    return std::make_unique<NoRetryPolicy>();
+}
+
+template <ErrorCategory kCategory>
+class RemoteCommandRetryScheduler::RetryPolicyForCategory final
+    : public RemoteCommandRetryScheduler::RetryPolicy {
+public:
+    RetryPolicyForCategory(std::size_t maximumAttempts, Milliseconds maximumResponseElapsedTotal)
+        : _maximumAttempts(maximumAttempts),
+          _maximumResponseElapsedTotal(maximumResponseElapsedTotal){};
+
+    std::size_t getMaximumAttempts() const override {
+        return _maximumAttempts;
+    }
+
+    Milliseconds getMaximumResponseElapsedTotal() const override {
+        return _maximumResponseElapsedTotal;
+    }
+
+    bool shouldRetryOnError(ErrorCodes::Error error) const override {
+        return ErrorCodes::isA<kCategory>(error);
+    }
+
+    std::string toString() const override {
+        using namespace fmt::literals;
+        return R"!({{type: "RetryPolicyForCategory",categoryIndex: {}, maxAttempts: {}, maxTimeMS: {}}})!"_format(
+            static_cast<std::underlying_type_t<ErrorCategory>>(kCategory),
+            _maximumAttempts,
+            _maximumResponseElapsedTotal.count());
+    }
+
+private:
+    std::size_t _maximumAttempts;
+    Milliseconds _maximumResponseElapsedTotal;
+};
+
+template <ErrorCategory kCategory>
+auto RemoteCommandRetryScheduler::makeRetryPolicy(std::size_t maxAttempts,
+                                                  Milliseconds maxResponseElapsedTotal)
+    -> std::unique_ptr<RetryPolicy> {
+    return std::make_unique<RetryPolicyForCategory<kCategory>>(maxAttempts,
+                                                               maxResponseElapsedTotal);
+}
+
+bool isMongosRetriableError(const ErrorCodes::Error& code);
 
 }  // namespace mongo

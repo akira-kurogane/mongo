@@ -1,13 +1,12 @@
 """Git Utility functions."""
-from __future__ import absolute_import
-from __future__ import print_function
+from __future__ import annotations
 
 import itertools
 import os
 import re
-from typing import Any, Callable, List, Tuple
+from typing import Callable, List
 
-from buildscripts import git as _git
+from buildscripts.linter import git_base as _git
 from buildscripts import moduleconfig
 from buildscripts.resmokelib.utils import globstar
 
@@ -31,20 +30,23 @@ def get_base_dir():
         return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
-def get_repos():
-    # type: () -> List[Repo]
-    """Get a list of Repos to check linters for."""
+def get_module_paths() -> List[str]:
+    """Get a list of paths that contain modules."""
     base_dir = get_base_dir()
 
     # Get a list of modules
-    # TODO: how do we filter rocks, does it matter?
     mongo_modules = moduleconfig.discover_module_directories(
         os.path.join(base_dir, MODULE_DIR), None)
 
     paths = [os.path.join(base_dir, MODULE_DIR, m) for m in mongo_modules]
-
     paths.append(base_dir)
 
+    return paths
+
+
+def get_repos() -> List[Repo]:
+    """Get a list of Repos to check linters for."""
+    paths = get_module_paths()
     return [Repo(p) for p in paths]
 
 
@@ -69,7 +71,7 @@ class Repo(_git.Repository):
 
         Returns the full path to the file for clang-format to consume.
         """
-        if candidates is not None and len(candidates) > 0:
+        if candidates is not None and len(candidates) > 0:  # pylint: disable=len-as-condition
             candidates = [self._get_local_dir(f) for f in candidates]
             valid_files = list(
                 set(candidates).intersection(self.get_candidate_files(filter_function)))
@@ -96,6 +98,27 @@ class Repo(_git.Repository):
         # type: (Callable[[str], bool]) -> List[str]
         """Query git to get a list of all files in the repo to consider for analysis."""
         return self._git_ls_files(["--cached"], filter_function)
+
+    def get_my_candidate_files(self, filter_function, origin_branch):
+        # type: (Callable[[str], bool], str) -> List[str]
+        """Query git to get a list of files in the repo from a diff."""
+        # There are 3 diffs we run:
+        # 1. List of commits between origin/master and HEAD of current branch
+        # 2. Cached/Staged files (--cached)
+        # 3. Working Tree files git tracks
+
+        fork_point = self.get_merge_base(["HEAD", origin_branch])
+
+        diff_files = self.git_diff(["--name-only", "%s..HEAD" % (fork_point)])
+        diff_files += self.git_diff(["--name-only", "--cached"])
+        diff_files += self.git_diff(["--name-only"])
+
+        file_set = {
+            os.path.normpath(os.path.join(self.directory, line.rstrip()))
+            for line in diff_files.splitlines() if filter_function(line.rstrip())
+        }
+
+        return list(file_set)
 
     def get_working_tree_candidate_files(self, filter_function):
         # type: (Callable[[str], bool]) -> List[str]
@@ -143,6 +166,22 @@ def get_files_to_check_working_tree(filter_function):
     return valid_files
 
 
+def get_valid_files_from_candidates(candidates, filter_fn: Callable[[str], bool]):
+    """
+    Get the valid files from the list of candidate files.
+
+    :param candidates: List of candidate files.
+    :param filter_fn: Function to filter files.
+    :return: List of valid files.
+    """
+    repos = get_repos()
+
+    valid_files = list(
+        itertools.chain.from_iterable([r.get_candidates(candidates, filter_fn) for r in repos]))
+
+    return valid_files
+
+
 def get_files_to_check(files, filter_function):
     # type: (List[str], Callable[[str], bool]) -> List[str]
     """Get a list of files that need to be checked based on which files are managed by git."""
@@ -150,16 +189,12 @@ def get_files_to_check(files, filter_function):
     candidates_nested = [expand_file_string(f) for f in files]
     candidates = list(itertools.chain.from_iterable(candidates_nested))
 
-    if len(files) > 0 and len(candidates) == 0:
+    if files and not candidates:
         raise ValueError("Globs '%s' did not find any files with glob." % (files))
 
-    repos = get_repos()
+    valid_files = get_valid_files_from_candidates(candidates, filter_function)
 
-    valid_files = list(
-        itertools.chain.from_iterable(
-            [r.get_candidates(candidates, filter_function) for r in repos]))
-
-    if len(files) > 0 and len(valid_files) == 0:
+    if files and not valid_files:
         raise ValueError("Globs '%s' did not find any files with glob in git." % (files))
 
     return valid_files
@@ -175,15 +210,23 @@ def get_files_to_check_from_patch(patches, filter_function):
 
     lines = []  # type: List[str]
     for patch in patches:
-        with open(patch, "rb") as infile:
+        with open(patch, "r", encoding="utf-8") as infile:
             lines += infile.readlines()
 
     candidates = [check.match(line).group(1) for line in lines if check.match(line)]
 
+    valid_files = get_valid_files_from_candidates(candidates, filter_function)
+    return valid_files
+
+
+def get_my_files_to_check(filter_function, origin_branch):
+    # type: (Callable[[str], bool], str) -> List[str]
+    """Get a list of files that need to be checked based on which files are managed by git."""
+    # Get a list of candidate_files based on diff between this branch and origin/master
     repos = get_repos()
 
     valid_files = list(
         itertools.chain.from_iterable(
-            [r.get_candidates(candidates, filter_function) for r in repos]))
+            [r.get_my_candidate_files(filter_function, origin_branch) for r in repos]))
 
     return valid_files

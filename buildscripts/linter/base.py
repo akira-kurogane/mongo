@@ -1,26 +1,24 @@
 """Base class and support functions for linters."""
-from __future__ import absolute_import
-from __future__ import print_function
 
 from abc import ABCMeta, abstractmethod
 from typing import Dict, List, Optional
 
 
-class LinterBase(object):
+class LinterBase(object, metaclass=ABCMeta):
     """Base Class for all linters."""
 
-    __metaclass__ = ABCMeta
-
-    def __init__(self, cmd_name, required_version):
-        # type: (str, str) -> None
+    def __init__(self, cmd_name, required_version, cmd_location=None):
+        # type: (str, str, Optional[str]) -> None
         """
         Create a linter.
 
         cmd_name - short friendly name
         required_version - the required version string to check against
+        cmd_location - location of executable
         """
         self.cmd_name = cmd_name
         self.required_version = required_version
+        self.cmd_location = cmd_location
 
     @abstractmethod
     def get_lint_cmd_args(self, file_name):
@@ -49,17 +47,6 @@ class LinterBase(object):
         This applies to tools like clang-format and yapf which do not have a notion of linting. We
         introduce the idea of linting by formatting a file with the tool to standard out and
         comparing it to the original.
-        """
-        return False
-
-    def ignore_interpreter(self):
-        # type: () -> bool
-        # pylint: disable=no-self-use
-        """
-        Check if we should ignore the interpreter when searching for the linter to run.
-
-        This applies to mypy specifically since the pylinters are executed under Python 2 but mypy
-        is executed by python 3.
         """
         return False
 

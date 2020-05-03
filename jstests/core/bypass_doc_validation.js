@@ -1,40 +1,72 @@
-// Test the bypassDocumentValidation flag with some database commands. The test uses relevant shell
-// helpers when they're available for the respective server commands.
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+//   requires_non_retryable_commands,
+//   uses_$out,
+//   uses_map_reduce_with_temp_collections,
+// ]
 
+/**
+ * Tests that various database commands respect the 'bypassDocumentValidation' flag:
+ *
+ * - aggregation with $out
+ * - applyOps (when not sharded)
+ * - findAndModify
+ * - insert
+ * - mapReduce
+ * - update
+ */
 (function() {
-    'use strict';
+'use strict';
 
-    var dbName = 'bypass_document_validation';
-    var collName = 'bypass_document_validation';
-    var myDb = db.getSiblingDB(dbName);
-    var coll = myDb[collName];
-    var docValidationErrorCode = ErrorCodes.DocumentValidationFailure;
-    coll.drop();
+// For isWiredTiger.
+load("jstests/concurrency/fsm_workload_helpers/server_types.js");
+// For isReplSet
+load("jstests/libs/fixture_helpers.js");
 
-    // Add a validator to an existing collection.
-    assert.writeOK(coll.insert({_id: 1}));
-    assert.writeOK(coll.insert({_id: 2}));
-    assert.commandWorked(myDb.runCommand({collMod: collName, validator: {a: {$exists: true}}}));
+function assertFailsValidation(res) {
+    if (res instanceof WriteResult || res instanceof BulkWriteResult) {
+        assert.writeErrorWithCode(res, ErrorCodes.DocumentValidationFailure, tojson(res));
+    } else {
+        assert.commandFailedWithCode(res, ErrorCodes.DocumentValidationFailure, tojson(res));
+    }
+}
 
+const dbName = 'bypass_document_validation';
+const collName = 'bypass_document_validation';
+const myDb = db.getSiblingDB(dbName);
+const coll = myDb[collName];
+
+/**
+ * Tests that we can bypass document validation when appropriate when a collection has validator
+ * 'validator', which should enforce the existence of a field "a".
+ */
+function runBypassDocumentValidationTest(validator) {
+    // Use majority write concern to clear the drop-pending that can cause lock conflicts with
+    // transactions.
+    coll.drop({writeConcern: {w: "majority"}});
+
+    // Insert documents into the collection that would not be valid before setting 'validator'.
+    assert.commandWorked(coll.insert({_id: 1}));
+    assert.commandWorked(coll.insert({_id: 2}));
+    assert.commandWorked(myDb.runCommand({collMod: collName, validator: validator}));
+
+    const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
     // Test applyOps with a simple insert if not on mongos.
-    if (!db.runCommand({isdbgrid: 1}).isdbgrid) {
-        var op = [{h: 1, v: 2, op: 'i', ns: coll.getFullName(), o: {_id: 9}}];
-        assert.commandFailedWithCode(
-            myDb.runCommand({applyOps: op, bypassDocumentValidation: false}),
-            ErrorCodes.DocumentValidationFailure);
+    if (!isMongos) {
+        const op = [{op: 'i', ns: coll.getFullName(), o: {_id: 9}}];
+        assertFailsValidation(myDb.runCommand({applyOps: op, bypassDocumentValidation: false}));
         assert.eq(0, coll.count({_id: 9}));
         assert.commandWorked(myDb.runCommand({applyOps: op, bypassDocumentValidation: true}));
         assert.eq(1, coll.count({_id: 9}));
     }
 
-    // Test aggregation with $out collection.
-    var outputCollName = 'bypass_output_coll';
-    var outputColl = myDb[outputCollName];
+    // Test the aggregation command with a $out stage.
+    const outputCollName = 'bypass_output_coll';
+    const outputColl = myDb[outputCollName];
     outputColl.drop();
-    assert.commandWorked(myDb.createCollection(outputCollName, {validator: {a: {$exists: true}}}));
-
-    // Test the aggregate shell helper.
-    var pipeline =
+    assert.commandWorked(myDb.createCollection(outputCollName, {validator: validator}));
+    const pipeline =
         [{$match: {_id: 1}}, {$project: {aggregation: {$add: [1]}}}, {$out: outputCollName}];
     assert.throws(function() {
         coll.aggregate(pipeline, {bypassDocumentValidation: false});
@@ -43,20 +75,7 @@
     coll.aggregate(pipeline, {bypassDocumentValidation: true});
     assert.eq(1, outputColl.count({aggregation: 1}));
 
-    // Test the copyDb command.
-    var copyDbName = dbName + '_copy';
-    myDb.getSiblingDB(copyDbName).dropDatabase();
-    assert.commandFailedWithCode(
-        db.adminCommand(
-            {copydb: 1, fromdb: dbName, todb: copyDbName, bypassDocumentValidation: false}),
-        docValidationErrorCode);
-    assert.eq(0, db.getSiblingDB(copyDbName)[collName].count());
-    myDb.getSiblingDB(copyDbName).dropDatabase();
-    assert.commandWorked(db.adminCommand(
-        {copydb: 1, fromdb: dbName, todb: copyDbName, bypassDocumentValidation: true}));
-    assert.eq(coll.count(), db.getSiblingDB(copyDbName)[collName].count());
-
-    // Test the findAndModify shell helper.
+    // Test the findAndModify command.
     assert.throws(function() {
         coll.findAndModify({update: {$set: {findAndModify: 1}}, bypassDocumentValidation: false});
     });
@@ -64,23 +83,23 @@
     coll.findAndModify({update: {$set: {findAndModify: 1}}, bypassDocumentValidation: true});
     assert.eq(1, coll.count({findAndModify: 1}));
 
-    // Test the map/reduce command.
-    var map = function() {
+    // Test the mapReduce command.
+    const map = function() {
         emit(1, 1);
     };
-    var reduce = function(k, vs) {
+    const reduce = function() {
         return 'mapReduce';
     };
-    assert.commandFailedWithCode(coll.runCommand({
+    let res = myDb.runCommand({
         mapReduce: collName,
         map: map,
         reduce: reduce,
         out: {replace: outputCollName},
         bypassDocumentValidation: false
-    }),
-                                 docValidationErrorCode);
+    });
+    assertFailsValidation(res);
     assert.eq(0, outputColl.count({value: 'mapReduce'}));
-    var res = coll.runCommand({
+    res = myDb.runCommand({
         mapReduce: collName,
         map: map,
         reduce: reduce,
@@ -90,18 +109,40 @@
     assert.commandWorked(res);
     assert.eq(1, outputColl.count({value: 'mapReduce'}));
 
-    // Test the insert command.  Includes a test for a doc with no _id (SERVER-20859).
+    // Test the mapReduce command if it is reading from a different database and collection without
+    // validation.
+    const otherDb = myDb.getSisterDB("mr_second_input_db");
+    const otherDbColl = otherDb.mr_second_input_coll;
+    assert.commandWorked(otherDbColl.insert({val: 1}));
+    outputColl.drop();
+    assert.commandWorked(myDb.createCollection(outputCollName, {validator: validator}));
+    res = otherDb.runCommand({
+        mapReduce: otherDbColl.getName(),
+        map: map,
+        reduce: reduce,
+        out: {replace: outputCollName, db: myDb.getName()},
+        bypassDocumentValidation: false
+    });
+    assertFailsValidation(res);
+    assert.eq(0, outputColl.count({value: 'mapReduce'}));
+    res = otherDb.runCommand({
+        mapReduce: otherDbColl.getName(),
+        map: map,
+        reduce: reduce,
+        out: {replace: outputCollName, db: myDb.getName()},
+        bypassDocumentValidation: true
+    });
+    assert.commandWorked(res);
+    assert.eq(1, outputColl.count({value: 'mapReduce'}));
+    // Test the insert command. Includes a test for a document with no _id (SERVER-20859).
     res = myDb.runCommand({insert: collName, documents: [{}], bypassDocumentValidation: false});
-    assert.eq(res.writeErrors[0].code, docValidationErrorCode, tojson(res));
+    assertFailsValidation(BulkWriteResult(res));
     res = myDb.runCommand(
         {insert: collName, documents: [{}, {_id: 6}], bypassDocumentValidation: false});
-    assert.eq(0, coll.count({_id: 6}));
-    assert.eq(res.writeErrors[0].code, docValidationErrorCode, tojson(res));
+    assertFailsValidation(BulkWriteResult(res));
     res = myDb.runCommand(
         {insert: collName, documents: [{}, {_id: 6}], bypassDocumentValidation: true});
     assert.commandWorked(res);
-    assert.eq(null, res.writeErrors);
-    assert.eq(1, coll.count({_id: 6}));
 
     // Test the update command.
     res = myDb.runCommand({
@@ -109,7 +150,7 @@
         updates: [{q: {}, u: {$set: {update: 1}}}],
         bypassDocumentValidation: false
     });
-    assert.eq(res.writeErrors[0].code, docValidationErrorCode, tojson(res));
+    assertFailsValidation(BulkWriteResult(res));
     assert.eq(0, coll.count({update: 1}));
     res = myDb.runCommand({
         update: collName,
@@ -117,6 +158,43 @@
         bypassDocumentValidation: true
     });
     assert.commandWorked(res);
-    assert.eq(null, res.writeErrors);
     assert.eq(1, coll.count({update: 1}));
+
+    // Pipeline-style update is only supported for commands and not for OP_UPDATE which cannot
+    // differentiate between an update object and an array.
+    res = myDb.runCommand({
+        update: collName,
+        updates: [{q: {}, u: [{$set: {pipeline: 1}}]}],
+        bypassDocumentValidation: false
+    });
+    assertFailsValidation(BulkWriteResult(res));
+    assert.eq(0, coll.count({pipeline: 1}));
+
+    assert.commandWorked(myDb.runCommand({
+        update: collName,
+        updates: [{q: {}, u: [{$set: {pipeline: 1}}]}],
+        bypassDocumentValidation: true
+    }));
+    assert.eq(1, coll.count({pipeline: 1}));
+
+    assert.commandFailed(myDb.runCommand({
+        findAndModify: collName,
+        update: [{$set: {findAndModifyPipeline: 1}}],
+        bypassDocumentValidation: false
+    }));
+    assert.eq(0, coll.count({findAndModifyPipeline: 1}));
+
+    assert.commandWorked(myDb.runCommand({
+        findAndModify: collName,
+        update: [{$set: {findAndModifyPipeline: 1}}],
+        bypassDocumentValidation: true
+    }));
+    assert.eq(1, coll.count({findAndModifyPipeline: 1}));
+}
+
+// Run the test using a normal validator.
+runBypassDocumentValidationTest({a: {$exists: true}});
+
+// Run the test again with an equivalent JSON Schema validator.
+runBypassDocumentValidationTest({$jsonSchema: {required: ['a']}});
 })();

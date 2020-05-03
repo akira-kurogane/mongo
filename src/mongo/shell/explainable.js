@@ -4,7 +4,6 @@
 //
 
 var Explainable = (function() {
-
     var parseVerbosity = function(verbosity) {
         // Truthy non-strings are interpreted as "allPlansExecution" verbosity.
         if (verbosity && (typeof verbosity !== "string")) {
@@ -19,8 +18,10 @@ var Explainable = (function() {
         // If we're here, then the verbosity is a string. We reject invalid strings.
         if (verbosity !== "queryPlanner" && verbosity !== "executionStats" &&
             verbosity !== "allPlansExecution") {
-            throw Error("explain verbosity must be one of {" + "'queryPlanner'," +
-                        "'executionStats'," + "'allPlansExecution'}");
+            throw Error("explain verbosity must be one of {" +
+                        "'queryPlanner'," +
+                        "'executionStats'," +
+                        "'allPlansExecution'}");
         }
 
         return verbosity;
@@ -66,7 +67,7 @@ var Explainable = (function() {
             print("\t.distinct(...) - explain a distinct operation");
             print("\t.find(...) - get an explainable query");
             print("\t.findAndModify(...) - explain a findAndModify operation");
-            print("\t.group(...) - explain a group operation");
+            print("\t.mapReduce(...) - explain a mapReduce operation");
             print("\t.remove(...) - explain a remove operation");
             print("\t.update(...) - explain an update operation");
             print("Explainable collection methods");
@@ -100,22 +101,22 @@ var Explainable = (function() {
             }
 
             // Add the explain option.
-            extraOpts = extraOpts || {};
+            let extraOptsCopy = Object.extend({}, (extraOpts || {}));
 
             // For compatibility with 3.4 and older versions, when the verbosity is "queryPlanner",
             // we use the explain option to the aggregate command. Otherwise we issue an explain
             // command wrapping the agg command, which is supported by newer versions of the server.
             if (this._verbosity === "queryPlanner") {
-                extraOpts.explain = true;
-                return this._collection.aggregate(pipeline, extraOpts);
+                extraOptsCopy.explain = true;
+                return this._collection.aggregate(pipeline, extraOptsCopy);
             } else {
                 // The aggregate command requires a cursor field.
-                if (!extraOpts.hasOwnProperty("cursor")) {
-                    extraOpts = Object.extend(extraOpts, {cursor: {}});
+                if (!extraOptsCopy.hasOwnProperty("cursor")) {
+                    extraOptsCopy = Object.extend(extraOptsCopy, {cursor: {}});
                 }
 
                 let aggCmd = Object.extend(
-                    {"aggregate": this._collection.getName(), "pipeline": pipeline}, extraOpts);
+                    {"aggregate": this._collection.getName(), "pipeline": pipeline}, extraOptsCopy);
                 let explainCmd = {"explain": aggCmd, "verbosity": this._verbosity};
                 let explainResult = this._collection.runReadCommand(explainCmd);
                 return throwOrReturn(explainResult);
@@ -140,14 +141,6 @@ var Explainable = (function() {
         this.findAndModify = function(params) {
             var famCmd = Object.extend({"findAndModify": this._collection.getName()}, params);
             var explainCmd = {"explain": famCmd, "verbosity": this._verbosity};
-            var explainResult = this._collection.runReadCommand(explainCmd);
-            return throwOrReturn(explainResult);
-        };
-
-        this.group = function(params) {
-            params.ns = this._collection.getName();
-            var grpCmd = {"group": this._collection.getDB()._groupFixParms(params)};
-            var explainCmd = {"explain": grpCmd, "verbosity": this._verbosity};
             var explainResult = this._collection.runReadCommand(explainCmd);
             return throwOrReturn(explainResult);
         };
@@ -195,14 +188,19 @@ var Explainable = (function() {
         this.update = function() {
             var parsed = this._collection._parseUpdate.apply(this._collection, arguments);
             var query = parsed.query;
-            var obj = parsed.obj;
+            var updateSpec = parsed.updateSpec;
             var upsert = parsed.upsert;
             var multi = parsed.multi;
             var collation = parsed.collation;
             var arrayFilters = parsed.arrayFilters;
+            var hint = parsed.hint;
 
             var bulk = this._collection.initializeOrderedBulkOp();
             var updateOp = bulk.find(query);
+
+            if (hint) {
+                updateOp.hint(hint);
+            }
 
             if (upsert) {
                 updateOp = updateOp.upsert();
@@ -217,13 +215,28 @@ var Explainable = (function() {
             }
 
             if (multi) {
-                updateOp.update(obj);
+                updateOp.update(updateSpec);
             } else {
-                updateOp.updateOne(obj);
+                updateOp.updateOne(updateSpec);
             }
 
             var explainCmd = bulk.convertToExplainCmd(this._verbosity);
             var explainResult = this._collection.runCommand(explainCmd);
+            return throwOrReturn(explainResult);
+        };
+
+        this.mapReduce = function(map, reduce, optionsObjOrOutString) {
+            assert(optionsObjOrOutString, "Must supply the 'optionsObjOrOutString ' argument");
+
+            const mapReduceCmd = {mapreduce: this._collection.getName(), map: map, reduce: reduce};
+
+            if (typeof (optionsObjOrOutString) == "string")
+                mapReduceCmd["out"] = optionsObjOrOutString;
+            else
+                Object.extend(mapReduceCmd, optionsObjOrOutString);
+
+            const explainCmd = {"explain": mapReduceCmd, "verbosity": this._verbosity};
+            const explainResult = this._collection.runCommand(explainCmd);
             return throwOrReturn(explainResult);
         };
     }

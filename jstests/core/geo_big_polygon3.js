@@ -1,3 +1,9 @@
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+// ]
+
 //
 //  Big Polygon edge cases
 //
@@ -22,21 +28,20 @@ coll.drop();
 var objects = [
     {name: "point with strictCRS", type: "Point", coordinates: [-97.9, 0], crs: strictCRS},
     {
-      name: "multipoint with strictCRS",
-      type: "MultiPoint",
-      coordinates: [[-97.9, 0], [-10.9, 0]],
-      crs: strictCRS
+        name: "multipoint with strictCRS",
+        type: "MultiPoint",
+        coordinates: [[-97.9, 0], [-10.9, 0]],
+        crs: strictCRS
     },
     {
-      name: "line with strictCRS",
-      type: "LineString",
-      coordinates: [[-122.1611953, 37.4420407], [-118.283638, 34.028517]],
-      crs: strictCRS
+        name: "line with strictCRS",
+        type: "LineString",
+        coordinates: [[-122.1611953, 37.4420407], [-118.283638, 34.028517]],
+        crs: strictCRS
     }
 ];
 
 objects.forEach(function(o) {
-
     // within
     assert.throws(function() {
         coll.count({geo: {$geoWithin: {$geometry: o}}});
@@ -93,41 +98,41 @@ assert.commandWorked(coll.dropIndex({geo: "2dsphere"}), "drop 2dsphere index");
 
 objects = [
     {
-      name: "NYC Times Square - point",
-      geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: strictCRS}
+        name: "NYC Times Square - point",
+        geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: strictCRS}
     },
     {
-      name: "NYC CitiField & JFK - multipoint",
-      geo: {
-          type: "MultiPoint",
-          coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: strictCRS
-      }
+        name: "NYC CitiField & JFK - multipoint",
+        geo: {
+            type: "MultiPoint",
+            coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: strictCRS
+        }
     },
     {
-      name: "NYC - Times Square to CitiField to JFK - line/string",
-      geo: {
-          type: "LineString",
-          coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: strictCRS
-      }
+        name: "NYC - Times Square to CitiField to JFK - line/string",
+        geo: {
+            type: "LineString",
+            coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: strictCRS
+        }
     },
     {
-      name: "NYC - Times Square to CitiField to JFK to Times Square - polygon",
-      geo: {
-          type: "Polygon",
-          coordinates: [
-              [[-73.9857, 40.7577], [-73.7789, 40.6397], [-73.8458, 40.7569], [-73.9857, 40.7577]]
-          ],
-          crs: strictCRS
-      }
+        name: "NYC - Times Square to CitiField to JFK to Times Square - polygon",
+        geo: {
+            type: "Polygon",
+            coordinates: [
+                [[-73.9857, 40.7577], [-73.7789, 40.6397], [-73.8458, 40.7569], [-73.9857, 40.7577]]
+            ],
+            crs: strictCRS
+        }
     }
 ];
 
 // Insert GeoJson strictCRS objects
 // Since there is no 2dsphere index, they can be inserted
 objects.forEach(function(o) {
-    assert.writeOK(coll.insert(o), "Geo Json strictCRS insert" + o.name);
+    assert.commandWorked(coll.insert(o), "Geo Json strictCRS insert" + o.name);
 });
 
 // Use Polygon to search for objects which should be ignored
@@ -159,50 +164,50 @@ coll.remove({});
 // Objects should be found from query
 objects = [
     {
-      name: "NYC Times Square - point crs84CRS",
-      geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: crs84CRS}
+        name: "NYC Times Square - point crs84CRS",
+        geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: crs84CRS}
     },
     {
-      name: "NYC Times Square - point epsg4326CRS",
-      geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: epsg4326CRS}
+        name: "NYC Times Square - point epsg4326CRS",
+        geo: {type: "Point", coordinates: [-73.9857, 40.7577], crs: epsg4326CRS}
     },
     {
-      name: "NYC CitiField & JFK - multipoint crs84CRS",
-      geo: {
-          type: "MultiPoint",
-          coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: crs84CRS
-      }
+        name: "NYC CitiField & JFK - multipoint crs84CRS",
+        geo: {
+            type: "MultiPoint",
+            coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: crs84CRS
+        }
     },
     {
-      name: "NYC CitiField & JFK - multipoint epsg4326CRS",
-      geo: {
-          type: "MultiPoint",
-          coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: epsg4326CRS
-      }
+        name: "NYC CitiField & JFK - multipoint epsg4326CRS",
+        geo: {
+            type: "MultiPoint",
+            coordinates: [[-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: epsg4326CRS
+        }
     },
     {
-      name: "NYC - Times Square to CitiField to JFK - line/string crs84CRS",
-      geo: {
-          type: "LineString",
-          coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: crs84CRS
-      }
+        name: "NYC - Times Square to CitiField to JFK - line/string crs84CRS",
+        geo: {
+            type: "LineString",
+            coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: crs84CRS
+        }
     },
     {
-      name: "NYC - Times Square to CitiField to JFK - line/string epsg4326CRS",
-      geo: {
-          type: "LineString",
-          coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
-          crs: epsg4326CRS
-      }
+        name: "NYC - Times Square to CitiField to JFK - line/string epsg4326CRS",
+        geo: {
+            type: "LineString",
+            coordinates: [[-73.9857, 40.7577], [-73.8458, 40.7569], [-73.7789, 40.6397]],
+            crs: epsg4326CRS
+        }
     }
 ];
 
 // Insert GeoJson crs84CRS & epsg4326CRS objects
 objects.forEach(function(o) {
-    assert.writeOK(coll.insert(o), "Geo Json insert" + o.name);
+    assert.commandWorked(coll.insert(o), "Geo Json insert" + o.name);
 });
 
 // Make sure stored crs84CRS & epsg4326CRS documents can be found
