@@ -116,5 +116,6 @@ env.Program(
     ],
     LIBDEPS=[
         'ftdc',
+        '$BUILD_DIR/mongo/db/bson/dotted_path_support',
     ],
 )
