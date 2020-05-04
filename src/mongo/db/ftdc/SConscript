@@ -112,6 +112,7 @@ env.CppUnitTest(
 env.Program(
     target='ftdc_dump',
     source=[
+        'ftdc_workspace.cpp',
         'ftdc_dump.cpp',
     ],
     LIBDEPS=[
