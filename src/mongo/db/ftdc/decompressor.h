@@ -49,11 +49,20 @@ public:
     FTDCDecompressor() = default;
 
     /**
-     * Inflates a compressed chunk of metrics into a vector of owned BSON documents.
+     * Inflates a compressed chunk of metrics into a tuple of it's reference
+     * BSONDoc, the sample and metrics count, and a N*M length array of the
+     * decompressed metrics.
      *
      * Will fail if the chunk is corrupt or too short.
      *
      * Returns N samples where N = sample count + 1. The 1 is the reference document.
+     */
+    StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>> uncompressToRefDocAndMetrics(ConstDataRange buf);
+
+    /**
+     * Inflates a compressed chunk of metrics into a vector of owned BSON documents.
+     *
+     * Will fail if uncompressToRefDocAndMetrics() fails.
      */
     StatusWith<std::vector<BSONObj>> uncompress(ConstDataRange buf);
 

@@ -42,7 +42,8 @@
 
 namespace mongo {
 
-StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf) {
+StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>>
+FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf) {
     ConstDataRangeCursor compressedDataRange(buf);
 
     // Read the length of the uncompressed buffer
@@ -111,16 +112,9 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
                 "The metrics in the reference document and metrics count do not match"};
     }
 
-    std::vector<BSONObj> docs;
-
-    // Allocate space for the reference document + samples
-    docs.reserve(1 + sampleCount);
-
-    docs.emplace_back(ref.getOwned());
-
     // We must always return the reference document
     if (sampleCount == 0) {
-        return {docs};
+        return {{ref, sampleCount, metricsCount, {}}};
     }
 
     // Read the samples
@@ -175,11 +169,33 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
         for (std::uint32_t j = 0; j < metricsCount; ++j) {
             metrics[j] = deltas[j * sampleCount + i];
         }
+    }
 
+    return {{ref, sampleCount, metricsCount, metrics}};
+}
+
+StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf) {
+    //std::vector<std::uint64_t> metrics;
+
+    auto swRM = uncompressToRefDocAndMetrics(buf);
+    if (!swRM.isOK()) {
+        return {swRM.getStatus()};
+    }
+    auto const& [ref, sampleCount, metricsCount, metrics] = swRM.getValue();
+
+    std::vector<BSONObj> docs;
+
+    // Allocate space for the reference document + samples
+    docs.reserve(1 + sampleCount);
+
+    docs.emplace_back(ref.getOwned());
+
+    for (std::uint32_t i = 0; i < sampleCount; ++i) {
         docs.emplace_back(FTDCBSONUtil::constructDocumentFromMetrics(ref, metrics).getValue());
     }
 
     return {docs};
+
 }
 
 }  // namespace mongo
