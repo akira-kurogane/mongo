@@ -91,14 +91,22 @@ int main(int argc, char* argv[], char** envp) {
 
     FTDCWorkspace ws;
     Status s = ws.addFTDCFiles(av);
-    auto fp = ws.filePaths();
 
-    if (fp.size() == 0) {
-        std::cerr << "There are no FTDC metrics files at " << argv[1];
-	size_t i;
-	for (i = 2; i < static_cast<size_t>(argc); ++i) {
-	    std::cerr << ", " << argv[i];
+    auto tp = ws.topology();
+    for (auto const& [rsnm, hpvals] : tp) {
+        std::cout << rsnm << std::endl;
+        for (auto const& [hp, val] : hpvals) {
+		std::cout << "  " << hp << std::endl;
 	}
+    }
+
+    auto fp = ws.filePaths();
+    if (fp.size() == 0) {
+        std::cerr << "There are no FTDC metrics files at " << av[0];
+        size_t i;
+        for (i = 1; i < av.size(); ++i) {
+            std::cerr << ", " << av[i];
+        }
         std::cerr << std::endl;
         exit(1);
     }
@@ -106,6 +114,5 @@ int main(int argc, char* argv[], char** envp) {
     for (auto fpItr = fp.begin(); fpItr != fp.end(); ++fpItr) {
         printFTDCFileSummary(*fpItr);
     }
-
     exit(0);
 }

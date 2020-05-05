@@ -33,8 +33,10 @@ public:
 
     std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> topology();
 
-//private:
-//    FTDCWorkspace();
+    struct TopologyId {
+        std::string hostPort;
+	std::string rsName;
+    };
 
 private:
     // Paths of all FTDC files in this workspace
@@ -47,7 +49,7 @@ private:
     // clusterId values in the metrics.
 
     // Add filepath to _paths and also into _rs by topology
-    Status _addFTDCFilepath(boost::filesystem::path p);
+    Status _addFTDCFilepath(boost::filesystem::path p, TopologyId& topologyId);
 };
 
 }  // namespace mongo
