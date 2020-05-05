@@ -166,8 +166,20 @@ StatusWith<BSONObj> getBSONDocumentFromMetadataDoc(const BSONObj& obj);
 
 /**
  * Get the set of metric documents from the compressed chunk of a metric document
+ *
+ * Each item in the vector is one sample expanded into the full BSONObj with
+ * keys. The size in memory is expanded a lot as a result.
  */
 StatusWith<std::vector<BSONObj>> getMetricsFromMetricDoc(const BSONObj& obj,
+                                                         FTDCDecompressor* decompressor);
+
+/**
+ * Extract metrics as a reference doc to get M keynames and BSON type, a sample
+ * count, and a N samples (+ 1 including the values in the ref doc) * M array
+ * of values cast in uint64_t. Each M consecutive values is the timeseries for
+ * n'th key.
+ */
+StatusWith<std::tuple<BSONObj, std::uint32_t, std::vector<std::uint64_t>>> getKeysAndTimeseriesFromMetricDoc(const BSONObj& obj,
                                                          FTDCDecompressor* decompressor);
 
 /**

@@ -8,6 +8,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/ftdc/file_reader.h"
 
 namespace mongo {
 
@@ -33,23 +34,21 @@ public:
 
     std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> topology();
 
-    struct TopologyId {
-        std::string hostPort;
-	std::string rsName;
-    };
-
 private:
+    //Map of all ProcessMetrics
+    std::map<std::tuple<std::string, unsigned long>, ProcessMetrics> _pmMap;
+
     // Paths of all FTDC files in this workspace
     std::set<boost::filesystem::path> _paths;
 
     // Replica set -> hostport -> filepaths two-layer map
-    std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> _rs;
-
     // Dev note: Ideally we would have a cluster level too, but there are no
     // clusterId values in the metrics.
+    std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> _rs;
 
     // Add filepath to _paths and also into _rs by topology
-    Status _addFTDCFilepath(boost::filesystem::path p, TopologyId& topologyId);
+    // TODO: remove the path arg, fill _paths from procMetrics.sourceFilepaths instead
+    Status _addFTDCFilepath(boost::filesystem::path p, ProcessMetrics& procMetrics);
 };
 
 }  // namespace mongo

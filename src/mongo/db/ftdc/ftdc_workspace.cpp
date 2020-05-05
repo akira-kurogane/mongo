@@ -5,7 +5,6 @@
 #include "mongo/db/ftdc/ftdc_workspace.h"
 
 #include "mongo/base/status_with.h"
-#include "mongo/db/ftdc/file_reader.h"
 #include "mongo/db/bson/dotted_path_support.h"
 
 namespace dps = ::mongo::dotted_path_support;
@@ -18,7 +17,7 @@ namespace {
  * Open a file with FTDCFileReader, read into as far as the initial metadata
  * packed doc. Extract some info and pass back in the topologyId ref parameter.
  */
-bool confirmFTDCFile(const boost::filesystem::path& p, ::mongo::FTDCWorkspace::TopologyId& topologyId) {
+bool confirmFTDCFile(const boost::filesystem::path& p, ProcessMetrics& procMetrics) {
     if (!boost::filesystem::is_regular_file(p) || boost::filesystem::file_size(p) == 0) {
         return false;
     }
@@ -27,33 +26,13 @@ bool confirmFTDCFile(const boost::filesystem::path& p, ::mongo::FTDCWorkspace::T
     if (s != Status::OK()) {
         return false;
     }
-    /**
-     * Intuition break warning: FTDCFileReader::hasNext() advances the position, not next()
-     */
-    auto sw = reader.hasNext();
-    if (!sw.isOK()) {
-        return false;
+    StatusWith<ProcessMetrics> swProcMetrics = reader.previewMetadataAndTimeseries();
+    if (swProcMetrics.isOK()) {
+        procMetrics = swProcMetrics.getValue();
+	return true;
     }
-    auto ftdcType = std::get<0>(reader.next());
-    if (ftdcType != FTDCBSONUtil::FTDCType::kMetadata) {
-        std::cerr << "First packed doc in " << p.string() << " isn't a kMetadata doc" << std::endl;
-        return false;
-    }
-    auto d = std::get<1>(reader.next()).getOwned();
-    //auto ts = std::get<2>(reader.next()); //This is the metricChunk's first "start" ts only. Stays constant whilst the _pos in the concatenated arrays of metrics are iterated
-    BSONElement hpElem = dps::extractElementAtPath(d, "hostInfo.system.hostname");
-    if (hpElem.eoo()) {
-        std::cerr << "No hostInfo.system.hostname element found in kMetadata doc" << std::endl;
-        return false;
-    } 
-    topologyId.hostPort = hpElem.String();
-    BSONElement rsnmElem = dps::extractElementAtPath(d, "getCmdLineOpts.parsed.replication.replSetName");
-    if (rsnmElem.eoo()) {
-         topologyId.rsName = "";
-    } else {
-         topologyId.rsName = rsnmElem.String();
-    }
-    return true;
+    std::cerr << swProcMetrics.getStatus().reason() << std::endl;
+    return false;
 }
 
 } // namespace
@@ -65,10 +44,10 @@ FTDCWorkspace::~FTDCWorkspace() {}
 Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, bool recursive) {
 
     for (auto p = paths.begin(); p != paths.end(); ++p) {
-        TopologyId tempTId = {"", ""};
+        ProcessMetrics pm;
         if (boost::filesystem::is_regular_file(*p)) {
-            if (confirmFTDCFile(*p, tempTId)) {
-                auto s = _addFTDCFilepath(*p, tempTId);
+            if (confirmFTDCFile(*p, pm)) {
+                auto s = _addFTDCFilepath(*p, pm);
             }
         } else if (boost::filesystem::is_directory(*p)) {
             //if (recursive) { 
@@ -78,8 +57,8 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
             for (; dItr != endItr; ++dItr) {
                 boost::filesystem::directory_entry& dEnt = *dItr;
                 auto f = dEnt.path().filename();
-                if (confirmFTDCFile(dEnt.path(), tempTId)) {
-                     auto s = _addFTDCFilepath(dEnt.path(), tempTId);
+                if (confirmFTDCFile(dEnt.path(), pm)) {
+                     auto s = _addFTDCFilepath(dEnt.path(), pm);
                 }
             }
         }
@@ -102,12 +81,19 @@ void FTDCWorkspace::clear() {
     _paths.clear();
 }
 
-Status FTDCWorkspace::_addFTDCFilepath(boost::filesystem::path p, TopologyId& topologyId) {
+Status FTDCWorkspace::_addFTDCFilepath(boost::filesystem::path p, ProcessMetrics& procMetrics) {
+
+    std::tuple<std::string, unsigned long> pmId = {procMetrics.hostport, procMetrics.pid};
+    if (_pmMap.find(pmId) == _pmMap.end()) {
+        _pmMap[pmId] = procMetrics;
+    } else {
+        ; //_pmMap[pmId].merge(procMetrics); TODO implement the merge method
+    }
 
     _paths.insert(p);
 
-    auto rsnm = topologyId.rsName;
-    auto hostpost = topologyId.hostPort;
+    auto rsnm = procMetrics.rsName();
+    auto hostpost = procMetrics.hostport;
     auto hfl = _rs.find(rsnm);
     if (hfl == _rs.end()) {
 	std::map<std::string, std::set<boost::filesystem::path>> x;

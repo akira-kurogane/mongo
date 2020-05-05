@@ -42,8 +42,29 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/str.h"
+#include "mongo/db/bson/dotted_path_support.h"
+
+namespace dps = ::mongo::dotted_path_support;
 
 namespace mongo {
+
+std::string ProcessMetrics::rsName() {
+    BSONElement rsnmElem = dps::extractElementAtPath(metadataDoc, "getCmdLineOpts.parsed.replication.replSetName");
+    if (rsnmElem.eoo()) {
+         return "";
+    } else {
+         return rsnmElem.String();
+    }
+}
+
+std::ostream& operator<<(std::ostream& os, ProcessMetrics& pm) {
+    std::string fpList;
+    for (auto const& [k, v] : pm.sourceFilepaths) {
+        fpList = fpList + v.string() + " ";
+    }
+    os << pm.hostport << " [" << pm.pid << "] " << pm.rsName() << " " << fpList;
+    return os;
+}
 
 FTDCFileReader::~FTDCFileReader() {
     _stream.close();
@@ -227,6 +248,54 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     _file = file;
 
     return Status::OK();
+}
+
+StatusWith<ProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
+    ProcessMetrics pm;
+    pm.pid = 0;
+    auto sw = hasNext();
+    
+    unsigned int ctr = 0;
+    /**
+     * Intuition break warning: FTDCFileReader::hasNext() advances the position, not next()
+     */
+    while (sw.isOK() && sw.getValue() && ctr++ < 100000) {
+        auto ftdcType = std::get<0>(next());
+        //auto d = std::get<1>(next()).getOwned();
+
+        if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
+            //if (!pm.pid) {
+                pm.refDoc = std::get<1>(next()).getOwned();
+                BSONElement startTSElem = dps::extractElementAtPath(pm.refDoc, "start");
+                if (startTSElem.eoo()) {
+                    return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
+                }
+                pm.start_ts = startTSElem.Date();
+                BSONElement pidElem = dps::extractElementAtPath(pm.refDoc, "serverStatus.pid");
+                if (pidElem.eoo()) {
+                    return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
+                }
+                pm.pid = pidElem.Long();
+//std::cout << d.jsonString(Strict) << std::endl;
+            //}
+	    return {pm}; //Exit early because this is a preview-only function
+            //pm.end_ts = ts;
+        } else if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
+            pm.metadataDoc = std::get<1>(next());
+            auto ts = std::get<2>(next());
+            pm.sourceFilepaths[ts] = _file;
+            BSONElement hpElem = dps::extractElementAtPath(pm.metadataDoc, "hostInfo.system.hostname");
+            if (hpElem.eoo()) {
+                return {ErrorCodes::KeyNotFound, "missing 'hostInfo.system.hostname' in metadata doc"};
+            }
+            pm.hostport = hpElem.String();
+        } else {
+            MONGO_UNREACHABLE;
+        }
+        sw = hasNext();
+    }
+
+    return {pm};
 }
 
 }  // namespace mongo
