@@ -52,6 +52,8 @@ struct FTDCProcessId {
     unsigned long pid;
 };
 
+bool operator==(const FTDCProcessId& l, const FTDCProcessId& r);
+bool operator!=(const FTDCProcessId& l, const FTDCProcessId& r);
 bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
 
 /**

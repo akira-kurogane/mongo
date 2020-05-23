@@ -48,6 +48,13 @@ namespace dps = ::mongo::dotted_path_support;
 
 namespace mongo {
 
+bool operator==(const FTDCProcessId& l, const FTDCProcessId& r) {
+    return l.hostport == r.hostport && l.pid == r.pid;
+}
+bool operator!=(const FTDCProcessId& l, const FTDCProcessId& r) {
+    return !(l==r);
+}
+
 bool operator<(const FTDCProcessId& l, const FTDCProcessId& r) {
     return l.hostport < r.hostport || (l.hostport == r.hostport && l.pid < r.pid);
 }
@@ -62,11 +69,28 @@ std::string FTDCProcessMetrics::rsName() {
 }
 
 Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
-    //throw error if hostport and pid don't match exactly
+    if (procId != other.procId) {
+        //It is a programming error if there is an attempt to merge metrics
+        //of different processes
+        return Status(ErrorCodes::BadValue,
+                      "FTDCProcessMetrics::merge() on non-matching FTDCProcessId.");
+    }
 
     for (auto const& [k, v] : other.sourceFilepaths) {
-        //TODO: if k (a datetime) is already present, work out which file is more recent / has a longer metric sample and use it instead.
-        sourceFilepaths[k] = v;
+        auto oldfpItr = sourceFilepaths.find(k);
+        if (oldfpItr == sourceFilepaths.end()) {
+            sourceFilepaths[k] = v;
+        } else {
+            auto oldfp = oldfpItr->second;
+            std::cerr << "Duplicate FTDC files for " << procId.hostport << ", pid=" << procId.pid <<
+                    ", starting datetime id=" << k << " found." << std::endl;
+            if (boost::filesystem::file_size(v) > boost::filesystem::file_size(oldfp)) {
+                std::cerr << "File " << oldfp << " will be ignored because file " << v << "is larger" << std::endl;
+                sourceFilepaths[k] = v;
+            } else {
+                std::cerr << "File " << v << " will be ignored because file " << oldfp << "is larger" << std::endl;
+            }
+        }
     }
 
     if (other.start_ts < start_ts) {
@@ -314,7 +338,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
                 return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
             }
             pm.procId.pid = pidElem.Long();
-	    return {pm}; //Exit early because this is a preview-only function
+            return {pm}; //Exit early because this is a preview-only function
         } else {
             MONGO_UNREACHABLE;
         }

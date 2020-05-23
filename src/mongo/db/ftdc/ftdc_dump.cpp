@@ -39,8 +39,8 @@ int main(int argc, char* argv[], char** envp) {
         std::cout << rsnm << std::endl;
         for (auto const& [hp, pmIds] : hpvals) {
             std::cout << "  " << hp << std::endl;
-            for (auto const& val : pmIds) {
-                std::cout << "    " << val.hostport << ":" << val.pid << std::endl;
+            for (auto const& pm : pmIds) {
+                std::cout << "    " << pm.hostport << ":" << pm.pid << std::endl;
             }
         }
     }
