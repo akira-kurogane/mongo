@@ -44,6 +44,17 @@
 namespace mongo {
 
 /**
+ * To identify a mongod (or mongos) process uniquely we use the hostport string
+ * and the pid.
+ */
+struct FTDCProcessId {
+    std::string hostport;
+    unsigned long pid;
+};
+
+bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
+
+/**
  * A struct representing the metrics found in one or more FTDC files for
  * one process instance of mongod or mongos i.e. will not run over to
  * include metrics generated after the process is restarted.
@@ -58,7 +69,7 @@ namespace mongo {
  * The files are packed in a tuple with the "_id" date value in the
  * kMetadataDoc as the first value to make it easy to identify when we've
  * received the same file. It may be a newer, larger version of the same
- * file and if so should replace. If not we can ignore using that file
+ * file and if it so should replace. If not we can ignore using that file
  * because it must be a duplicate or an earlier, shorter version.
  *
  * refDoc is the metrics refDoc, the uncompressed full BSON result from
@@ -71,9 +82,8 @@ namespace mongo {
  * metricsCount will be set from the packed value next to sampleCount. It
  * is expected to be identical in all files for the same process.
  */
-struct ProcessMetrics {
-    unsigned long pid;
-    std::string hostport;
+struct FTDCProcessMetrics {
+    FTDCProcessId procId;
     std::map<Date_t, boost::filesystem::path> sourceFilepaths;
     Date_t start_ts;
     Date_t end_ts;
@@ -84,7 +94,17 @@ struct ProcessMetrics {
 
     std::string rsName();
 
-    friend std::ostream& operator<<(std::ostream& os, ProcessMetrics& pm);
+    Status merge(const FTDCProcessMetrics& pm);
+
+    /**
+     * Executes metadataAndTimeseries for each file in this process session,
+     * The metadata doc is ignored. The metrics are concatenated together as
+     * one larger array of timeseries.
+     */
+    std::map<std::string, std::vector<uint64_t>> timeseries(float resolution = 0.0);
+
+    //temporary debugging use
+    friend std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm);
 };
 
 /**
@@ -132,15 +152,15 @@ public:
      *
      * Assumption is that one file will only contain one kMetadataDoc and the
      * remainder will be kMetricChunks. If this is incorrect change to return
-     * a vector of ProcessMetrics.
+     * a vector of FTDCProcessMetrics.
      */
-    ProcessMetrics metadataAndTimeseries(float resolution = 0.0);
+    FTDCProcessMetrics metadataAndTimeseries(float resolution = 0.0);
 
     /**
      * As above, but only scans the beginning of each file to fill toplogy
      * identity fields and fetch the reference doc / first sample.
      */
-    StatusWith<ProcessMetrics> previewMetadataAndTimeseries();
+    StatusWith<FTDCProcessMetrics> previewMetadataAndTimeseries();
 
 private:
     /**

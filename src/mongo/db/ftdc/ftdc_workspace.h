@@ -32,23 +32,28 @@ public:
 
     std::set<boost::filesystem::path> filePaths();
 
-    std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> topology();
+    /**
+     * Topology is replicaset name -> hostport
+     *
+     * Cluster is missing because there is no clusterId in the FTDC metrics.
+     */
+    std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
+    topology();
 
 private:
-    //Map of all ProcessMetrics
-    std::map<std::tuple<std::string, unsigned long>, ProcessMetrics> _pmMap;
+    // Map of all FTDCProcessMetrics
+    std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;
 
     // Paths of all FTDC files in this workspace
     std::set<boost::filesystem::path> _paths;
 
-    // Replica set -> hostport -> filepaths two-layer map
-    // Dev note: Ideally we would have a cluster level too, but there are no
-    // clusterId values in the metrics.
-    std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>> _rs;
+    // Map of map via replset name -> hostpost to {hostport, pid}, which is the
+    // key to the FTDCProcessMetrics in _pmMap
+    std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>> _rs;
 
-    // Add filepath to _paths and also into _rs by topology
-    // TODO: remove the path arg, fill _paths from procMetrics.sourceFilepaths instead
-    Status _addFTDCFilepath(boost::filesystem::path p, ProcessMetrics& procMetrics);
+    // Add ProcessMetric object to _pmMap, and filepath to _paths and also into
+    // _rs by topology
+    Status _addFTDCProcessMetrics(FTDCProcessMetrics& pm);
 };
 
 }  // namespace mongo

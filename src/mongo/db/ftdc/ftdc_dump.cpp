@@ -23,14 +23,6 @@ int main(int argc, char* argv[], char** envp) {
     FTDCWorkspace ws;
     Status s = ws.addFTDCFiles(av);
 
-    auto tp = ws.topology();
-    for (auto const& [rsnm, hpvals] : tp) {
-        std::cout << rsnm << std::endl;
-        for (auto const& [hp, val] : hpvals) {
-		std::cout << "  " << hp << std::endl;
-	}
-    }
-
     auto fp = ws.filePaths();
     if (fp.size() == 0) {
         std::cerr << "There are no FTDC metrics files at " << av[0];
@@ -40,6 +32,17 @@ int main(int argc, char* argv[], char** envp) {
         }
         std::cerr << std::endl;
         exit(1);
+    }
+
+    auto tp = ws.topology();
+    for (auto const& [rsnm, hpvals] : tp) {
+        std::cout << rsnm << std::endl;
+        for (auto const& [hp, pmIds] : hpvals) {
+            std::cout << "  " << hp << std::endl;
+            for (auto const& val : pmIds) {
+                std::cout << "    " << val.hostport << ":" << val.pid << std::endl;
+            }
+        }
     }
 
     exit(0);

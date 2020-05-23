@@ -48,7 +48,11 @@ namespace dps = ::mongo::dotted_path_support;
 
 namespace mongo {
 
-std::string ProcessMetrics::rsName() {
+bool operator<(const FTDCProcessId& l, const FTDCProcessId& r) {
+    return l.hostport < r.hostport || (l.hostport == r.hostport && l.pid < r.pid);
+}
+
+std::string FTDCProcessMetrics::rsName() {
     BSONElement rsnmElem = dps::extractElementAtPath(metadataDoc, "getCmdLineOpts.parsed.replication.replSetName");
     if (rsnmElem.eoo()) {
          return "";
@@ -57,12 +61,39 @@ std::string ProcessMetrics::rsName() {
     }
 }
 
-std::ostream& operator<<(std::ostream& os, ProcessMetrics& pm) {
+Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
+    //throw error if hostport and pid don't match exactly
+
+    for (auto const& [k, v] : other.sourceFilepaths) {
+        //TODO: if k (a datetime) is already present, work out which file is more recent / has a longer metric sample and use it instead.
+        sourceFilepaths[k] = v;
+    }
+
+    if (other.start_ts < start_ts) {
+        start_ts = other.start_ts;
+    }
+    if (other.end_ts > end_ts) {
+        end_ts = other.end_ts;
+    }
+
+    //metadataDoc should be identical
+    //refDoc is expected to have the same number of keys
+
+    for (auto const& [k, v] : other.sampleCounts) {
+        sampleCounts[k] = v;
+    }
+
+    //Throw error if metricsCount doesn't match
+
+    return Status::OK();
+}
+
+std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm) {
     std::string fpList;
     for (auto const& [k, v] : pm.sourceFilepaths) {
         fpList = fpList + v.string() + " ";
     }
-    os << pm.hostport << " [" << pm.pid << "] " << pm.rsName() << " " << fpList;
+    os << pm.procId.hostport << " [" << pm.procId.pid << "] " << pm.rsName() << " " << fpList;
     return os;
 }
 
@@ -250,9 +281,8 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     return Status::OK();
 }
 
-StatusWith<ProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
-    ProcessMetrics pm;
-    pm.pid = 0;
+StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
+    FTDCProcessMetrics pm;
     auto sw = hasNext();
     
     unsigned int ctr = 0;
@@ -263,24 +293,7 @@ StatusWith<ProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
         auto ftdcType = std::get<0>(next());
         //auto d = std::get<1>(next()).getOwned();
 
-        if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
-            //if (!pm.pid) {
-                pm.refDoc = std::get<1>(next()).getOwned();
-                BSONElement startTSElem = dps::extractElementAtPath(pm.refDoc, "start");
-                if (startTSElem.eoo()) {
-                    return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
-                }
-                pm.start_ts = startTSElem.Date();
-                BSONElement pidElem = dps::extractElementAtPath(pm.refDoc, "serverStatus.pid");
-                if (pidElem.eoo()) {
-                    return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
-                }
-                pm.pid = pidElem.Long();
-//std::cout << d.jsonString(Strict) << std::endl;
-            //}
-	    return {pm}; //Exit early because this is a preview-only function
-            //pm.end_ts = ts;
-        } else if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
+        if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
             pm.metadataDoc = std::get<1>(next());
             auto ts = std::get<2>(next());
             pm.sourceFilepaths[ts] = _file;
@@ -288,7 +301,20 @@ StatusWith<ProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
             if (hpElem.eoo()) {
                 return {ErrorCodes::KeyNotFound, "missing 'hostInfo.system.hostname' in metadata doc"};
             }
-            pm.hostport = hpElem.String();
+            pm.procId.hostport = hpElem.String();
+        } else if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
+            pm.refDoc = std::get<1>(next()).getOwned();
+            BSONElement startTSElem = dps::extractElementAtPath(pm.refDoc, "start");
+            if (startTSElem.eoo()) {
+                return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
+            }
+            pm.start_ts = startTSElem.Date();
+            BSONElement pidElem = dps::extractElementAtPath(pm.refDoc, "serverStatus.pid");
+            if (pidElem.eoo()) {
+                return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
+            }
+            pm.procId.pid = pidElem.Long();
+	    return {pm}; //Exit early because this is a preview-only function
         } else {
             MONGO_UNREACHABLE;
         }

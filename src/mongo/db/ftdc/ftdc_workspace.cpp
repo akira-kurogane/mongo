@@ -17,7 +17,7 @@ namespace {
  * Open a file with FTDCFileReader, read into as far as the initial metadata
  * packed doc. Extract some info and pass back in the topologyId ref parameter.
  */
-bool confirmFTDCFile(const boost::filesystem::path& p, ProcessMetrics& procMetrics) {
+bool confirmFTDCFile(const boost::filesystem::path& p, FTDCProcessMetrics& procMetrics) {
     if (!boost::filesystem::is_regular_file(p) || boost::filesystem::file_size(p) == 0) {
         return false;
     }
@@ -26,7 +26,7 @@ bool confirmFTDCFile(const boost::filesystem::path& p, ProcessMetrics& procMetri
     if (s != Status::OK()) {
         return false;
     }
-    StatusWith<ProcessMetrics> swProcMetrics = reader.previewMetadataAndTimeseries();
+    StatusWith<FTDCProcessMetrics> swProcMetrics = reader.previewMetadataAndTimeseries();
     if (swProcMetrics.isOK()) {
         procMetrics = swProcMetrics.getValue();
 	return true;
@@ -44,10 +44,10 @@ FTDCWorkspace::~FTDCWorkspace() {}
 Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, bool recursive) {
 
     for (auto p = paths.begin(); p != paths.end(); ++p) {
-        ProcessMetrics pm;
+        FTDCProcessMetrics pm;
         if (boost::filesystem::is_regular_file(*p)) {
             if (confirmFTDCFile(*p, pm)) {
-                auto s = _addFTDCFilepath(*p, pm);
+                auto s = _addFTDCProcessMetrics(pm);
             }
         } else if (boost::filesystem::is_directory(*p)) {
             //if (recursive) { 
@@ -58,7 +58,7 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
                 boost::filesystem::directory_entry& dEnt = *dItr;
                 auto f = dEnt.path().filename();
                 if (confirmFTDCFile(dEnt.path(), pm)) {
-                     auto s = _addFTDCFilepath(dEnt.path(), pm);
+                     auto s = _addFTDCProcessMetrics(pm);
                 }
             }
         }
@@ -71,7 +71,7 @@ std::set<boost::filesystem::path> FTDCWorkspace::filePaths() {
     return _paths;
 }
 
-std::map<std::string, std::map<std::string, std::set<boost::filesystem::path>>>
+std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
 FTDCWorkspace::topology() {
     return _rs;
 }
@@ -79,32 +79,36 @@ FTDCWorkspace::topology() {
 void FTDCWorkspace::clear() {
     _rs.clear();
     _paths.clear();
+    _pmMap.clear();
 }
 
-Status FTDCWorkspace::_addFTDCFilepath(boost::filesystem::path p, ProcessMetrics& procMetrics) {
+Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
 
-    std::tuple<std::string, unsigned long> pmId = {procMetrics.hostport, procMetrics.pid};
-    if (_pmMap.find(pmId) == _pmMap.end()) {
-        _pmMap[pmId] = procMetrics;
+    if (_pmMap.find(pm.procId) == _pmMap.end()) {
+        _pmMap[pm.procId] = pm;
     } else {
-        ; //_pmMap[pmId].merge(procMetrics); TODO implement the merge method
+        auto s = _pmMap[pm.procId].merge(pm);
+	if (!s.isOK()) {
+            return s;
+	}
+    }
+    for (auto const& p : pm.sourceFilepaths) {
+        _paths.insert(p.second);
     }
 
-    _paths.insert(p);
-
-    auto rsnm = procMetrics.rsName();
-    auto hostpost = procMetrics.hostport;
+    auto rsnm = pm.rsName();
+    auto hostpost = pm.procId.hostport;
     auto hfl = _rs.find(rsnm);
     if (hfl == _rs.end()) {
-	std::map<std::string, std::set<boost::filesystem::path>> x;
+	std::map<std::string, std::set<FTDCProcessId>> x;
         _rs[rsnm] = x;
     }
     auto fl = _rs[rsnm].find(hostpost);
     if (fl == _rs[rsnm].end()) {
-	std::set<boost::filesystem::path> x;
+	std::set<FTDCProcessId> x;
 	_rs[rsnm][hostpost] = x;
     }
-    _rs[rsnm][hostpost].insert(p);
+    _rs[rsnm][hostpost].insert(pm.procId);
 
     return Status::OK();
 }
