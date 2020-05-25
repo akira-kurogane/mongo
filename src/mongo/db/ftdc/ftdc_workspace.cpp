@@ -84,6 +84,17 @@ void FTDCWorkspace::clear() {
 
 Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
 
+    /**
+     * We don't want it if there is no metadataDoc. This happens as a matter
+     * of course for FTDCProcessMetrics generated from a metrics.interim file.
+     * It would be an improvement if we identify and merge with the other
+     * metrics file that the FTDCFileManager would recoverInterimFile into,
+     * but now we do nothing.
+     */
+    if (pm.metadataDoc.isEmpty()) {
+        return Status::OK();
+    }
+
     if (_pmMap.find(pm.procId) == _pmMap.end()) {
         _pmMap[pm.procId] = pm;
     } else {

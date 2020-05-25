@@ -65,8 +65,9 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
  * from files before and after in time that have identical pid and
  * hostname(+port).
  *
- * "start_ts" and "end_ts" are the first and last "start" value from the
- * kMetricChunks in all files.
+ * start_ts is the first "start" value from the kMetricChunks in all files.
+ * estimate_end_ts is "start" + (metricCount * 1 sec) of the last
+ * kMetricChunk in the last file.
  *
  * The files are packed in a tuple with the "_id" date value in the
  * kMetadataDoc as the first value to make it easy to identify when we've
@@ -74,25 +75,24 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
  * file and if it so should replace. If not we can ignore using that file
  * because it must be a duplicate or an earlier, shorter version.
  *
- * refDoc is the metrics refDoc, the uncompressed full BSON result from
- * getDiagnosticData that is the first sample in each kMetricChunk.
+ * firstRefDoc is the refDoc member from the first kMetricChunk. It is the
+ * getDiagnosticData BSON object including the values. XXX It will have a subset,
+ * probably the 100% subset, of keys in the metricsKeys map. XXX
  *
- * sampleCount will be the sum of samples in all kMetricChunks for a given
- * file. It's map key is the same "_id" date value used as key for
+ * A sampleCounts value will be the sum of samples in all kMetricChunks for a
+ * given file. It's map key is the same "_id" date value used as key for
  * sourceFilepaths;
- *
- * metricsCount will be set from the packed value next to sampleCount. It
- * is expected to be identical in all files for the same process.
  */
 struct FTDCProcessMetrics {
     FTDCProcessId procId;
     std::map<Date_t, boost::filesystem::path> sourceFilepaths;
-    Date_t start_ts;
-    Date_t end_ts;
+    std::map<Date_t, std::uint32_t> sampleCounts;
+    std::map<Date_t, std::tuple<Date_t, Date_t>> timespans; //start_ts, estimated_end_ts
+    Date_t start_ts; //TODO eliminate by making method that returns timespans.first-by-key-order.get<0>
+    Date_t estimate_end_ts; //TODO eliminate by making method that returns timespans.last-by-key-order.get<1>
     BSONObj metadataDoc;
-    BSONObj refDoc;
-    std::map<Date_t, size_t> sampleCounts;
-    size_t metricsCount;
+    BSONObj firstRefDoc;
+    std::map<std::string, BSONType> keys;
 
     std::string rsName();
 
