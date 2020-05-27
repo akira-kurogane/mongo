@@ -143,60 +143,19 @@ FTDCFileReader::~FTDCFileReader() {
 StatusWith<bool> FTDCFileReader::hasNext() {
     while (true) {
         if (_state == State::kNeedsDoc) {
-            if (_stream.eof()) {
-                return {false};
+            auto swRP = readAndParseTopLevelDoc();
+
+            auto swDocs = FTDCBSONUtil::getMetricsFromMetricDoc(_parent, &_decompressor);
+            if (!swDocs.isOK()) {
+                return swDocs.getStatus();
             }
 
-            auto swDoc = readDocument();
-            if (!swDoc.isOK()) {
-                return swDoc.getStatus();
-            }
+            _docs = swDocs.getValue();
 
-            if (swDoc.getValue().isEmpty()) {
-                return {false};
-            }
+            // There is always at least the reference document
+            _pos = 0;
 
-            _parent = swDoc.getValue();
-
-            // metadata or metrics?
-            auto swType = FTDCBSONUtil::getBSONDocumentType(_parent);
-            if (!swType.isOK()) {
-                return swType.getStatus();
-            }
-
-            auto swId = FTDCBSONUtil::getBSONDocumentId(_parent);
-            if (!swId.isOK()) {
-                return swId.getStatus();
-            }
-
-            _dateId = swId.getValue();
-
-            FTDCBSONUtil::FTDCType type = swType.getValue();
-
-            if (type == FTDCBSONUtil::FTDCType::kMetadata) {
-                _state = State::kMetadataDoc;
-
-                auto swMetadata = FTDCBSONUtil::getBSONDocumentFromMetadataDoc(_parent);
-                if (!swMetadata.isOK()) {
-                    return swMetadata.getStatus();
-                }
-
-                _metadata = swMetadata.getValue();
-            } else if (type == FTDCBSONUtil::FTDCType::kMetricChunk) {
-                _state = State::kMetricChunk;
-
-                auto swDocs = FTDCBSONUtil::getMetricsFromMetricDoc(_parent, &_decompressor);
-                if (!swDocs.isOK()) {
-                    return swDocs.getStatus();
-                }
-
-                _docs = swDocs.getValue();
-
-                // There is always at least the reference document
-                _pos = 0;
-            }
-
-            return {true};
+            return swRP;
         }
 
         // We previously returned a metadata document, now we need another document from disk
@@ -220,6 +179,89 @@ StatusWith<bool> FTDCFileReader::hasNext() {
     }
 }
 
+StatusWith<bool> FTDCFileReader::readAndParseTopLevelDoc() {
+
+    if (_stream.eof()) {
+        return {false};
+    }
+
+    auto swDoc = readTopLevelBSONDoc();
+    if (!swDoc.isOK()) {
+        return swDoc.getStatus();
+    }
+
+    if (swDoc.getValue().isEmpty()) {
+        return {false};
+    }
+
+    _parent = swDoc.getValue();
+
+    // metadata or metrics?
+    auto swType = FTDCBSONUtil::getBSONDocumentType(_parent);
+    if (!swType.isOK()) {
+        return swType.getStatus();
+    }
+
+    auto swId = FTDCBSONUtil::getBSONDocumentId(_parent);
+    if (!swId.isOK()) {
+        return swId.getStatus();
+    }
+
+    _dateId = swId.getValue();
+
+    FTDCBSONUtil::FTDCType type = swType.getValue();
+
+    if (type == FTDCBSONUtil::FTDCType::kMetadata) {
+        _state = State::kMetadataDoc;
+
+        /**
+         * FYI a raw FTDC metadata doc looks like this if printed as JSON.
+         * { "_id" : { "$date" : "2019-11-25T15:08:42.031+0900" },
+         *   "type" : 0,
+         *   "doc" : {
+         *     "start" : { "$date" : "2019-11-25T15:08:42.031+0900" },
+         *     "buildInfo" : { "start": { .. }, "version" : "3.6.12", ... },
+         *     "getCmdLineOpts" : { "start" : { ... }, "argv" : [ ... ], "parsed" : { "config" : ... },
+         *     "hostInfo" : { "start" : { ... }, "system" : { ... },
+         *     "end" : { "$date" : "2019-11-25T15:08:42.031+0900" }
+         *   }
+         * }
+         */
+
+        auto swMetadata = FTDCBSONUtil::getBSONDocumentFromMetadataDoc(_parent);
+        if (!swMetadata.isOK()) {
+            return swMetadata.getStatus();
+        }
+
+        _metadata = swMetadata.getValue();
+
+    } else if (type == FTDCBSONUtil::FTDCType::kMetricChunk) {
+        _state = State::kMetricChunk;
+
+        /**
+         * FYI a raw FTDC metadata doc looks like this if printed as JSON.
+         * The ref bson doc, sample and metrics counts, and the varint deltas
+         * are not exposed. Decompression into yet another bson doc is required first.
+         * { "_id" : { "$date" : "2019-11-25T15:08:43.000+0900" },
+         *   "type" : 1,
+         *   "data" : { "$binary" : "<uncompressed-size-uint32_t><zlib-compressed-binary-val>", "$type" : "00" }
+         * }
+         */
+
+        auto swMP = FTDCBSONUtil::getMetricsPreviewFromMetricDoc(_parent, &_decompressor);
+        if (!swMP.isOK()) {
+            return swMP.getStatus();
+        }
+
+        auto valsTuple = swMP.getValue();
+        _refDoc = std::get<0>(valsTuple);
+        _sampleCount = std::get<2>(valsTuple);
+
+    }
+
+    return {true};
+}
+
 std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> FTDCFileReader::next() {
     dassert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
 
@@ -236,7 +278,7 @@ std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> FTDCFileReader::next(
     MONGO_UNREACHABLE;
 }
 
-StatusWith<BSONObj> FTDCFileReader::readDocument() {
+StatusWith<BSONObj> FTDCFileReader::readTopLevelBSONDoc() {
     if (!_stream.is_open()) {
         return {ErrorCodes::FileNotOpen, "open() needs to be called first."};
     }
@@ -322,58 +364,51 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
 
 StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
     FTDCProcessMetrics pm;
-    //TODO: instead of using existing hasNext(), next()
-    //  make own iterator of packed docs. iterate tuple of date_id, FTDCType, and raw value.
-    //  With kMetadata one get metadataDoc
-    //  With kMetricChunk ones calls uncompressToRefDocAndMetrics() to get {ref, sampleCount, metricsCount, metrics-vector}
-    auto sw = hasNext();
-    
+    auto sw = readAndParseTopLevelDoc();
+    assert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
+
     unsigned int ctr = 0;
     Date_t estimateEndTS;
     /**
      * Intuition break warning: FTDCFileReader::hasNext() advances the position, not next()
      */
     while (sw.isOK() && sw.getValue() && ctr++ < 100000) {
-        auto ftdcType = std::get<0>(next());
-        //auto d = std::get<1>(next()).getOwned();
-        auto date_id = std::get<2>(next());
-        pm.sourceFilepaths[date_id] = _file;
+        pm.sourceFilepaths[_dateId] = _file;
 
-        if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
+        if (_state == State::kMetadataDoc) {
+            // _dateId, _metadata have been loaded by readAndParseTopLevelDoc()
 
-            pm.metadataDoc = std::get<1>(next());
+            pm.metadataDoc = _metadata;
             BSONElement hpElem = dps::extractElementAtPath(pm.metadataDoc, "hostInfo.system.hostname");
             if (hpElem.eoo()) {
                 return {ErrorCodes::KeyNotFound, "missing 'hostInfo.system.hostname' in metadata doc"};
             }
             pm.procId.hostport = hpElem.String();
 
-        } else if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
+        } else { // _state == State::kMetricChunk
+            // _dateId, _refDoc, _sampleCount have been loaded by readAndParseTopLevelDoc()
 
-            BSONObj refDoc = std::get<1>(next()).getOwned();
-            //TODO: pm.keys += zip(refDoc.getFieldNames(), bsontype)
-            BSONElement startTSElem = dps::extractElementAtPath(refDoc, "start");
+            //TODO: pm.keys += zip(_refDoc.getFieldNames(), bsontype)
+            BSONElement startTSElem = dps::extractElementAtPath(_refDoc, "start");
             if (startTSElem.eoo()) {
                 return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
             }
-std::uint32_t sampleCount = 1; //TODO get from metricChunk
-            pm.sampleCounts[date_id] += sampleCount;
-            estimateEndTS = startTSElem.Date() + Milliseconds(static_cast<int64_t>(sampleCount) * 1000);
-            pm.timespans[date_id] = {startTSElem.Date(), estimateEndTS};
+            pm.sampleCounts[_dateId] += _sampleCount;
+            estimateEndTS = startTSElem.Date() + Milliseconds(static_cast<int64_t>(_sampleCount) * 1000);
+            pm.timespans[_dateId] = {startTSElem.Date(), estimateEndTS};
             if (pm.firstRefDoc.isEmpty()) {
-                pm.firstRefDoc = refDoc.getOwned();
+                pm.firstRefDoc = _refDoc.getOwned();
                 pm.start_ts = startTSElem.Date();
-                BSONElement pidElem = dps::extractElementAtPath(refDoc, "serverStatus.pid");
+                BSONElement pidElem = dps::extractElementAtPath(_refDoc, "serverStatus.pid");
                 if (pidElem.eoo()) {
                     return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
                 }
                 pm.procId.pid = pidElem.Long();
             }
 
-        } else {
-            MONGO_UNREACHABLE;
         }
-        sw = hasNext();
+        sw = readAndParseTopLevelDoc();
+        assert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
     }
     pm.estimate_end_ts = estimateEndTS;
 

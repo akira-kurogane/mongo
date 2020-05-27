@@ -39,8 +39,10 @@ int main(int argc, char* argv[], char** envp) {
         std::cout << rsnm << std::endl;
         for (auto const& [hp, pmIds] : hpvals) {
             std::cout << "  " << hp << std::endl;
-            for (auto const& pm : pmIds) {
-                std::cout << "    " << pm.hostport << ":" << pm.pid << std::endl;
+            for (auto const& pmId : pmIds) {
+                std::cout << "    " << pmId.hostport << ":" << pmId.pid << std::endl;
+		auto pm = ws.processMetrics(pmId);
+                std::cout << "    " << pm.start_ts << " - " << pm.estimate_end_ts << std::endl;
             }
         }
     }

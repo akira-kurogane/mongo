@@ -40,6 +40,8 @@ public:
     std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
     topology();
 
+    const FTDCProcessMetrics& processMetrics(FTDCProcessId pmId);
+
 private:
     // Map of all FTDCProcessMetrics
     std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;

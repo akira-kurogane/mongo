@@ -76,6 +76,10 @@ FTDCWorkspace::topology() {
     return _rs;
 }
 
+const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
+   return _pmMap[pmId];
+}
+
 void FTDCWorkspace::clear() {
     _rs.clear();
     _paths.clear();

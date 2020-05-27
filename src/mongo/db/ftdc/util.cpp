@@ -490,6 +490,30 @@ StatusWith<std::vector<BSONObj>> getMetricsFromMetricDoc(const BSONObj& obj,
     return decompressor->uncompress({buffer, static_cast<std::size_t>(length)});
 }
 
+StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t>>
+getMetricsPreviewFromMetricDoc(const BSONObj& obj, FTDCDecompressor* decompressor) {
+    if (kDebugBuild) {
+        auto swType = getBSONDocumentType(obj);
+        dassert(swType.isOK() && swType.getValue() == FTDCType::kMetricChunk);
+    }
+
+    BSONElement element;
+
+    Status status = bsonExtractTypedField(obj, kFTDCDataField, BSONType::BinData, &element);
+    if (!status.isOK()) {
+        return {status};
+    }
+
+    int length;
+    const char* buffer = element.binData(length);
+    if (length < 0) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Field " << std::string(kFTDCTypeField) << " is not a BinData."};
+    }
+
+    return decompressor->uncompressMetricsPreview({buffer, static_cast<std::size_t>(length)});
+}
+
 }  // namespace FTDCBSONUtil
 
 }  // namespace mongo

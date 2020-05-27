@@ -57,7 +57,8 @@ public:
      *
      * Returns N samples where N = sample count + 1. The 1 is the reference document.
      */
-    StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>> uncompressToRefDocAndMetrics(ConstDataRange buf);
+    StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>>
+    uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetrics = false);
 
     /**
      * Inflates a compressed chunk of metrics into a vector of owned BSON documents.
@@ -65,6 +66,13 @@ public:
      * Will fail if uncompressToRefDocAndMetrics() fails.
      */
     StatusWith<std::vector<BSONObj>> uncompress(ConstDataRange buf);
+
+    /**
+     * Like uncompress but avoiding further decompression and BSON object
+     * reassembly after the refDoc, metricsCount and sampleCount are unpacked.
+     */
+    StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t>>
+    uncompressMetricsPreview(ConstDataRange buf);
 
 private:
     BlockCompressor _compressor;

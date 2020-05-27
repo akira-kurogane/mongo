@@ -43,7 +43,7 @@
 namespace mongo {
 
 StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>>
-FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf) {
+FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetrics) {
     ConstDataRangeCursor compressedDataRange(buf);
 
     // Read the length of the uncompressed buffer
@@ -60,6 +60,19 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf) {
     if (uncompressedLength > 10000000) {
         return Status(ErrorCodes::InvalidLength, "Metrics chunk has exceeded the allowable size.");
     }
+
+    // Devnote: When skipMetrics=true it seems wasteful to use the zlib block
+    // decompression for the whole thing when we only want the ref doc. But it
+    // seems that each metric chunk is typically 200k, with the ref doc taking
+    // 1/4 of that already.
+    /*if (skipMetrics) {
+        LittleEndian<std::uint32_t> refDocEstSz = 100 * 1024;
+        //getDiagnosticData is about 50kb in samples of v4.2
+        uncompressedLength = uncompressedLength > refDocEstSz ? refDocEstSz : uncompressedLength;
+        // Devnote: Ideally we'd peek inside the first four bytes to get the
+        // exact BSON size of the refDoc, but the current DataRangeCursor class
+        // only has read *And* advance methods, no 'just read'.
+    }*/
 
     auto statusUncompress = _compressor.uncompress(compressedDataRange, uncompressedLength);
 
@@ -92,6 +105,13 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf) {
     }
 
     std::uint32_t sampleCount = swSampleCount.getValue();
+
+    // TODO: as we've already zlib-decompressed, maybe we should return just the
+    // "start" timeseries so the estimated-end-ts logic can be discarded.
+    // If we hack metricsCount=1 that would work as-is, I think
+    if (skipMetrics) {
+        return {{ref, metricsCount, sampleCount, {}}};
+    }
 
     // Limit size of the buffer we need for metrics and samples
     if (metricsCount * sampleCount > 1000000) {
@@ -171,7 +191,7 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf) {
         }
     }
 
-    return {{ref, sampleCount, metricsCount, metrics}};
+    return {{ref, metricsCount, sampleCount, metrics}};
 }
 
 StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf) {
@@ -181,7 +201,7 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
     if (!swRM.isOK()) {
         return {swRM.getStatus()};
     }
-    auto const& [ref, sampleCount, metricsCount, metrics] = swRM.getValue();
+    auto const& [ref, metricsCount, sampleCount, metrics] = swRM.getValue();
 
     std::vector<BSONObj> docs;
 
@@ -196,6 +216,18 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
 
     return {docs};
 
+}
+
+StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t>>
+FTDCDecompressor::uncompressMetricsPreview(ConstDataRange buf) {
+    //TODO: change to using a 'uncompressToRefDocAndSampleCount[AndTS]()'
+    auto swRM = uncompressToRefDocAndMetrics(buf, true);
+    if (!swRM.isOK()) {
+        return {swRM.getStatus()};
+    }
+    auto const& [ref, metricsCount, sampleCount, metrics] = swRM.getValue();
+
+    return {std::tuple<BSONObj, std::uint32_t, std::uint32_t>(ref, sampleCount, metricsCount)};
 }
 
 }  // namespace mongo

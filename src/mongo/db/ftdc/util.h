@@ -174,6 +174,15 @@ StatusWith<std::vector<BSONObj>> getMetricsFromMetricDoc(const BSONObj& obj,
                                                          FTDCDecompressor* decompressor);
 
 /**
+ * Return just the metrics ref doc and the sample and metrics counts, without
+ * reconstructing the varInt deltas to BSON docs.
+ * TODO: decompress just the refDoc, metricsCount, and sampleCount.
+ */
+StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t>>
+getMetricsPreviewFromMetricDoc(const BSONObj& obj,
+                               FTDCDecompressor* decompressor);
+
+/**
  * Extract metrics as a reference doc to get M keynames and BSON type, a sample
  * count, and a N samples (+ 1 including the values in the ref doc) * M array
  * of values cast in uint64_t. Each M consecutive values is the timeseries for

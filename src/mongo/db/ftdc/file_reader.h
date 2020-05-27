@@ -166,11 +166,15 @@ public:
 
 private:
     /**
-     * Read next consecutive packed document from _stream of raw file. This will
+     * Read next consecutive BSON document from _stream of raw file. This will
      * be either a kMetadataDoc or kMetricChunk. If the file is corrupt returns
      * an appropriate status.
      */
-    StatusWith<BSONObj> readDocument();
+    StatusWith<BSONObj> readTopLevelBSONDoc();
+
+    // Read next top-level doc, set _state, _parent, _dateId, _metadataDoc,
+    // _docs and _pos (= current metric chunk array pos) members.
+    StatusWith<bool> readAndParseTopLevelDoc();
 
 private:
     FTDCDecompressor _decompressor;
@@ -219,6 +223,12 @@ private:
 
     // Current metadata document - unowned
     BSONObj _metadata;
+
+    // ref doc of current metrics chunk
+    BSONObj _refDoc;
+
+    // sample count in current metrics chunk
+    std::uint32_t _sampleCount;
 
     // Parent document
     BSONObj _parent;
