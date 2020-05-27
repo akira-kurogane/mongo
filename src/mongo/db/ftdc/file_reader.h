@@ -87,14 +87,14 @@ struct FTDCProcessMetrics {
     FTDCProcessId procId;
     std::map<Date_t, boost::filesystem::path> sourceFilepaths;
     std::map<Date_t, std::uint32_t> sampleCounts;
-    std::map<Date_t, std::tuple<Date_t, Date_t>> timespans; //start_ts, estimated_end_ts
-    Date_t start_ts; //TODO eliminate by making method that returns timespans.first-by-key-order.get<0>
-    Date_t estimate_end_ts; //TODO eliminate by making method that returns timespans.last-by-key-order.get<1>
+    std::map<Date_t, std::tuple<Date_t, Date_t>> timespans;
     BSONObj metadataDoc;
     BSONObj firstRefDoc;
     std::map<std::string, BSONType> keys;
 
-    std::string rsName();
+    std::string rsName() const;
+    Date_t firstSampleTs() const;
+    Date_t estimateLastSampleTs() const;
 
     Status merge(const FTDCProcessMetrics& pm);
 

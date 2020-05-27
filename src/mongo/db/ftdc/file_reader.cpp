@@ -59,13 +59,21 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r) {
     return l.hostport < r.hostport || (l.hostport == r.hostport && l.pid < r.pid);
 }
 
-std::string FTDCProcessMetrics::rsName() {
+std::string FTDCProcessMetrics::rsName() const {
     BSONElement rsnmElem = dps::extractElementAtPath(metadataDoc, "getCmdLineOpts.parsed.replication.replSetName");
     if (rsnmElem.eoo()) {
          return "";
     } else {
          return rsnmElem.String();
     }
+}
+
+Date_t FTDCProcessMetrics::firstSampleTs() const {
+    return std::get<0>(timespans.begin()->second);
+}
+
+Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
+    return std::get<1>(timespans.rbegin()->second);
 }
 
 //Unit test: FTDCProcessMetrics a.merge(b) should create the same doc as b.merge(a);
@@ -86,11 +94,8 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
     /**
      * If other contains the same file (identified by the Date _id, not by
      * filepath) and that file is a younger, smaller-sample-length version then
-     * we don't want to use any values from it: filepath, sampleCount, start_ts
-     * and estimated_end_ts and refDoc. 
-     * However: we can expect start_ts and refDoc to be identical, and
-     * estimated_end_ts and start_ts are safe to use within heuristics of
-     * greater-than and less-than rules.
+     * we don't want to use any values from it: filepath, sampleCount, timespan
+     * and refDoc. 
      */
     for (auto const& [date_id, oth_fpath] : other.sourceFilepaths) {
         auto oth_sampleCount = other.sampleCounts.find(date_id)->second;
@@ -115,13 +120,11 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
         }
     }
 
-    if (other.start_ts < start_ts) {
-        start_ts = other.start_ts;
+    auto fSTs = firstSampleTs();
+    auto oFSTs = other.firstSampleTs();
+    if (oFSTs < fSTs) {
         metadataDoc = other.metadataDoc; //expected to be identical, but for consistency let's use earliest.
         firstRefDoc = other.firstRefDoc;
-    }
-    if (other.estimate_end_ts > estimate_end_ts) {
-        estimate_end_ts = other.estimate_end_ts;
     }
 
     return Status::OK();
@@ -368,10 +371,6 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
     assert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
 
     unsigned int ctr = 0;
-    Date_t estimateEndTS;
-    /**
-     * Intuition break warning: FTDCFileReader::hasNext() advances the position, not next()
-     */
     while (sw.isOK() && sw.getValue() && ctr++ < 100000) {
         pm.sourceFilepaths[_dateId] = _file;
 
@@ -394,11 +393,10 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
                 return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
             }
             pm.sampleCounts[_dateId] += _sampleCount;
-            estimateEndTS = startTSElem.Date() + Milliseconds(static_cast<int64_t>(_sampleCount) * 1000);
+            auto estimateEndTS = startTSElem.Date() + Milliseconds(static_cast<int64_t>(_sampleCount) * 1000);
             pm.timespans[_dateId] = {startTSElem.Date(), estimateEndTS};
             if (pm.firstRefDoc.isEmpty()) {
                 pm.firstRefDoc = _refDoc.getOwned();
-                pm.start_ts = startTSElem.Date();
                 BSONElement pidElem = dps::extractElementAtPath(_refDoc, "serverStatus.pid");
                 if (pidElem.eoo()) {
                     return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
@@ -410,7 +408,6 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
         sw = readAndParseTopLevelDoc();
         assert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
     }
-    pm.estimate_end_ts = estimateEndTS;
 
     return {pm};
 }

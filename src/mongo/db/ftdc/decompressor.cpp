@@ -106,9 +106,6 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
 
     std::uint32_t sampleCount = swSampleCount.getValue();
 
-    // TODO: as we've already zlib-decompressed, maybe we should return just the
-    // "start" timeseries so the estimated-end-ts logic can be discarded.
-    // If we hack metricsCount=1 that would work as-is, I think
     if (skipMetrics) {
         return {{ref, metricsCount, sampleCount, {}}};
     }

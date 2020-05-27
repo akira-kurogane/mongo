@@ -42,7 +42,7 @@ int main(int argc, char* argv[], char** envp) {
             for (auto const& pmId : pmIds) {
                 std::cout << "    " << pmId.hostport << ":" << pmId.pid << std::endl;
 		auto pm = ws.processMetrics(pmId);
-                std::cout << "    " << pm.start_ts << " - " << pm.estimate_end_ts << std::endl;
+                std::cout << "    " << pm.firstSampleTs() << " - " << pm.estimateLastSampleTs() << std::endl;
             }
         }
     }
