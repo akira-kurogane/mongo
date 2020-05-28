@@ -155,7 +155,7 @@ BSONObj createBSONMetricChunkDocument(ConstDataRange buf, Date_t now);
 StatusWith<Date_t> getBSONDocumentId(const BSONObj& obj);
 
 /**
- * Get the type of a BSON document
+ * Get the type of a FTDC file's top-level BSON document
  */
 StatusWith<FTDCType> getBSONDocumentType(const BSONObj& obj);
 
@@ -195,6 +195,12 @@ StatusWith<std::tuple<BSONObj, std::uint32_t, std::vector<std::uint64_t>>> getKe
  * Is this a type that FTDC find's interesting? I.e. is this a numeric or container type?
  */
 bool isFTDCType(BSONType type);
+
+/**
+ * Returns a map of full, dot-concatenated fields names vs. the leaf elem's BSON type.
+ */
+std::map<std::string, BSONType> flattenedKeyNamesVsType(const BSONObj& doc);
+
 }  // namespace FTDCBSONUtil
 
 

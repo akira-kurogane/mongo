@@ -514,6 +514,19 @@ getMetricsPreviewFromMetricDoc(const BSONObj& obj, FTDCDecompressor* decompresso
     return decompressor->uncompressMetricsPreview({buffer, static_cast<std::size_t>(length)});
 }
 
+std::map<std::string, BSONType> flattenedKeyNamesVsType(const BSONObj& doc) {
+    std::map<std::string, BSONType> keys;
+    // This probably doesn't have to be the *FTDC* BSONObjIterator; the input
+    // BSONObj is only expected to be one already created with it. But we
+    // may as well use it.
+    FTDCBSONObjIterator itDoc(doc);
+    while (itDoc.more()) {
+        BSONElement elem = itDoc.next();
+        keys[elem.fieldName()] = elem.type();
+    }
+    return keys;
+}
+
 }  // namespace FTDCBSONUtil
 
 }  // namespace mongo

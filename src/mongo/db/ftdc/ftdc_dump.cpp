@@ -34,6 +34,9 @@ int main(int argc, char* argv[], char** envp) {
         exit(1);
     }
 
+    auto tspan = ws.boundaryTimespan();
+    std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
+        
     auto tp = ws.topology();
     for (auto const& [rsnm, hpvals] : tp) {
         std::cout << rsnm << std::endl;
@@ -41,9 +44,17 @@ int main(int argc, char* argv[], char** envp) {
             std::cout << "  " << hp << std::endl;
             for (auto const& pmId : pmIds) {
                 std::cout << "    " << pmId.hostport << ":" << pmId.pid << std::endl;
-		auto pm = ws.processMetrics(pmId);
+                auto pm = ws.processMetrics(pmId);
                 std::cout << "    " << pm.firstSampleTs() << " - " << pm.estimateLastSampleTs() << std::endl;
             }
+        }
+    }
+
+    size_t dummyCtr = 0;
+    for (auto const& k : ws.keys()) {
+        std::cout << k << std::endl;
+        if (dummyCtr++ > 20) {
+            break;
         }
     }
 

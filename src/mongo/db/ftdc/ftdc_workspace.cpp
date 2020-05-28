@@ -72,12 +72,38 @@ std::set<boost::filesystem::path> FTDCWorkspace::filePaths() {
 }
 
 std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
-FTDCWorkspace::topology() {
+FTDCWorkspace::topology() const {
     return _rs;
 }
 
 const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
-   return _pmMap[pmId];
+    return _pmMap[pmId];
+}
+
+std::set<std::string> FTDCWorkspace::keys() {
+    std::set<std::string> m;
+    for (auto const& [pmId, pm] : _pmMap) {
+        for (auto const& [k, bt] : pm.keys) {
+            m.insert(k);
+	}
+    }
+    return m;
+}
+
+FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
+    Date_t first = Date_t::max();
+    Date_t last = Date_t::min();
+    for (auto const& [pmId, pm] : _pmMap) {
+        for (auto const& [dateId, tspan] : pm.timespans) {
+            if (tspan.first < first) {
+                first = tspan.first;
+	    }
+            if (tspan.last > last) {
+                last = tspan.last;
+	    }
+	}
+    }
+    return {first, last};
 }
 
 void FTDCWorkspace::clear() {

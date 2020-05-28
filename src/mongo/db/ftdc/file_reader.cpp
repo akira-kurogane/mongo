@@ -69,11 +69,11 @@ std::string FTDCProcessMetrics::rsName() const {
 }
 
 Date_t FTDCProcessMetrics::firstSampleTs() const {
-    return std::get<0>(timespans.begin()->second);
+    return timespans.begin()->second.first;
 }
 
 Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
-    return std::get<1>(timespans.rbegin()->second);
+    return timespans.rbegin()->second.last;
 }
 
 //Unit test: FTDCProcessMetrics a.merge(b) should create the same doc as b.merge(a);
@@ -365,6 +365,11 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     return Status::OK();
 }
 
+void FTDCProcessMetrics::mergeRefDocKeys(const BSONObj& refDoc) {
+	//todo merge
+   keys = FTDCBSONUtil::flattenedKeyNamesVsType(refDoc);
+}
+
 StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
     FTDCProcessMetrics pm;
     auto sw = readAndParseTopLevelDoc();
@@ -387,7 +392,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
         } else { // _state == State::kMetricChunk
             // _dateId, _refDoc, _sampleCount have been loaded by readAndParseTopLevelDoc()
 
-            //TODO: pm.keys += zip(_refDoc.getFieldNames(), bsontype)
+            pm.mergeRefDocKeys(_refDoc);
             BSONElement startTSElem = dps::extractElementAtPath(_refDoc, "start");
             if (startTSElem.eoo()) {
                 return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};

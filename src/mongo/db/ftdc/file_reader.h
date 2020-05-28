@@ -57,6 +57,14 @@ bool operator!=(const FTDCProcessId& l, const FTDCProcessId& r);
 bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
 
 /**
+ * Timestamps range. For conveying the metrics sample coverage time.
+ */
+struct FTDCPMTimespan {
+    Date_t first;
+    Date_t last;
+};
+
+/**
  * A struct representing the metrics found in one or more FTDC files for
  * one process instance of mongod or mongos i.e. will not run over to
  * include metrics generated after the process is restarted.
@@ -83,11 +91,12 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
  * given file. It's map key is the same "_id" date value used as key for
  * sourceFilepaths;
  */
+
 struct FTDCProcessMetrics {
     FTDCProcessId procId;
     std::map<Date_t, boost::filesystem::path> sourceFilepaths;
     std::map<Date_t, std::uint32_t> sampleCounts;
-    std::map<Date_t, std::tuple<Date_t, Date_t>> timespans;
+    std::map<Date_t, FTDCPMTimespan> timespans;
     BSONObj metadataDoc;
     BSONObj firstRefDoc;
     std::map<std::string, BSONType> keys;
@@ -97,6 +106,7 @@ struct FTDCProcessMetrics {
     Date_t estimateLastSampleTs() const;
 
     Status merge(const FTDCProcessMetrics& pm);
+    void mergeRefDocKeys(const BSONObj& _refDoc);
 
     /**
      * Executes metadataAndTimeseries for each file in this process session,

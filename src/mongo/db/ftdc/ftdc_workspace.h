@@ -38,9 +38,22 @@ public:
      * Cluster is missing because there is no clusterId in the FTDC metrics.
      */
     std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
-    topology();
+    topology() const;
 
+    /**
+     * Simple getter for the FTDCProcessMetrics objects
+     */
     const FTDCProcessMetrics& processMetrics(FTDCProcessId pmId);
+
+    /**
+     * A union of all key names from all FTDCProcessMetrics objects
+     */
+    std::set<std::string> keys();
+
+    /**
+     * The min first sample and max last (estimated) sample timestamps
+     */
+    FTDCPMTimespan boundaryTimespan();
 
 private:
     // Map of all FTDCProcessMetrics
