@@ -514,6 +514,16 @@ getMetricsPreviewFromMetricDoc(const BSONObj& obj, FTDCDecompressor* decompresso
     return decompressor->uncompressMetricsPreview({buffer, static_cast<std::size_t>(length)});
 }
 
+//StatusWith<bool> extractMetricsFromDocument(const BSONObj& referenceDoc,
+//                                            const BSONObj& currentDoc,
+//                                            std::vector<std::uint64_t>* metrics,
+//                                            bool matches,
+//                                            size_t recursion) {
+//    if (recursion > kMaxRecursion) {
+//        return {ErrorCodes::BadValue, "Recursion limit reached."};
+//    }
+//TODO: expensive copy in effect. Change to walk that keeps passing keys map down, 
+//with key prefix, set value only on (scalar type) leaf nodes.
 std::map<std::string, BSONType> flattenedKeyNamesVsType(const BSONObj& doc) {
     std::map<std::string, BSONType> keys;
     // This probably doesn't have to be the *FTDC* BSONObjIterator; the input
@@ -521,8 +531,20 @@ std::map<std::string, BSONType> flattenedKeyNamesVsType(const BSONObj& doc) {
     // may as well use it.
     FTDCBSONObjIterator itDoc(doc);
     while (itDoc.more()) {
-        BSONElement elem = itDoc.next();
-        keys[elem.fieldName()] = elem.type();
+        const BSONElement elem = itDoc.next();
+        switch (elem.type()) {
+            case Object:
+            case Array: {
+                auto childKeys = flattenedKeyNamesVsType(elem.Obj());
+	        for (auto const& [ck, type] : childKeys) {
+                    keys[elem.fieldName() + std::string(".") + ck] = type;
+	        }
+            } break;
+
+            default:
+                keys[elem.fieldName()] = elem.type();
+                break;
+        }
     }
     return keys;
 }
