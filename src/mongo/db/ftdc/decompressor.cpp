@@ -131,7 +131,7 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
 
     // We must always return the reference document
     if (sampleCount == 0) {
-        return {{ref, sampleCount, metricsCount, {}}};
+        return {{ref, metricsCount, sampleCount, {}}};
     }
 
     // Read the samples
@@ -224,7 +224,7 @@ FTDCDecompressor::uncompressMetricsPreview(ConstDataRange buf) {
     }
     auto const& [ref, metricsCount, sampleCount, metrics] = swRM.getValue();
 
-    return {std::tuple<BSONObj, std::uint32_t, std::uint32_t>(ref, sampleCount, metricsCount)};
+    return {std::tuple<BSONObj, std::uint32_t, std::uint32_t>(ref, metricsCount, sampleCount)};
 }
 
 }  // namespace mongo

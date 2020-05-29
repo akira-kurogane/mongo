@@ -55,7 +55,8 @@ public:
      *
      * Will fail if the chunk is corrupt or too short.
      *
-     * Returns N samples where N = sample count + 1. The 1 is the reference document.
+     * Returns N samples where N = sample count + 1. The 0th column is the
+     * values in reference document.
      */
     StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t, std::vector<std::uint64_t>>>
     uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetrics = false);
