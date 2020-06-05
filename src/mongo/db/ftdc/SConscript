@@ -105,6 +105,7 @@ env.CppUnitTest(
 env.Program(
     target='ftdc_dump',
     source=[
+        'ftdc_process_metrics.cpp',
         'ftdc_workspace.cpp',
         'ftdc_dump.cpp',
     ],
