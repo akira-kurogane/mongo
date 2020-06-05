@@ -101,3 +101,15 @@ env.CppUnitTest(
         'ftdc',
     ],
 )
+
+env.Program(
+    target='ftdc_dump',
+    source=[
+        'ftdc_workspace.cpp',
+        'ftdc_dump.cpp',
+    ],
+    LIBDEPS=[
+        'ftdc',
+        '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+    ],
+)
