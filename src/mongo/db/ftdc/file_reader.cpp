@@ -123,8 +123,8 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
     auto fSTs = firstSampleTs();
     auto oFSTs = other.firstSampleTs();
     if (oFSTs < fSTs) {
-        metadataDoc = other.metadataDoc; //expected to be identical, but for consistency let's use earliest.
-        firstRefDoc = other.firstRefDoc;
+        metadataDoc = other.metadataDoc; //expected to be identical, but for consistency let's use latest
+        lastRefDoc = other.lastRefDoc;
     }
 
     return Status::OK();
@@ -258,6 +258,7 @@ StatusWith<bool> FTDCFileReader::readAndParseTopLevelDoc() {
 
         auto valsTuple = swMP.getValue();
         _refDoc = std::get<0>(valsTuple);
+        _metricsCount = std::get<1>(valsTuple);
         _sampleCount = std::get<2>(valsTuple);
 
     }
@@ -372,17 +373,21 @@ void FTDCProcessMetrics::mergeRefDocKeys(const BSONObj& refDoc) {
 
 StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
     FTDCProcessMetrics pm;
+//std::cout << _file << std::endl;
     auto sw = readAndParseTopLevelDoc();
     assert(_state == State::kMetricChunk || _state == State::kMetadataDoc);
 
+    pm.procId.pid = 0;
     unsigned int ctr = 0;
     while (sw.isOK() && sw.getValue() && ctr++ < 100000) {
-        pm.sourceFilepaths[_dateId] = _file;
 
         if (_state == State::kMetadataDoc) {
             // _dateId, _metadata have been loaded by readAndParseTopLevelDoc()
 
-            pm.metadataDoc = _metadata;
+            pm.sourceFilepaths[_dateId] = _file;
+
+            pm.metadataDoc = _metadata.getOwned();
+
             BSONElement hpElem = dps::extractElementAtPath(pm.metadataDoc, "hostInfo.system.hostname");
             if (hpElem.eoo()) {
                 return {ErrorCodes::KeyNotFound, "missing 'hostInfo.system.hostname' in metadata doc"};
@@ -390,7 +395,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
             pm.procId.hostport = hpElem.String();
 
         } else { // _state == State::kMetricChunk
-            // _dateId, _refDoc, _sampleCount have been loaded by readAndParseTopLevelDoc()
+            // _dateId, _refDoc, _metricsCount, _sampleCount have been loaded by readAndParseTopLevelDoc()
 
             pm.mergeRefDocKeys(_refDoc);
             BSONElement startTSElem = dps::extractElementAtPath(_refDoc, "start");
@@ -400,14 +405,16 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::previewMetadataAndTimeseries() {
             pm.sampleCounts[_dateId] += _sampleCount;
             auto estimateEndTS = startTSElem.Date() + Milliseconds(static_cast<int64_t>(_sampleCount) * 1000);
             pm.timespans[_dateId] = {startTSElem.Date(), estimateEndTS};
-            if (pm.firstRefDoc.isEmpty()) {
-                pm.firstRefDoc = _refDoc.getOwned();
-                BSONElement pidElem = dps::extractElementAtPath(_refDoc, "serverStatus.pid");
+            BSONElement pidElem = dps::extractElementAtPath(_refDoc, "serverStatus.pid");
+            if (pm.procId.pid == 0) {
                 if (pidElem.eoo()) {
                     return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
                 }
                 pm.procId.pid = pidElem.Long();
+	    } else if (pm.procId.pid != static_cast<uint64_t>(pidElem.Long())) {
+                return {ErrorCodes::KeyNotFound, "Programming error, invariant check failed: serverStatus.pid changed mid-file."};
             }
+            pm.lastRefDoc = _refDoc.getOwned();
 
         }
         sw = readAndParseTopLevelDoc();

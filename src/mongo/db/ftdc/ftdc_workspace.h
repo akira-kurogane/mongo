@@ -59,15 +59,11 @@ private:
     // Map of all FTDCProcessMetrics
     std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;
 
-    // Paths of all FTDC files in this workspace
-    std::set<boost::filesystem::path> _paths;
-
     // Map of map via replset name -> hostpost to {hostport, pid}, which is the
     // key to the FTDCProcessMetrics in _pmMap
     std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>> _rs;
 
-    // Add ProcessMetric object to _pmMap, and filepath to _paths and also into
-    // _rs by topology
+    // Add ProcessMetric object to _pmMap, and also into _rs by topology
     Status _addFTDCProcessMetrics(FTDCProcessMetrics& pm);
 };
 

@@ -74,6 +74,9 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
         // only has read *And* advance methods, no 'just read'.
     }*/
 
+    // Sampling with some fields collection from the field shows that
+    // size of the ref doc and deltas is approx 4 times larger than the zlib-
+    // compressed size.
     auto statusUncompress = _compressor.uncompress(compressedDataRange, uncompressedLength);
 
     if (!statusUncompress.isOK()) {
@@ -116,17 +119,17 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
                       "Metrics Count and Sample Count have exceeded the allowable range.");
     }
 
-    std::vector<std::uint64_t> metrics;
+    std::vector<std::uint64_t> refDocVals;
 
-    metrics.reserve(metricsCount);
+    refDocVals.reserve(metricsCount);
 
     // We pass the reference document as both the reference document and current document as we only
     // want the array of metrics.
-    (void)FTDCBSONUtil::extractMetricsFromDocument(ref, ref, &metrics);
+    (void)FTDCBSONUtil::extractMetricsFromDocument(ref, ref, &refDocVals);
 
-    if (metrics.size() != metricsCount) {
+    if (refDocVals.size() != metricsCount) {
         return {ErrorCodes::BadValue,
-                "The metrics in the reference document and metrics count do not match"};
+                "The number of FTDC-type metrics in the reference document and metricsCount do not match"};
     }
 
     // We must always return the reference document
@@ -172,7 +175,7 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
 
     // Inflate the deltas
     for (std::uint32_t i = 0; i < metricsCount; i++) {
-        deltas[FTDCCompressor::getArrayOffset(sampleCount, 0, i)] += metrics[i];
+        deltas[FTDCCompressor::getArrayOffset(sampleCount, 0, i)] += refDocVals[i];
     }
 
     for (std::uint32_t i = 0; i < metricsCount; i++) {
@@ -181,16 +184,12 @@ FTDCDecompressor::uncompressToRefDocAndMetrics(ConstDataRange buf, bool skipMetr
                 deltas[FTDCCompressor::getArrayOffset(sampleCount, j - 1, i)];
         }
     }
+    // Now they are full values, not deltas
 
-    for (std::uint32_t i = 0; i < sampleCount; ++i) {
-        for (std::uint32_t j = 0; j < metricsCount; ++j) {
-            metrics[j] = deltas[j * sampleCount + i];
-        }
-    }
-
-    return {{ref, metricsCount, sampleCount, metrics}};
+    return {{ref, metricsCount, sampleCount, deltas}};
 }
 
+//Todo: initialize the metrics array here and pass by ref to uncompressToRefDocAndMetrics()
 StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf) {
     //std::vector<std::uint64_t> metrics;
 
@@ -207,14 +206,21 @@ StatusWith<std::vector<BSONObj>> FTDCDecompressor::uncompress(ConstDataRange buf
 
     docs.emplace_back(ref.getOwned());
 
+    std::vector<std::uint64_t> sampleMetrics;
+    sampleMetrics.reserve(metricsCount);
     for (std::uint32_t i = 0; i < sampleCount; ++i) {
-        docs.emplace_back(FTDCBSONUtil::constructDocumentFromMetrics(ref, metrics).getValue());
+        sampleMetrics.clear();
+        for (std::uint32_t j = 0; j < metricsCount; ++j) {
+            sampleMetrics[j] = metrics[j * sampleCount + i];
+        }
+        docs.emplace_back(FTDCBSONUtil::constructDocumentFromMetrics(ref, sampleMetrics).getValue());
     }
 
     return {docs};
 
 }
 
+//Todo: initialize the metrics array here and pass by ref to uncompressToRefDocAndMetrics(). It will be of no use, this is just to keep it like uncompress() does
 StatusWith<std::tuple<BSONObj, std::uint32_t, std::uint32_t>>
 FTDCDecompressor::uncompressMetricsPreview(ConstDataRange buf) {
     //TODO: change to using a 'uncompressToRefDocAndSampleCount[AndTS]()'

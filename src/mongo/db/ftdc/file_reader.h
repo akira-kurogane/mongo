@@ -83,9 +83,9 @@ struct FTDCPMTimespan {
  * file and if it so should replace. If not we can ignore using that file
  * because it must be a duplicate or an earlier, shorter version.
  *
- * firstRefDoc is the refDoc member from the first kMetricChunk. It is the
- * getDiagnosticData BSON object including the values. XXX It will have a subset,
- * probably the 100% subset, of keys in the metricsKeys map. XXX
+ * lastRefDoc is the last refDoc member from the last kMetricChunk from all
+ * files loaded so far. It will probably have many more dozens of metrics in it
+ * than the very first refDoc created when the process started.
  *
  * A sampleCounts value will be the sum of samples in all kMetricChunks for a
  * given file. It's map key is the same "_id" date value used as key for
@@ -98,7 +98,7 @@ struct FTDCProcessMetrics {
     std::map<Date_t, std::uint32_t> sampleCounts;
     std::map<Date_t, FTDCPMTimespan> timespans;
     BSONObj metadataDoc;
-    BSONObj firstRefDoc;
+    BSONObj lastRefDoc;
     std::map<std::string, BSONType> keys;
 
     std::string rsName() const;
@@ -237,7 +237,31 @@ private:
     // ref doc of current metrics chunk
     BSONObj _refDoc;
 
-    // sample count in current metrics chunk
+    // metrics and sample count in current metrics chunk. N.b. this sample
+    // count is of the packed deltas array, doesn't include the reference
+    // doc's values. Typically it is 299. 1 sec in the ref doc, the remaining
+    // seconds in the 5 min chunk in the packed deltas array.
+    /**
+     * 1061 metrics x 159 samples
+     * 1219 metrics x 0 samples <-- local.oplog stats appear
+     * 1291 metrics x 9 samples <-- repl is intialized
+     * 1294 metrics x 0 samples <-- primary node detected, lastWrite is recorded, etc.
+     * 1296 metrics x 0 samples <-- one new lock statistic increments for the first time
+     * 1306 metrics x 299 samples <-- readConcernMajorityOpTime appears
+     * 1306 metrics x 299 samples
+     * 1306 metrics x 299 samples
+     * ...
+     * 1306 metrics x 299 samples
+     * 1306 metrics x 299 samples
+     * 1306 metrics x 299 samples
+     * 1306 metrics x 59 samples
+     * 1327 metrics x 104 samples <-- shardingStatistics appears
+     * 1329 metrics x 261 samples <-- a couple of new lock stats appear
+     * 1330 metrics x 299 samples <-- a couple of new lock stats appear
+     * 1330 metrics x 299 samples
+     * ...
+     * */
+    std::uint32_t _metricsCount;
     std::uint32_t _sampleCount;
 
     // Parent document

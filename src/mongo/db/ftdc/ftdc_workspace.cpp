@@ -68,7 +68,13 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
 }
 
 std::set<boost::filesystem::path> FTDCWorkspace::filePaths() {
-    return _paths;
+    std::set<boost::filesystem::path> paths;
+    for (auto const& [pmId, pm] : _pmMap) {
+        for (auto const& [dtId, path] : pm.sourceFilepaths) {
+            paths.insert(path);
+        }
+    }
+    return paths;
 }
 
 std::map<std::string, std::map<std::string, std::set<FTDCProcessId>>>
@@ -108,7 +114,6 @@ FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
 
 void FTDCWorkspace::clear() {
     _rs.clear();
-    _paths.clear();
     _pmMap.clear();
 }
 
@@ -132,9 +137,6 @@ Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
 	if (!s.isOK()) {
             return s;
 	}
-    }
-    for (auto const& p : pm.sourceFilepaths) {
-        _paths.insert(p.second);
     }
 
     auto rsnm = pm.rsName();
