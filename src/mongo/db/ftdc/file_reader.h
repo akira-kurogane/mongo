@@ -74,6 +74,9 @@ public:
      */
     std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> next();
 
+    //TODO
+    //StatusWith<FTDCProcessMetrics> extractProcessMetricsHeaders();
+
 private:
     /**
      * Read a document from the file. If the file is corrupt, returns an appropriate status.

@@ -31,7 +31,7 @@ public:
      */
     void clear();
 
-    const std::set<boost::filesystem::path>& filePaths();
+    std::set<boost::filesystem::path> filePaths();
 
     /**
      * Topology is replicaset name -> hostport
