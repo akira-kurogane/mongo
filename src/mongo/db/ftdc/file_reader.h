@@ -39,6 +39,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/ftdc/decompressor.h"
 #include "mongo/db/ftdc/util.h"
+#include "mongo/db/ftdc/ftdc_process_metrics.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -75,7 +76,7 @@ public:
     std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> next();
 
     //TODO
-    //StatusWith<FTDCProcessMetrics> extractProcessMetricsHeaders();
+    StatusWith<FTDCProcessMetrics> extractProcessMetricsHeaders();
 
 private:
     /**

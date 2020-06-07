@@ -11,10 +11,9 @@ namespace mongo {
 namespace {
 
 /**
- * Open a file with FTDCFileReader, read into as far as the initial metadata
- * packed doc. Extract some info and pass back in the topologyId ref parameter.
+ * FTDCFileReader::extractProcessMetricsHeaders() success implies this is a valid FTDC file.
  */
-bool confirmFTDCFile(const boost::filesystem::path& p, FTDCProcessMetrics& procMetrics) {
+bool extractPMHeaders(const boost::filesystem::path& p, FTDCProcessMetrics& procMetrics) {
     if (!boost::filesystem::is_regular_file(p) || boost::filesystem::file_size(p) == 0) {
         return false;
     }
@@ -23,12 +22,12 @@ bool confirmFTDCFile(const boost::filesystem::path& p, FTDCProcessMetrics& procM
     if (s != Status::OK()) {
         return false;
     }
-//    StatusWith<FTDCProcessMetrics> swProcMetrics = reader.extractProcessMetricsHeaders();
-//    if (swProcMetrics.isOK()) {
-//        procMetrics = swProcMetrics.getValue();
-//	return true;
-//    }
-//    std::cerr << swProcMetrics.getStatus().reason() << std::endl;
+    StatusWith<FTDCProcessMetrics> swProcMetrics = reader.extractProcessMetricsHeaders();
+    if (swProcMetrics.isOK()) {
+        procMetrics = swProcMetrics.getValue();
+	return true;
+    }
+    std::cerr << swProcMetrics.getStatus().reason() << std::endl;
     return false;
 }
 
@@ -43,7 +42,7 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
     for (auto p = paths.begin(); p != paths.end(); ++p) {
         FTDCProcessMetrics pm;
         if (boost::filesystem::is_regular_file(*p)) {
-            if (confirmFTDCFile(*p, pm)) {
+            if (extractPMHeaders(*p, pm)) {
                 auto s = _addFTDCProcessMetrics(pm);
             }
         } else if (boost::filesystem::is_directory(*p)) {
@@ -54,7 +53,7 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
             for (; dItr != endItr; ++dItr) {
                 boost::filesystem::directory_entry& dEnt = *dItr;
                 auto f = dEnt.path().filename();
-                if (confirmFTDCFile(dEnt.path(), pm)) {
+                if (extractPMHeaders(dEnt.path(), pm)) {
                      auto s = _addFTDCProcessMetrics(pm);
                 }
             }
@@ -69,10 +68,10 @@ std::set<boost::filesystem::path> FTDCWorkspace::filePaths() {
     for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
          itPM != _pmMap.end(); ++itPM) {
         auto pm = itPM->second;
-        for (std::map<Date_t, boost::filesystem::path>::const_iterator itFp = pm.sourceFilepaths.begin();
-             itFp !=pm.sourceFilepaths.end(); ++itFp) {
-            auto path = itFp->second;
-            paths.insert(path);
+        for (std::map<Date_t, FTDCFileSpan>::const_iterator itFp = pm.filespans.begin();
+             itFp !=pm.filespans.end(); ++itFp) {
+            auto fspn = itFp->second;
+            paths.insert(fspn.path);
         }
     }
     return paths;
@@ -87,7 +86,8 @@ const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
     return _pmMap[pmId];
 }
 
-std::set<std::string> FTDCWorkspace::keys() {
+//TODO: reenable when FTDCProcessMetrics::keys() ready
+/*std::set<std::string> FTDCWorkspace::keys() {
     std::set<std::string> m;
     for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
          itPM != _pmMap.end(); ++itPM) {
@@ -99,7 +99,7 @@ std::set<std::string> FTDCWorkspace::keys() {
 	}
     }
     return m;
-}
+}*/
 
 FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
     Date_t first = Date_t::max();
@@ -107,9 +107,9 @@ FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
     for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
          itPM != _pmMap.end(); ++itPM) {
         auto pm = itPM->second;
-        for (std::map<Date_t, FTDCPMTimespan>::const_iterator it = pm.timespans.begin();
-             it !=pm.timespans.end(); ++it) {
-            auto tspan = it->second;
+        for (std::map<Date_t, FTDCFileSpan>::const_iterator it = pm.filespans.begin();
+             it !=pm.filespans.end(); ++it) {
+            auto tspan = it->second.timespan;
             if (tspan.first < first) {
                 first = tspan.first;
 	    }
@@ -148,7 +148,7 @@ Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
 	}
     }
 
-    auto rsnm = ""; //TODO extract rsname for FTDCProcessMetrics object
+    auto rsnm = ""; //TODO extract rsname for FTDCProcessMetrics object's metadataDoc
     auto hostpost = pm.procId.hostport;
     auto hfl = _rs.find(rsnm);
     if (hfl == _rs.end()) {

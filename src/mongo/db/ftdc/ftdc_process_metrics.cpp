@@ -18,11 +18,11 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r) {
 }
 
 Date_t FTDCProcessMetrics::firstSampleTs() const {
-    return timespans.begin()->second.first;
+    return filespans.begin()->second.timespan.first;
 }
 
 Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
-    return timespans.rbegin()->second.last;
+    return filespans.rbegin()->second.timespan.last;
 }
 
 //Unit test: FTDCProcessMetrics a.merge(b) should create the same doc as b.merge(a);
@@ -46,28 +46,27 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
      * we don't want to use any values from it: filepath, sampleCount, timespan
      * and refDoc. 
      */
-    for (std::map<Date_t, boost::filesystem::path>::const_iterator it = other.sourceFilepaths.begin();
-         it != other.sourceFilepaths.end(); ++it) {
+    for (std::map<Date_t, FTDCFileSpan>::const_iterator it = other.filespans.begin();
+         it != other.filespans.end(); ++it) {
         auto date_id = it->first;
-        auto oth_fpath = it->second;
-        auto oth_sampleCount = other.sampleCounts.find(date_id)->second;
-        auto oth_timespan = other.timespans.find(date_id)->second;
-        auto oldfpItr = sourceFilepaths.find(date_id);
-        if (oldfpItr == sourceFilepaths.end()) {
-            sourceFilepaths[date_id] = oth_fpath;
-            sampleCounts[date_id] = oth_sampleCount;
-            timespans[date_id] = oth_timespan;
+        auto oth_fpath = it->second.path;
+        auto oth_sampleCount = it->second.sampleCount;
+        auto oth_timespan = it->second.timespan;
+        auto oldfpItr = filespans.find(date_id);
+        if (oldfpItr == filespans.end()) {
+            filespans[date_id] = { oth_fpath, oth_sampleCount, oth_timespan };
         } else {
-            auto existing_fpath = oldfpItr->second;
-            std::cerr << "Info: Duplicate FTDC files for " << procId.hostport << ", pid=" << procId.pid <<
-                    ", starting datetime id=" << date_id << " found." << std::endl;
-            if (oth_sampleCount < sampleCounts[date_id]) {
-                std::cerr << "File " << oth_fpath << " will be ignored because file " << existing_fpath << " has larger sample count" << std::endl;
+            auto existing_fpath = oldfpItr->second.path;
+            std::cerr << "Info: Duplicate FTDC files for " << procId.hostport <<
+                    ", pid=" << procId.pid << ", starting datetime id=" <<
+                    date_id << " found." << std::endl;
+            if (oth_sampleCount < filespans[date_id].sampleCount) {
+                std::cerr << "File " << oth_fpath << " will be ignored because file " <<
+                    existing_fpath << " has larger sample count" << std::endl;
             } else {
-                std::cerr << "File " << existing_fpath << " will be ignored because file " << oth_fpath << "is larger" << std::endl;
-                sourceFilepaths[date_id] = oth_fpath;
-                sampleCounts[date_id] = oth_sampleCount;
-                timespans[date_id] = oth_timespan;
+                std::cerr << "File " << existing_fpath << "'s metrics will be discarded because file " <<
+                    oth_fpath << " has larger sample count" << std::endl;
+                filespans[date_id] = { oth_fpath, oth_sampleCount, oth_timespan };
             }
         }
     }
@@ -75,7 +74,7 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
     auto fSTs = firstSampleTs();
     auto oFSTs = other.firstSampleTs();
     if (oFSTs < fSTs) {
-        metadataDoc = other.metadataDoc; //expected to be identical, but for consistency let's use latest
+        metadataDoc = other.metadataDoc; //expected to be identical in all files, but for consistency let's use latest
         lastRefDoc = other.lastRefDoc;
     }
 
@@ -84,9 +83,9 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
 
 std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm) {
     std::string fpList;
-    for (std::map<Date_t, boost::filesystem::path>::iterator it = pm.sourceFilepaths.begin();
-         it != pm.sourceFilepaths.end(); ++it) {
-        fpList = fpList + it->second.string() + " ";
+    for (std::map<Date_t, FTDCFileSpan>::iterator it = pm.filespans.begin();
+         it != pm.filespans.end(); ++it) {
+        fpList = fpList + it->second.path.string() + " ";
     }
     os << pm.procId.hostport << " [" << pm.procId.pid << "] " << "[TODO print rsName]" << " " << fpList;
     return os;

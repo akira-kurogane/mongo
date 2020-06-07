@@ -33,6 +33,17 @@ struct FTDCPMTimespan {
 };
 
 /**
+ * The minimal properties of a FTDC file needed for effective iteration.
+ * This sampleCount property is the sum of all sampleCount vals in the
+ * kMetricChunk docs in each file.
+ */
+struct FTDCFileSpan {
+    boost::filesystem::path path;
+    std::uint32_t sampleCount; //sum of all in file
+    FTDCPMTimespan timespan;
+};
+
+/**
  * A struct representing the metrics found in one or more FTDC files for
  * one process instance of mongod or mongos i.e. will not run over to
  * include metrics generated after the process is restarted.
@@ -54,23 +65,17 @@ struct FTDCPMTimespan {
  * lastRefDoc is the last refDoc member from the last kMetricChunk from all
  * files loaded so far. It will probably have many more dozens of metrics in it
  * than the very first refDoc created when the process started.
- *
- * A sampleCounts value will be the sum of samples in all kMetricChunks for a
- * given file. It's map key is the same "_id" date value used as key for
- * sourceFilepaths;
  */
 
 struct FTDCProcessMetrics {
     FTDCProcessId procId;
-    std::map<Date_t, boost::filesystem::path> sourceFilepaths;
-    std::map<Date_t, std::uint32_t> sampleCounts;
-    std::map<Date_t, FTDCPMTimespan> timespans;
+    std::map<Date_t, FTDCFileSpan> filespans;
     BSONObj metadataDoc;
     BSONObj lastRefDoc;
-    std::map<std::string, BSONType> keys;
 
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
+    //std::map<std::string, BSONType> keys();
 
     Status merge(const FTDCProcessMetrics& pm);
     void mergeRefDocKeys(const BSONObj& _refDoc);

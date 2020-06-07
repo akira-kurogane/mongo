@@ -36,6 +36,7 @@
 #include "mongo/base/data_range_cursor.h"
 #include "mongo/base/data_type_validated.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/jsobj.h"
@@ -220,6 +221,76 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     _file = file;
 
     return Status::OK();
+}
+
+StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
+    FTDCProcessMetrics pm;
+    Date_t dtId;
+    FTDCFileSpan ftdcFileSpan = { _file /*path*/, 0/*sampleCount*/,
+	    {Date_t::max()/*first*/, Date_t::min()/*last*/}/*timespan*/};
+    Date_t fileFirstStartTs;
+    Date_t currDocStartTs;
+    
+    while (true) {
+        StatusWith<BSONObj> swFTDCBsonDoc = readDocument();
+        if (!swFTDCBsonDoc.isOK()) {
+            return swFTDCBsonDoc.getStatus();
+        }
+
+	// Exit when no more docs
+        if (swFTDCBsonDoc.getValue().isEmpty()) {
+            break;
+        }
+
+        BSONElement tmpElem;
+
+	auto ftdcDoc = swFTDCBsonDoc.getValue();
+
+        long long longIntVal;
+        Status sType = bsonExtractIntegerField(ftdcDoc, "type"/*kFTDCTypeField*/, &longIntVal);
+        if (!sType.isOK()) {
+            return {sType};
+        }
+	FTDCBSONUtil::FTDCType ftdcType = static_cast<FTDCBSONUtil::FTDCType>(longIntVal);
+
+        if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
+            // The Date_t "_id" field is in every FTDC file top-level doc but
+	    // we'll use only the one in the metadata doc as a primary identifier
+            Status sDateId = bsonExtractTypedField(ftdcDoc, "_id"/*kFTDCIdField*/, BSONType::Date, &tmpElem);
+            if (!sDateId.isOK()) {
+                return {sDateId};
+            }
+	    dtId = tmpElem.Date();
+
+            Status sMDExtract = bsonExtractTypedField(ftdcDoc, "doc"/*kFTDCDocField*/, BSONType::Object, &tmpElem);
+            if (!sMDExtract.isOK()) {
+                return {sMDExtract};
+            }
+
+            pm.metadataDoc = tmpElem.Obj();
+
+        /*} else if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
+            auto swCompressedRefDocAndDeltas = getMetricsFromMetricDoc(ftdcDoc);
+            get sampleCount
+            note startTs, estimatedEndTs
+	    set fileFirstStartTs first time
+            if (last by filepos + size test) {
+                set lastRefDoc;
+	    }*/
+	/*} else {
+	    MONGO_UNREACHABLE();*/
+	}
+    }
+    //pm.filespans[dtId] = { _file, sampleCountSum, {fileFirstStartTs, currDocStartTs + (1 * Seconds)} };
+    
+    //assert(pm.metadataDoc
+    //assert ftdcFileSpan.first < ftdcFileSpan.last
+
+    // We've read 1 file; set it's filespan info. Key value = metadataDoc's
+    // date _id value.
+    pm.filespans[dtId] = ftdcFileSpan;
+
+    return pm;
 }
 
 }  // namespace mongo
