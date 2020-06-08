@@ -248,7 +248,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
 
         auto ftdcDoc = swFTDCBsonDoc.getValue();
         // The extra 8 bytes is just in case there's an empty doc. Purely conjecture.
-        bool isLastDoc = (_fileSize - 8u) <= static_cast<size_t>(_stream.tellg()) + ftdcDoc.objsize();
+        bool isLastDoc = (_fileSize - 8u) <= static_cast<size_t>(_stream.tellg());
 
         long long longIntVal;
         Status sType = bsonExtractIntegerField(ftdcDoc, "type"/*kFTDCTypeField*/, &longIntVal);
