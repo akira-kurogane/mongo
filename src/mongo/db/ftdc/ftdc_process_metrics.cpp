@@ -96,4 +96,21 @@ std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm) {
     return os;
 }
 
+FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys,
+                                     Date_t start, Date_t end, uint32_t sampleResolution) {
+    _keys = keys;
+    _start = start;
+    _stepMs = sampleResolution;
+    _sampleLength = (end.toMillisSinceEpoch() - start.toMillisSinceEpoch()) / _stepMs;
+    for (size_t i = 0; i < _keys.size(); ++i) {
+        _keyRow[_keys[i]] = i;
+    }
+
+    _metrics.resize(_sampleLength * _keys.size(), UINT64_MAX); //Max value being used to indicate unset
+}
+
+FTDCMetricsSubset::~FTDCMetricsSubset() {
+    ;
+}
+
 }  // namespace mongo

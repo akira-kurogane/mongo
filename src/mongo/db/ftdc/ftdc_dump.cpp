@@ -34,8 +34,8 @@ int main(int argc, char* argv[], char** envp) {
         exit(1);
     }
 
-    //auto tspan = ws.boundaryTimespan();
-    //std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
+    auto tspan = ws.boundaryTimespan();
+    std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
         
     auto tp = ws.topology();
     for (auto const& [rsnm, hpvals] : tp) {

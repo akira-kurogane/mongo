@@ -75,8 +75,19 @@ public:
      */
     std::tuple<FTDCBSONUtil::FTDCType, const BSONObj&, Date_t> next();
 
-    //TODO
+    /**
+     * Returns a FTDCProcessMetrics object initialized with the data in the
+     * metadata doc and the last metric chunk's ref doc (= getDiagnosticData)
+     * This method is quick as it skips all metric chunks except the last one.
+     */
     StatusWith<FTDCProcessMetrics> extractProcessMetricsHeaders();
+
+    /**
+     * Fills the metrics timeseries into the FTDCMetricsSubset. Its const keys
+     * list and timespan define which metrics will be sample, and to which
+     * resolution the metrics will be aggregated to.
+     */
+    Status extractTimeseries(FTDCMetricsSubset& mr);
 
 private:
     /**
