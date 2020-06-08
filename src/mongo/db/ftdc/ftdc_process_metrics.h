@@ -17,7 +17,7 @@ namespace mongo {
  */
 struct FTDCProcessId {
     std::string hostport;
-    unsigned long pid;
+    uint64_t pid;
 };
 
 bool operator==(const FTDCProcessId& l, const FTDCProcessId& r);
@@ -34,12 +34,9 @@ struct FTDCPMTimespan {
 
 /**
  * The minimal properties of a FTDC file needed for effective iteration.
- * This sampleCount property is the sum of all sampleCount vals in the
- * kMetricChunk docs in each file.
  */
 struct FTDCFileSpan {
     boost::filesystem::path path;
-    std::uint32_t sampleCount; //sum of all in file
     FTDCPMTimespan timespan;
 };
 
@@ -73,6 +70,7 @@ struct FTDCProcessMetrics {
     BSONObj metadataDoc;
     BSONObj lastRefDoc;
 
+    std::string rsName() const;
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
     //std::map<std::string, BSONType> keys();

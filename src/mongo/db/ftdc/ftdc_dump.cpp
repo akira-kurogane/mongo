@@ -21,18 +21,34 @@ int main(int argc, char* argv[], char** envp) {
     }
 
     FTDCWorkspace ws;
-//    Status s = ws.addFTDCFiles(av);
-//
-//    auto fp = ws.filePaths();
-//    if (fp.size() == 0) {
-//        std::cerr << "There are no FTDC metrics files at " << av[0];
-//        size_t i;
-//        for (i = 1; i < av.size(); ++i) {
-//            std::cerr << ", " << av[i];
-//        }
-//        std::cerr << std::endl;
-//        exit(1);
-//    }
+    Status s = ws.addFTDCFiles(av);
+
+    auto fp = ws.filePaths();
+    if (fp.size() == 0) {
+        std::cerr << "There are no FTDC metrics files at " << av[0];
+        size_t i;
+        for (i = 1; i < av.size(); ++i) {
+            std::cerr << ", " << av[i];
+        }
+        std::cerr << std::endl;
+        exit(1);
+    }
+
+    //auto tspan = ws.boundaryTimespan();
+    //std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
+        
+    auto tp = ws.topology();
+    for (auto const& [rsnm, hpvals] : tp) {
+        std::cout << rsnm << std::endl;
+        for (auto const& [hp, pmIds] : hpvals) {
+            std::cout << "  " << hp << std::endl;
+            for (auto const& pmId : pmIds) {
+                std::cout << "    " << pmId.hostport << ":" << pmId.pid << std::endl;
+                auto pm = ws.processMetrics(pmId);
+                std::cout << "    " << pm.firstSampleTs() << " - " << pm.estimateLastSampleTs() << std::endl;
+            }
+        }
+    }
 
     exit(0);
 }

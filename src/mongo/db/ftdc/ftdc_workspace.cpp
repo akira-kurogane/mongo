@@ -148,7 +148,7 @@ Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
 	}
     }
 
-    auto rsnm = ""; //TODO extract rsname for FTDCProcessMetrics object's metadataDoc
+    auto rsnm = pm.rsName();
     auto hostpost = pm.procId.hostport;
     auto hfl = _rs.find(rsnm);
     if (hfl == _rs.end()) {
