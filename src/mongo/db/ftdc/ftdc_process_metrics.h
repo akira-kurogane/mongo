@@ -30,6 +30,39 @@ bool operator<(const FTDCProcessId& l, const FTDCProcessId& r);
 struct FTDCPMTimespan {
     Date_t first;
     Date_t last;
+
+    bool isValid();
+    bool overlaps(FTDCPMTimespan& other);
+};
+
+/**
+ * A subset of the metrics, optionally downsampled to lower resolution
+ * - Subset of metrics by dot-concatenated key list
+ * - To a fixed timespan
+ * - To a resolution in milliseconds - E.g. 60000 for 1 min samples. 1000ms as default.
+ */
+class FTDCMetricsSubset {
+
+public:
+    FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimespan tspan,
+                      uint32_t r = 1000);
+    ~FTDCMetricsSubset() {};
+
+public:
+    FTDCPMTimespan timespan() {
+        return _tspan;
+    }
+    uint32_t resolution() { return _stepMs; }
+
+private:
+    FTDCPMTimespan _tspan;
+    uint32_t _stepMs;
+
+    size_t _sampleLength; //end time = _start + (sampleLength * _stepMs)
+
+    std::vector<std::string> _keys;
+    std::map<std::string, unsigned int> _keyRow;
+    std::vector<std::uint64_t> _metrics;
 };
 
 /**
@@ -83,35 +116,11 @@ struct FTDCProcessMetrics {
      * The metadata doc is ignored. The metrics are concatenated together as
      * one larger array of timeseries.
      */
-    std::map<std::string, std::vector<uint64_t>> timeseries(float resolution = 0.0);
+    StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
+		FTDCPMTimespan tspan, uint32_t sampleResolution);
 
     //temporary debugging use
     friend std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm);
-};
-
-/**
- * A subset of the metrics, optionally downsampled to lower resolution
- * - Subset of metrics by dot-concatenated key list
- * - To a fixed timespan
- * - To a resolution in milliseconds - E.g. 60000 for 1 min samples. 1000ms as default.
- */
-class FTDCMetricsSubset {
-
-public:
-    FTDCMetricsSubset(std::vector<std::string> keys, Date_t start, Date_t end,
-		      uint32_t sampleResolution = 1000);
-    ~FTDCMetricsSubset();
-
-private:
-   Date_t _start;
-
-   uint32_t _stepMs;
-
-   size_t _sampleLength; //end time = _start + (sampleLength * _stepMs)
-
-   std::vector<std::string> _keys;
-   std::map<std::string, unsigned int> _keyRow;
-   std::vector<std::uint64_t> _metrics;
 };
 
 }  // namespace mongo

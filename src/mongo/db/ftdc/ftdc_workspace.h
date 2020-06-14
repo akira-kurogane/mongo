@@ -56,6 +56,16 @@ public:
      */
     FTDCPMTimespan boundaryTimespan();
 
+    /**
+     * Return the timeseries from all process metrics, filtered by
+     *   the argument.
+     * keys is a vector so a presentation ordered is implied; it is passed as
+     * non-const ref value so compulsory fields such as "start" can be added
+     * if they were absent.
+     */
+    std::map<FTDCProcessId, FTDCMetricsSubset> timeseries(std::vector<std::string>& keys,
+                    FTDCPMTimespan timespan, uint32_t sampleResolution = 1000);
+
 private:
     // Map of all FTDCProcessMetrics
     std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;

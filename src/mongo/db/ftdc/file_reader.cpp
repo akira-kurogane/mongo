@@ -386,4 +386,23 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
     return pm;
 }
 
+Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
+    //TODO
+    //iterate the metric chunks
+    //if overlap mr.timespan
+    //  decompress zlib
+    //  iterate refDoc, confirm which items match mr.keys, map that ordinal vs. the mr.keyRow
+    //  iterate VarInt-packed values. "start" must be included, others depend on what is mr.keys
+    //  find the pos of each new maximum start ts < next mr.stepMs() from mr.timespan.first. Put that in another pos array
+    //  read VarInt values into mr.metrics
+    //  Just advance() not readAndAdvance() if an unwanted metric 'metric'
+    //  For wanted metrics:
+    //    insert refDoc value into all cells that had a found "start" ts
+    //    sum the deltas from the VarInt values by each step pos group
+    //next metric chunk
+    //
+    //If next metric chunk has a closer "start" time to the rounded-up stepMs, just overwrite the one in the previous.
+    return Status::OK();
+}
+
 }  // namespace mongo

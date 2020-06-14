@@ -25,7 +25,7 @@ bool extractPMHeaders(const boost::filesystem::path& p, FTDCProcessMetrics& proc
     StatusWith<FTDCProcessMetrics> swProcMetrics = reader.extractProcessMetricsHeaders();
     if (swProcMetrics.isOK()) {
         procMetrics = swProcMetrics.getValue();
-	return true;
+        return true;
     }
     std::cerr << swProcMetrics.getStatus().reason() << std::endl;
     return false;
@@ -96,7 +96,7 @@ const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
              it != pm.keys.end(); ++it) {
             auto k = it->first;
             m.insert(k);
-	}
+        }
     }
     return m;
 }*/
@@ -112,10 +112,10 @@ FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
             auto tspan = it->second.timespan;
             if (tspan.first < first) {
                 first = tspan.first;
-	    }
+            }
             if (tspan.last > last) {
                 last = tspan.last;
-	    }
+            }
         }
     }
     return {first, last};
@@ -143,26 +143,51 @@ Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
         _pmMap[pm.procId] = pm;
     } else {
         auto s = _pmMap[pm.procId].merge(pm);
-	if (!s.isOK()) {
+        if (!s.isOK()) {
             return s;
-	}
+        }
     }
 
     auto rsnm = pm.rsName();
     auto hostpost = pm.procId.hostport;
     auto hfl = _rs.find(rsnm);
     if (hfl == _rs.end()) {
-	std::map<std::string, std::set<FTDCProcessId>> x;
+        std::map<std::string, std::set<FTDCProcessId>> x;
         _rs[rsnm] = x;
     }
     auto fl = _rs[rsnm].find(hostpost);
     if (fl == _rs[rsnm].end()) {
-	std::set<FTDCProcessId> x;
-	_rs[rsnm][hostpost] = x;
+        std::set<FTDCProcessId> x;
+        _rs[rsnm][hostpost] = x;
     }
     _rs[rsnm][hostpost].insert(pm.procId);
 
     return Status::OK();
+}
+
+std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
+                std::vector<std::string>& keys,
+                FTDCPMTimespan tspan, uint32_t sampleResolution) {
+    std::map<FTDCProcessId, FTDCMetricsSubset> resultMap;
+    for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
+         itPM != _pmMap.end(); ++itPM) {
+        auto pmId = itPM->first;
+        auto pm = itPM->second;
+        auto s = pm.firstSampleTs();
+        auto e = pm.estimateLastSampleTs();
+        if (tspan.isValid() && ((s >= tspan.first && s < tspan.first) ||
+                        (e > tspan.first && e <= tspan.last))) {
+            auto swTF = pm.timeseries(keys, tspan, sampleResolution); //AKIRA this could be return by value from ProcessMetrics::xxxx() too.
+            if (!swTF.isOK()) {
+                std::cerr << "Error attempting to read timeseries data from " << pmId.hostport <<
+                        " (pid=" << pmId.pid << ")\n";
+                continue;
+            }
+            //TODO: add copy or move ctro to allow swTF.getValue() be assigned to resultMap?
+	    //resultMap[pmId] = swTF.getValue();
+        }
+    }
+    return resultMap;
 }
 
 } // namespace mongo

@@ -1,4 +1,5 @@
 #include "mongo/db/ftdc/ftdc_process_metrics.h"
+#include "mongo/db/ftdc/file_reader.h"
 
 #include "mongo/db/bson/dotted_path_support.h"
 
@@ -15,6 +16,31 @@ bool operator!=(const FTDCProcessId& l, const FTDCProcessId& r) {
 
 bool operator<(const FTDCProcessId& l, const FTDCProcessId& r) {
     return l.hostport < r.hostport || (l.hostport == r.hostport && l.pid < r.pid);
+}
+
+bool FTDCPMTimespan::isValid() {
+    return last > first;
+}
+
+bool FTDCPMTimespan::overlaps(FTDCPMTimespan& other) {
+    return isValid() && other.isValid() &&
+	((first >= other.first && first < other.last) ||
+        (last > other.first && last <= other.last));
+}
+//        if (tspan.isValid() && ((s >= tspan.first && s < tspan.first) ||
+//                        (e > tspan.first && e <= tspan.last))) {
+
+FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimespan tspan,
+                            uint32_t sampleResolution) {
+    _keys = keys;
+    _tspan = tspan;
+    _stepMs = sampleResolution;
+    _sampleLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
+    for (size_t i = 0; i < _keys.size(); ++i) {
+        _keyRow[_keys[i]] = i;
+    }
+
+    _metrics.resize(_sampleLength * _keys.size(), UINT64_MAX); //Max value being used to indicate unset
 }
 
 std::string FTDCProcessMetrics::rsName() const {
@@ -86,6 +112,29 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
     return Status::OK();
 }
 
+StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::string>& keys, 
+		FTDCPMTimespan tspan, uint32_t sampleResolution) {
+    FTDCMetricsSubset m(keys, tspan, sampleResolution);
+    // TODO:
+    // Init the BSON types of the keys first, log which metrics in output.keys are missing
+
+    for (std::map<Date_t, FTDCFileSpan>::iterator it = filespans.begin();
+         it != filespans.end(); ++it) {
+	if (it->second.timespan.overlaps(tspan)) {
+            FTDCFileReader reader;
+            auto s = reader.open(it->second.path);
+            if (s != Status::OK()) {
+                return s;
+            }
+	    auto sET = reader.extractTimeseries(m);
+            if (!sET.isOK()) {
+                return sET;
+            }
+        }
+    }
+    return {m};
+}
+
 std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm) {
     std::string fpList;
     for (std::map<Date_t, FTDCFileSpan>::iterator it = pm.filespans.begin();
@@ -94,23 +143,6 @@ std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm) {
     }
     os << pm.procId.hostport << " [" << pm.procId.pid << "] " << pm.rsName() << " " << fpList;
     return os;
-}
-
-FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys,
-                                     Date_t start, Date_t end, uint32_t sampleResolution) {
-    _keys = keys;
-    _start = start;
-    _stepMs = sampleResolution;
-    _sampleLength = (end.toMillisSinceEpoch() - start.toMillisSinceEpoch()) / _stepMs;
-    for (size_t i = 0; i < _keys.size(); ++i) {
-        _keyRow[_keys[i]] = i;
-    }
-
-    _metrics.resize(_sampleLength * _keys.size(), UINT64_MAX); //Max value being used to indicate unset
-}
-
-FTDCMetricsSubset::~FTDCMetricsSubset() {
-    ;
 }
 
 }  // namespace mongo

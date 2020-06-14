@@ -50,5 +50,25 @@ int main(int argc, char* argv[], char** envp) {
         }
     }
 
+    Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
+    Date_t testRangeE = testRangeS + Seconds(250);
+    std::vector<std::string> keys = {
+        "serverStatus.wiredTiger.cache.bytes read into cache",
+        "serverStatus.wiredTiger.cache.bytes written from cache",
+        "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", //gauge
+        "serverStatus.wiredTiger.cache.eviction state", //gauge
+        "serverStatus.wiredTiger.transaction.transaction checkpoint generation", //boolean gauge
+        "serverStatus.opLatencies.*.latency",
+        "serverStatus.opLatencies.*.ops" };
+    std::map<FTDCProcessId, FTDCMetricsSubset> x = ws.timeseries(keys, {testRangeS, testRangeE});
+
+    // Better test would include some metrics absent, some unknown keys, and a metric only appearing halfway through the 250s say some finegrained lock stat
+
+    //For graphing lib purposes an output like this, in limited size, will be accepted I think
+    //[ {"ts": x, "ops": y, "dirty_bytes": z, ...},
+    //  {"ts": x, "ops": y, "dirty_bytes": z, ...},
+    //  {"ts": x, "ops": y, "dirty_bytes": z, ...},
+    //]
+
     exit(0);
 }
