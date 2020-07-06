@@ -227,13 +227,82 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     return Status::OK();
 }
 
+StatusWith<std::tuple<BSONObj, uint32_t, uint32_t, Date_t, unsigned long>>
+extractRefDocEtcOnly(ConstDataRangeCursor& bdCDR) {
+
+    // The "data" BinData field of a kMetricsChunk contains the following
+    // - uint32_t length of the data after decompression
+    // - compressed zlib data
+    auto swUncompressedLength = bdCDR.readAndAdvance<LittleEndian<std::uint32_t>>();
+    if (!swUncompressedLength.isOK()) {
+        return {swUncompressedLength.getStatus()};
+    }
+    auto zlibUncompressedLength = swUncompressedLength.getValue();
+
+    // Block compressor creates, and owns, the buffer the Zlib-
+    // uncompressed data is written into. The buffer will have:
+    // - One BSONObj (the ref doc)
+    // - uint32_t metricCount
+    // - uint32_t sampleCount
+    // - VarInt data that will expand to (mC * sC) uint64_t values.
+    BlockCompressor blockCompressor; // 'Block compressor' = Zlib wrapper class
+    auto swUncompress = blockCompressor.uncompress(bdCDR, zlibUncompressedLength);
+    if (!swUncompress.isOK()) {
+        return {swUncompress.getStatus()};
+    }
+
+    // Post-zlib-decompression buffer ConstDataRangeCursor
+    ConstDataRangeCursor pzCdc = swUncompress.getValue();
+
+    auto swRef = pzCdc.readAndAdvance<Validated<BSONObj>>();
+    if (!swRef.isOK()) {
+        return {swRef.getStatus()};
+    }
+    BSONObj refDoc = swRef.getValue();
+
+    // Read count of metrics
+    auto swMetricsCount = pzCdc.readAndAdvance<LittleEndian<std::uint32_t>>();
+    if (!swMetricsCount.isOK()) {
+        return {swMetricsCount.getStatus()};
+    }
+    std::uint32_t metricsCount = swMetricsCount.getValue();
+
+    // Read count of samples
+    auto swSampleCount = pzCdc.readAndAdvance<LittleEndian<std::uint32_t>>();
+    if (!swSampleCount.isOK()) {
+        return {swSampleCount.getStatus()};
+    }
+    std::uint32_t sampleCount = swSampleCount.getValue();
+
+    BSONElement startTSElem = dps::extractElementAtPath(refDoc, "start");
+    if (startTSElem.eoo()) {
+        return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
+    }
+
+    BSONElement pidElem = dps::extractElementAtPath(refDoc, "serverStatus.pid");
+    if (pidElem.eoo()) {
+        return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
+    }
+    unsigned long tmpPid = static_cast<unsigned long>(pidElem.Long());
+
+    //  TODO: proceed into the metrics array and cycle through first row (sampleCount
+    //  items long) of VarInts, which are the "start" ts vals, to get the ts of the last
+    //  metric chunk so we can return exact lastTs of the metric chunk
+
+    auto result = std::make_tuple(refDoc.getOwned(), metricsCount, sampleCount, startTSElem.Date(), tmpPid);
+    return {result};
+}
+
 StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
     FTDCProcessMetrics pm;
-    Date_t dtId;
+    Date_t metadataDocDtId = Date_t::min();
     FTDCFileSpan ftdcFileSpan = { _file, {Date_t::max(), Date_t::min()} };
     bool firstMCProcessed = false;
 
+    std::stack<int> mcFO;
+    bool seekMatchingPidMC = false;
     while (true) {
+        mcFO.emplace(_stream.tellg()); //pos at start of current doc, before bson read
         StatusWith<BSONObj> swFTDCBsonDoc = readDocument();
         if (!swFTDCBsonDoc.isOK()) {
             return swFTDCBsonDoc.getStatus();
@@ -248,7 +317,16 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
 
         auto ftdcDoc = swFTDCBsonDoc.getValue();
         // The extra 8 bytes is just in case there's an empty doc. Purely conjecture.
+        // _stream.tellg() is now the start of the next doc, or 1 past end of file.
         bool isLastDoc = (_fileSize - 8u) <= static_cast<size_t>(_stream.tellg());
+
+        // The Date_t "_id" field is in every FTDC file top-level doc. We'll use
+        // the one in the metadata doc as a primary id for the file.
+        Status sDateId = bsonExtractTypedField(ftdcDoc, "_id"/*kFTDCIdField*/, BSONType::Date, &tmpElem);
+        if (!sDateId.isOK()) {
+            return {sDateId};
+        }
+        auto dtId = tmpElem.Date();
 
         long long longIntVal;
         Status sType = bsonExtractIntegerField(ftdcDoc, "type"/*kFTDCTypeField*/, &longIntVal);
@@ -258,13 +336,9 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
         FTDCBSONUtil::FTDCType ftdcType = static_cast<FTDCBSONUtil::FTDCType>(longIntVal);
 
         if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
-            // The Date_t "_id" field is in every FTDC file top-level doc but
-            // we'll use only the one in the metadata doc as a primary identifier
-            Status sDateId = bsonExtractTypedField(ftdcDoc, "_id"/*kFTDCIdField*/, BSONType::Date, &tmpElem);
-            if (!sDateId.isOK()) {
-                return {sDateId};
-            }
-            dtId = tmpElem.Date();
+            mcFO.pop(); //mcFO is just for metrics chunks
+            dassert(metadataDocDtId == Date_t::min());
+            metadataDocDtId = dtId;
 
             Status sMDExtract = bsonExtractTypedField(ftdcDoc, "doc"/*kFTDCDocField*/, BSONType::Object, &tmpElem);
             if (!sMDExtract.isOK()) {
@@ -292,6 +366,96 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
                 return {sZlibBinData};
             }
 
+            int binDataBSONElemLength;
+            const char* buffer = tmpElem.binData(binDataBSONElemLength);
+            if (binDataBSONElemLength < 0) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Field " << "data"/*std::string(kFTDCDataField)*/ << " is not a BinData."};
+            }
+            ConstDataRangeCursor bdCDR({buffer, static_cast<size_t>(binDataBSONElemLength)});
+
+            BSONObj refDoc;
+            uint32_t metricsCount;
+            uint32_t sampleCount;
+            Date_t startTs;
+            long unsigned tmpPid;
+
+            auto swTsPidEtc = extractRefDocEtcOnly(bdCDR);
+            if (!swTsPidEtc.isOK()) {
+                return {swTsPidEtc.getStatus()};
+            }
+            std::tie(refDoc, metricsCount, sampleCount, startTs, tmpPid) = swTsPidEtc.getValue();
+
+            if (!firstMCProcessed) {
+                ftdcFileSpan.timespan.first = startTs;
+                pm.procId.pid = tmpPid;
+                firstMCProcessed = true;
+            } else {
+
+                if (tmpPid != pm.procId.pid) {
+                    if (isLastDoc && sampleCount < 10) {
+                        /**
+                         * Workaround: Sometimes the first several samples of a new process
+                         * are written into the previous process' file, as its last metrics chunk.
+                         * (Speculation: maybe it is caused by a bug in the processing of
+                         * metrics.interim files found after an unclean shutdown.)
+                         */
+                        mcFO.pop();
+                        seekMatchingPidMC = true;
+                        break;
+                    } else {
+                        std::stringstream pidChangeErrSS;
+                        pidChangeErrSS << "FTDC metrics invariant check failed: serverStatus.pid changed from "
+                                << pm.procId.pid << " to " << tmpPid << " mid-file, with " << sampleCount << " samples";
+                        return {ErrorCodes::UnknownError, pidChangeErrSS.str()};
+                    }
+                }
+            }
+            
+            if (isLastDoc) {
+                pm.lastRefDoc = refDoc.getOwned();
+                ftdcFileSpan.timespan.last = startTs + Milliseconds(static_cast<int64_t>(sampleCount) * 1000);
+            }
+
+        } else {
+            MONGO_UNREACHABLE;
+        }
+    }
+
+    /**
+     * Special rewind to get info from second-to-last doc
+     */
+    if (seekMatchingPidMC) {
+        while (mcFO.size()) {
+            _stream.close();
+            _stream.open(_file.c_str(), std::ios_base::in | std::ios_base::binary);
+            _stream.seekg(mcFO.top());
+            StatusWith<BSONObj> swFTDCBsonDoc = readDocument();
+            if (!swFTDCBsonDoc.isOK()) {
+                return swFTDCBsonDoc.getStatus();
+            }
+
+            dassert(!swFTDCBsonDoc.getValue().isEmpty());
+
+            BSONElement tmpElem;
+
+            auto ftdcDoc = swFTDCBsonDoc.getValue();
+
+            long long longIntVal;
+            Status sType = bsonExtractIntegerField(ftdcDoc, "type"/*kFTDCTypeField*/, &longIntVal);
+            if (!sType.isOK()) {
+                return {sType};
+            }
+            FTDCBSONUtil::FTDCType ftdcType = static_cast<FTDCBSONUtil::FTDCType>(longIntVal);
+
+            dassert(ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk);
+
+            /*** Repeats 'if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {' block above ***/
+            Status sZlibBinData = bsonExtractTypedField(ftdcDoc, "data"/*kFTDCDataField*/, BSONType::BinData, &tmpElem);
+            if (!sZlibBinData.isOK()) {
+                return {sZlibBinData};
+            }
+
             // The "data" BinData field's data value contains
             // - uint32_t length of the data after decompression
             // - compressed zlib data
@@ -303,85 +467,32 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
             }
             ConstDataRangeCursor bdCDR({buffer, static_cast<size_t>(binDataBSONElemLength)});
 
-            auto swUncompressedLength = bdCDR.readAndAdvance<LittleEndian<std::uint32_t>>();
-            if (!swUncompressedLength.isOK()) {
-                return {swUncompressedLength.getStatus()};
+            BSONObj refDoc;
+            uint32_t metricsCount;
+            uint32_t sampleCount;
+            Date_t startTs;
+            long unsigned tmpPid;
+
+            auto swTsPidEtc = extractRefDocEtcOnly(bdCDR);
+            if (!swTsPidEtc.isOK()) {
+                return {swTsPidEtc.getStatus()};
             }
-            auto zlibUncompressedLength = swUncompressedLength.getValue();
+            std::tie(refDoc, metricsCount, sampleCount, startTs, tmpPid) = swTsPidEtc.getValue();
+            /*******************************************************************/
 
-            // Block compressor creates, and owns, the buffer the Zlib-
-            // uncompressed data is written into. The buffer will have:
-            // - One BSONObj (the ref doc)
-            // - uint32_t metricCount
-            // - uint32_t sampleCount
-            // - VarInt data that will expand to (mC * sC) uint64_t values.
-            BlockCompressor blockCompressor; // 'Block compressor' = Zlib wrapper class
-            auto swUncompress = blockCompressor.uncompress(bdCDR, zlibUncompressedLength);
-            if (!swUncompress.isOK()) {
-                return {swUncompress.getStatus()};
-            }
-
-            // Post-zlib-decompression buffer ConstDataRangeCursor
-            ConstDataRangeCursor pzCdc = swUncompress.getValue();
-
-            auto swRef = pzCdc.readAndAdvance<Validated<BSONObj>>();
-            if (!swRef.isOK()) {
-                return {swRef.getStatus()};
-            }
-            BSONObj refDoc = swRef.getValue();
-
-            // Read count of metrics
-            auto swMetricsCount = pzCdc.readAndAdvance<LittleEndian<std::uint32_t>>();
-            if (!swMetricsCount.isOK()) {
-                return {swMetricsCount.getStatus()};
-            }
-            //std::uint32_t metricsCount = swMetricsCount.getValue();
-
-            // Read count of samples
-            auto swSampleCount = pzCdc.readAndAdvance<LittleEndian<std::uint32_t>>();
-            if (!swSampleCount.isOK()) {
-                return {swSampleCount.getStatus()};
-            }
-            std::uint32_t sampleCount = swSampleCount.getValue();
-
-            BSONElement startTSElem = dps::extractElementAtPath(refDoc, "start");
-            if (startTSElem.eoo()) {
-                return {ErrorCodes::KeyNotFound, "missing 'start' timestamp in a metric sample"};
-            }
-
-            BSONElement pidElem = dps::extractElementAtPath(refDoc, "serverStatus.pid");
-            if (pidElem.eoo()) {
-                return {ErrorCodes::KeyNotFound, "missing 'serverStatus.pid' in a metric sample"};
-            }
-            auto tmpPid = pm.procId.pid;
-            tmpPid = static_cast<unsigned long>(pidElem.Long());
-
-            if (!firstMCProcessed) {
-                ftdcFileSpan.timespan.first = startTSElem.Date();
-                pm.procId.pid = tmpPid;
-            } else {
-                if (tmpPid != pm.procId.pid) {
-                    return {ErrorCodes::UnknownError, "FTDC metrics invariant check failed: serverStatus.pid changed mid-file."};
-                }
-            }
-
-            if (isLastDoc) {
-                //TODO: cycle through first sampleCount VarInts, which are the "start" ts vals, to get the *exact* ts of the last metric chunk
+            if (tmpPid == pm.procId.pid) { //found the most recent metrics chunk with the same pid as the first chunk's
                 pm.lastRefDoc = refDoc.getOwned();
-                ftdcFileSpan.timespan.last = startTSElem.Date() + Milliseconds(static_cast<int64_t>(sampleCount) * 1000);
+                ftdcFileSpan.timespan.last = startTs + Milliseconds(static_cast<int64_t>(sampleCount) * 1000);
+                break;
             }
-
-            firstMCProcessed = true;
-
-        } else {
-            MONGO_UNREACHABLE;
+            mcFO.pop();
         }
     }
 
     //assert(pm.metadataDoc
     //assert ftdcFileSpan.first < ftdcFileSpan.last
 
-    pm.filespans[dtId] = ftdcFileSpan;
+    pm.filespans[metadataDocDtId] = ftdcFileSpan;
 
     return pm;
 }
