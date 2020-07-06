@@ -113,4 +113,5 @@ env.Program(
         'ftdc',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
     ],
+    CCFLAGS=['-std=c++17'],
 )

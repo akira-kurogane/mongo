@@ -60,7 +60,11 @@ int main(int argc, char* argv[], char** envp) {
         "serverStatus.wiredTiger.transaction.transaction checkpoint generation", //boolean gauge
         "serverStatus.opLatencies.*.latency",
         "serverStatus.opLatencies.*.ops" };
-    std::map<FTDCProcessId, FTDCMetricsSubset> x = ws.timeseries(keys, {testRangeS, testRangeE});
+    std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE});
+std::cout << fPmTs.size() << std::endl;
+    for (auto& [pmId, m] : fPmTs) {
+        std::cout << pmId.hostport << ": " << m.timespan().first << std::endl;
+    }
 
     // Better test would include some metrics absent, some unknown keys, and a metric only appearing halfway through the 250s say some finegrained lock stat
 

@@ -169,10 +169,8 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
                 std::vector<std::string>& keys,
                 FTDCPMTimespan tspan, uint32_t sampleResolution) {
     std::map<FTDCProcessId, FTDCMetricsSubset> resultMap;
-    for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
-         itPM != _pmMap.end(); ++itPM) {
-        auto pmId = itPM->first;
-        auto pm = itPM->second;
+
+    for (auto& [pmId, pm] : _pmMap) {
         auto s = pm.firstSampleTs();
         auto e = pm.estimateLastSampleTs();
         if (tspan.isValid() && ((s >= tspan.first && s < tspan.first) ||
@@ -183,8 +181,7 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
                         " (pid=" << pmId.pid << ")\n";
                 continue;
             }
-            //TODO: add copy or move ctro to allow swTF.getValue() be assigned to resultMap?
-	    //resultMap[pmId] = swTF.getValue();
+	    resultMap.insert(std::make_pair(pmId, std::move(swTF.getValue())));
         }
     }
     return resultMap;
