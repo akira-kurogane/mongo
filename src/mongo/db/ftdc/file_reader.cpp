@@ -229,7 +229,7 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
 
 StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
     FTDCProcessMetrics pm;
-    Date_t dtId;
+    Date_t metadataDocDtId = Date_t::min();
     FTDCFileSpan ftdcFileSpan = { _file, {Date_t::max(), Date_t::min()} };
     bool firstMCProcessed = false;
 
@@ -250,6 +250,14 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
         // The extra 8 bytes is just in case there's an empty doc. Purely conjecture.
         bool isLastDoc = (_fileSize - 8u) <= static_cast<size_t>(_stream.tellg());
 
+        // The Date_t "_id" field is in every FTDC file top-level doc.
+        // We'll use the one in the metadata doc as a primary identifier
+        Status sDateId = bsonExtractTypedField(ftdcDoc, "_id"/*kFTDCIdField*/, BSONType::Date, &tmpElem);
+        if (!sDateId.isOK()) {
+            return {sDateId};
+        }
+        auto dtId = tmpElem.Date();
+
         long long longIntVal;
         Status sType = bsonExtractIntegerField(ftdcDoc, "type"/*kFTDCTypeField*/, &longIntVal);
         if (!sType.isOK()) {
@@ -258,13 +266,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
         FTDCBSONUtil::FTDCType ftdcType = static_cast<FTDCBSONUtil::FTDCType>(longIntVal);
 
         if (ftdcType == FTDCBSONUtil::FTDCType::kMetadata) {
-            // The Date_t "_id" field is in every FTDC file top-level doc but
-            // we'll use only the one in the metadata doc as a primary identifier
-            Status sDateId = bsonExtractTypedField(ftdcDoc, "_id"/*kFTDCIdField*/, BSONType::Date, &tmpElem);
-            if (!sDateId.isOK()) {
-                return {sDateId};
-            }
-            dtId = tmpElem.Date();
+	    metadataDocDtId = dtId;
 
             Status sMDExtract = bsonExtractTypedField(ftdcDoc, "doc"/*kFTDCDocField*/, BSONType::Object, &tmpElem);
             if (!sMDExtract.isOK()) {
@@ -281,9 +283,24 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
 
         } else if (ftdcType == FTDCBSONUtil::FTDCType::kMetricChunk) {
 
-            if (firstMCProcessed && !isLastDoc) {
-                // Just skip. We won't need middle metric chunks in a file
-                // Devnote: unless we decide later to get sampleCount sum and/or "start" ts value array
+	    /**
+	     * If no metadataDoc found yet OR dtId < metadataDoc then assume this metrics chunk
+	     * if from salvaged interim data of the previous server process; skip it.
+	     *
+             * FTDCFileManager::recoverInterimFile() and ...::openArchiveFile() will salvage
+	     * metrics chunk docs (theoretically also metadata docs) and insert them before the
+	     * new process' metrics chunks. If we detect this just skip it. (The ideal solution
+	     * is that FTDCProcessMetrics objects can have an additional 'tail' file in their file
+	     * list they can use to reach their lost metric chunk tail; not attempting this now.)
+	     */
+            if (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
+                std::cout << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
+			"it is assumed to be interim data from previous server process\n";
+		continue;
+
+	    } if (firstMCProcessed && !isLastDoc) { //i.e. a middle metric chunk
+                // Just skip.
+                // Devnote: unless we decide later to get exact sampleCount sum and/or "start" ts value array
                 continue;
             }
 
@@ -381,7 +398,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
     //assert(pm.metadataDoc
     //assert ftdcFileSpan.first < ftdcFileSpan.last
 
-    pm.filespans[dtId] = ftdcFileSpan;
+    pm.filespans[metadataDocDtId] = ftdcFileSpan;
 
     return pm;
 }
