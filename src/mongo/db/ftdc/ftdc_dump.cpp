@@ -53,17 +53,36 @@ int main(int argc, char* argv[], char** envp) {
     Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
     Date_t testRangeE = testRangeS + Seconds(250);
     std::vector<std::string> keys = {
+        /*test: leaving "start" blank, should be forcefully added*/
+        "serverStatus.connections.current",
+        "serverStatus.connections.available",
+        "serverStatus.tcmalloc.tcmalloc.total_free_bytes",
         "serverStatus.wiredTiger.cache.bytes read into cache",
         "serverStatus.wiredTiger.cache.bytes written from cache",
         "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", //gauge
         "serverStatus.wiredTiger.cache.eviction state", //gauge
-        "serverStatus.wiredTiger.transaction.transaction checkpoint generation", //boolean gauge
-        "serverStatus.opLatencies.*.latency",
-        "serverStatus.opLatencies.*.ops" };
+        "serverStatus.wiredTiger.transaction.transaction checkpoint currently running", //boolean gauge
+        "serverStatus.wiredTiger.transaction.transaction checkpoint generation",
+        "serverStatus.repl.lastWrite.opTime.ts", 
+        "serverStatus.opLatencies.reads.latency",
+        "serverStatus.opLatencies.reads.ops" };
     std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE});
-std::cout << fPmTs.size() << std::endl;
-    for (auto& [pmId, m] : fPmTs) {
-        std::cout << pmId.hostport << ": " << m.timespan().first << std::endl;
+
+    if (!fPmTs.size()) {
+        std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
+    }
+    for (auto& [pmId, ms] : fPmTs) {
+        std::cout << pmId.hostport << ": " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
+size_t junkCtr = 0;
+        for (auto& kNT : ms.keyNamesAndType()) {
+            std::cout << " key " << kNT.keyName << " (" << typeName(kNT.bsonType) << ")\n";
+            auto mv = ms.metricsX(junkCtr++);
+            //std::cout << "  " << (*mv.begin()) << ", " << (*(mv.begin() + 1)) << ", ..., " << (*(mv.begin() + 249)) << "\n";;
+            for (auto& v : mv) {
+                std::cout << v << ", ";
+            }
+            std::cout << "\n";
+        }
     }
 
     // Better test would include some metrics absent, some unknown keys, and a metric only appearing halfway through the 250s say some finegrained lock stat

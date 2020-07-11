@@ -25,22 +25,43 @@ bool FTDCPMTimespan::isValid() {
 bool FTDCPMTimespan::overlaps(FTDCPMTimespan& other) {
     return isValid() && other.isValid() &&
 	((first >= other.first && first < other.last) ||
-        (last > other.first && last <= other.last));
+        (last > other.first && last <= other.last) || 
+	(first < other.first && last > other.last) || 
+	(other.first < first && other.last > last));
 }
-//        if (tspan.isValid() && ((s >= tspan.first && s < tspan.first) ||
-//                        (e > tspan.first && e <= tspan.last))) {
 
 FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimespan tspan,
                             uint32_t sampleResolution) {
-    _keys = keys;
-    _tspan = tspan;
-    _stepMs = sampleResolution;
-    _sampleLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
-    for (size_t i = 0; i < _keys.size(); ++i) {
-        _keyRow[_keys[i]] = i;
+    /**
+     * Add "start" metric (i.e. timestamp of samples) if absent.
+     */
+    if (std::find(keys.begin(), keys.end(), "start") == keys.end()) {
+        keys.emplace_back("start");
+    }
+    /**
+     * Force "start" to be the first key to make it simple to find.
+     */
+    auto startKeyItr = std::find(keys.begin(), keys.end(), "start");
+    while (startKeyItr != keys.begin()) {
+        *startKeyItr-- = *(startKeyItr - 1);
+    }
+    keys[0] = "start";
+
+    _kNT.reserve(keys.size());
+    size_t keyRowCtr = 0;
+
+    for (auto k : keys) {
+        FTDCMSKeyNameType y{k, BSONType::Undefined};
+        _kNT.emplace_back(y);
+	_keyRows[k] = keyRowCtr++;
     }
 
-    _metrics.resize(_sampleLength * _keys.size(), UINT64_MAX); //Max value being used to indicate unset
+    _tspan = tspan;
+    _stepMs = sampleResolution;
+ 
+    _rowLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
+
+    metrics.resize(_rowLength * _kNT.size(), UINT64_MAX); //Max value being used to indicate unset
 }
 
 std::string FTDCProcessMetrics::rsName() const {
@@ -114,6 +135,8 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
 
 StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::string>& keys, 
 		FTDCPMTimespan tspan, uint32_t sampleResolution) {
+    invariant(tspan.isValid());
+
     FTDCMetricsSubset m(keys, tspan, sampleResolution);
     // TODO:
     // Init the BSON types of the keys first, log which metrics in output.keys are missing

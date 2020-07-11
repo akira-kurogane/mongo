@@ -171,11 +171,11 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
     std::map<FTDCProcessId, FTDCMetricsSubset> resultMap;
 
     for (auto& [pmId, pm] : _pmMap) {
-        auto s = pm.firstSampleTs();
-        auto e = pm.estimateLastSampleTs();
-        if (tspan.isValid() && ((s >= tspan.first && s < tspan.first) ||
-                        (e > tspan.first && e <= tspan.last))) {
-            auto swTF = pm.timeseries(keys, tspan, sampleResolution); //AKIRA this could be return by value from ProcessMetrics::xxxx() too.
+        FTDCPMTimespan pmTspan = {pm.firstSampleTs(), pm.estimateLastSampleTs()};
+        if (tspan.isValid() && tspan.overlaps(pmTspan)) { 
+			//((s >= tspan.first && s < tspan.first) ||
+                        //(e > tspan.first && e <= tspan.last))) {
+            auto swTF = pm.timeseries(keys, tspan, sampleResolution);
             if (!swTF.isOK()) {
                 std::cerr << "Error attempting to read timeseries data from " << pmId.hostport <<
                         " (pid=" << pmId.pid << ")\n";

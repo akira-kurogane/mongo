@@ -35,11 +35,19 @@ struct FTDCPMTimespan {
     bool overlaps(FTDCPMTimespan& other);
 };
 
+struct FTDCMSKeyNameType {
+    std::string keyName;
+    BSONType bsonType;
+    //TODO add a COUNTER, GAUGE, HISTOGRAM timeseries type here too
+};
+
 /**
  * A subset of the metrics, optionally downsampled to lower resolution
  * - Subset of metrics by dot-concatenated key list
  * - To a fixed timespan
  * - To a resolution in milliseconds - E.g. 60000 for 1 min samples. 1000ms as default.
+ *
+ * _keys will have "start" key added during ctor if absent
  */
 class FTDCMetricsSubset {
 
@@ -53,16 +61,42 @@ public:
         return _tspan;
     }
     uint32_t resolution() { return _stepMs; }
+    std::vector<std::string> keys() {
+        std::vector<std::string> r;
+	r.reserve(_kNT.size());
+        for (auto x : _kNT) {
+            r.emplace_back(x.keyName);
+	}
+        return r;
+    }
+
+//std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
+    size_t keyRow(std::string k) { return _keyRows[k]; }
+
+    BSONType bsonType(std::string k) { return _kNT[_keyRows[k]].bsonType; }
+    void setBsonType(std::string k, BSONType t) { _kNT[_keyRows[k]].bsonType = t; }
+
+    std::vector<std::uint64_t> metrics; //Size = _rowLength * _kNT.size()
+
+    std::vector<FTDCMSKeyNameType> keyNamesAndType() { return _kNT; }
+
+std::vector<std::uint64_t> metricsX(size_t i) {
+  std::vector<std::uint64_t> r;
+  r.reserve(_rowLength);
+  r = std::vector<std::uint64_t>(metrics.begin() + (_rowLength * i), metrics.begin() + (_rowLength * (i + 1)));
+  return r;
+}
+    size_t cellOffset(size_t row, size_t col) { return row * _rowLength + col; }
 
 private:
     FTDCPMTimespan _tspan;
     uint32_t _stepMs;
 
-    size_t _sampleLength; //end time = _start + (sampleLength * _stepMs)
+    size_t _rowLength; //end time = _start + (sampleLength * _stepMs)
 
-    std::vector<std::string> _keys;
-    std::map<std::string, unsigned int> _keyRow;
-    std::vector<std::uint64_t> _metrics;
+    std::vector<FTDCMSKeyNameType> _kNT;
+
+    std::map<std::string, size_t> _keyRows;
 };
 
 /**
