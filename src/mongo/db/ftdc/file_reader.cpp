@@ -447,17 +447,17 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
             case bsonTimestamp:
                 /**
                  * A timestamp is saved in two separate metrics. See the double
-		 * emplaceBack() calls in "case bsonTimestamp:" in
-		 * extractMetricsFromDocument(). First metric row is for the
-		 * unix epoch secs; the second the mongodb timestamp increment
-		 * field.
-		 * (Putting it another way: these are the ".t" and ".i"
-		 * subfields of a timestamp object in MongoDB Extended JSON.)
-		 *
+                 * emplaceBack() calls in "case bsonTimestamp:" in
+                 * extractMetricsFromDocument(). First metric row is for the
+                 * unix epoch secs; the second the mongodb timestamp increment
+                 * field.
+                 * (Putting it another way: these are the ".t" and ".i"
+                 * subfields of a timestamp object in MongoDB Extended JSON.)
+                 *
                  * The flattened key name will point to just the first one,
-		 * for epoch seconds. N.b. we must increment ordCounter once
-		 * more in this block to move past the second metric row for the
-		 * timestamp increment metric.
+                 * for epoch seconds. N.b. we must increment ordCounter once
+                 * more in this block to move past the second metric row for the
+                 * timestamp increment metric.
                  */
                 keys[elem.fieldName()] = std::make_tuple(ordCounter++, elem.type(), static_cast<uint64_t>(elem.timestamp().getSecs()));
                 ordCounter++;
@@ -687,15 +687,23 @@ std::cout << "sampleCount = " << sampleCount << "\n";
 
             }
 
+            // Initialize fill the tsOrds map
             std::vector<int> tsOrds(tsVals.size(), -1);
 //std::cout << "tsOrds = { ";
             for (std::uint32_t j = 0; j < tsVals.size(); j++) {
-                if (tsVals[j] >= static_cast<uint64_t>(mr.timespan().first.toMillisSinceEpoch()) &&
+                if (tsVals[j] < static_cast<uint64_t>(mr.timespan().first.toMillisSinceEpoch())) {
+                    // deltas in a kMetricsChunk before the FTDCMetricSubset's starting time
+                    // should be accumulated into the first column of the metric row
+                    tsOrds[j] = 0;
+//std::cout << tsOrds[j] << ", ";
+                } else if (tsVals[j] >= static_cast<uint64_t>(mr.timespan().first.toMillisSinceEpoch()) &&
                                 tsVals[j] < static_cast<uint64_t>(mr.timespan().last.toMillisSinceEpoch())) {
                     tsOrds[j] = (tsVals[j] - mr.timespan().first.toMillisSinceEpoch()) / mr.resolution();
-		    mr.metrics[tsOrds[j]] = tsVals[j]; //It's OK to overwrite "start" ts values placed in same ord in previous loop. We want max "start" ts in the cell.
+                    // Using this opportunity to set the "start" ts values in mr.metric's first row.
+                    mr.metrics[mr.cellOffset(0, tsOrds[j])] = tsVals[j]; //It's OK to overwrite "start" ts values placed in same cell in previous loop. We want max "start" ts in the cell.
 //std::cout << tsOrds[j] << ", ";
                 }
+                //TODO fix ... gap cells need to be attributed to next assigned tsOrd
 //else { std::cout << "-1, "; }
                 //else leave as initialized value -1, to mean no/unset/invalid
             }
@@ -705,26 +713,34 @@ std::cout << "sampleCount = " << sampleCount << "\n";
 //std::cout << "Deltas: ";
             //metric 0 is "start" whose compressed VarInt values were consumed above already
             for (std::uint32_t i = 1; i < metricsCount; i++) {
+                int meRow = -1;
+                std::set<int> uto;
+
                 auto mRow = eR.find(i);
 
-                if (mRow != eR.end()) {
-//std::cout << "\nmRow " << mr.rowKeyName(mRow->second) << ": ";
-                    std::set<int> uto;
-                    for (auto x :  tsOrds) {
-                        uto.insert(x);
-                    }
-                    uto.erase(-1); // -1 is for 'unset' 
-                    for (auto tOrd : uto) {
-                        mr.metrics[mr.cellOffset(mRow->second, tOrd)] = uint64RefDocVals[i];
-                    }
+                bool e = mRow != eR.end(); //This is a metric row that will be exported.
+                if (e) {
+                    meRow = mRow->second;
+//std::cout << "\nmeRow " << mr.rowKeyName(meRow) << ": uint64_t val = " << uint64RefDocVals[i] << "\n";
                 }
 
+                //TODO: create delta map for unique tsOrds, accumulate sum into that, then apply to each mr.metrics[mr.cellOffset(meRow, mrmOrd)] += <matching cumulative delta sum>
+                uint64_t cD = 0;
+                std::map<size_t, uint64_t> mrmCD;
+                int lastMrmOrd = -1;
                 for (std::uint32_t j = 0; j < sampleCount; j++) {
+
+                    auto mrmOrd = tsOrds[j + 1]; // val will be -1 if a sample above mr.timespan.last
+                    if (lastMrmOrd >= 0 && mrmOrd != lastMrmOrd) {
+                        mrmCD[lastMrmOrd] = cD;
+                    }
+
                     if (zeroesCount) {
                         //TODO: Test the following method:
                         // auto sampleIncr = min(sampleCount - j; zeroesCount); zeroesCount -= sampleIncr; j += sampleIncr - 1; (because of ++ on j in loop definition
-//std::cout << "0 ";
+//if (e) { std::cout << "0 "; }
                         zeroesCount--;
+                        lastMrmOrd = mrmOrd;
                         continue;
                     }
 
@@ -742,16 +758,27 @@ std::cout << "sampleCount = " << sampleCount << "\n";
                         }
                         zeroesCount = swZero.getValue();
 
-                    } else if (mRow != eR.end()) {
-                        auto mrmOrd = tsOrds[j + 1];
-                        if (mrmOrd >= 0) {
-//std::cout << (swDelta.getValue() > (UINT64_MAX - 1000000) ? UINT64_MAX - swDelta.getValue() - 1 : static_cast<uint64_t>(swDelta.getValue())) << " ";
-                            // Sanity warning: the FTDCVarInt is uint64_t. Unsigned int overflow is used to achieve negative deltas
-			    // Eg. next_val = (UINT64_MAX - 3) + prev_val. next_val == prev_val - 3
-                            mr.metrics[mr.cellOffset(mRow->second, tsOrds[j + 1])] += swDelta.getValue();
-                        }
+                    } else {
+                        // Sanity warning: the FTDCVarInt is uint64_t. Unsigned int overflow is used to achieve negative deltas
+                        // Eg. next_val = (UINT64_MAX - 3) + prev_val. next_val == prev_val - 3
+                        cD += swDelta.getValue();
+                    }
+
+                    lastMrmOrd = mrmOrd;
+                }
+
+                if (e) {
+                    if (lastMrmOrd != -1) {
+                        mrmCD[lastMrmOrd] = cD;
+                    }
+
+                    for (auto [o, cdval] : mrmCD) {
+//std::cout << "meRow = " << meRow << ", cell ord = " << o << ": gets " << uint64RefDocVals[i] << " + " << cdval << "\n";
+                        mr.metrics[mr.cellOffset(meRow, o)] = uint64RefDocVals[i] + cdval;
                     }
                 }
+
+
             }
 
 
@@ -759,7 +786,7 @@ std::cout << "sampleCount = " << sampleCount << "\n";
             MONGO_UNREACHABLE;
         }
     }
-//std::cout << "\n";
+std::cout << "\n";
 
     return Status::OK();
 }

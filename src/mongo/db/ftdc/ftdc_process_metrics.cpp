@@ -61,7 +61,7 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
  
     _rowLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
 
-    metrics.resize(_rowLength * _kNT.size(), UINT64_MAX); //Max value being used to indicate unset
+    metrics.resize(_rowLength * _kNT.size(), 7777777777); //Max value being used to indicate unset
 }
 
 std::string FTDCProcessMetrics::rsName() const {

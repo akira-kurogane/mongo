@@ -70,7 +70,7 @@ public:
         return r;
     }
 
-//std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
+std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
     size_t keyRow(std::string k) { return _keyRows[k]; }
 
     BSONType bsonType(std::string k) { return _kNT[_keyRows[k]].bsonType; }

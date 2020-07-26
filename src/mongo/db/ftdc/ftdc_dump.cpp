@@ -66,7 +66,7 @@ int main(int argc, char* argv[], char** envp) {
         "serverStatus.repl.lastWrite.opTime.ts", 
         "serverStatus.opLatencies.reads.latency",
         "serverStatus.opLatencies.reads.ops" };
-    std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE});
+    std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, 10000);
 
     if (!fPmTs.size()) {
         std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
