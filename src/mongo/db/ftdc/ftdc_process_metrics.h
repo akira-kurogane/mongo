@@ -62,6 +62,7 @@ public:
         return _tspan;
     }
     uint32_t resolution() { return _stepMs; }
+
     std::vector<std::string> keys() {
         std::vector<std::string> r;
 	r.reserve(_kNT.size());
@@ -81,12 +82,23 @@ std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
 
     std::vector<FTDCMSKeyNameType> keyNamesAndType() { return _kNT; }
 
-std::vector<std::uint64_t> metricsX(size_t i) {
-  std::vector<std::uint64_t> r;
-  r.reserve(_rowLength);
-  r = std::vector<std::uint64_t>(metrics.begin() + (_rowLength * i), metrics.begin() + (_rowLength * (i + 1)));
-  return r;
-}
+    /**
+     * Return all metrics in a BSONDoc of this format:
+     * {
+     *   key: [ BSONElement, BSONElement, ... ],
+     *   ...
+     * }
+     * First key will be "start" timestamp. All arrays same length; each i'th
+     * element is the sample at i'th "start" timestamp value.
+     */
+    BSONObj bsonMetrics();
+
+//std::vector<std::uint64_t> metricsX(size_t i) {
+//  std::vector<std::uint64_t> r;
+//  r.reserve(_rowLength);
+//  r = std::vector<std::uint64_t>(metrics.begin() + cellOffset(i, 0), metrics.begin() + cellOffset(i + 1, 0));
+//  return r;
+//}
     size_t cellOffset(size_t row, size_t col) { return row * _rowLength + col; }
 
 private:
@@ -150,6 +162,15 @@ struct FTDCProcessMetrics {
     std::string rsName() const;
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
+    /**
+     * TODO: unsure if I should implement keys() or not.
+     * Having a list of keys and their type is easy after flattenedBSONDoc()
+     * is run on every refDoc / the last refDoc for a process. This is in
+     * done for extractTimeseries() but not for extractProcessMetricsHeaders().
+     * It could look for the last kMetricsChunk in the last file and doing
+     * it on-demand, but then the fuction would have return type
+     * StatusWith<map<s, type>> not just map<s, type>.
+     */
     //std::map<std::string, BSONType> keys();
 
     Status merge(const FTDCProcessMetrics& pm);

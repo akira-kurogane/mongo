@@ -52,6 +52,11 @@ int main(int argc, char* argv[], char** envp) {
 
     Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
     Date_t testRangeE = testRangeS + Seconds(250);
+    uint32_t testStepMs = 10000;
+    //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 1) / 10;
+    //Date_t testRangeE = tspan.last - ((tspan.last - tspan.first) * 2) / 10;
+    //uint32_t testStepMs = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / 30;
+
     std::vector<std::string> keys = {
         /*test: leaving "start" blank, should be forcefully added*/
         "serverStatus.connections.current",
@@ -66,14 +71,15 @@ int main(int argc, char* argv[], char** envp) {
         "serverStatus.repl.lastWrite.opTime.ts", 
         "serverStatus.opLatencies.reads.latency",
         "serverStatus.opLatencies.reads.ops" };
-    std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, 10000);
+
+    std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, testStepMs);
 
     if (!fPmTs.size()) {
         std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
     }
     for (auto& [pmId, ms] : fPmTs) {
-        std::cout << pmId.hostport << ": " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
-size_t junkCtr = 0;
+        std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
+        /*size_t junkCtr = 0;
         for (auto& kNT : ms.keyNamesAndType()) {
             std::cout << " key " << kNT.keyName << " (" << typeName(kNT.bsonType) << ")\n";
             auto mv = ms.metricsX(junkCtr++);
@@ -82,7 +88,9 @@ size_t junkCtr = 0;
                 std::cout << v << ", ";
             }
             std::cout << "\n";
-        }
+        }*/
+        auto b = ms.bsonMetrics();
+        std::cout << b.jsonString(JsonStringFormat::Strict, 1);
     }
 
     // Better test would include some metrics absent, some unknown keys, and a metric only appearing halfway through the 250s say some finegrained lock stat

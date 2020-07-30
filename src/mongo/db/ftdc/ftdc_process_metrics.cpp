@@ -24,10 +24,10 @@ bool FTDCPMTimespan::isValid() {
 
 bool FTDCPMTimespan::overlaps(FTDCPMTimespan& other) {
     return isValid() && other.isValid() &&
-	((first >= other.first && first < other.last) ||
-        (last > other.first && last <= other.last) || 
-	(first < other.first && last > other.last) || 
-	(other.first < first && other.last > last));
+        ((first >= other.first && first < other.last) ||
+        (last > other.first && last <= other.last) ||
+        (first < other.first && last > other.last) || 
+        (other.first < first && other.last > last));
 }
 
 /**
@@ -36,7 +36,7 @@ bool FTDCPMTimespan::overlaps(FTDCPMTimespan& other) {
  */
 FTDCPMTimespan FTDCPMTimespan::intersection(FTDCPMTimespan& other) {
     return { first >= other.first ? first : other.first,
-	     last < other.last ? last : other.last };
+             last < other.last ? last : other.last };
 }
 
 FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimespan tspan,
@@ -62,7 +62,7 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
     for (auto k : keys) {
         FTDCMSKeyNameType y{k, BSONType::Undefined};
         _kNT.emplace_back(y);
-	_keyRows[k] = keyRowCtr++;
+        _keyRows[k] = keyRowCtr++;
     }
 
     _tspan = tspan;
@@ -81,6 +81,52 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
     }
 
     metrics.resize(_rowLength * _kNT.size(), 7777777777); //Max value being used to indicate unset
+}
+
+BSONObj FTDCMetricsSubset::bsonMetrics() {
+   invariant(_rowLength * _kNT.size() == metrics.size());
+   auto mPtr = metrics.begin();
+   BSONObjBuilder builder;
+   for (auto x : _kNT) {
+        //current metric row's array builder
+        BSONObjBuilder ab(builder.subarrayStart(x.keyName));
+        switch (x.bsonType) {
+            case NumberDouble:
+            case NumberInt:
+            case NumberLong:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   ab.append(ab.numStr(i), static_cast<long long int>(*mPtr++));
+                }
+                break;
+
+            case Bool:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   ab.append(ab.numStr(i), static_cast<bool>(*mPtr++));
+                }
+                break;
+
+            case Date:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   ab.append(ab.numStr(i), Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)));
+                }
+                break;
+
+            case bsonTimestamp: {
+                //TODO: if we want the original increment part as well then 
+                // _flattenedBSONDoc() should add it somehow. Eg. as keyName + ".i" of this field.
+                for (size_t i = 0; i < _rowLength; ++i) {
+                    ab.append(ab.numStr(i), Timestamp(static_cast<long long int>(*mPtr++), 0/*dummy increment field*/));
+                }
+                break;
+            }
+
+            default:
+                MONGO_UNREACHABLE;
+                break;
+        }
+        ab.done();
+    }
+    return builder.obj();
 }
 
 std::string FTDCProcessMetrics::rsName() const {
@@ -153,7 +199,7 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
 }
 
 StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::string>& keys, 
-		FTDCPMTimespan tspan, uint32_t sampleResolution) {
+                FTDCPMTimespan tspan, uint32_t sampleResolution) {
     invariant(tspan.isValid());
     FTDCPMTimespan ownTspan = { firstSampleTs(), estimateLastSampleTs() };
     invariant(ownTspan.overlaps(tspan)); //strictly forcing callers to avoid using when the result timespan would be empty
@@ -165,13 +211,13 @@ StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::st
 
     for (std::map<Date_t, FTDCFileSpan>::iterator it = filespans.begin();
          it != filespans.end(); ++it) {
-	if (it->second.timespan.overlaps(trimmedTspan)) {
+        if (it->second.timespan.overlaps(trimmedTspan)) {
             FTDCFileReader reader;
             auto s = reader.open(it->second.path);
             if (s != Status::OK()) {
                 return s;
             }
-	    auto sET = reader.extractTimeseries(m);
+            auto sET = reader.extractTimeseries(m);
             if (!sET.isOK()) {
                 return sET;
             }
