@@ -60,6 +60,10 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
         }
     }
 
+    //TODO: when salvageChunk* values are returned by extractProcessMetricsHeaders()
+    // post-process to match them to found FTDCProcessMetrics. There won't necessarily
+    // be a match for all, though.
+
     return Status::OK();
 }
 
@@ -134,6 +138,8 @@ Status FTDCWorkspace::_addFTDCProcessMetrics(FTDCProcessMetrics& pm) {
      * It would be an improvement if we identify and merge with the other
      * metrics file that the FTDCFileManager would recoverInterimFile into,
      * but now we do nothing.
+     * TODO: return this as another 'salvage chunk' item instead if we implement
+     * the salvageChunk* properties in FTDCProcessMetrics
      */
     if (pm.metadataDoc.isEmpty()) {
         return Status::OK();
@@ -173,12 +179,10 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
     for (auto& [pmId, pm] : _pmMap) {
         FTDCPMTimespan pmTspan = {pm.firstSampleTs(), pm.estimateLastSampleTs()};
         if (tspan.isValid() && tspan.overlaps(pmTspan)) { 
-			//((s >= tspan.first && s < tspan.first) ||
-                        //(e > tspan.first && e <= tspan.last))) {
             auto swTF = pm.timeseries(keys, tspan, sampleResolution);
             if (!swTF.isOK()) {
                 std::cerr << "Error attempting to read timeseries data from " << pmId.hostport <<
-                        " (pid=" << pmId.pid << ")\n";
+                        " (pid=" << pmId.pid << "): " << swTF.getStatus().reason() << "\n";
                 continue;
             }
 	    resultMap.insert(std::make_pair(pmId, std::move(swTF.getValue())));

@@ -130,6 +130,13 @@ struct FTDCFileSpan {
  * lastRefDoc is the last refDoc member from the last kMetricChunk from all
  * files loaded so far. It will probably have many more dozens of metrics in it
  * than the very first refDoc created when the process started.
+ *
+ * salvageChunkDtId: Use != Date_t::min() to see if unset or not.
+ * salvageChunkFileSpan: The last kMetricsChunk for a process can be in another
+ * file which doesn't have kMetadataDoc that would identify it as belonging to
+ * this process. There are two ways this occurs: 1. the interim file. 2. After
+ * a crash the new process will write the kMetadataDoc, then copy in the interim
+ * file's chunk, then start writing its own.
  */
 
 struct FTDCProcessMetrics {
@@ -137,6 +144,8 @@ struct FTDCProcessMetrics {
     std::map<Date_t, FTDCFileSpan> filespans;
     BSONObj metadataDoc;
     BSONObj lastRefDoc;
+    //TODO: Date_t salvageChunkDtId = Date_t::min();
+    //TODO: FTDCFileSpan salvageChunkFilespan;
 
     std::string rsName() const;
     Date_t firstSampleTs() const;

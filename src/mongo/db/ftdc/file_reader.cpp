@@ -228,6 +228,13 @@ Status FTDCFileReader::open(const boost::filesystem::path& file) {
     return Status::OK();
 }
 
+/**
+ * TODO: add an extra result object beyond the FTDCProcessMetrics object
+ * that specifies the dtId and filespan of 'salvage' metrics chunks that
+ * are found.
+ * The calling scope can keep these and try to match them with finished
+ * and merged FTDCProcessMetrics objects
+ */
 StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
     FTDCProcessMetrics pm;
     Date_t metadataDocDtId = Date_t::min();
@@ -297,6 +304,9 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
             if (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
                 std::cout << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
                         "it is assumed to be interim data from previous server process\n";
+		//TODO: put in a separate result object so it can poentially be matched to
+		// another FTDCProcessMetrics object (and inserted to its salvageChunk*
+		// properties) after all files are initially processed.
                 continue;
 
             }
