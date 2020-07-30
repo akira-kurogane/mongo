@@ -33,6 +33,7 @@ struct FTDCPMTimespan {
 
     bool isValid();
     bool overlaps(FTDCPMTimespan& other);
+    FTDCPMTimespan intersection(FTDCPMTimespan& other);
 };
 
 struct FTDCMSKeyNameType {
@@ -149,6 +150,8 @@ struct FTDCProcessMetrics {
      * Executes metadataAndTimeseries for each file in this process session,
      * The metadata doc is ignored. The metrics are concatenated together as
      * one larger array of timeseries.
+     * tspan argument will be reduced to what overlaps with firstSampleTs()
+     * - estimateLastSampleTs()
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
 		FTDCPMTimespan tspan, uint32_t sampleResolution);

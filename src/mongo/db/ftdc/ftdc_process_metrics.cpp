@@ -30,6 +30,15 @@ bool FTDCPMTimespan::overlaps(FTDCPMTimespan& other) {
 	(other.first < first && other.last > last));
 }
 
+/**
+ * This will return an invalid timespan if the two timespans don't overlap.
+ * Test with isValid() if not confirming overlaps() is true before using.
+ */
+FTDCPMTimespan FTDCPMTimespan::intersection(FTDCPMTimespan& other) {
+    return { first >= other.first ? first : other.first,
+	     last < other.last ? last : other.last };
+}
+
 FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimespan tspan,
                             uint32_t sampleResolution) {
     /**
@@ -60,6 +69,16 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
     _stepMs = sampleResolution;
  
     _rowLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
+    /**
+     * If a partial span exists on the end add that too. E.g. if _stepMs is
+     * 10000 and the sample is at x mins, 34 secs then the last column will be
+     * for x min 31s to 40s but the last "start" ts value in it will be 34s. It
+     * will follow the second-to-last whole step for x min 21s to 30s which
+     * (probably) does have a last sample at x min 30s.
+     */
+    if ((tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) % _stepMs) {
+        _rowLength += 1;
+    }
 
     metrics.resize(_rowLength * _kNT.size(), 7777777777); //Max value being used to indicate unset
 }
@@ -136,14 +155,17 @@ Status FTDCProcessMetrics::merge(const FTDCProcessMetrics& other) {
 StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::string>& keys, 
 		FTDCPMTimespan tspan, uint32_t sampleResolution) {
     invariant(tspan.isValid());
-
-    FTDCMetricsSubset m(keys, tspan, sampleResolution);
+    FTDCPMTimespan ownTspan = { firstSampleTs(), estimateLastSampleTs() };
+    invariant(ownTspan.overlaps(tspan)); //strictly forcing callers to avoid using when the result timespan would be empty
+    FTDCPMTimespan trimmedTspan = tspan.intersection(ownTspan);
+//std::cout << "Trimmed timespan for " << procId.hostport << "(" << procId.pid << ") = " << trimmedTspan.first << " - " << trimmedTspan.last << "\n";
+    FTDCMetricsSubset m(keys, trimmedTspan, sampleResolution);
     // TODO:
     // Init the BSON types of the keys first, log which metrics in output.keys are missing
 
     for (std::map<Date_t, FTDCFileSpan>::iterator it = filespans.begin();
          it != filespans.end(); ++it) {
-	if (it->second.timespan.overlaps(tspan)) {
+	if (it->second.timespan.overlaps(trimmedTspan)) {
             FTDCFileReader reader;
             auto s = reader.open(it->second.path);
             if (s != Status::OK()) {
