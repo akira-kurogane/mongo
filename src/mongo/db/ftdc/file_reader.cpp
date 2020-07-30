@@ -478,20 +478,6 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> flattenedBSONDoc(c
    return _flattenedBSONDoc(doc, ctr);
 }
 
-bool ftdcNumericType(BSONType x) {
-    return x == BSONType::NumberLong || BSONType::NumberInt || BSONType::NumberDouble || BSONType::NumberDecimal;
-}
-
-BSONType superiorPrecisionType(BSONType a, BSONType b) {
-    for (auto x : {BSONType::NumberLong, BSONType::NumberDouble,
-               BSONType::NumberDecimal, BSONType::NumberInt}) {
-        if (a == x || b == x) {
-            return x;
-        }
-    }
-    return BSONType::Undefined;
-}
-
 Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
 //std::cout << mr.timespan().first << " - " << mr.timespan().last << "\n";
     //mr is initialized only with keys, tspan, sampleResolution;
@@ -606,36 +592,30 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
 //std::cout << fbdItr->first << ": " << typeName(std::get<1>(fbdItr->second)) << " at ord " << std::get<0>(fbdItr->second) << "\n";
 //}
 
-//std::cout << "dtId of this metricsChunk = " << dtId << "\n";
             for (auto const& k : mr.keys()) {
                  auto mrkElem = fbdMap.find(k);
                  if (mrkElem != fbdMap.end()) {
                      auto refDocOrd = std::get<0>(mrkElem->second);
                      eR[refDocOrd] = mr.keyRow(k);
-                     //std::cout << k << " is at ord " << std::get<0>(mrkElem->second) << "\n";
                      auto bt = std::get<1>(mrkElem->second);
-//std::cout << k << ": type=" << typeName(bt) << ", value = " << std::get<2>(mrkElem->second) << "\n";
+		     /**
+		      * To avoid being disturbed by unimportant BSONType changes
+		      * 'promote' all four numeric types to NumberLong. They were
+		      * all cast to long long int in extractMetricsFromDocument()
+		      * so there is no real change if a field changes type in
+		      * the refDoc of one kMetricsChunk compared to the
+		      * previous one.
+		      */
+                     if (bt ==BSONType::NumberInt || bt == BSONType::NumberDouble ||
+                           bt == BSONType::NumberDecimal) {
+                         bt = BSONType::NumberLong;
+                     }
                      if (mr.bsonType(k) == BSONType::Undefined) {
                          mr.setBsonType(k, bt);
                      } else if (mr.bsonType(k) == bt) {
                          ; //it's a match; do nothing
-                     } else if (ftdcNumericType(mr.bsonType(k)) && ftdcNumericType(bt)) {
-                         /**
-                          * We don't need to recast values - these four types
-                          * were all persisted as NumberLong vals (i.e. long
-                          * long int) in extractMetricsFromDocument(). Just
-                          * change the type to the one with highest precision.
-			  * Devnote: Possibly too much fuss to have taken just
-			  * to be able to show that the type is still double
-			  * or decimal rather than showing all as NumberLong.
-                          */
-                         BSONType t = superiorPrecisionType(mr.bsonType(k), bt);
-                         if (bt == t) {
-//std::cout << "field " << k << " promoted from " << typeName(mr.bsonType(k)) << " to " << typeName(bt) << " at metric chunk " << dtId << "\n";
-                             mr.setBsonType(k, bt);
-                         }
-                     } else { //a type has changed, other than the four identical underlying format numeric types
-//std::cout << "field " << k << " changed from " << typeName(mr.bsonType(k)) << " to " << typeName(bt) << " at metric chunk " << dtId << "\n";
+                     } else {
+                         std::cerr << "field " << k << " changed from " << typeName(mr.bsonType(k)) << " to " << typeName(bt) << " at metric chunk " << dtId << "\n";
                          invariant(mr.bsonType(k) == bt);
                      }
                      uint64RefDocVals[refDocOrd] = std::get<2>(mrkElem->second);
