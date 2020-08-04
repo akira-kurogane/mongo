@@ -162,16 +162,7 @@ struct FTDCProcessMetrics {
     std::string rsName() const;
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
-    /**
-     * TODO: unsure if I should implement keys() or not.
-     * Having a list of keys and their type is easy after flattenedBSONDoc()
-     * is run on every refDoc / the last refDoc for a process. This is in
-     * done for extractTimeseries() but not for extractProcessMetricsHeaders().
-     * It could look for the last kMetricsChunk in the last file and doing
-     * it on-demand, but then the fuction would have return type
-     * StatusWith<map<s, type>> not just map<s, type>.
-     */
-    //std::map<std::string, BSONType> keys();
+    std::map<std::string, BSONType> lastRefDocKeys();
 
     Status merge(const FTDCProcessMetrics& pm);
     void mergeRefDocKeys(const BSONObj& _refDoc);

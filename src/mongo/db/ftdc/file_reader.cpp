@@ -206,7 +206,6 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
 
     ConstDataRange cdr(_buffer.data(), _buffer.data() + bsonLength);
 
-    // TODO: Validated only validates objects based on a flag which is the default at the moment
     auto swl = cdr.read<Validated<BSONObj>>();
     if (!swl.isOK()) {
         return swl.getStatus();
@@ -483,7 +482,7 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
     return keys;
 }
 
-std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> flattenedBSONDoc(const BSONObj& doc) {
+std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> FTDCFileReader::flattenedBSONDoc(const BSONObj& doc) {
    size_t ctr = 0;
    return _flattenedBSONDoc(doc, ctr);
 }
@@ -719,7 +718,6 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
                     mr.metrics[mr.cellOffset(0, tsOrds[j])] = tsVals[j]; //It's OK to overwrite "start" ts values placed in same cell in previous loop. We want max "start" ts in the cell.
 //std::cout << tsOrds[j] << ", ";
                 }
-                //TODO fix ... gap cells need to be attributed to next assigned tsOrd
 //else { std::cout << "-1, "; }
                 //else leave as initialized value -1, to mean no/unset/invalid
             }
@@ -740,7 +738,6 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
 //std::cout << "\nmeRow " << mr.rowKeyName(meRow) << ": uint64_t val = " << uint64RefDocVals[i] << "\n";
                 }
 
-                //TODO: create delta map for unique tsOrds, accumulate sum into that, then apply to each mr.metrics[mr.cellOffset(meRow, mrmOrd)] += <matching cumulative delta sum>
                 uint64_t cD = 0;
                 std::map<size_t, uint64_t> mrmCD;
                 int lastMrmOrd = -1;
@@ -752,9 +749,6 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
                     }
 
                     if (zeroesCount) {
-                        //TODO: Test the following method:
-                        // auto sampleIncr = min(sampleCount - j; zeroesCount); zeroesCount -= sampleIncr; j += sampleIncr - 1; (because of ++ on j in loop definition
-//if (e) { std::cout << "0 "; }
                         zeroesCount--;
                         lastMrmOrd = mrmOrd;
                         continue;

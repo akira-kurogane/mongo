@@ -90,20 +90,21 @@ const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
     return _pmMap[pmId];
 }
 
-//TODO: reenable when FTDCProcessMetrics::keys() ready
-/*std::set<std::string> FTDCWorkspace::keys() {
+//TODO: return the map of keyname -> BSONType like the PM method does?
+std::set<std::string> FTDCWorkspace::keys() {
     std::set<std::string> m;
     for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
          itPM != _pmMap.end(); ++itPM) {
         auto pm = itPM->second;
-        for (std::map<std::string, BSONType>::const_iterator it = pm.keys.begin();
-             it != pm.keys.end(); ++it) {
+	auto pmKeys = pm.lastRefDocKeys();
+        for (std::map<std::string, BSONType>::const_iterator it = pmKeys.begin();
+             it != pmKeys.end(); ++it) {
             auto k = it->first;
             m.insert(k);
         }
     }
     return m;
-}*/
+}
 
 FTDCPMTimespan FTDCWorkspace::boundaryTimespan() {
     Date_t first = Date_t::max();

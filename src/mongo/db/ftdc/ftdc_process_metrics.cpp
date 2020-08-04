@@ -146,6 +146,16 @@ Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
     return filespans.rbegin()->second.timespan.last;
 }
 
+std::map<std::string, BSONType> FTDCProcessMetrics::lastRefDocKeys() {
+   std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> x =
+	   FTDCFileReader::flattenedBSONDoc(lastRefDoc);
+   std::map<std::string, BSONType> m;
+   for (auto itr = x.begin(); itr != x.end(); itr++) {
+       m.insert({itr->first, std::get<1>(itr->second)});
+   }
+   return m;
+}
+
 //Unit test: FTDCProcessMetrics a.merge(b) should create the same doc as b.merge(a);
 //Unit test: file (in sourceFilepaths) that is younger or identical version of should not change any member value
 //Unit test: file that is the later, bigger-sample-length should raise estimated_end_ts
@@ -206,8 +216,6 @@ StatusWith<FTDCMetricsSubset> FTDCProcessMetrics::timeseries(std::vector<std::st
     FTDCPMTimespan trimmedTspan = tspan.intersection(ownTspan);
 //std::cout << "Trimmed timespan for " << procId.hostport << "(" << procId.pid << ") = " << trimmedTspan.first << " - " << trimmedTspan.last << "\n";
     FTDCMetricsSubset m(keys, trimmedTspan, sampleResolution);
-    // TODO:
-    // Init the BSON types of the keys first, log which metrics in output.keys are missing
 
     for (std::map<Date_t, FTDCFileSpan>::iterator it = filespans.begin();
          it != filespans.end(); ++it) {

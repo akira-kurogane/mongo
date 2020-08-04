@@ -23,6 +23,14 @@ int main(int argc, char* argv[], char** envp) {
     FTDCWorkspace ws;
     Status s = ws.addFTDCFiles(av);
 
+    std::cout << "Ten random keys in this workspace:\n";
+    auto ks =  ws.keys();
+    for (size_t i = 0; i < 10; i++) {
+        auto mitr = ks.begin();
+	std::advance(mitr, rand() % ks.size());
+        std::cout << "  " << *mitr << "\n";
+    }
+
     auto fp = ws.filePaths();
     if (fp.size() == 0) {
         std::cerr << "There are no FTDC metrics files at " << av[0];
@@ -79,16 +87,6 @@ int main(int argc, char* argv[], char** envp) {
     }
     for (auto& [pmId, ms] : fPmTs) {
         std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
-        /*size_t junkCtr = 0;
-        for (auto& kNT : ms.keyNamesAndType()) {
-            std::cout << " key " << kNT.keyName << " (" << typeName(kNT.bsonType) << ")\n";
-            auto mv = ms.metricsX(junkCtr++);
-            //std::cout << "  " << (*mv.begin()) << ", " << (*(mv.begin() + 1)) << ", ..., " << (*(mv.begin() + 249)) << "\n";;
-            for (auto& v : mv) {
-                std::cout << v << ", ";
-            }
-            std::cout << "\n";
-        }*/
         auto b = ms.bsonMetrics();
         std::cout << b.jsonString(JsonStringFormat::Strict, 1);
     }
