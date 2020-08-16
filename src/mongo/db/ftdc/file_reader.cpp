@@ -301,11 +301,11 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
              * list they can use to reach their lost metric chunk tail; not attempting this now.)
              */
             if (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
-                std::cout << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
+                std::cerr << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
                         "it is assumed to be interim data from previous server process\n";
-		//TODO: put in a separate result object so it can poentially be matched to
-		// another FTDCProcessMetrics object (and inserted to its salvageChunk*
-		// properties) after all files are initially processed.
+                //TODO: put in a separate result object so it can poentially be matched to
+                // another FTDCProcessMetrics object (and inserted to its salvageChunk*
+                // properties) after all files are initially processed.
                 continue;
 
             }
@@ -607,14 +607,12 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
                      auto refDocOrd = std::get<0>(mrkElem->second);
                      eR[refDocOrd] = mr.keyRow(k);
                      auto bt = std::get<1>(mrkElem->second);
-		     /**
-		      * To avoid being disturbed by unimportant BSONType changes
-		      * 'promote' all four numeric types to NumberLong. They were
-		      * all cast to long long int in extractMetricsFromDocument()
-		      * so there is no real change if a field changes type in
-		      * the refDoc of one kMetricsChunk compared to the
-		      * previous one.
-		      */
+                     /**
+                      * All four numerics types (see BSONElement::isNumber())
+                      * are serialized as long long int in
+		      * extractMetricsFromDocument() so to simplify all are
+		      * 'promoted' to NumberLong type here.
+                      */
                      if (bt ==BSONType::NumberInt || bt == BSONType::NumberDouble ||
                            bt == BSONType::NumberDecimal) {
                          bt = BSONType::NumberLong;
