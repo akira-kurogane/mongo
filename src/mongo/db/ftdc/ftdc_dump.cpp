@@ -27,7 +27,7 @@ int main(int argc, char* argv[], char** envp) {
     auto ks =  ws.keys();
     for (size_t i = 0; i < 10; i++) {
         auto mitr = ks.begin();
-	std::advance(mitr, rand() % ks.size());
+        std::advance(mitr, rand() % ks.size());
         std::cout << "  " << *mitr << "\n";
     }
 
@@ -58,12 +58,16 @@ int main(int argc, char* argv[], char** envp) {
         }
     }
 
-    Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
-    Date_t testRangeE = testRangeS + Seconds(250);
-    uint32_t testStepMs = 10000;
+    //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
+    //b
+    //Date_t testRangeE = testRangeS + Seconds(250);
+    //uint32_t testStepMs = 10000;
     //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 1) / 10;
     //Date_t testRangeE = tspan.last - ((tspan.last - tspan.first) * 2) / 10;
     //uint32_t testStepMs = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / 30;
+    Date_t testRangeS =  tspan.first;
+    Date_t testRangeE = tspan.first + Seconds(360);
+    uint32_t testStepMs = 10000;
 
     std::vector<std::string> keys = {
         /*test: leaving "start" blank, should be forcefully added*/
@@ -78,7 +82,11 @@ int main(int argc, char* argv[], char** envp) {
         "serverStatus.wiredTiger.transaction.transaction checkpoint generation",
         "serverStatus.repl.lastWrite.opTime.ts", 
         "serverStatus.opLatencies.reads.latency",
-        "serverStatus.opLatencies.reads.ops" };
+        "serverStatus.opLatencies.reads.ops",
+        "serverStatus.shardingStatistics.totalDonorChunkCloneTimeMillis",
+    };
+    //ks =  ws.keys();
+    //std::vector<std::string> keys(ks.begin(), ks.end());
 
     std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, testStepMs);
 
@@ -87,8 +95,10 @@ int main(int argc, char* argv[], char** envp) {
     }
     for (auto& [pmId, ms] : fPmTs) {
         std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
-        auto b = ms.bsonMetrics();
-        std::cout << b.jsonString(JsonStringFormat::Strict, 1);
+        //auto b = ms.bsonMetrics();
+        //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
+	ms.writePandasDataframeCSV("/tmp/junk.csv");
+
     }
 
     // Better test would include some metrics absent, some unknown keys, and a metric only appearing halfway through the 250s say some finegrained lock stat

@@ -713,7 +713,7 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
 //std::cout << tsOrds[j] << ", ";
                 } else if (tsVals[j] >= static_cast<uint64_t>(mr.timespan().first.toMillisSinceEpoch()) &&
                                 tsVals[j] < static_cast<uint64_t>(mr.timespan().last.toMillisSinceEpoch())) {
-                    tsOrds[j] = (tsVals[j] - mr.timespan().first.toMillisSinceEpoch()) / mr.resolution();
+                    tsOrds[j] = (tsVals[j] - mr.timespan().first.toMillisSinceEpoch()) / mr.resolutionMs();
                     // Using this opportunity to set the "start" ts values in mr.metric's first row.
                     mr.metrics[mr.cellOffset(0, tsOrds[j])] = tsVals[j]; //It's OK to overwrite "start" ts values placed in same cell in previous loop. We want max "start" ts in the cell.
 //std::cout << tsOrds[j] << ", ";

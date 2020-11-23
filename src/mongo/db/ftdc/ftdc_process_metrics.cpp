@@ -80,7 +80,7 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
         _rowLength += 1;
     }
 
-    metrics.resize(_rowLength * _kNT.size(), 7777777777); //Max value being used to indicate unset
+    metrics.resize(_rowLength * _kNT.size(), 7777777777); //Constant value being used to indicate unset
 }
 
 BSONObj FTDCMetricsSubset::bsonMetrics() {
@@ -120,6 +120,12 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
                 break;
             }
 
+            case Undefined:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   ab.appendUndefined(ab.numStr(i));
+                }
+                break;
+
             default:
                 MONGO_UNREACHABLE;
                 break;
@@ -127,6 +133,62 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
         ab.done();
     }
     return builder.obj();
+}
+
+void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path fp) {
+//DEBUG ignoring fp argument for now, writing to stdout instead
+    auto b = bsonMetrics();
+    std::vector<FTDCMSKeyNameType> ktv = keyNamesAndType();
+    for (auto const& kt : ktv) {
+        std::cout << "\"" << kt.keyName << "\",";
+    }
+    std::cout << "\n";
+    for (auto const& kt : ktv) {
+        std::cout << typeName(kt.bsonType) << ",";
+    }
+    std::cout << "\n";
+    std::cout << "\n";
+    size_t rowLen = 0;
+    BSONObjIterator itDoc(b);
+    while (itDoc.more()) {
+        const BSONElement elem = itDoc.next();
+        if (elem.type() != Array) {
+                std::cerr << "DEBUG " << elem.fieldName() << " not an array DEBUG\n";
+        } else {
+            std::cout << "\"" << elem.fieldName() << "\",";
+            if (rowLen == 0) {
+               rowLen = elem.Array().size();
+            }
+        }
+    }
+    std::cout << "\n";
+    for (size_t i = 0; i < rowLen; i++) {
+       itDoc = BSONObjIterator(b);
+       while (itDoc.more()) {
+          const BSONElement elem = itDoc.next();
+          if (elem.Array()[i].toString(false) == "7777777777") {
+             std::cout << "null,";
+          } else {
+             switch (elem.Array()[0].type()) {
+                case Date:
+                    if (elem.Array()[i].Date().toMillisSinceEpoch() == 7777777777) {
+                        std::cout << "null,";
+                    } else {
+                        std::cout << "\"" << elem.Array()[i].Date().toString() << "\",";
+                    }
+                    break;
+                case bsonTimestamp:
+                    std::cout << elem.Array()[i].timestamp().getSecs() << ",";
+                    break;
+                default:
+                    std::cout << elem.Array()[i].toString(false) << ",";
+                    break;
+            }
+        }
+    }
+    std::cout << "\n";
+    }
+    std::cout << "\n";
 }
 
 std::string FTDCProcessMetrics::rsName() const {
@@ -148,7 +210,7 @@ Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
 
 std::map<std::string, BSONType> FTDCProcessMetrics::lastRefDocKeys() {
    std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> x =
-	   FTDCFileReader::flattenedBSONDoc(lastRefDoc);
+           FTDCFileReader::flattenedBSONDoc(lastRefDoc);
    std::map<std::string, BSONType> m;
    for (auto itr = x.begin(); itr != x.end(); itr++) {
        m.insert({itr->first, std::get<1>(itr->second)});
