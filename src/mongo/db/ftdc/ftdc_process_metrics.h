@@ -61,14 +61,14 @@ public:
     FTDCPMTimespan timespan() {
         return _tspan;
     }
-    uint32_t resolution() { return _stepMs; }
+    uint32_t resolutionMs() { return _stepMs; }
 
     std::vector<std::string> keys() {
         std::vector<std::string> r;
-	r.reserve(_kNT.size());
+        r.reserve(_kNT.size());
         for (auto x : _kNT) {
             r.emplace_back(x.keyName);
-	}
+        }
         return r;
     }
 
@@ -92,6 +92,15 @@ std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
      * element is the sample at i'th "start" timestamp value.
      */
     BSONObj bsonMetrics();
+
+    /**
+     * Write all metrics to a CSV file suitable for Pandas dataframe import
+     * "start","serveStatus.A.a","serverStatus.A.b",....
+     * "2020-11-11T11:11:11.000+000",123,456,...
+     * "2020-11-11T11:11:12.000+000",123,488,...
+     * ...
+     */
+    void writePandasDataframeCSV(boost::filesystem::path fp);
 
 //std::vector<std::uint64_t> metricsX(size_t i) {
 //  std::vector<std::uint64_t> r;
@@ -175,7 +184,7 @@ struct FTDCProcessMetrics {
      * - estimateLastSampleTs()
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
-		FTDCPMTimespan tspan, uint32_t sampleResolution);
+                FTDCPMTimespan tspan, uint32_t sampleResolution);
 
     //temporary debugging use
     friend std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm);
