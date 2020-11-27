@@ -102,6 +102,7 @@ env.CppUnitTest(
     ],
 )
 
+env.Append(CXXFLAGS='-g')
 env.Program(
     target='ftdc_dump',
     source=[
