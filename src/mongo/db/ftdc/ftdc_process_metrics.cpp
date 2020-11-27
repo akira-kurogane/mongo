@@ -4,6 +4,7 @@
 #include "mongo/db/bson/dotted_path_support.h"
 
 namespace dps = ::mongo::dotted_path_support;
+namespace fs = boost::filesystem;
 
 namespace mongo {
 
@@ -135,60 +136,65 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
     return builder.obj();
 }
 
-void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path fp) {
-//DEBUG ignoring fp argument for now, writing to stdout instead
+void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dp, FTDCProcessId pmId) {
+    fs::path data_fpath(dp.string() + "/pandas_dataframe." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
+    fs::path mpf_fpath = data_fpath;
+    mpf_fpath.replace_extension(".mapping.csv");
     auto b = bsonMetrics();
+
+    std::ofstream mpf(mpf_fpath, std::ios::out);
     std::vector<FTDCMSKeyNameType> ktv = keyNamesAndType();
     for (auto const& kt : ktv) {
-        std::cout << "\"" << kt.keyName << "\",";
+        mpf << "\"" << kt.keyName << "\",";
     }
-    std::cout << "\n";
+    mpf << "\n";
     for (auto const& kt : ktv) {
-        std::cout << typeName(kt.bsonType) << ",";
+        mpf << typeName(kt.bsonType) << ",";
     }
-    std::cout << "\n";
-    std::cout << "\n";
+    mpf << "\n";
+
+    std::ofstream df(data_fpath, std::ios::out);
     size_t rowLen = 0;
     BSONObjIterator itDoc(b);
     while (itDoc.more()) {
         const BSONElement elem = itDoc.next();
         if (elem.type() != Array) {
-                std::cerr << "DEBUG " << elem.fieldName() << " not an array DEBUG\n";
+            std::cerr << "DEBUG " << elem.fieldName() << " not an array DEBUG\n";
         } else {
-            std::cout << "\"" << elem.fieldName() << "\",";
+            df << "\"" << elem.fieldName() << "\",";
             if (rowLen == 0) {
                rowLen = elem.Array().size();
             }
         }
     }
-    std::cout << "\n";
+    df << "\n";
     for (size_t i = 0; i < rowLen; i++) {
-       itDoc = BSONObjIterator(b);
-       while (itDoc.more()) {
-          const BSONElement elem = itDoc.next();
-          if (elem.Array()[i].toString(false) == "7777777777") {
-             std::cout << "null,";
-          } else {
-             switch (elem.Array()[0].type()) {
+        itDoc = BSONObjIterator(b);
+        while (itDoc.more()) {
+            const BSONElement elem = itDoc.next();
+            if (elem.Array()[i].toString(false) == "7777777777") {
+                df << "null,";
+            } else {
+                switch (elem.Array()[0].type()) {
                 case Date:
                     if (elem.Array()[i].Date().toMillisSinceEpoch() == 7777777777) {
-                        std::cout << "null,";
+                        df << "null,";
                     } else {
-                        std::cout << "\"" << elem.Array()[i].Date().toString() << "\",";
+                        df << "\"" << elem.Array()[i].Date().toString() << "\",";
                     }
                     break;
                 case bsonTimestamp:
-                    std::cout << elem.Array()[i].timestamp().getSecs() << ",";
+                    df << elem.Array()[i].timestamp().getSecs() << ",";
                     break;
                 default:
-                    std::cout << elem.Array()[i].toString(false) << ",";
+                    df << elem.Array()[i].toString(false) << ",";
                     break;
+                }
             }
         }
+        df << "\n";
     }
-    std::cout << "\n";
-    }
-    std::cout << "\n";
+    std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << rowLen << " rows at " << (_stepMs/1000) << "s period.\n";
 }
 
 std::string FTDCProcessMetrics::rsName() const {

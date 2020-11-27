@@ -81,11 +81,11 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         exit(1);
     }
 
-    auto tsoc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
+    auto omc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
     if (!vm["output-dir"].defaulted()) {
         auto dp = fs::path(vm["output-dir"].as<std::string>());
-        if (!tsoc && dp != "/tmp"/*default*/) {
-            std::cerr << "Ignoring \"--output-dir\" option because no timeseries format option, eg. --output-bson, is selected.\n";
+        if (!omc && dp != "/tmp"/*default*/) {
+            std::cerr << "Note: Ignoring \"--output-dir\" option because no timeseries format option, eg. --output-bson, is selected.\n";
         }
         if (!fs::is_directory(dp)) {
             std::cerr << "--output-dir option value "  << dp << " is not a directory\n";
@@ -149,16 +149,15 @@ int main(int argc, char* argv[], char** envp) {
         }
     }
 
-    //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
-    //b
-    //Date_t testRangeE = testRangeS + Seconds(250);
-    //uint32_t testStepMs = 10000;
+    Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
+    Date_t testRangeE = testRangeS + Seconds(250);
+    //vm.emplace("resolutionMs", po::variable_value{1000, false});
     //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 1) / 10;
     //Date_t testRangeE = tspan.last - ((tspan.last - tspan.first) * 2) / 10;
-    //uint32_t testStepMs = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / 30;
-    Date_t testRangeS =  tspan.first;
-    Date_t testRangeE = tspan.last;
-    uint32_t testStepMs = 1000;
+    //vm.emplace("resolutionMs", po::variable_value{ (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / 30, false);
+    //Date_t testRangeS =  tspan.first;
+    //Date_t testRangeE = tspan.last;
+    //vm.emplace("resolutionMs", po::variable_value{60000, false});
 
     //TODO if (opts.metricsFilter() ..)
     std::vector<std::string> keys = {
@@ -188,26 +187,30 @@ int main(int argc, char* argv[], char** envp) {
     //ks =  ws.keys();
     //std::vector<std::string> keys(ks.begin(), ks.end());
 
-    if (vm.count("output-bson-dir") || vm.count("output-csv-dir") || vm.count("output-pandas-csv-dir")) {
-        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, testStepMs); //TODO testStepMs = vm["resolutionMs"]
+    auto omc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
+    if (omc) {
+        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, vm["resolutionMs"].as<unsigned int>());
     
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
         }
 
+        auto odirpath = vm["output-dir"].as<std::string>();
         for (auto& [pmId, ms] : fPmTs) {
-            std::string fnameroot = pmId.hostport + std::to_string(pmId.pid);
             std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
             if (vm.count("output-bson")) {
                 auto b = ms.bsonMetrics();
-                //TODO write to directory with pmID in name, echo path and give tip to use bsondump to view
-                std::cout << b.jsonString(JsonStringFormat::Strict, 1);
+                fs::path bfpath(odirpath + "/ftdc_timeseries." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".bson");
+                std::ofstream bf(bfpath, std::ios::out);
+                bf << b; //TODO: this is dumping as a string format :( need to change to binary
+                std::cout << "Created " << bfpath << ". Tip: you can view content with bsondump.\n";
+                //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
             }
             if (vm.count("output-csv")) {
                 std::cerr << "Incomplete development: --output-csv not implemented yet.\n";
             }
             if (vm.count("output-pandas-csv")) {
-                ms.writePandasDataframeCSV(vm["output-dir"].as<std::string>() + "/pandas_dataframe." + fnameroot + ".csv");
+                ms.writePandasDataframeCSV(odirpath, pmId);
             }
     
         }
