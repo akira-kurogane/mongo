@@ -68,7 +68,7 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
 
     _tspan = tspan;
     _stepMs = sampleResolution;
- 
+
     _rowLength = (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / _stepMs;
     /**
      * If a partial span exists on the end add that too. E.g. if _stepMs is
@@ -142,7 +142,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
 
     auto mPtr = metrics.begin();
     for (auto x : _kNT) {
-        cf << x.keyName << ",";
+        cf << "\"" << x.keyName << "\",";
         switch (x.bsonType) {
             case NumberDouble:
             case NumberInt:
@@ -161,7 +161,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
 
             case Date:
                 for (size_t i = 0; i < _rowLength; ++i) {
-                   cf << Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)) << ",";
+                   cf << "\"" << Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)) << "\",";
                 }
                 break;
 
@@ -183,7 +183,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
                 MONGO_UNREACHABLE;
                 break;
         }
-	cf << "\n";
+        cf << "\n";
     }
 }
 
@@ -194,59 +194,61 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
 
     auto b = bsonMetrics();
 
+    invariant(_rowLength * _kNT.size() == metrics.size());
     std::ofstream mpf(mpf_fpath, std::ios::out);
-    std::vector<FTDCMSKeyNameType> ktv = keyNamesAndType();
-    for (auto const& kt : ktv) {
-        mpf << "\"" << kt.keyName << "\",";
+    //TO DELETE std::vector<FTDCMSKeyNameType> ktv = keyNamesAndType(); //this is _kNT ... maybe I should have just referenced it directly
+    for (size_t c = 0; c < _kNT.size(); ++c) {
+        mpf << "\"" << _kNT[c].keyName << "\",";
     }
     mpf << "\n";
-    for (auto const& kt : ktv) {
-        mpf << typeName(kt.bsonType) << ",";
+    for (size_t c = 0; c < _kNT.size(); ++c) {
+        mpf << typeName(_kNT[c].bsonType) << ",";
     }
     mpf << "\n";
 
-    std::ofstream df(data_fpath, std::ios::out);
-    size_t rowLen = 0;
-    BSONObjIterator itDoc(b);
-    while (itDoc.more()) {
-        const BSONElement elem = itDoc.next();
-        if (elem.type() != Array) {
-            std::cerr << "DEBUG " << elem.fieldName() << " not an array DEBUG\n";
-        } else {
-            df << "\"" << elem.fieldName() << "\",";
-            if (rowLen == 0) {
-               rowLen = elem.Array().size();
-            }
-        }
+    std::ofstream cf(data_fpath, std::ios::out);
+    for (size_t c = 0; c < _kNT.size(); ++c) {
+        cf << "\"" << _kNT[c].keyName << "\",";
     }
-    df << "\n";
-    for (size_t i = 0; i < rowLen; i++) {
-        itDoc = BSONObjIterator(b);
-        while (itDoc.more()) {
-            const BSONElement elem = itDoc.next();
-            if (elem.Array()[i].toString(false) == "7777777777") {
-                df << "null,";
-            } else {
-                switch (elem.Array()[0].type()) {
+    cf << "\n";
+    for (size_t rowPos = 0; rowPos < _rowLength; ++rowPos) {
+        for (size_t c = 0; c < _kNT.size(); ++c) {
+            auto bt = _kNT[c].bsonType;
+            auto val = metrics[c * _rowLength + rowPos];
+            switch (bt) {
+                case NumberDouble:
+                case NumberInt:
+                case NumberLong:
+                    cf << std::to_string(val) << ",";
+                    break;
+
+                case Bool:
+                    cf << (val ? "true" : "false") << ",";
+                    break;
+
                 case Date:
-                    if (elem.Array()[i].Date().toMillisSinceEpoch() == 7777777777) {
-                        df << "null,";
-                    } else {
-                        df << "\"" << elem.Array()[i].Date().toString() << "\",";
-                    }
+                    cf << "\"" << Date_t::fromMillisSinceEpoch(val) << "\",";
                     break;
-                case bsonTimestamp:
-                    df << elem.Array()[i].timestamp().getSecs() << ",";
-                    break;
-                default:
-                    df << elem.Array()[i].toString(false) << ",";
+
+                case bsonTimestamp: {
+                    //TODO: maybe Date_t::fromSecondsSinceEpoch(val) is better. I.e. make it the same as for Date as this is CSV and BSON format won't be reconstructured from it
+                    cf << std::to_string(val) << ",";
                     break;
                 }
+
+                case Undefined:
+                    cf << "undefined,";
+                    break;
+
+                default:
+                    MONGO_UNREACHABLE;
+                    break;
             }
+            cf << "\n";
         }
-        df << "\n";
     }
-    std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << rowLen << " rows at " << (_stepMs/1000) << "s period.\n";
+
+    std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
 }
 
 std::string FTDCProcessMetrics::rsName() const {
