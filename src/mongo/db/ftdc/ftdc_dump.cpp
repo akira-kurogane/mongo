@@ -150,7 +150,7 @@ int main(int argc, char* argv[], char** envp) {
     }
 
     Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
-    Date_t testRangeE = testRangeS + Seconds(250);
+    Date_t testRangeE = testRangeS + Seconds(86400);
     //vm.emplace("resolutionMs", po::variable_value{1000, false});
     //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 1) / 10;
     //Date_t testRangeE = tspan.last - ((tspan.last - tspan.first) * 2) / 10;
@@ -207,7 +207,7 @@ int main(int argc, char* argv[], char** envp) {
                 //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
             }
             if (vm.count("output-csv")) {
-                std::cerr << "Incomplete development: --output-csv not implemented yet.\n";
+                ms.writeCSV(odirpath, pmId);
             }
             if (vm.count("output-pandas-csv")) {
                 ms.writePandasDataframeCSV(odirpath, pmId);

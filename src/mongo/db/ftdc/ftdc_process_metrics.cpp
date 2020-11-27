@@ -136,10 +136,62 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
     return builder.obj();
 }
 
-void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dp, FTDCProcessId pmId) {
-    fs::path data_fpath(dp.string() + "/pandas_dataframe." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
+void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+    fs::path csvfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
+    std::ofstream cf(csvfpath, std::ios::out);
+
+    auto mPtr = metrics.begin();
+    for (auto x : _kNT) {
+        cf << x.keyName << ",";
+        switch (x.bsonType) {
+            case NumberDouble:
+            case NumberInt:
+            case NumberLong:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   cf << std::to_string(static_cast<long long int>(*mPtr++)) << ",";
+                }
+                break;
+
+            case Bool:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   bool x = *mPtr++;
+                   cf << (x ? "true" : "false") << ",";
+                }
+                break;
+
+            case Date:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   cf << Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)) << ",";
+                }
+                break;
+
+            case bsonTimestamp: {
+                for (size_t i = 0; i < _rowLength; ++i) {
+                    //TODO: maybe Date_t::fromSecondsSinceEpoch(*mPtr++) is better. I.e. make it the same as for Date as this is CSV and BSON format won't be reconstructured from it
+                    cf << std::to_string(static_cast<long long int>(*mPtr++)) << ",";
+                }
+                break;
+            }
+
+            case Undefined:
+                for (size_t i = 0; i < _rowLength; ++i) {
+                   cf << "undefined,";
+                }
+                break;
+
+            default:
+                MONGO_UNREACHABLE;
+                break;
+        }
+	cf << "\n";
+    }
+}
+
+void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+    fs::path data_fpath(dirfp.string() + "/pandas_dataframe." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
     fs::path mpf_fpath = data_fpath;
     mpf_fpath.replace_extension(".mapping.csv");
+
     auto b = bsonMetrics();
 
     std::ofstream mpf(mpf_fpath, std::ios::out);

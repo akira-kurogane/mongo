@@ -94,13 +94,24 @@ std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
     BSONObj bsonMetrics();
 
     /**
+     * Write all metrics to a CSV file
+     * "start","2020-11-11T11:11:11.000+000","2020-11-11T11:11:12.000+000",
+     * "serveStatus.A.a",123,123,...
+     * "serverStatus.A.b",456,488,...
+     * ...
+     */
+    void writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
+
+    /**
      * Write all metrics to a CSV file suitable for Pandas dataframe import
      * "start","serveStatus.A.a","serverStatus.A.b",....
      * "2020-11-11T11:11:11.000+000",123,456,...
      * "2020-11-11T11:11:12.000+000",123,488,...
      * ...
+     * As well as the data file with the above format a *.mapping.csv file
+     * will be added alongside it.
      */
-    void writePandasDataframeCSV(boost::filesystem::path fp, FTDCProcessId pmId);
+    void writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
 
 //std::vector<std::uint64_t> metricsX(size_t i) {
 //  std::vector<std::uint64_t> r;
