@@ -159,37 +159,55 @@ int main(int argc, char* argv[], char** envp) {
     //Date_t testRangeE = tspan.last;
     //vm.emplace("resolutionMs", po::variable_value{60000, false});
 
-    //TODO if (opts.metricsFilter() ..)
-    std::vector<std::string> keys = {
-        /*test: leaving "start" blank, should be forcefully added*/
-        "serverStatus.connections.current",
-        "serverStatus.connections.available",
-        "serverStatus.tcmalloc.tcmalloc.total_free_bytes",
-        "serverStatus.wiredTiger.cache.bytes read into cache",
-        "serverStatus.wiredTiger.cache.bytes written from cache",
-        "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", //gauge
-        "serverStatus.wiredTiger.cache.eviction state", //gauge
-        "serverStatus.wiredTiger.transaction.transaction checkpoint currently running", //boolean gauge
-        "serverStatus.wiredTiger.transaction.transaction checkpoint generation",
-        "serverStatus.repl.lastWrite.opTime.ts", 
-        "serverStatus.opLatencies.reads.latency",
-        "serverStatus.opLatencies.reads.ops",
-        "serverStatus.opLatencies.writes.latency",
-        "serverStatus.opLatencies.writes.ops",
-        "serverStatus.opcounters.command",
-        "serverStatus.opcounters.delete",
-        "serverStatus.opcounters.getmore",
-        "serverStatus.opcounters.insert",
-        "serverStatus.opcounters.query",
-        "serverStatus.opcounters.update",
-        "serverStatus.shardingStatistics.totalDonorChunkCloneTimeMillis",
-    };
-    //ks =  ws.keys();
-    //std::vector<std::string> keys(ks.begin(), ks.end());
+    std::vector<std::string> ekl; //Extraction metric key list
+    if (vm.count("metrics-filter")) {
+        std::ifstream mif(vm["metrics-filter"].as<std::string>());
+        if (!mif) {
+            std::cerr << "Error: couldn't open --metrics-filter file " << vm["metrics-filter"].as<std::string>() << "\n";
+	    exit(1);
+        }
+	std::string s;
+	while (std::getline(mif, s)) {
+            //if (s.trim() != "") {
+                ekl.push_back(s);
+	    //}
+	}
+	if (ekl.size() == 0) {
+            std::cerr << "The --metrics-filter file " << vm["metrics-filter"].as<std::string>() << " didn't have any lines in it. Exiting.\n";
+	    exit(1);
+	}
+        /*ekl = {
+            / *test: leaving "start" blank, should be forcefully added* /
+            "serverStatus.connections.current",
+            "serverStatus.connections.available",
+            "serverStatus.tcmalloc.tcmalloc.total_free_bytes",
+            "serverStatus.wiredTiger.cache.bytes read into cache",
+            "serverStatus.wiredTiger.cache.bytes written from cache",
+            "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", //gauge
+            "serverStatus.wiredTiger.cache.eviction state", //gauge
+            "serverStatus.wiredTiger.transaction.transaction checkpoint currently running", //boolean gauge
+            "serverStatus.wiredTiger.transaction.transaction checkpoint generation",
+            "serverStatus.repl.lastWrite.opTime.ts", 
+            "serverStatus.opLatencies.reads.latency",
+            "serverStatus.opLatencies.reads.ops",
+            "serverStatus.opLatencies.writes.latency",
+            "serverStatus.opLatencies.writes.ops",
+            "serverStatus.opcounters.command",
+            "serverStatus.opcounters.delete",
+            "serverStatus.opcounters.getmore",
+            "serverStatus.opcounters.insert",
+            "serverStatus.opcounters.query",
+            "serverStatus.opcounters.update",
+            "serverStatus.shardingStatistics.totalDonorChunkCloneTimeMillis",
+        };*/
+    } else {
+        auto ks =  ws.keys();
+        ekl.assign(ks.begin(), ks.end());
+    }
 
     auto omc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
     if (omc) {
-        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(keys, {testRangeS, testRangeE}, vm["resolutionMs"].as<unsigned int>());
+        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl, {testRangeS, testRangeE}, vm["resolutionMs"].as<unsigned int>());
     
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
@@ -203,6 +221,7 @@ int main(int argc, char* argv[], char** envp) {
                 fs::path bfpath(odirpath + "/ftdc_timeseries." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".bson");
                 std::ofstream bf(bfpath, std::ios::out);
                 bf << b; //TODO: this is dumping as a string format :( need to change to binary
+		//iov.iov_len = b->len; iov.iov_base = (void *)bson_get_data(b); mongoc_stream_writev (stream, &iov, 1, 0);
                 std::cout << "Created " << bfpath << ". Tip: you can view content with bsondump.\n";
                 //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
             }
