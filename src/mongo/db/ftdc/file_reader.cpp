@@ -292,15 +292,18 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
 
             /**
              * If no metadataDoc found yet OR dtId < metadataDoc then assume this metrics chunk
-             * if from salvaged interim data of the previous server process; skip it.
+             * is from salvaged interim data of the previous server process; skip it.
              *
              * FTDCFileManager::recoverInterimFile() and ...::openArchiveFile() will salvage
              * metrics chunk docs (theoretically also metadata docs) and insert them before the
              * new process' metrics chunks. If we detect this just skip it. (The ideal solution
              * is that FTDCProcessMetrics objects can have an additional 'tail' file in their file
              * list they can use to reach their lost metric chunk tail; not attempting this now.)
+	     *
+	     * I'll suppress the message if it is for a "metrics.interim" file by itself.
              */
-            if (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
+            if (_file.filename() != "metrics.interim" && 
+			    metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
                 std::cerr << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
                         "it is assumed to be interim data from previous, probably crashed, server process\n";
                 //TODO: put in a separate result object so it can poentially be matched to
