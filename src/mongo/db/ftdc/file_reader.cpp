@@ -302,7 +302,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
              */
             if (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
                 std::cerr << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
-                        "it is assumed to be interim data from previous server process\n";
+                        "it is assumed to be interim data from previous, probably crashed, server process\n";
                 //TODO: put in a separate result object so it can poentially be matched to
                 // another FTDCProcessMetrics object (and inserted to its salvageChunk*
                 // properties) after all files are initially processed.
