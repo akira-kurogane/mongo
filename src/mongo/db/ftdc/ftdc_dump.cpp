@@ -16,7 +16,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     po::options_description general("General options");
     general.add_options()
         ("help", "produce a help message")
-        ("input-file", po::value<std::vector<std::string>>(), "path to FTDC metrics file, or parent directory. Can be multiple locations. \"--input-file\" option flag is unnecessary.")
+        ("input-file", po::value<std::vector<std::string>>(), "path to FTDC directory (typically \"diagnostic.data/\") and/or individual metrics.YYYYMMDD... FTDC metric files. Can be multiple locations. (It's optional to write \"--input-file\", all positional args are used to be input directories or files.)")
         ;
     
     po::options_description filter_opts("Filter options");
@@ -36,7 +36,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
 
     po::options_description export_optsd("Export options");
     export_optsd.add_options()
-        ("export-dir", po::value<std::string>()->default_value("/tmp"), "Directory to put exported timeseries metrics files in.")
+        ("export-dir", po::value<std::string>()->default_value("."), "Directory to put exported timeseries metrics files in. Current working dir is default.")
         ("bson-timeseries", "Export timeseries as BSON file(s)")
         ("csv-timeseries", "Export timeseries as CSV file(s)")
         ("pandas-csv-timeseries", "Export timeseries as Pandas dataframe CSV format. A *.mapping.csv file is also saved alongside each data csv file.")
@@ -104,19 +104,19 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     }
 
     auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
+    auto dp = fs::path(vm["export-dir"].as<std::string>());
     if (!vm["export-dir"].defaulted()) {
-        auto dp = fs::path(vm["export-dir"].as<std::string>());
         if (!omc) {
-            std::cerr << "Note: Ignoring \"--export-dir\" option because no timeseries format option, eg. --bson-timeseries, is selected.\n";
+            std::cerr << "Note: Ignoring \"--export-dir\" option because no timeseries format option, eg. --csv-timeseries, is selected.\n";
         }
         if (!fs::is_directory(dp)) {
             std::cerr << "--export-dir option value "  << dp << " is not a directory\n";
             exit(1);
         }
-        if (-1 == access(dp.c_str(), W_OK)) {
-            std::cerr << "This process doesn't have write permisions for --export-dir "  << dp << "\n";
-            exit(1);
-        }
+    }
+    if (omc && -1 == access(dp.c_str(), W_OK)) {
+        std::cerr << "This process doesn't have write permisions for --export-dir " << dp << "\n";
+        exit(1);
     }
 
     return vm;
@@ -146,7 +146,8 @@ int main(int argc, char* argv[], char** envp) {
     auto tspan = ws.boundaryTimespan();
 
     if (vm["print-topology"].as<bool>() || vm.count("print-metadata")) {
-        std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
+        std::cout << "Samples between " << dateToISOStringUTC(tspan.first) <<
+		" - " << dateToISOStringUTC(tspan.last) << std::endl;
             
         auto tp = ws.topology();
         for (auto const& [rsnm, hpvals] : tp) {
@@ -156,7 +157,8 @@ int main(int argc, char* argv[], char** envp) {
                 for (auto const& pmId : pmIds) {
                     auto pm = ws.processMetrics(pmId);
                     std::cout << "    instance pid=" << pmId.pid << "\t";
-                    std::cout << "    " << pm.firstSampleTs() << " - " << pm.estimateLastSampleTs() << std::endl;
+                    std::cout << "    " << dateToISOStringUTC(pm.firstSampleTs()) <<
+			    " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
 		    if (vm.count("print-metadata")) {
 		        std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
 		    }
@@ -219,7 +221,7 @@ int main(int argc, char* argv[], char** envp) {
 
         auto odirpath = vm["export-dir"].as<std::string>();
         for (auto& [pmId, ms] : fPmTs) {
-            std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
+            //std::cout << "\nExporting timeseries for " << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
             if (vm.count("bson-timeseries")) {
                 auto b = ms.bsonMetrics();
                 fs::path bfpath(odirpath + "/ftdc_timeseries." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".bson");
