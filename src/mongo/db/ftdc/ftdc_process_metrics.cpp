@@ -142,40 +142,40 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
 
     auto mPtr = metrics.begin();
     for (auto x : _kNT) {
-        cf << "\"" << x.keyName << "\",";
+        cf << "\"" << x.keyName;
         switch (x.bsonType) {
             case NumberDouble:
             case NumberInt:
             case NumberLong:
                 for (size_t i = 0; i < _rowLength; ++i) {
-                   cf << std::to_string(static_cast<long long int>(*mPtr++)) << ",";
+                   cf << "," << std::to_string(static_cast<long long int>(*mPtr++));
                 }
                 break;
 
             case Bool:
                 for (size_t i = 0; i < _rowLength; ++i) {
                    bool x = *mPtr++;
-                   cf << (x ? "true" : "false") << ",";
+                   cf << "," << (x ? "true" : "false");
                 }
                 break;
 
             case Date:
                 for (size_t i = 0; i < _rowLength; ++i) {
-                   cf << "\"" << Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)) << "\",";
+                   cf << ",\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)));
                 }
                 break;
 
             case bsonTimestamp: {
                 for (size_t i = 0; i < _rowLength; ++i) {
                     //TODO: maybe Date_t::fromSecondsSinceEpoch(*mPtr++) is better. I.e. make it the same as for Date as this is CSV and BSON format won't be reconstructured from it
-                    cf << std::to_string(static_cast<long long int>(*mPtr++)) << ",";
+                    cf << "," << std::to_string(static_cast<long long int>(*mPtr++));
                 }
                 break;
             }
 
             case Undefined:
                 for (size_t i = 0; i < _rowLength; ++i) {
-                   cf << "undefined,";
+                   cf << ",undefined";
                 }
                 break;
 
@@ -185,6 +185,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
         }
         cf << "\n";
     }
+    std::cout << csvfpath << " created. It contains a matrix of " << _kNT.size() << " metrics by " << _rowLength << " time samples.\n";
 }
 
 void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
@@ -227,7 +228,7 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
                     break;
 
                 case Date:
-                    cf << "\"" << Date_t::fromMillisSinceEpoch(val) << "\",";
+                    cf << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(val)) << "\",";
                     break;
 
                 case bsonTimestamp: {
