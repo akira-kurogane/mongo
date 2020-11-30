@@ -21,21 +21,26 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     
     po::options_description filter_opts("Filter options");
     filter_opts.add_options()
-        ("hostport", po::value<std::string>(), "hostname:port filter")
         ("ts-start", po::value<std::string>(), "exclude results before this timestamp")
         ("ts-end",   po::value<std::string>(), "exclude results after this timestamp")
-        ("metrics-filter", po::value<std::string>(), "file of metric names to include. (See output of --list-metrics for format.)")
+        ("metrics-filter", po::value<std::string>(), "file of metric names to include. (See output of --list-metrics for samples of format.)")
         ;
     
-    po::options_description output_opts("Output options");
-    output_opts.add_options()
-        ("print-topology", po::value<bool>()->default_value(true), "Print replica sets, hosts, timespans. Will be default if no other output option chosen.")
-        ("list-metrics", "Print list of all metrics found to stdout")
-        ("output-dir", po::value<std::string>()->default_value("/tmp"), "Directory to put timeseries metrics output files in")
-        ("output-bson", "Output timeseries metrics in BSON format to directory")
-        ("output-csv", "Output timeseries metrics in CSV format to directory")
-        ("output-pandas-csv", "Output timeseries metrics in Pandas dataframe CSV format to directory. A *.mapping.csv alongside each data csv file is also output.")
-        ("resolutionMs", po::value<unsigned int>()->default_value(1000), "Resolution in milliseconds for timeseries output methods.")
+    po::options_description smyprint_optsd("Print summaries to stdout");
+    smyprint_optsd.add_options()
+        ("print-topology", po::value<bool>()->default_value(true), "Print replica sets, hosts, timespans. On by default.")
+        ("print-metadata-doc", "Print last kMetadataDoc BSON object for each db instance.")
+        ("list-metrics", "Print list of all metrics in these FTDC files")
+        ;
+        //plus a function to print reconstructed diagnosticData doc at any given second?
+
+    po::options_description export_optsd("Export options");
+    export_optsd.add_options()
+        ("export-dir", po::value<std::string>()->default_value("/tmp"), "Directory to put exported timeseries metrics files in.")
+        ("bson-timeseries", "Export timeseries as BSON file(s)")
+        ("csv-timeseries", "Export timeseries as CSV file(s)")
+        ("pandas-csv-timeseries", "Export timeseries as Pandas dataframe CSV format. A *.mapping.csv file is also saved alongside each data csv file.")
+        ("resolution", po::value<float>()->default_value(1), "Resolution in seconds for timeseries output methods.")
         ;
 
     po::positional_options_description posarg_optsd;
@@ -44,7 +49,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     // Declare an options description instance which will include
     // all the options
     po::options_description all_opts("Allowed options");
-    all_opts.add(general).add(filter_opts).add(output_opts);
+    all_opts.add(general).add(filter_opts).add(smyprint_optsd).add(export_optsd);
     
     po::variables_map vm;
     po::parsed_options parsed_opts = po::command_line_parser(argc, argv).options(all_opts).positional(posarg_optsd).run();
@@ -57,11 +62,6 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         std::cout << all_opts;
         exit(0);
     }
-
-    //auto pa = po::collect_unrecognized(parsed_opts.options, po::include_positional);
-    //if (pa.size()) {
-    //    pa.erase(pa.begin()); //delete the exe name at position [0] in this vector
-    //}
 
     if (vm.count("input-file")) {
         auto ifv = vm["input-file"].as<std::vector<std::string>>();
@@ -81,18 +81,40 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         exit(1);
     }
 
-    auto omc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
-    if (!vm["output-dir"].defaulted()) {
-        auto dp = fs::path(vm["output-dir"].as<std::string>());
-        if (!omc && dp != "/tmp"/*default*/) {
-            std::cerr << "Note: Ignoring \"--output-dir\" option because no timeseries format option, eg. --output-bson, is selected.\n";
+    std::vector<std::string> iso8601_optnms({ "ts-start", "ts-end" });
+    for (auto const& optnm : iso8601_optnms) {
+        if (vm.count(optnm)) {
+            auto optval_str = vm[optnm].as<std::string>();
+            StatusWith<Date_t> sWdt = dateFromISOString(optval_str);
+            if (!sWdt.isOK()) {
+                std::cerr << "Error: " << optnm << " option value \"" << optval_str << "\" could not be parsed as a date.\nAn ISO 8601 format is required. YYYY-MM-DDTHH:MM[:SS[.m[m[m]]]]Z.\nTimezone indicators -HHMM or +HHMM also accepted instead of the UTC indicator \"Z\".\n";
+                exit(1);
+            }
+        }
+    }
+    if (vm.count("ts-start") && vm.count("ts-end")) {
+        auto ts_start_str = vm["ts-start"].as<std::string>();
+        auto ts_end_str   = vm["ts-end"].as<std::string>();
+        StatusWith<Date_t> sWdts = dateFromISOString(ts_start_str);
+        StatusWith<Date_t> sWdte = dateFromISOString(ts_end_str);
+	if (sWdts.getValue() >= sWdte.getValue()) {
+            std::cerr << "Error: --ts-end option value " << ts_end_str << " is earlier or equal to the --ts-start option value " << ts_start_str << ". Exiting.\n";
+	    exit(1);
+	}
+    }
+
+    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
+    if (!vm["export-dir"].defaulted()) {
+        auto dp = fs::path(vm["export-dir"].as<std::string>());
+        if (!omc) {
+            std::cerr << "Note: Ignoring \"--export-dir\" option because no timeseries format option, eg. --bson-timeseries, is selected.\n";
         }
         if (!fs::is_directory(dp)) {
-            std::cerr << "--output-dir option value "  << dp << " is not a directory\n";
+            std::cerr << "--export-dir option value "  << dp << " is not a directory\n";
             exit(1);
         }
         if (-1 == access(dp.c_str(), W_OK)) {
-            std::cerr << "This process doesn't have write permisions for --output-dir "  << dp << "\n";
+            std::cerr << "This process doesn't have write permisions for --export-dir "  << dp << "\n";
             exit(1);
         }
     }
@@ -123,18 +145,21 @@ int main(int argc, char* argv[], char** envp) {
 
     auto tspan = ws.boundaryTimespan();
 
-    if (vm["print-topology"].as<bool>()) {
+    if (vm["print-topology"].as<bool>() || vm.count("print-metadata")) {
         std::cout << "Samples between " << tspan.first << " - " << tspan.last << std::endl;
             
         auto tp = ws.topology();
         for (auto const& [rsnm, hpvals] : tp) {
-            std::cout << rsnm << std::endl;
+            std::cout << (rsnm == "" ? "<no replsetname>" : rsnm) << std::endl;
             for (auto const& [hp, pmIds] : hpvals) {
                 std::cout << "  " << hp << std::endl;
                 for (auto const& pmId : pmIds) {
-                    std::cout << "    " << pmId.hostport << ":" << pmId.pid << std::endl;
                     auto pm = ws.processMetrics(pmId);
+                    std::cout << "    instance pid=" << pmId.pid << "\t";
                     std::cout << "    " << pm.firstSampleTs() << " - " << pm.estimateLastSampleTs() << std::endl;
+		    if (vm.count("print-metadata")) {
+		        std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
+		    }
                 }
             }
         }
@@ -149,86 +174,65 @@ int main(int argc, char* argv[], char** envp) {
         }
     }
 
-    Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 4) / 10;
-    Date_t testRangeE = testRangeS + Seconds(86400);
-    //vm.emplace("resolutionMs", po::variable_value{1000, false});
-    //Date_t testRangeS =  tspan.first + ((tspan.last - tspan.first) * 1) / 10;
-    //Date_t testRangeE = tspan.last - ((tspan.last - tspan.first) * 2) / 10;
-    //vm.emplace("resolutionMs", po::variable_value{ (tspan.last.toMillisSinceEpoch() - tspan.first.toMillisSinceEpoch()) / 30, false);
-    //Date_t testRangeS =  tspan.first;
-    //Date_t testRangeE = tspan.last;
-    //vm.emplace("resolutionMs", po::variable_value{60000, false});
+    Date_t ts_limit_start =  tspan.first;
+    if (vm.count("ts-start")) {
+        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-start"].as<std::string>()); //pre-validated in init_cmdline_opts()
+	ts_limit_start = sWdt.getValue();
+    }
+    Date_t ts_limit_end = tspan.last;
+    if (vm.count("ts-end")) {
+        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-end"].as<std::string>()); //pre-validated in init_cmdline_opts()
+	ts_limit_end = sWdt.getValue();
+    }
 
     std::vector<std::string> ekl; //Extraction metric key list
     if (vm.count("metrics-filter")) {
         std::ifstream mif(vm["metrics-filter"].as<std::string>());
         if (!mif) {
             std::cerr << "Error: couldn't open --metrics-filter file " << vm["metrics-filter"].as<std::string>() << "\n";
-	    exit(1);
+            exit(1);
         }
-	std::string s;
-	while (std::getline(mif, s)) {
+        std::string s;
+        while (std::getline(mif, s)) {
             //if (s.trim() != "") {
                 ekl.push_back(s);
-	    //}
-	}
-	if (ekl.size() == 0) {
+            //}
+        }
+        if (ekl.size() == 0) {
             std::cerr << "The --metrics-filter file " << vm["metrics-filter"].as<std::string>() << " didn't have any lines in it. Exiting.\n";
-	    exit(1);
-	}
-        /*ekl = {
-            / *test: leaving "start" blank, should be forcefully added* /
-            "serverStatus.connections.current",
-            "serverStatus.connections.available",
-            "serverStatus.tcmalloc.tcmalloc.total_free_bytes",
-            "serverStatus.wiredTiger.cache.bytes read into cache",
-            "serverStatus.wiredTiger.cache.bytes written from cache",
-            "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", //gauge
-            "serverStatus.wiredTiger.cache.eviction state", //gauge
-            "serverStatus.wiredTiger.transaction.transaction checkpoint currently running", //boolean gauge
-            "serverStatus.wiredTiger.transaction.transaction checkpoint generation",
-            "serverStatus.repl.lastWrite.opTime.ts", 
-            "serverStatus.opLatencies.reads.latency",
-            "serverStatus.opLatencies.reads.ops",
-            "serverStatus.opLatencies.writes.latency",
-            "serverStatus.opLatencies.writes.ops",
-            "serverStatus.opcounters.command",
-            "serverStatus.opcounters.delete",
-            "serverStatus.opcounters.getmore",
-            "serverStatus.opcounters.insert",
-            "serverStatus.opcounters.query",
-            "serverStatus.opcounters.update",
-            "serverStatus.shardingStatistics.totalDonorChunkCloneTimeMillis",
-        };*/
+            exit(1);
+        }
     } else {
         auto ks =  ws.keys();
         ekl.assign(ks.begin(), ks.end());
     }
 
-    auto omc = vm.count("output-bson") + vm.count("output-csv") + vm.count("output-pandas-csv");
+    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
     if (omc) {
-        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl, {testRangeS, testRangeE}, vm["resolutionMs"].as<unsigned int>());
+        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
+			{ts_limit_start, ts_limit_end},
+			vm["resolution"].as<float>() * 1000/*ms*/);
     
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
         }
 
-        auto odirpath = vm["output-dir"].as<std::string>();
+        auto odirpath = vm["export-dir"].as<std::string>();
         for (auto& [pmId, ms] : fPmTs) {
             std::cout << "\n" << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
-            if (vm.count("output-bson")) {
+            if (vm.count("bson-timeseries")) {
                 auto b = ms.bsonMetrics();
                 fs::path bfpath(odirpath + "/ftdc_timeseries." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".bson");
                 std::ofstream bf(bfpath, std::ios::out);
-                bf << b; //TODO: this is dumping as a string format :( need to change to binary
-		//iov.iov_len = b->len; iov.iov_base = (void *)bson_get_data(b); mongoc_stream_writev (stream, &iov, 1, 0);
+                bf << b; //TODO: this is dumping as a string format :( supposed to be binary
+                //iov.iov_len = b->len; iov.iov_base = (void *)bson_get_data(b); mongoc_stream_writev (stream, &iov, 1, 0);
                 std::cout << "Created " << bfpath << ". Tip: you can view content with bsondump.\n";
                 //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
             }
-            if (vm.count("output-csv")) {
+            if (vm.count("csv-timeseries")) {
                 ms.writeCSV(odirpath, pmId);
             }
-            if (vm.count("output-pandas-csv")) {
+            if (vm.count("pandas-csv-timeseries")) {
                 ms.writePandasDataframeCSV(odirpath, pmId);
             }
     
