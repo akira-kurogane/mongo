@@ -138,7 +138,7 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
 
 void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
     fs::path csvfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
-    std::ofstream cf(csvfpath, std::ios::out);
+    std::ofstream cf(csvfpath.c_str());
 
     auto mPtr = metrics.begin();
     for (auto x : _kNT) {
@@ -196,7 +196,7 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
     auto b = bsonMetrics();
 
     invariant(_rowLength * _kNT.size() == metrics.size());
-    std::ofstream mpf(mpf_fpath, std::ios::out);
+    std::ofstream mpf(mpf_fpath.c_str());
     //TO DELETE std::vector<FTDCMSKeyNameType> ktv = keyNamesAndType(); //this is _kNT ... maybe I should have just referenced it directly
     for (size_t c = 0; c < _kNT.size(); ++c) {
         mpf << "\"" << _kNT[c].keyName << "\",";
@@ -207,7 +207,7 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
     }
     mpf << "\n";
 
-    std::ofstream cf(data_fpath, std::ios::out);
+    std::ofstream cf(data_fpath.c_str());
     for (size_t c = 0; c < _kNT.size(); ++c) {
         cf << "\"" << _kNT[c].keyName << "\",";
     }

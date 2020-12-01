@@ -225,7 +225,7 @@ int main(int argc, char* argv[], char** envp) {
             if (vm.count("bson-timeseries")) {
                 auto b = ms.bsonMetrics();
                 fs::path bfpath(odirpath + "/ftdc_timeseries." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".bson");
-                std::ofstream bf(bfpath, std::ios::out);
+                std::ofstream bf(bfpath.c_str());
                 bf << b; //TODO: this is dumping as a string format :( supposed to be binary
                 //iov.iov_len = b->len; iov.iov_base = (void *)bson_get_data(b); mongoc_stream_writev (stream, &iov, 1, 0);
                 std::cout << "Created " << bfpath << ". Tip: you can view content with bsondump.\n";
