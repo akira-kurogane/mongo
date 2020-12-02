@@ -1,5 +1,6 @@
 # -*- mode: python -*-
 Import("env")
+Import("get_option")
 
 env = env.Clone()
 
@@ -103,7 +104,7 @@ env.CppUnitTest(
 )
 
 env.Append(CXXFLAGS='-g')
-env.Program(
+ftdc_dump = env.Program(
     target='ftdc_dump',
     source=[
         'ftdc_process_metrics.cpp',
@@ -116,3 +117,10 @@ env.Program(
     ],
     CCFLAGS=['-std=c++17'],
 )
+
+hygienic = get_option('install-mode') == 'hygienic'
+
+if hygienic:
+    env.Default('$INSTALL_DIR/bin/ftdc_dump$PROGSUFFIX')
+else:
+    env.Default(env.Install('#/', ftdc_dump))
