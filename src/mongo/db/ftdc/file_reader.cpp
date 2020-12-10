@@ -303,7 +303,7 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
 	     * I'll suppress the message if it is for a "metrics.interim" file by itself.
              */
             if (_file.filename() != "metrics.interim" && 
-			    metadataDocDtId == Date_t::min() || dtId < metadataDocDtId) {
+			    (metadataDocDtId == Date_t::min() || dtId < metadataDocDtId)) {
                 std::cerr << "Skipping kMetricsChunk with date Id = " << dtId << " in file " << _file << " because " <<
                         "it is assumed to be interim data from previous, probably crashed, server process\n";
                 //TODO: put in a separate result object so it can poentially be matched to
