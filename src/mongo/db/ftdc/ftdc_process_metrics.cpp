@@ -1,3 +1,4 @@
+#include <pcrecpp.h>
 #include "mongo/db/ftdc/ftdc_process_metrics.h"
 #include "mongo/db/ftdc/file_reader.h"
 
@@ -250,6 +251,108 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
     }
 
     std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
+}
+
+//TODO: apply all the rules used in https://github.com/percona/mongodb_exporter/blob/v0.20.0/exporter/metrics.go
+std::string mongodb_exporter_rename(std::string s) {
+    pcrecpp::RE("^serverStatus").Replace("ss", &s);
+    pcrecpp::RE("[-. ]").GlobalReplace("_", &s);
+    return "mongodb_" + s;
+}
+
+void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+    fs::path jfpath(dirfp.string() + "/ftdc_for_vm_import." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".jsonlines");
+    std::ofstream jf(jfpath.c_str());
+
+    auto b = bsonMetrics();
+
+    invariant(_rowLength * _kNT.size() == metrics.size());
+
+    std::vector<std::uint64_t> start_ts_v(&metrics[keyRow("start") * _rowLength],
+		                          &metrics[(keyRow("start") + 1) * _rowLength]);
+    invariant(start_ts_v.size());
+
+    auto rs_ptr = metrics.begin(); //Row start pointer
+    std::string oth_labels = ",\"job\":\"mongodb\",\"instance\":\"" + pmId.hostport + "\""; //TODO add other labels such as rsname
+    for (auto x : _kNT) {
+        if (x.keyName != "start") { //we don't output the "start" timestamp as its own timeserie
+
+        jf << "{\"metric\":{\"__name__\":\"" << mongodb_exporter_rename(x.keyName) << "\"" << oth_labels << "}";
+
+        std::stringstream vals_ss;
+	vals_ss << "[";
+        std::stringstream ts_ss;
+	ts_ss << "[";
+
+        switch (x.bsonType) {
+            case NumberDouble:
+            case NumberInt:
+            case NumberLong:
+                for (size_t i = 0; i < _rowLength; ++i) {
+		   if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
+                       ts_ss << start_ts_v[i] << ",";
+                       vals_ss << std::to_string(static_cast<long long int>(rs_ptr[i])) << ",";
+		   }
+                }
+                break;
+
+            case Bool:
+                for (size_t i = 0; i < _rowLength; ++i) {
+		   if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
+                       ts_ss << start_ts_v[i] << ",";
+                       bool x = rs_ptr[i];
+                       vals_ss << (x ? "true" : "false") << ","; //TODO confirm if this is the right datatype representation for VM
+		   }
+                }
+                break;
+
+            case Date:
+                for (size_t i = 0; i < _rowLength; ++i) {
+		   if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
+                       ts_ss << start_ts_v[i] << ",";
+                       vals_ss << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(rs_ptr[i]))) << ","; //TODO change to VM datatype
+		   }
+                }
+                break;
+
+            case bsonTimestamp: {
+                for (size_t i = 0; i < _rowLength; ++i) {
+		   if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
+                       ts_ss << start_ts_v[i] << ",";
+                       //TODO: maybe Date_t::fromSecondsSinceEpoch(*rs_ptr++) is better. I.e. make it the same as for Date as this is CSV and BSON format won't be reconstructured from it
+                       vals_ss << std::to_string(static_cast<long long int>(rs_ptr[i])) << ","; //TODO change to VM datatype
+		   }
+                }
+                break;
+            }
+
+            case Undefined:
+                //do no output
+                break;
+
+            default:
+                MONGO_UNREACHABLE;
+                break;
+        }
+
+	if (ts_ss.str().size() > 0) {
+	    vals_ss.seekp(-1, vals_ss.cur); //overwrite last "," with array end "]";
+	    vals_ss << "]";
+	    ts_ss.seekp(-1, ts_ss.cur); //overwrite last "," with array end "]";
+	    ts_ss << "]";
+            jf << ",\"values\":"     << vals_ss.str();
+	    jf << ",\"timestamps\":" << ts_ss.str();
+	}
+else { std::cerr << "DEBUG: " << x.keyName << " had no non-null metrics\n"; }
+
+        jf << "}\n";
+
+	} //if-not-"start"-key
+
+        rs_ptr += _rowLength;
+    }
+
+    std::cout << "Created " << jfpath << " Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
 }
 
 std::string FTDCProcessMetrics::rsName() const {

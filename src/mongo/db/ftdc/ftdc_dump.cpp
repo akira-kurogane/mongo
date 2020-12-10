@@ -40,6 +40,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         ("bson-timeseries", "Export timeseries as BSON file(s)")
         ("csv-timeseries", "Export timeseries as CSV file(s)")
         ("pandas-csv-timeseries", "Export timeseries as Pandas dataframe CSV format. A *.mapping.csv file is also saved alongside each data csv file.")
+        ("vm-jsonlines-timeseries", "Export jsonlines file(s) that can be imported into VictoriaMetrics using the /api/v1/import endpoint.")
         ("resolution", po::value<float>()->default_value(1), "Resolution in seconds for timeseries output methods.")
         ;
 
@@ -209,7 +210,8 @@ int main(int argc, char* argv[], char** envp) {
         ekl.assign(ks.begin(), ks.end());
     }
 
-    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
+    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") +
+	       vm.count("pandas-csv-timeseries") + vm.count("vm-jsonlines-timeseries");
     if (omc) {
         std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
 			{ts_limit_start, ts_limit_end},
@@ -236,6 +238,9 @@ int main(int argc, char* argv[], char** envp) {
             }
             if (vm.count("pandas-csv-timeseries")) {
                 ms.writePandasDataframeCSV(odirpath, pmId);
+            }
+            if (vm.count("vm-jsonlines-timeseries")) {
+                ms.writeVMJsonLines(odirpath, pmId);
             }
     
         }

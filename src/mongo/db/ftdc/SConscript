@@ -114,6 +114,7 @@ ftdc_dump = env.Program(
     LIBDEPS=[
         'ftdc',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+        '$BUILD_DIR/third_party/shim_pcrecpp',
     ],
     CCFLAGS=['-std=c++17'],
 )

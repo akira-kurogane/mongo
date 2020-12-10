@@ -113,6 +113,23 @@ std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
      */
     void writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
 
+
+    /**
+     * Write all metrics to a jsonlines file suitable for VictorMetric's
+     * /api/v1/import endpoint.
+     * (Each metric will be one line only; The multiline format is just for this
+     * comment.)
+     * {"metric":
+     *   {"__name__":"mongodb_ss_A_a","job":"mongodb","instance":"hostA:27018"},
+     *   values":[1,1,2,...,n'th value],
+     *   "timestamps":[1549891472010,1549891487724,1549891503438,...,n'th-epochms-timestamp]
+     * }
+     * {"metric":
+     *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018"},
+     *   ....
+     */
+    void writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId);
+
 //std::vector<std::uint64_t> metricsX(size_t i) {
 //  std::vector<std::uint64_t> r;
 //  r.reserve(_rowLength);
