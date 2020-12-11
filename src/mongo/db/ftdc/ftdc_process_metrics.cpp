@@ -398,8 +398,6 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
     fs::path jfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".victoriametrics.jsonlines");
     std::ofstream jf(jfpath.c_str());
 
-    auto b = bsonMetrics();
-
     invariant(_rowLength * _kNT.size() == metrics.size());
 
     auto start_ts_v = metricsRow("start");
