@@ -72,7 +72,7 @@ public:
         return r;
     }
 
-std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
+    std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
     size_t keyRow(std::string k) { return _keyRows[k]; }
 
     BSONType bsonType(std::string k) { return _kNT[_keyRows[k]].bsonType; }
@@ -120,22 +120,32 @@ std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
      * (Each metric will be one line only; The multiline format is just for this
      * comment.)
      * {"metric":
-     *   {"__name__":"mongodb_ss_A_a","job":"mongodb","instance":"hostA:27018"},
+     *   {"__name__":"mongodb_ss_A_a","job":"mongodb","instance":"hostA:27018",
+     *    "cl_role":"xxx","cl_id":"...","rs_nm":"rs1","rs_state":"1"},
      *   values":[1,1,2,...,n'th value],
      *   "timestamps":[1549891472010,1549891487724,1549891503438,...,n'th-epochms-timestamp]
      * }
      * {"metric":
-     *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018"},
-     *   ....
+     *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018",
+     *   .... } }
      */
-    void writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId);
+    void writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId,
+		    std::map<std::string, std::string> topologyLabels);
 
-//std::vector<std::uint64_t> metricsX(size_t i) {
-//  std::vector<std::uint64_t> r;
-//  r.reserve(_rowLength);
-//  r = std::vector<std::uint64_t>(metrics.begin() + cellOffset(i, 0), metrics.begin() + cellOffset(i + 1, 0));
-//  return r;
-//}
+    /**
+     * Return a copy of one row of the metrics in a vector of base uint64_t type
+     */
+    std::vector<std::uint64_t> metricsRow(size_t i) {
+      std::vector<std::uint64_t> r;
+      r.reserve(_rowLength);
+      r = std::vector<std::uint64_t>(metrics.begin() + cellOffset(i, 0),
+		                     metrics.begin() + cellOffset(i + 1, 0));
+      return r;
+    }
+    std::vector<std::uint64_t> metricsRow(std::string keyName) {
+      return metricsRow(keyRow(keyName));
+    }
+
     size_t cellOffset(size_t row, size_t col) { return row * _rowLength + col; }
 
 private:
@@ -197,6 +207,7 @@ struct FTDCProcessMetrics {
     //TODO: FTDCFileSpan salvageChunkFilespan;
 
     std::string rsName() const;
+    std::string clusterRole() const;
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
     std::map<std::string, BSONType> lastRefDocKeys();
@@ -213,6 +224,25 @@ struct FTDCProcessMetrics {
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
                 FTDCPMTimespan tspan, uint32_t sampleResolution);
+
+    /**
+     * This produces a map that has the same keys, one exception aside, that
+     * topologyInfo.baseLabels() in exporter/topology_info.go does.
+     *
+     * The cluster id can not be determined from FTDC metrics files.
+     *
+     * Exception to mongodb_exporter rules: "rs_state" (eg. "1" (primary),
+     * "2" (secondary), etc.) is left unset because it is not constant for
+     * the span of the mongod process.
+     */
+    std::map<std::string, std::string> topologyLabels() const {
+       std::map<std::string, std::string> m;
+       m["cl_role"] = clusterRole();
+       m["cl_id"] = "";
+       m["rs_nm"] = rsName();
+       //m["rs_state"] = "";
+       return m;
+    }
 
     //temporary debugging use
     friend std::ostream& operator<<(std::ostream& os, FTDCProcessMetrics& pm);

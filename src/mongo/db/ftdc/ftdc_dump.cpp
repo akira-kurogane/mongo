@@ -98,10 +98,10 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         auto ts_end_str   = vm["ts-end"].as<std::string>();
         StatusWith<Date_t> sWdts = dateFromISOString(ts_start_str);
         StatusWith<Date_t> sWdte = dateFromISOString(ts_end_str);
-	if (sWdts.getValue() >= sWdte.getValue()) {
+        if (sWdts.getValue() >= sWdte.getValue()) {
             std::cerr << "Error: --ts-end option value " << ts_end_str << " is earlier or equal to the --ts-start option value " << ts_start_str << ". Exiting.\n";
-	    exit(1);
-	}
+            exit(1);
+        }
     }
 
     auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
@@ -148,7 +148,7 @@ int main(int argc, char* argv[], char** envp) {
 
     if (vm["print-topology"].as<bool>() || vm.count("print-metadata")) {
         std::cout << "Samples between " << dateToISOStringUTC(tspan.first) <<
-		" - " << dateToISOStringUTC(tspan.last) << std::endl;
+                " - " << dateToISOStringUTC(tspan.last) << std::endl;
             
         auto tp = ws.topology();
         for (auto const& [rsnm, hpvals] : tp) {
@@ -159,10 +159,10 @@ int main(int argc, char* argv[], char** envp) {
                     auto pm = ws.processMetrics(pmId);
                     std::cout << "    instance pid=" << pmId.pid << "\t";
                     std::cout << "    " << dateToISOStringUTC(pm.firstSampleTs()) <<
-			    " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
-		    if (vm.count("print-metadata")) {
-		        std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
-		    }
+                            " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
+                    if (vm.count("print-metadata")) {
+                        std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
+                    }
                 }
             }
         }
@@ -180,12 +180,12 @@ int main(int argc, char* argv[], char** envp) {
     Date_t ts_limit_start =  tspan.first;
     if (vm.count("ts-start")) {
         StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-start"].as<std::string>()); //pre-validated in init_cmdline_opts()
-	ts_limit_start = sWdt.getValue();
+        ts_limit_start = sWdt.getValue();
     }
     Date_t ts_limit_end = tspan.last;
     if (vm.count("ts-end")) {
         StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-end"].as<std::string>()); //pre-validated in init_cmdline_opts()
-	ts_limit_end = sWdt.getValue();
+        ts_limit_end = sWdt.getValue();
     }
 
     std::vector<std::string> ekl; //Extraction metric key list
@@ -211,11 +211,11 @@ int main(int argc, char* argv[], char** envp) {
     }
 
     auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") +
-	       vm.count("pandas-csv-timeseries") + vm.count("vm-jsonlines-timeseries");
+               vm.count("pandas-csv-timeseries") + vm.count("vm-jsonlines-timeseries");
     if (omc) {
         std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
-			{ts_limit_start, ts_limit_end},
-			vm["resolution"].as<float>() * 1000/*ms*/);
+                        {ts_limit_start, ts_limit_end},
+                        vm["resolution"].as<float>() * 1000/*ms*/);
     
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
@@ -240,7 +240,9 @@ int main(int argc, char* argv[], char** envp) {
                 ms.writePandasDataframeCSV(odirpath, pmId);
             }
             if (vm.count("vm-jsonlines-timeseries")) {
-                ms.writeVMJsonLines(odirpath, pmId);
+                auto tpl_lbls = ws.processMetrics(pmId).topologyLabels();
+                //TODO: optionally fill tpl_lbls["cl_id"] if user provides one?
+                ms.writeVMJsonLines(odirpath, pmId, tpl_lbls);
             }
     
         }
