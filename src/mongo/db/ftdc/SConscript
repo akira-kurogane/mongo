@@ -107,6 +107,7 @@ env.Append(CXXFLAGS='-g')
 ftdc_dump = env.Program(
     target='ftdc_dump',
     source=[
+        'prometheus_renaming.cpp',
         'ftdc_process_metrics.cpp',
         'ftdc_workspace.cpp',
         'ftdc_dump.cpp',

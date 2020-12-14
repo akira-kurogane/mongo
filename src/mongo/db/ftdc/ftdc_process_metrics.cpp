@@ -1,6 +1,7 @@
 #include <pcrecpp.h>
 #include "mongo/db/ftdc/ftdc_process_metrics.h"
 #include "mongo/db/ftdc/file_reader.h"
+#include "mongo/db/ftdc/prometheus_renaming.h"
 
 #include "mongo/db/bson/dotted_path_support.h"
 
@@ -253,152 +254,18 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
     std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
 }
 
-/**
- * This function replicates the metric renaming done in the
- * prometheusize() function in exporter/metrics.go in the
- * "v0.20.0" branch of https://github.com/percona/mongodb_exporter/
- *
- * Eg. "serverStatus.connections.current" ->
- *       "mongodb_ss_connections_current"
- *     "replSetGetStatus.members.1.opTime" ->
- *       "mongodb_rs_members_1_opTime"
- *
- * Note that it only rewrites the metric name, and some metrics have 
- * further processing that remove a part and replace it with a label.
- * Eg. mongodb_rs_members_1_opTime ->
- *       mongodb_rs_members_opTime{rs_mbr="hostA:portY"}
- *     mongodb_ss_opLatencies_ops ->
- *       xx
- *
- * The golang code being referenced as of Dec 2019 is below:
- * -----
- * prefixes = [][]string{
- *              {"serverStatus.wiredTiger.transaction", "ss_wt_txn"},
- *              {"serverStatus.wiredTiger", "ss_wt"},
- *              {"serverStatus", "ss"},
- *              {"replSetGetStatus", "rs"},
- *              {"systemMetrics", "sys"},
- *              {"local.oplog.rs.stats.wiredTiger", "oplog_stats_wt"},
- *              {"local.oplog.rs.stats", "oplog_stats"},
- *              {"collstats_storage.wiredTiger", "collstats_storage_wt"},
- *              {"collstats_storage.indexDetails", "collstats_storage_idx"},
- *              {"collStats.storageStats", "collstats_storage"},
- *              {"collStats.latencyStats", "collstats_latency"},
- *      }
- *      ...
- *      ...
- *      // Regular expressions used to make the metric name Prometheus-compatible
- *      // This variables are global to compile the regexps only once.
- *      specialCharsRe        = regexp.MustCompile(`[^a-zA-Z0-9_]+`)
- *      repeatedUnderscoresRe = regexp.MustCompile(`__+`)
- *      dollarRe              = regexp.MustCompile(`\_$`)
- */
-std::string prometheusize(std::string s) {
-
-    pcrecpp::RE("^serverStatus.wiredTiger.transaction").Replace("ss_wt_txn", &s);
-    pcrecpp::RE("^serverStatus.wiredTiger").Replace("ss_wt", &s);
-    pcrecpp::RE("^serverStatus").Replace("ss", &s);
-    pcrecpp::RE("^replSetGetStatus").Replace("rs", &s);
-    pcrecpp::RE("^systemMetrics").Replace("sys", &s);
-    pcrecpp::RE("^local.oplog.rs.stats.wiredTiger").Replace("oplog_stats_wt", &s);
-    pcrecpp::RE("^local.oplog.rs.stats").Replace("oplog_stats", &s);
-    pcrecpp::RE("^collstats_storage.wiredTiger").Replace("collstats_storage_wt", &s);
-    pcrecpp::RE("^collstats_storage.indexDetails").Replace("collstats_storage_idx", &s);
-    pcrecpp::RE("^collStats.storageStats").Replace("collstats_storage", &s);
-    pcrecpp::RE("^collStats.latencyStats").Replace("collstats_latency", &s);
-
-    pcrecpp::RE("[^a-zA-Z0-9_]+").GlobalReplace("_", &s);
-    pcrecpp::RE("__+").GlobalReplace("_", &s);
-    pcrecpp::RE("\\_$").GlobalReplace("", &s);
-
-    return "mongodb_" + s;
-}
-
-/**
- * Change some metrics by removing substrings of the name and assinging in extra labels
- * This meets the requirement of https://jira.percona.com/browse/PMM-6506,
- * which is achieved with the function specialConversions() in exporter/metrics.go
- *
- *         nodeToPDMetrics = map[string]string{
- *              "collStats.storageStats.indexDetails.":            "index_name",
- *              "globalLock.activeQueue.":                         "count_type",
- *              "globalLock.locks.":                               "lock_type",
- *              "serverStatus.asserts.":                           "assert_type",
- *              "serverStatus.connections.":                       "conn_type",
- *              "serverStatus.globalLock.currentQueue.":           "count_type",
- *              "serverStatus.metrics.commands.":                  "cmd_name",
- *              "serverStatus.metrics.cursor.open.":               "csr_type",
- *              "serverStatus.metrics.document.":                  "doc_op_type",
- *              "serverStatus.opLatencies.":                       "op_type",
- *              "serverStatus.opReadConcernCounters.":             "concern_type",
- *              "serverStatus.opcounters.":                        "legacy_op_type",
- *              "serverStatus.opcountersRepl.":                    "legacy_op_type",
- *              "serverStatus.transactions.commitTypes.":          "commit_type",
- *              "serverStatus.wiredTiger.concurrentTransactions.": "txn_rw_type",
- *              "serverStatus.wiredTiger.perf.":                   "perf_bucket",
- *              "systemMetrics.disks.":                            "device_name",
- *      }
- * Extra-fiddly ones that labelize a node not at the lowest level.
- * mongodb_ss_opLatencies_(commands|writes|reads)_(ops|latency){...}
- * mongodb_ss_opLatencies_\2{...,"op_type":"\1"}
- *
- * mongodb_ss_wt_concurrentTransactions_(available|out|totalTickets){...}
- * mongodb_ss_wt_concurrentTransactions{...,"txn_rw":"\1"}
- */
-
-pcrecpp::RE oplatencies_re("^(mongodb_ss_opLatencies)_(commands|writes|reads)_(ops|latency)");
-pcrecpp::RE wt_conctx_re("^(mongodb_ss_wt_concurrentTransactions)_(available|out|totalTickets)");
-
-std::vector<std::tuple<pcrecpp::RE, std::string>> last_node_relabels = {
-    {pcrecpp::RE("^(mongodb_collstats_storage_idx)_(.+)"),         "index_name"}, 
-    {pcrecpp::RE("^(mongodb_globalLock_activeQueue)_(.+)"),        "count_type"},
-    {pcrecpp::RE("^(mongodb_globalLock_locks)_(.+)"),              "lock_type"},
-    {pcrecpp::RE("^(mongodb_ss_asserts)_(.+)"),                    "assert_type"},
-    {pcrecpp::RE("^(mongodb_ss_connections)_(.+)"),                "conn_type"},
-    {pcrecpp::RE("^(mongodb_ss_globalLock_currentQueue)_(.+)"),    "count_type"},
-    {pcrecpp::RE("^(mongodb_ss_metrics_commands)_(.+)"),           "cmd_name"},
-    {pcrecpp::RE("^(mongodb_ss_metrics_cursor_open)_(.+)"),        "csr_type"},
-    {pcrecpp::RE("^(mongodb_ss_metrics_document)_(.+)"),           "doc_op_type"},
-    {pcrecpp::RE("^(mongodb_ss_opReadConcernCounters)_(.+)"),      "concern_type"},
-    {pcrecpp::RE("^(mongodb_ss_opcounters)_(.+)"),                 "legacy_op_type"},
-    {pcrecpp::RE("^(mongodb_ss_opcountersRepl)_(.+)"),             "legacy_op_type"},
-    {pcrecpp::RE("^(mongodb_ss_transactions_commitTypes)_(.+)"),   "commit_type"},
-    {pcrecpp::RE("^(mongodb_ss_wt_perf)_(.+)"),                    "perf_bucket"},
-    {pcrecpp::RE("^(mongodb_sys_disks)_(.+)"),                     "device_name"}
-};
-
-std::tuple<std::string, std::map<std::string, std::string>> specialLabels(std::string m_name) {
-    std::map<std::string, std::string> l;
-    std::string n = m_name;
-    std::string ms1, ms2, ms3;
-
-    if (oplatencies_re.FullMatch(n, &ms1, &ms2, &ms3)) {
-        n = ms1 + "_" + ms3;
-        l["op_type"] = ms2;
-    }
-    if (wt_conctx_re.FullMatch(n, &ms1, &ms2)) {
-        n = ms1;
-        l["txn_rw"] = ms2;
-    }
-
-    for (auto regnl : last_node_relabels) {
-        auto [ re, nl ] = regnl;
-        if (re.FullMatch(n, &ms1, &ms2)) {
-            n = ms1;
-            l[nl] = ms2;
-            continue;
-        }
-    }
-
-    return {n, l};
-}
-
 void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 FTDCProcessId pmId, std::map<std::string, std::string> topologyLabels) {
     fs::path jfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".victoriametrics.jsonlines");
     std::ofstream jf(jfpath.c_str());
 
     invariant(_rowLength * _kNT.size() == metrics.size());
+
+    std::set<std::string> mdc_keys_set;
+    for (auto x : _kNT) {
+        mdc_keys_set.insert(x.keyName);
+    }
+    auto pnl = prometheusRenamesMap(mdc_keys_set);
 
     auto start_ts_v = metricsRow("start");
     invariant(start_ts_v.size());
@@ -417,8 +284,7 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
     for (auto x : _kNT) {
         if (x.keyName != "start") { //we don't output the "start" timestamp as its own timeseries
 
-            auto prom_m_name = prometheusize(x.keyName);
-            auto [ m_name, xl ] = specialLabels(prom_m_name);
+            auto [ m_name, xl ] = pnl[x.keyName];
             jf << "{\"metric\":{\"__name__\":\"" << m_name << "\"" <<
                     pm_constant_lbls << ",\"rs_state\":\"" << rs_state << "\"";
             for (auto [ k, v ] : xl) { //Add extra labels if this metric has them
@@ -427,47 +293,39 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
             jf << "}";
 
             std::stringstream vals_ss;
-            vals_ss << "[";
             std::stringstream ts_ss;
-            ts_ss << "[";
 
             switch (x.bsonType) {
                 case NumberDouble:
                 case NumberInt:
                 case NumberLong:
-                    for (size_t i = 0; i < _rowLength; ++i) {
-                       if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
-                           ts_ss << start_ts_v[i] << ",";
-                           vals_ss << std::to_string(static_cast<long long int>(rs_ptr[i])) << ",";
-                       }
-                    }
-                    break;
-
                 case Bool:
                     for (size_t i = 0; i < _rowLength; ++i) {
                        if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
                            ts_ss << start_ts_v[i] << ",";
-                           bool x = rs_ptr[i];
-                           vals_ss << (x ? "true" : "false") << ","; //TODO confirm if this is the right datatype representation for VM
+                           vals_ss << rs_ptr[i] << ",";
                        }
                     }
                     break;
 
+                //TODO: determine if we import as milliseconds or seconds in mongodb_exporter, apply the same here
                 case Date:
                     for (size_t i = 0; i < _rowLength; ++i) {
                        if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
                            ts_ss << start_ts_v[i] << ",";
-                           vals_ss << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(rs_ptr[i]))) << ","; //TODO change to VM datatype
+                           vals_ss << rs_ptr[i] << ","; //TODO change to VM datatype
                        }
                     }
                     break;
 
+                //TODO: determine if we import as milliseconds or seconds in mongodb_exporter, apply the same here
+                //This value will be the .t component of the timestamp only. The .i member is not inside this
+                //uint64_t value. The .t component is epoch secs not ms.
                 case bsonTimestamp: {
                     for (size_t i = 0; i < _rowLength; ++i) {
                        if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
                            ts_ss << start_ts_v[i] << ",";
-                           //TODO: maybe Date_t::fromSecondsSinceEpoch(*rs_ptr++) is better. I.e. make it the same as for Date as this is CSV and BSON format won't be reconstructured from it
-                           vals_ss << std::to_string(static_cast<long long int>(rs_ptr[i])) << ","; //TODO change to VM datatype
+                           vals_ss << rs_ptr[i] << ","; //TODO change to VM datatype
                        }
                     }
                     break;
@@ -487,10 +345,10 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 vals_ss << "]";
                 ts_ss.seekp(-1, ts_ss.cur); //overwrite last "," with array end "]";
                 ts_ss << "]";
-                jf << ",\"values\":"     << vals_ss.str();
-                jf << ",\"timestamps\":" << ts_ss.str();
+                jf << ",\"values\":["     << vals_ss.str();
+                jf << ",\"timestamps\":[" << ts_ss.str();
             }
-else { std::cerr << "DEBUG: " << x.keyName << " had only null values in its timeseries metrics in this sample period.\n"; }
+//else { std::cerr << "DEBUG: the timeseries for metric " << x.keyName << " had only null values in this sample period.\n"; }
 
             jf << "}\n";
 
