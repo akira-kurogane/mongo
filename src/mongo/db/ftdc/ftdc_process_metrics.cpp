@@ -285,12 +285,13 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
         if (x.keyName != "start") { //we don't output the "start" timestamp as its own timeseries
 
             auto [ m_name, xl ] = pnl[x.keyName];
-            jf << "{\"metric\":{\"__name__\":\"" << m_name << "\"" <<
-                    pm_constant_lbls << ",\"rs_state\":\"" << rs_state << "\"";
+
+            std::string mdos = "{\"__name__\":\"" + m_name + "\"" +
+                    pm_constant_lbls + ",\"rs_state\":\"" + std::to_string(rs_state) + "\"";
             for (auto [ k, v ] : xl) { //Add extra labels if this metric has them
-                jf << ",\"" << k << "\":\"" << v << "\"";
+                mdos += ",\"" + k + "\":\"" + v + "\"";
             }
-            jf << "}";
+            mdos += "}";
 
             std::stringstream vals_ss;
             std::stringstream ts_ss;
@@ -345,12 +346,10 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 vals_ss << "]";
                 ts_ss.seekp(-1, ts_ss.cur); //overwrite last "," with array end "]";
                 ts_ss << "]";
-                jf << ",\"values\":["     << vals_ss.str();
-                jf << ",\"timestamps\":[" << ts_ss.str();
+                jf << "{\"metric\":" << mdos << ",\"values\":[" << vals_ss.str() << ",\"timestamps\":[" << ts_ss.str() << "}\n";
             }
 //else { std::cerr << "DEBUG: the timeseries for metric " << x.keyName << " had only null values in this sample period.\n"; }
 
-            jf << "}\n";
 
         } //End: if (x.keyName != "start")
 
