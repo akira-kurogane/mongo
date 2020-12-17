@@ -301,6 +301,8 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 case NumberInt:
                 case NumberLong:
                 case Bool:
+                case Date:
+                case bsonTimestamp:
                     for (size_t i = 0; i < _rowLength; ++i) {
                        if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
                            ts_ss << start_ts_v[i] << ",";
@@ -309,28 +311,11 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                     }
                     break;
 
-                //TODO: determine if we import as milliseconds or seconds in mongodb_exporter, apply the same here
-                case Date:
-                    for (size_t i = 0; i < _rowLength; ++i) {
-                       if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
-                           ts_ss << start_ts_v[i] << ",";
-                           vals_ss << rs_ptr[i] << ","; //TODO change to VM datatype
-                       }
-                    }
-                    break;
-
-                //TODO: determine if we import as milliseconds or seconds in mongodb_exporter, apply the same here
-                //This value will be the .t component of the timestamp only. The .i member is not inside this
-                //uint64_t value. The .t component is epoch secs not ms.
-                case bsonTimestamp: {
-                    for (size_t i = 0; i < _rowLength; ++i) {
-                       if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
-                           ts_ss << start_ts_v[i] << ",";
-                           vals_ss << rs_ptr[i] << ","; //TODO change to VM datatype
-                       }
-                    }
-                    break;
-                }
+                //Devnote: there will be a inconsistency between the units of Date and bsonTimestamp.
+                //I decided it to leave it as-is to be consistent with the source.
+                //The metric row for a bsonTimestamp being iterated here will be the .t component of
+                //the timestamp only. The .i member is not inside this uint64_t value.
+                //The .t component is epoch seconds, not milliseconds like the Date value representations.
 
                 case Undefined:
                     //do no output
