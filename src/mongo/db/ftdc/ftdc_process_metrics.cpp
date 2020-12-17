@@ -144,7 +144,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
 
     auto mPtr = metrics.begin();
     for (auto x : _kNT) {
-        cf << "\"" << x.keyName;
+        cf << "\"" << x.keyName << "\"";
         switch (x.bsonType) {
             case NumberDouble:
             case NumberInt:
@@ -163,7 +163,7 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
 
             case Date:
                 for (size_t i = 0; i < _rowLength; ++i) {
-                   cf << ",\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++)));
+                   cf << ",\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(*mPtr++))) << "\"";
                 }
                 break;
 
@@ -272,22 +272,57 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
     auto rs_state_v = metricsRow("replSetGetStatus.myState");
     invariant(rs_state_v.size());
 
-    auto rs_ptr = metrics.begin(); //Row start pointer
     std::string pm_constant_lbls = ",\"job\":\"mongodb\",\"instance\":\"" + pmId.hostport + "\"";
     for (auto [k, v] : topologyLabels) {
         pm_constant_lbls += ",\"" + k + "\":\"" + v + "\"";
     }
 
-    //TODO: iterate by ranges of constant rs_state
-    //std::vector<std::tuple<size_t, size_t>>
-    uint64_t rs_state = 1;
+    /**
+     * Build a vector of timespans ranges, defined by starting and end(+1) i'th indexes in
+     * current metrics subset, while a replSetGetStatus.myState is constant.
+     * Eg. a replication-using node that starts will have null for say a few seconds to a minute
+     * depending on how long oplog etc. checks take. Then it will be 2 soon. It may become 1 
+     * later.
+     * {
+     *   { null, 0,   45 }, //a slow startup time with 45s before replication is initialized
+     *   { 2,   45, 3172 }, //secondary state
+     *   { 1, 3172, 9009 }  //became primary and stayed that way for most of two hours
+     *   { 2, 9009, 9999 }  //became secondary again. This is the end of this example.
+     * }
+     * Going to the trouble of doing this because the "rs_state" prometheus label applies to
+     * the entire jsonline. I.e. we have to make four lines in the case above for every metric
+     */
+    struct rs_state_range {
+        uint64_t rs_state;
+        size_t start;
+        size_t end;
+    };
+    std::vector<rs_state_range> rs_st_ranges;
+    for (size_t i = 0; i < _rowLength; ++i) {
+       if (start_ts_v[i] != 7777777777) {
+           if (!rs_st_ranges.size() || rs_st_ranges[rs_st_ranges.size() - 1].rs_state != rs_state_v[i]) {
+               rs_st_ranges.push_back({rs_state_v[i], i, i + 1});
+           } else {
+               rs_st_ranges[rs_st_ranges.size() - 1].end = i + 1;
+           }
+       }
+    }
+//for (auto xx : rs_st_ranges) {
+//std::cout << "rs_state=" << xx.rs_state << " " << xx.start << " - " << xx.end << "\n";
+//}
+
+    for (auto rs_st_rg : rs_st_ranges) {
+
+    auto rs_ptr = metrics.begin(); //Row start pointer
+
     for (auto x : _kNT) {
         if (x.keyName != "start") { //we don't output the "start" timestamp as its own timeseries
 
             auto [ m_name, xl ] = pnl[x.keyName];
 
+            auto rs_st_str = rs_st_rg.rs_state == 7777777777 ? "" : std::to_string(rs_st_rg.rs_state);
             std::string mdos = "{\"__name__\":\"" + m_name + "\"" +
-                    pm_constant_lbls + ",\"rs_state\":\"" + std::to_string(rs_state) + "\"";
+                    pm_constant_lbls + ",\"rs_state\":\"" + rs_st_str + "\"";
             for (auto [ k, v ] : xl) { //Add extra labels if this metric has them
                 mdos += ",\"" + k + "\":\"" + v + "\"";
             }
@@ -303,7 +338,7 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 case Bool:
                 case Date:
                 case bsonTimestamp:
-                    for (size_t i = 0; i < _rowLength; ++i) {
+                    for (size_t i = rs_st_rg.start; i < rs_st_rg.end; ++i) {
                        if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
                            ts_ss << start_ts_v[i] << ",";
                            vals_ss << rs_ptr[i] << ",";
@@ -340,6 +375,8 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
 
         rs_ptr += _rowLength;
     }
+
+    } //end for (auto rs_st_rg : rs_st_ranges)
 
     std::cout << "Created " << jfpath << " Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
 }
