@@ -269,6 +269,8 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
 
     auto start_ts_v = metricsRow("start");
     invariant(start_ts_v.size());
+    auto end_ts_v = metricsRow("end");
+    invariant(end_ts_v.size() == start_ts_v.size());
     auto rs_state_v = metricsRow("replSetGetStatus.myState");
     invariant(rs_state_v.size());
 
@@ -299,7 +301,7 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
     };
     std::vector<rs_state_range> rs_st_ranges;
     for (size_t i = 0; i < _rowLength; ++i) {
-       if (start_ts_v[i] != 7777777777) {
+       if (end_ts_v[i] != 7777777777) { //if "end" value is null, all values except "start" ts will surely be null too
            if (!rs_st_ranges.size() || rs_st_ranges[rs_st_ranges.size() - 1].rs_state != rs_state_v[i]) {
                rs_st_ranges.push_back({rs_state_v[i], i, i + 1});
            } else {
@@ -320,13 +322,7 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
 
             auto [ m_name, xl ] = pnl[x.keyName];
 
-            auto rs_st_str = rs_st_rg.rs_state == 7777777777 ? "" : std::to_string(rs_st_rg.rs_state);
-            std::string mdos = "{\"__name__\":\"" + m_name + "\"" +
-                    pm_constant_lbls + ",\"rs_state\":\"" + rs_st_str + "\"";
-            for (auto [ k, v ] : xl) { //Add extra labels if this metric has them
-                mdos += ",\"" + k + "\":\"" + v + "\"";
-            }
-            mdos += "}";
+            auto nonulls_start_i = rs_st_rg.start;
 
             std::stringstream vals_ss;
             std::stringstream ts_ss;
@@ -338,11 +334,26 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 case Bool:
                 case Date:
                 case bsonTimestamp:
-                    for (size_t i = rs_st_rg.start; i < rs_st_rg.end; ++i) {
-                       if (start_ts_v[i] != 7777777777 && rs_ptr[i] != 7777777777) {
-                           ts_ss << start_ts_v[i] << ",";
-                           vals_ss << rs_ptr[i] << ",";
-                       }
+                    //A metric may not exist at the beginning of a process' timespan,
+                    //but once it is set it stays set until the end of the process' metrics.
+                    //So we scan past any contiguous null series at the start
+                    while (rs_ptr[nonulls_start_i] == 7777777777 && nonulls_start_i < rs_st_rg.end) {
+                        ++nonulls_start_i;
+                    }
+                    for (size_t i = nonulls_start_i; i < rs_st_rg.end; ++i) {
+                        //end_ts is being used to detect the samples line that are all null (except
+                        //start ts field which will be forced-filled in FTDCFileReader::extractTimeseries())
+                        if (end_ts_v[i] != 7777777777) {
+// Disabled De-dup logic      bool skip = false;
+// Disabled De-dup logic      if (i > nonulls_start_i && i < (rs_st_rg.end - 1)) {
+// Disabled De-dup logic          skip = (rs_ptr[i] == rs_ptr[i - 1]) && (rs_ptr[i] == rs_ptr[i + 1]);
+// Disabled De-dup logic      }
+////skip = false; //DEBUG
+// Disabled De-dup logic      if (!skip) {
+                                ts_ss << start_ts_v[i] << ",";
+                                vals_ss << rs_ptr[i] << ",";
+// Disabled De-dup logic      }
+                        }
                     }
                     break;
 
@@ -366,6 +377,15 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
                 vals_ss << "]";
                 ts_ss.seekp(-1, ts_ss.cur); //overwrite last "," with array end "]";
                 ts_ss << "]";
+
+                auto rs_st_str = rs_st_rg.rs_state == 7777777777 ? "" : std::to_string(rs_st_rg.rs_state);
+                std::string mdos = "{\"__name__\":\"" + m_name + "\"" +
+                        pm_constant_lbls + ",\"rs_state\":\"" + rs_st_str + "\"";
+                for (auto [ k, v ] : xl) { //Add extra labels if this metric has them
+                    mdos += ",\"" + k + "\":\"" + v + "\"";
+                }
+                mdos += "}";
+
                 jf << "{\"metric\":" << mdos << ",\"values\":[" << vals_ss.str() << ",\"timestamps\":[" << ts_ss.str() << "}\n";
             }
 //else { std::cerr << "DEBUG: the timeseries for metric " << x.keyName << " had only null values in this sample period.\n"; }
