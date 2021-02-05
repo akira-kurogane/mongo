@@ -146,7 +146,7 @@ int main(int argc, char* argv[], char** envp) {
 
     auto tspan = ws.boundaryTimespan();
 
-    if (vm["print-topology"].as<bool>() || vm.count("print-metadata")) {
+    if (vm["print-topology"].as<bool>() || vm.count("print-metadata-doc")) {
         std::cout << "Samples between " << dateToISOStringUTC(tspan.first) <<
                 " - " << dateToISOStringUTC(tspan.last) << std::endl;
             
@@ -160,7 +160,7 @@ int main(int argc, char* argv[], char** envp) {
                     std::cout << "    instance pid=" << pmId.pid << "\t";
                     std::cout << "    " << dateToISOStringUTC(pm.firstSampleTs()) <<
                             " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
-                    if (vm.count("print-metadata")) {
+                    if (vm.count("print-metadata-doc")) {
                         std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
                     }
                 }
@@ -215,7 +215,7 @@ int main(int argc, char* argv[], char** envp) {
     if (omc) {
         std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
                         {ts_limit_start, ts_limit_end},
-                        vm["resolution"].as<float>() * 1000/*ms*/);
+                        vm["resolution"].as<float>() * 1000/*ms*/); //TODO: add timeshift-hack arg
     
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
