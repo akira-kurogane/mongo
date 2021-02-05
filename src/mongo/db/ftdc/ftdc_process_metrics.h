@@ -221,6 +221,7 @@ struct FTDCProcessMetrics {
      * one larger array of timeseries.
      * tspan argument will be reduced to what overlaps with firstSampleTs()
      * - estimateLastSampleTs()
+     * TODO: add timeshift-hack arg
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
                 FTDCPMTimespan tspan, uint32_t sampleResolution);

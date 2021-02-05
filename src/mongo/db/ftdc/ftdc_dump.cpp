@@ -104,7 +104,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         }
     }
 
-    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries");
+    auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") + vm.count("pandas-csv-timeseries") + vm.count("vm-jsonlines-timeseries");
     auto dp = fs::path(vm["export-dir"].as<std::string>());
     if (!vm["export-dir"].defaulted()) {
         if (!omc) {
