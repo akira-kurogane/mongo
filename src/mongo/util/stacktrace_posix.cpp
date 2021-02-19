@@ -32,7 +32,7 @@
 #include "mongo/util/stacktrace.h"
 
 #include <cstdlib>
-#include <dlfcn.h>
+//#include <dlfcn.h>
 #include <iostream>
 #include <string>
 #include <sys/utsname.h>
@@ -161,86 +161,86 @@ void printStackTrace(std::ostream& os) {
  * @param os    ostream& to receive printed stack backtrace
  */
 void printStackTrace(std::ostream& os) {
-    static const char unknownFileName[] = "???";
-    void* addresses[maxBackTraceFrames];
-    Dl_info dlinfoForFrames[maxBackTraceFrames];
-
-    ////////////////////////////////////////////////////////////
-    // Get the backtrace addresses.
-    ////////////////////////////////////////////////////////////
-
-    const int addressCount = backtrace(addresses, maxBackTraceFrames);
-    if (addressCount == 0) {
-        const int err = errno;
-        os << "Unable to collect backtrace addresses (errno: " << err << ' ' << strerror(err) << ')'
-           << std::endl;
-        return;
-    }
-
-    ////////////////////////////////////////////////////////////
-    // Collect symbol information for each backtrace address.
-    ////////////////////////////////////////////////////////////
-
-    os << std::hex << std::uppercase;
-    for (int i = 0; i < addressCount; ++i) {
-        Dl_info& dlinfo(dlinfoForFrames[i]);
-        if (!dladdr(addresses[i], &dlinfo)) {
-            dlinfo.dli_fname = unknownFileName;
-            dlinfo.dli_fbase = NULL;
-            dlinfo.dli_sname = NULL;
-            dlinfo.dli_saddr = NULL;
-        }
-        os << ' ' << addresses[i];
-    }
-
-    os << "\n----- BEGIN BACKTRACE -----\n";
-
-    ////////////////////////////////////////////////////////////
-    // Display the JSON backtrace
-    ////////////////////////////////////////////////////////////
-
-    os << "{\"backtrace\":[";
-    for (int i = 0; i < addressCount; ++i) {
-        const Dl_info& dlinfo = dlinfoForFrames[i];
-        const uintptr_t fileOffset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_fbase);
-        if (i)
-            os << ',';
-        os << "{\"b\":\"" << uintptr_t(dlinfo.dli_fbase) << "\",\"o\":\"" << fileOffset;
-        if (dlinfo.dli_sname) {
-            os << "\",\"s\":\"" << dlinfo.dli_sname;
-        }
-        os << "\"}";
-    }
-    os << ']';
-
-    if (soMapJson)
-        os << ",\"processInfo\":" << *soMapJson;
-    os << "}\n";
-
-    ////////////////////////////////////////////////////////////
-    // Display the human-readable trace
-    ////////////////////////////////////////////////////////////
-    for (int i = 0; i < addressCount; ++i) {
-        Dl_info& dlinfo(dlinfoForFrames[i]);
-        os << ' ';
-        if (dlinfo.dli_fbase) {
-            os << getBaseName(dlinfo.dli_fname) << '(';
-            if (dlinfo.dli_sname) {
-                const uintptr_t offset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_saddr);
-                os << dlinfo.dli_sname << "+0x" << offset;
-            } else {
-                const uintptr_t offset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_fbase);
-                os << "+0x" << offset;
-            }
-            os << ')';
-        } else {
-            os << unknownFileName;
-        }
-        os << " [" << addresses[i] << ']' << std::endl;
-    }
-
-    os << std::dec << std::nouppercase;
-    os << "-----  END BACKTRACE  -----" << std::endl;
+//    static const char unknownFileName[] = "???";
+//    void* addresses[maxBackTraceFrames];
+//    Dl_info dlinfoForFrames[maxBackTraceFrames];
+//
+//    ////////////////////////////////////////////////////////////
+//    // Get the backtrace addresses.
+//    ////////////////////////////////////////////////////////////
+//
+//    const int addressCount = backtrace(addresses, maxBackTraceFrames);
+//    if (addressCount == 0) {
+//        const int err = errno;
+//        os << "Unable to collect backtrace addresses (errno: " << err << ' ' << strerror(err) << ')'
+//           << std::endl;
+//        return;
+//    }
+//
+//    ////////////////////////////////////////////////////////////
+//    // Collect symbol information for each backtrace address.
+//    ////////////////////////////////////////////////////////////
+//
+//    os << std::hex << std::uppercase;
+//    for (int i = 0; i < addressCount; ++i) {
+//        Dl_info& dlinfo(dlinfoForFrames[i]);
+//        if (!dladdr(addresses[i], &dlinfo)) {
+//            dlinfo.dli_fname = unknownFileName;
+//            dlinfo.dli_fbase = NULL;
+//            dlinfo.dli_sname = NULL;
+//            dlinfo.dli_saddr = NULL;
+//        }
+//        os << ' ' << addresses[i];
+//    }
+//
+//    os << "\n----- BEGIN BACKTRACE -----\n";
+//
+//    ////////////////////////////////////////////////////////////
+//    // Display the JSON backtrace
+//    ////////////////////////////////////////////////////////////
+//
+//    os << "{\"backtrace\":[";
+//    for (int i = 0; i < addressCount; ++i) {
+//        const Dl_info& dlinfo = dlinfoForFrames[i];
+//        const uintptr_t fileOffset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_fbase);
+//        if (i)
+//            os << ',';
+//        os << "{\"b\":\"" << uintptr_t(dlinfo.dli_fbase) << "\",\"o\":\"" << fileOffset;
+//        if (dlinfo.dli_sname) {
+//            os << "\",\"s\":\"" << dlinfo.dli_sname;
+//        }
+//        os << "\"}";
+//    }
+//    os << ']';
+//
+//    if (soMapJson)
+//        os << ",\"processInfo\":" << *soMapJson;
+//    os << "}\n";
+//
+//    ////////////////////////////////////////////////////////////
+//    // Display the human-readable trace
+//    ////////////////////////////////////////////////////////////
+//    for (int i = 0; i < addressCount; ++i) {
+//        Dl_info& dlinfo(dlinfoForFrames[i]);
+//        os << ' ';
+//        if (dlinfo.dli_fbase) {
+//            os << getBaseName(dlinfo.dli_fname) << '(';
+//            if (dlinfo.dli_sname) {
+//                const uintptr_t offset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_saddr);
+//                os << dlinfo.dli_sname << "+0x" << offset;
+//            } else {
+//                const uintptr_t offset = uintptr_t(addresses[i]) - uintptr_t(dlinfo.dli_fbase);
+//                os << "+0x" << offset;
+//            }
+//            os << ')';
+//        } else {
+//            os << unknownFileName;
+//        }
+//        os << " [" << addresses[i] << ']' << std::endl;
+//    }
+//
+//    os << std::dec << std::nouppercase;
+//    os << "-----  END BACKTRACE  -----" << std::endl;
 }
 
 #endif

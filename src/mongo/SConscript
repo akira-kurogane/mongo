@@ -102,8 +102,6 @@ env.Library(
         'platform/posix_fadvise.cpp',
         'platform/process_id.cpp',
         'platform/random.cpp',
-        'platform/shared_library.cpp',
-        'platform/shared_library_${TARGET_OS_FAMILY}.cpp',
         'platform/stack_locator.cpp',
         'platform/stack_locator_${TARGET_OS}.cpp',
         'platform/strcasestr.cpp',
@@ -135,6 +133,8 @@ env.Library(
         'util/uuid.cpp',
         'util/version.cpp',
     ],
+        #'platform/shared_library.cpp',
+        #'platform/shared_library_${TARGET_OS_FAMILY}.cpp',
     # NOTE: This library *must not* depend on any libraries than
     # the ones declared here. Do not add to this list.
     LIBDEPS=[
