@@ -3080,14 +3080,14 @@ def doConfigure(myenv):
         else:
             free_monitoring = "off"
 
-    if not env.TargetOSIs("windows") \
-        and free_monitoring == "on" \
-        and not conf.CheckLibWithHeader(
-        "curl",
-        ["curl/curl.h"], "C",
-        "curl_global_init(0);",
-        autoadd=False):
-        env.ConfError("Could not find <curl/curl.h> and curl lib")
+    #if not env.TargetOSIs("windows") \
+    #    and free_monitoring == "on" \
+    #    and not conf.CheckLibWithHeader(
+    #    "curl",
+    #    ["curl/curl.h"], "C",
+    #    "curl_global_init(0);",
+    #    autoadd=False):
+    #    env.ConfError("Could not find <curl/curl.h> and curl lib")
 
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
