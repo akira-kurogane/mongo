@@ -61,7 +61,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
 
     if (vm.count("help")) {
         std::cout << all_opts;
-        exit(0);
+	_exit(0);
     }
 
     if (vm.count("input-file")) {
@@ -70,7 +70,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         while (paItr != ifv.end()) {
             if (!fs::exists(*paItr)) {
                 std::cerr << "Error: there is no directory or file at " << (*paItr) << "\n";
-                exit(1);
+                _exit(1);
             }
             input_fpaths.push_back(*paItr);
             paItr++;
@@ -79,7 +79,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     if (input_fpaths.size() == 0) {
         std::cerr << "Error: no input directories or files specified\n";
         std::cerr << "Usage: ftdc_dump <options> ftdc-dir-or-file-path [ftdc-dir-or-file-path]*\n";
-        exit(1);
+        _exit(1);
     }
 
     std::vector<std::string> iso8601_optnms({ "ts-start", "ts-end" });
@@ -89,7 +89,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
             StatusWith<Date_t> sWdt = dateFromISOString(optval_str);
             if (!sWdt.isOK()) {
                 std::cerr << "Error: " << optnm << " option value \"" << optval_str << "\" could not be parsed as a date.\nAn ISO 8601 format is required. YYYY-MM-DDTHH:MM[:SS[.m[m[m]]]]Z.\nTimezone indicators -HHMM or +HHMM also accepted instead of the UTC indicator \"Z\".\n";
-                exit(1);
+                _exit(1);
             }
         }
     }
@@ -100,7 +100,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         StatusWith<Date_t> sWdte = dateFromISOString(ts_end_str);
         if (sWdts.getValue() >= sWdte.getValue()) {
             std::cerr << "Error: --ts-end option value " << ts_end_str << " is earlier or equal to the --ts-start option value " << ts_start_str << ". Exiting.\n";
-            exit(1);
+            _exit(1);
         }
     }
 
@@ -112,12 +112,12 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         }
         if (!fs::is_directory(dp)) {
             std::cerr << "--export-dir option value "  << dp << " is not a directory\n";
-            exit(1);
+            _exit(1);
         }
     }
     if (omc && -1 == access(dp.c_str(), W_OK)) {
         std::cerr << "This process doesn't have write permisions for --export-dir " << dp << "\n";
-        exit(1);
+        _exit(1);
     }
 
     return vm;
@@ -141,7 +141,7 @@ int main(int argc, char* argv[], char** envp) {
             std::cerr << ", " << input_fpaths[i];
         }
         std::cerr << std::endl;
-        exit(1);
+        _exit(1);
     }
 
     auto tspan = ws.boundaryTimespan();
@@ -193,7 +193,7 @@ int main(int argc, char* argv[], char** envp) {
         std::ifstream mif(vm["metrics-filter"].as<std::string>());
         if (!mif) {
             std::cerr << "Error: couldn't open --metrics-filter file " << vm["metrics-filter"].as<std::string>() << "\n";
-            exit(1);
+            _exit(1);
         }
         std::string s;
         while (std::getline(mif, s)) {
@@ -203,7 +203,7 @@ int main(int argc, char* argv[], char** envp) {
         }
         if (ekl.size() == 0) {
             std::cerr << "The --metrics-filter file " << vm["metrics-filter"].as<std::string>() << " didn't have any lines in it. Exiting.\n";
-            exit(1);
+            _exit(1);
         }
     } else {
         auto ks =  ws.keys();
@@ -248,5 +248,5 @@ int main(int argc, char* argv[], char** envp) {
         }
     }
 
-    exit(0);
+    _exit(0);
 }
