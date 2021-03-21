@@ -271,7 +271,14 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
     invariant(start_ts_v.size());
     auto end_ts_v = metricsRow("end");
     invariant(end_ts_v.size() == start_ts_v.size());
-    auto rs_state_v = metricsRow("replSetGetStatus.myState");
+
+    std::vector<std::uint64_t> rs_state_v;
+    auto tmpKeyRow = _keyRows.find("replSetGetStatus.myState");
+    if (tmpKeyRow != _keyRows.end()) {
+        rs_state_v = metricsRow("replSetGetStatus.myState");
+    } else {
+        rs_state_v = nullsRow();
+    }
     invariant(rs_state_v.size());
 
     std::string pm_constant_lbls = ",\"job\":\"mongodb\",\"instance\":\"" + pmId.hostport + "\"";

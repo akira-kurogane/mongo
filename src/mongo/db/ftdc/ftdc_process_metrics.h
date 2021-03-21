@@ -73,7 +73,10 @@ public:
     }
 
     std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
-    size_t keyRow(std::string k) { return _keyRows[k]; }
+    size_t keyRow(std::string kn) {
+        assert(_keyRows.find(kn) != _keyRows.end());
+        return _keyRows[kn];
+    }
 
     BSONType bsonType(std::string k) { return _kNT[_keyRows[k]].bsonType; }
     void setBsonType(std::string k, BSONType t) { _kNT[_keyRows[k]].bsonType = t; }
@@ -130,20 +133,25 @@ public:
      *   .... } }
      */
     void writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId,
-		    std::map<std::string, std::string> topologyLabels);
+                    std::map<std::string, std::string> topologyLabels);
 
     /**
      * Return a copy of one row of the metrics in a vector of base uint64_t type
      */
     std::vector<std::uint64_t> metricsRow(size_t i) {
-      std::vector<std::uint64_t> r;
-      r.reserve(_rowLength);
-      r = std::vector<std::uint64_t>(metrics.begin() + cellOffset(i, 0),
-		                     metrics.begin() + cellOffset(i + 1, 0));
-      return r;
+        std::vector<std::uint64_t> r;
+        r.reserve(_rowLength);
+        r = std::vector<std::uint64_t>(metrics.begin() + cellOffset(i, 0),
+                                       metrics.begin() + cellOffset(i + 1, 0));
+        return r;
     }
     std::vector<std::uint64_t> metricsRow(std::string keyName) {
-      return metricsRow(keyRow(keyName));
+        return metricsRow(keyRow(keyName));
+    }
+
+    std::vector<std::uint64_t> nullsRow() {
+        std::vector<std::uint64_t> r(_rowLength, 7777777777);
+        return r;
     }
 
     size_t cellOffset(size_t row, size_t col) { return row * _rowLength + col; }
