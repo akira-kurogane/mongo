@@ -29,35 +29,40 @@ RUNNING
 
     $ ./ftdc_dump --help
     General options:
-      --help                     produce a help message
-      --input-file arg           path to FTDC directory (typically 
-                                 "diagnostic.data/") and/or individual 
-                                 metrics.YYYYMMDD... FTDC metric files. Can be 
-                                 multiple locations. (It's optional to write 
-                                 "--input-file", all positional args are used to be
-                                 input directories or files.)
-    Filter options:
-      --ts-start arg             exclude results before this timestamp
-      --ts-end arg               exclude results after this timestamp
-      --metrics-filter arg       file of metric names to include. (See output of 
-                                 --list-metrics for samples of format.)
-    Print summaries to stdout:
-      --print-topology arg (=1)  Print replica sets, hosts, timespans. On by 
-                                 default.
-      --print-metadata-doc       Print last kMetadataDoc BSON object for each db 
-                                 instance.
-      --list-metrics             Print list of all metrics in these FTDC files
-    Export options:
-      --export-dir arg (=.)      Directory to put exported timeseries metrics files
-                                 in. Current working dir is default.
-      --bson-timeseries          Export timeseries as BSON file(s)
-      --csv-timeseries           Export timeseries as CSV file(s)
-      --pandas-csv-timeseries    Export timeseries as Pandas dataframe CSV format. 
-                                 A *.mapping.csv file is also saved alongside each 
-                                 data csv file.
-      --resolution arg (=1)      Resolution in seconds for timeseries output 
-                                 methods.
+      --help                      produce a help message
+      --input-file arg            path to FTDC directory (typically
+                                  "diagnostic.data/") and/or individual
+                                  metrics.YYYYMMDD... FTDC metric files. Can be
+                                  multiple locations. (It's optional to write
+                                  "--input-file", all positional args are used to
+                                  be input directories or files.)
 
+    Filter options:
+      --ts-start arg              exclude results before this timestamp
+      --ts-end arg                exclude results after this timestamp
+      --metrics-filter arg        file of metric names to include. (See output of
+                                  --list-metrics for samples of format.)
+
+    Print summaries to stdout:
+      --print-topology arg (=1)   Print replica sets, hosts, timespans. On by
+                                  default.
+      --print-metadata-doc        Print last kMetadataDoc BSON object for each db
+                                  instance.
+      --list-metrics              Print list of all metrics in these FTDC files
+
+    Export options:
+      --export-dir arg (=.)       Directory to put exported timeseries metrics
+                                  files in. Current working dir is default.
+      --bson-timeseries           Export timeseries as BSON file(s)
+      --csv-timeseries            Export timeseries as CSV file(s)
+      --pandas-csv-timeseries     Export timeseries as Pandas dataframe CSV format.
+                                  A *.mapping.csv file is also saved alongside each
+                                  data csv file.
+      --vm-jsonlines-timeseries   Export jsonlines file(s) that can be imported
+                                  into VictoriaMetrics using the /api/v1/import
+                                  endpoint.
+      --resolution arg (=1)       Resolution in seconds for timeseries output
+                                  methods.
 
 LICENSE
 
