@@ -18,21 +18,22 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         ("help", "produce a help message")
         ("input-file", po::value<std::vector<std::string>>(), "path to FTDC directory (typically \"diagnostic.data/\") and/or individual metrics.YYYYMMDD... FTDC metric files. Can be multiple locations. (It's optional to write \"--input-file\", all positional args are used to be input directories or files.)")
         ;
-    
+
     po::options_description filter_opts("Filter options");
     filter_opts.add_options()
         ("ts-start", po::value<std::string>(), "exclude results before this timestamp")
         ("ts-end",   po::value<std::string>(), "exclude results after this timestamp")
-        ("metrics-filter", po::value<std::string>(), "file of metric names to include. (See output of --list-metrics for samples of format.)")
+        ("metrics-filter", po::value<std::string>(), "file of metric names to include. (See output of --metrics-list for samples of format.)")
         ;
-    
+
     po::options_description smyprint_optsd("Print summaries to stdout");
     smyprint_optsd.add_options()
         ("print-topology", po::value<bool>()->default_value(true), "Print replica sets, hosts, timespans. On by default.")
-        ("print-metadata-doc", "Print last kMetadataDoc BSON object for each db instance.")
-        ("list-metrics", "Print list of all metrics in these FTDC files")
+        ("print-process-metadata-docs", "Print last kMetadataDoc BSON object for each db instance.")
+        ("metrics-list", "Print list of all metrics in these FTDC files")
+        ("json-ws-summary", "Prints a single JSON object with aggregate timespan, topology info and file list")
+        ("json-metrics-list", "Prints a single JSON array of all metric names found in the input files")
         ;
-        //plus a function to print reconstructed diagnosticData doc at any given second?
 
     po::options_description export_optsd("Export options");
     export_optsd.add_options()
@@ -46,12 +47,12 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
 
     po::positional_options_description posarg_optsd;
     posarg_optsd.add("input-file", -1);
-    
+
     // Declare an options description instance which will include
     // all the options
     po::options_description all_opts("Allowed options");
     all_opts.add(general).add(filter_opts).add(smyprint_optsd).add(export_optsd);
-    
+
     po::variables_map vm;
     po::parsed_options parsed_opts = po::command_line_parser(argc, argv).options(all_opts).positional(posarg_optsd).run();
     po::store(parsed_opts, vm);
@@ -61,7 +62,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
 
     if (vm.count("help")) {
         std::cout << all_opts;
-	_exit(0);
+        _exit(0);
     }
 
     if (vm.count("input-file")) {
@@ -124,17 +125,89 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
 
 }
 
+void outputAggregateTimespan(FTDCPMTimespan& tspan, bool json) {
+    if (json) {
+        std::cout << "{\"s\": \"" << dateToISOStringUTC(tspan.first) << "\", " <<
+            "\"e\": \"" << dateToISOStringUTC(tspan.last) << "\"}";
+    } else {
+        std::cout << "Samples between " << dateToISOStringUTC(tspan.first) <<
+            " - " << dateToISOStringUTC(tspan.last) << std::endl;
+    }
+}
+
+void outputTopology(FTDCWorkspace & ws, bool json) {
+    auto tp = ws.topology();
+    for (auto const& [rsnm, hpvals] : tp) {
+        std::cout << (rsnm == "" ? "<no replsetname>" : rsnm) << std::endl;
+        for (auto const& [hp, pmIds] : hpvals) {
+            std::cout << "  " << hp << std::endl;
+            for (auto const& pmId : pmIds) {
+                auto pm = ws.processMetrics(pmId);
+                std::cout << "    instance pid=" << pmId.pid << "\t";
+                std::cout << "    " << dateToISOStringUTC(pm.firstSampleTs()) <<
+                        " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
+            }
+        }
+    }
+}
+
+/**
+ * Prints the "type": 0, first BSON document in a FTDC metrics file.
+ *   Prints only one per process regardless of how many files for
+ *   each process are found because, ignoring timestamp, they'll be
+ *   identical.
+ * Prints in JSON format regardless of the json argument, but will
+ *   be formatted as a single array object when json mode is true.
+ */
+void outputProcessMetadataDocs(FTDCWorkspace & ws, bool json) {
+    auto tp = ws.topology();
+    bool d = false;
+    std::cout << (json ? "[" : "");
+    for (auto const& [rsnm, hpvals] : tp) {
+        for (auto const& [hp, pmIds] : hpvals) {
+            for (auto const& pmId : pmIds) {
+                auto pm = ws.processMetrics(pmId);
+                if (json) {
+                    std::cout << (d ? "," : "") <<
+                            pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1);
+                } else {
+                    std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
+                }
+                d = true;
+            }
+        }
+    }
+    std::cout << (json ? "]" : "");
+}
+
+void outputMetricList(FTDCWorkspace & ws, bool json) {
+    auto ks = ws.keys();
+    auto mitr = ks.begin();
+    bool d = false;
+    std::cout << (json ? "[" : "");
+    while (mitr != ks.end()) {
+        if (json) {
+            std::cout << (d ? "," : "") << "\"" << *mitr << "\"";
+        } else {
+            std::cout << "  " << *mitr << "\n";
+        }
+        d = true;
+        mitr++;
+    }
+    std::cout << (json ? "]" : "");
+}
+
 int main(int argc, char* argv[], char** envp) {
 
     //Parse cmdline options. Will exit on --help or option error
     std::vector<fs::path> input_fpaths;
     auto vm = init_cmdline_opts(argc, argv, input_fpaths);
-    
+
     FTDCWorkspace ws;
     Status s = ws.addFTDCFiles(input_fpaths); //TODO add --ts-start/end and --hostport for filtering
 
-    auto fp = ws.filePaths();
-    if (fp.size() == 0) {
+    auto fps = ws.filePaths();
+    if (fps.size() == 0) {
         std::cerr << "There are no FTDC metrics files at " << input_fpaths[0];
         size_t i;
         for (i = 1; i < input_fpaths.size(); ++i) {
@@ -146,35 +219,45 @@ int main(int argc, char* argv[], char** envp) {
 
     auto tspan = ws.boundaryTimespan();
 
-    if (vm["print-topology"].as<bool>() || vm.count("print-metadata-doc")) {
-        std::cout << "Samples between " << dateToISOStringUTC(tspan.first) <<
-                " - " << dateToISOStringUTC(tspan.last) << std::endl;
-            
-        auto tp = ws.topology();
-        for (auto const& [rsnm, hpvals] : tp) {
-            std::cout << (rsnm == "" ? "<no replsetname>" : rsnm) << std::endl;
-            for (auto const& [hp, pmIds] : hpvals) {
-                std::cout << "  " << hp << std::endl;
-                for (auto const& pmId : pmIds) {
-                    auto pm = ws.processMetrics(pmId);
-                    std::cout << "    instance pid=" << pmId.pid << "\t";
-                    std::cout << "    " << dateToISOStringUTC(pm.firstSampleTs()) <<
-                            " - " << dateToISOStringUTC(pm.estimateLastSampleTs()) << std::endl;
-                    if (vm.count("print-metadata-doc")) {
-                        std::cout << pm.metadataDoc.jsonString(JsonStringFormat::Strict, 1) << "\n\n";
-                    }
-                }
-            }
+    //If a json result is requested output that one JSON string and exit
+    if (vm.count("json-ws-summary")) {
+        std::cout << "{\"time_range\": ";
+        outputAggregateTimespan(tspan, true);
+        std::cout << ", \"hosts\": [";
+        bool d = false;
+        for (const auto& hp : ws.hostPortList()) {
+            std::cout << (d ? "," : "") << "\"" << hp << "\"";
+            d = true;
         }
+        std::cout << "],\"input_filepaths\":[";
+        d = false;
+        for (const auto& fp : fps) {
+            std::cout << (d ? "," : "") << fp; //these fp have enclosing quotes already
+            d = true;
+        }
+        std::cout << "]}";
+        std::cout << std::endl;
+        _exit(0);
     }
 
-    if (vm.count("list-metrics")) {
-        auto ks =  ws.keys();
-        auto mitr = ks.begin();
-        while (mitr != ks.end()) {
-            std::cout << "  " << *mitr << "\n";
-            mitr++;
-        }
+    if (vm.count("json-metrics-list")) {
+        outputMetricList(ws, true);
+        std::cout << std::endl;
+        _exit(0);
+    }
+
+    outputAggregateTimespan(tspan, false);
+
+    if (vm["print-topology"].as<bool>()) {
+        outputTopology(ws, false);
+    }
+
+    if (vm.count("print-process-metadata-docs")) {
+        outputProcessMetadataDocs(ws, false);
+    }
+
+    if (vm.count("metrics-list")) {
+        outputMetricList(ws, false);
     }
 
     Date_t ts_limit_start =  tspan.first;
@@ -216,7 +299,7 @@ int main(int argc, char* argv[], char** envp) {
         std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
                         {ts_limit_start, ts_limit_end},
                         vm["resolution"].as<float>() * 1000/*ms*/); //TODO: add timeshift-hack arg
-    
+
         if (!fPmTs.size()) {
             std::cout << "FTDCWorkspace::timeseries() returned an empty map (i.e. no results)\n";
         }
@@ -244,7 +327,7 @@ int main(int argc, char* argv[], char** envp) {
                 //TODO: optionally fill tpl_lbls["cl_id"] if user provides one?
                 ms.writeVMJsonLines(odirpath, pmId, tpl_lbls);
             }
-    
+
         }
     }
 

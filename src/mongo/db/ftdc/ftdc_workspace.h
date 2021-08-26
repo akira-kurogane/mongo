@@ -42,6 +42,21 @@ public:
     topology() const;
 
     /**
+     * Set of all unique <hostname>:<port> strings
+     */
+    std::set<std::string> hostPortList() const {
+        std::set<std::string> v;
+        auto tp = topology();
+        for (auto const& [rsnm, hpvals] : tp) {
+            for (auto const& [hp, pmIds] : hpvals) {
+                v.insert(hp);
+            }
+        }
+        return v;
+    }
+
+
+    /**
      * Simple getter for the FTDCProcessMetrics objects
      */
     const FTDCProcessMetrics& processMetrics(FTDCProcessId pmId);
