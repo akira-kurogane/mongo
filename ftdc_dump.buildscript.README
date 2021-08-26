@@ -1,0 +1,1 @@
+buildscripts/scons.py build/opt/mongo/db/ftdc/ftdc_dump --disable-warnings-as-errors -j 6 LINKFLAGS="-static -static-libstdc++ -static-libgcc" 2>&1 MONGO_VERSION=4.0.3 | grep -v '^Checking'
