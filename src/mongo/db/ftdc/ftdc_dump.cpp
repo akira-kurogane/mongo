@@ -16,6 +16,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
     po::options_description general("General options");
     general.add_options()
         ("help", "produce a help message")
+        ("recursive", po::value<bool>()->implicit_value(true)->default_value(false), "search for files in all subdirectories recursively")
         ("input-file", po::value<std::vector<std::string>>(), "path to FTDC directory (typically \"diagnostic.data/\") and/or individual metrics.YYYYMMDD... FTDC metric files. Can be multiple locations. (It's optional to write \"--input-file\", all positional args are used to be input directories or files.)")
         ;
 
@@ -204,7 +205,7 @@ int main(int argc, char* argv[], char** envp) {
     auto vm = init_cmdline_opts(argc, argv, input_fpaths);
 
     FTDCWorkspace ws;
-    Status s = ws.addFTDCFiles(input_fpaths); //TODO add --ts-start/end and --hostport for filtering
+    Status s = ws.addFTDCFiles(input_fpaths, vm["recursive"].as<bool>()); //TODO add --ts-start/end and --hostport for filtering
 
     auto fps = ws.filePaths();
     if (fps.size() == 0) {
@@ -214,6 +215,9 @@ int main(int argc, char* argv[], char** envp) {
             std::cerr << ", " << input_fpaths[i];
         }
         std::cerr << std::endl;
+        if (!vm["recursive"].as<bool>()) {
+            std::cerr << "(Tip: there is a --recursive option. Directories will only be iterated to their first level by default.)\n";
+        }
         _exit(1);
     }
 

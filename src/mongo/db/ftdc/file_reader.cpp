@@ -180,6 +180,7 @@ StatusWith<BSONObj> FTDCFileReader::readDocument() {
     }
 
     // Reads past the end of the file will be caught below
+    // This error will occur with more or less perfect certainty when a non-BSON file is scanned.
     if (bsonLength > _fileSize || bsonLength < BSONObj::kMinBSONLength) {
         return {ErrorCodes::InvalidLength,
                 str::stream() << "Invalid BSON length found in file \'" << _file.generic_string()

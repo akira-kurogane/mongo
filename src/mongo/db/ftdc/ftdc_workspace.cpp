@@ -1,5 +1,6 @@
 #include "mongo/platform/basic.h"
 
+// TODO use stdc++17 std::filesystem instead of boost if we update the build scripts
 #include <boost/filesystem.hpp>
 
 #include "mongo/db/ftdc/ftdc_workspace.h"
@@ -27,7 +28,10 @@ bool extractPMHeaders(const boost::filesystem::path& p, FTDCProcessMetrics& proc
         procMetrics = swProcMetrics.getValue();
         return true;
     }
-    std::cerr << swProcMetrics.getStatus().reason() << std::endl;
+    bool nonbson_found = swProcMetrics.getStatus() == ErrorCodes::InvalidLength;
+    if (!(/*ignore_nonftdc && */ nonbson_found)) {
+        std::cerr << swProcMetrics.getStatus().reason() << std::endl;
+    }
     return false;
 }
 
@@ -46,15 +50,25 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
                 auto s = _addFTDCProcessMetrics(pm);
             }
         } else if (boost::filesystem::is_directory(*p)) {
-            //if (recursive) {
-            //boost::filesystem::recursive_directory_iterator dItr(*p);
-            boost::filesystem::directory_iterator dItr(*p);
-            boost::filesystem::directory_iterator endItr;
-            for (; dItr != endItr; ++dItr) {
-                boost::filesystem::directory_entry& dEnt = *dItr;
-                auto f = dEnt.path().filename();
-                if (extractPMHeaders(dEnt.path(), pm)) {
-                     auto s = _addFTDCProcessMetrics(pm);
+            if (recursive) {
+                boost::filesystem::recursive_directory_iterator dItr(*p);
+                boost::filesystem::recursive_directory_iterator endItr;
+                for (; dItr != endItr; ++dItr) {
+                    boost::filesystem::directory_entry& dEnt = *dItr;
+                    auto f = dEnt.path().filename();
+                    if (extractPMHeaders(dEnt.path(), pm)) {
+                         auto s = _addFTDCProcessMetrics(pm);
+                    }
+                }
+            } else {
+                boost::filesystem::directory_iterator dItr(*p);
+                boost::filesystem::directory_iterator endItr;
+                for (; dItr != endItr; ++dItr) {
+                    boost::filesystem::directory_entry& dEnt = *dItr;
+                    auto f = dEnt.path().filename();
+                    if (extractPMHeaders(dEnt.path(), pm)) {
+                         auto s = _addFTDCProcessMetrics(pm);
+                    }
                 }
             }
         }
@@ -96,7 +110,7 @@ std::set<std::string> FTDCWorkspace::keys() {
     for (std::map<FTDCProcessId, FTDCProcessMetrics>::const_iterator itPM = _pmMap.begin();
          itPM != _pmMap.end(); ++itPM) {
         auto pm = itPM->second;
-	auto pmKeys = pm.lastRefDocKeys();
+        auto pmKeys = pm.lastRefDocKeys();
         for (std::map<std::string, BSONType>::const_iterator it = pmKeys.begin();
              it != pmKeys.end(); ++it) {
             auto k = it->first;
@@ -186,7 +200,7 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
                         " (pid=" << pmId.pid << "): " << swTF.getStatus().reason() << "\n";
                 continue;
             }
-	    resultMap.insert(std::make_pair(pmId, std::move(swTF.getValue())));
+            resultMap.insert(std::make_pair(pmId, std::move(swTF.getValue())));
         }
     }
     return resultMap;
