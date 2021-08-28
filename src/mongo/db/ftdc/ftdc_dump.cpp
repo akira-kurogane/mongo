@@ -309,6 +309,9 @@ int main(int argc, char* argv[], char** envp) {
         }
 
         auto odirpath = vm["export-dir"].as<std::string>();
+        if (odirpath.size() > 1 && odirpath[odirpath.size() - 1] == '/') {
+            odirpath = odirpath.substr(0, odirpath.size() - 1);
+        }
         for (auto& [pmId, ms] : fPmTs) {
             //std::cout << "\nExporting timeseries for " << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
             if (vm.count("bson-timeseries")) {
