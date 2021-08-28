@@ -56,8 +56,13 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
                 for (; dItr != endItr; ++dItr) {
                     boost::filesystem::directory_entry& dEnt = *dItr;
                     auto f = dEnt.path().filename();
-                    if (extractPMHeaders(dEnt.path(), pm)) {
-                         auto s = _addFTDCProcessMetrics(pm);
+                    //don't recurse hidden dirs or attempt to FTDC-parse hidden files
+                    if (f.string()[0] == '.') {
+                       dItr.no_push();
+                    } else {
+                       if (extractPMHeaders(dEnt.path(), pm)) {
+                          auto s = _addFTDCProcessMetrics(pm);
+                       }
                     }
                 }
             } else {
@@ -66,8 +71,13 @@ Status FTDCWorkspace::addFTDCFiles(std::vector<boost::filesystem::path> paths, b
                 for (; dItr != endItr; ++dItr) {
                     boost::filesystem::directory_entry& dEnt = *dItr;
                     auto f = dEnt.path().filename();
-                    if (extractPMHeaders(dEnt.path(), pm)) {
-                         auto s = _addFTDCProcessMetrics(pm);
+                    //don't attempt to FTDC-parse hidden files
+                    if (f.string()[0] == '.') {
+                       ;
+                    } else {
+                       if (extractPMHeaders(dEnt.path(), pm)) {
+                          auto s = _addFTDCProcessMetrics(pm);
+                       }
                     }
                 }
             }
