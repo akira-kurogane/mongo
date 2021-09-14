@@ -93,18 +93,21 @@ public:
     FTDCMetricsSubset hnakMergedTimeseries(std::vector<std::string>& keys,
                     FTDCPMTimespan timespan, uint32_t sampleResolution = 1000);
 
+    //static printJSONMetricValsArray(std::vector<std::uint64_t>& v, BSONType bt);
+
 private:
     // Map of all FTDCProcessMetrics
     std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;
 
-    // Hierarchy of metrics grouped by process id host.
+    // list of metricnames under each unique <hostname:port:pid>
     // Useful for merging metrics from different hosts sorted as close as possible
     //   to their natural order returned in the getDiagnosticData output.
-    std::map<std::string, std::list<std::string>> metricsByProcHierarchy();
+    std::map<std::string, std::list<std::string>> _metricsByProcHierarchy();
 
     // Reduction of the hierarchy in metricsByProcHierarchy() to have a parent
-    //   level of hosts only.
-    std::map<std::string, std::list<std::string>> metricsByHostHierarchy();
+    //   level of hosts only. I.e. lists of metricnames under each unique
+    //   <hostname:port>.
+    std::map<std::string, std::list<std::string>> _metricsByHostHierarchy();
 
     // Map of map via replset name -> hostpost to {hostport, pid}, which is the
     // key to the FTDCProcessMetrics in _pmMap

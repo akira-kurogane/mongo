@@ -292,20 +292,29 @@ int main(int argc, char* argv[], char** envp) {
         auto ekl = extractionKeyList(ws, vm);
         auto mms = ws.hnakMergedTimeseries(ekl, {ts_limit_start, ts_limit_end},
             vm["resolution"].as<float>() * 1000/*ms*/);
+        //N.b. hnakMergedTimeseries() returns input keys multiplied for each host.
+        //  Eg. "serverStatus.connections.current/hosta1.a.com", "<DITTO>/hostb1.b.com".
+        //  "start" is the exception - it's a common value that applies to the results
+        //  from all hosts.
         auto keys = mms.keys();
         assert(keys[0] == "start"); //Always expecting the "start" timestamp value in the first row
-        std::cout << "{\"metric\":\"start\"," << 
-            "\"values\":[" << 9999 << "]}\n";
-        for (auto k : keys) {
-            if (k == "start") {
+        auto vv = mms.metricsRow("start");
+        std::cout << "{\"metric\":\"start\",\"host\":\"\",\"values\":[";
+        std::copy(vv.begin(), vv.end(), std::ostream_iterator<std::uint64_t>(std::cout, ","));
+        std::cout << "]}\n";
+        for (auto kwh : keys) {
+            if (kwh == "start") {
                 continue;
             }
-            auto dlmpos = k.find_last_of('/');
+            auto dlmpos = kwh.find_last_of('/');
             assert(dlmpos != string::npos && dlmpos != 0);
-            auto hp = k.substr(dlmpos + 1);
-            k.resize(dlmpos);
+            auto hp = kwh.substr(dlmpos + 1);
+            auto k = kwh.substr(0, dlmpos);
+            auto vv = mms.metricsRow(kwh);
             std::cout << "{\"metric\":\"" << k << "\",\"host\":\"" << hp << "\"," << 
-                "\"values\":[" << 9999 << "]}\n";
+                "\"values\":[";
+            std::copy(vv.begin(), vv.end(), std::ostream_iterator<std::uint64_t>(std::cout, ","));
+            std::cout << "]}\n";
         }
         _exit(0);
     }

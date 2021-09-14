@@ -57,7 +57,7 @@ FTDCMetricsSubset::FTDCMetricsSubset(std::vector<std::string> keys, FTDCPMTimesp
     while (startKeyItr != keys.begin()) {
         *startKeyItr-- = *(startKeyItr - 1);
     }
-    keys[0] = "start";
+    assert(keys[0] == "start");
 
     _kNT.reserve(keys.size());
     size_t keyRowCtr = 0;

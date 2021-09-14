@@ -197,7 +197,7 @@ const FTDCProcessMetrics& FTDCWorkspace::processMetrics(FTDCProcessId pmId) {
     return _pmMap[pmId];
 }
 
-std::map<std::string, std::list<std::string>> FTDCWorkspace::metricsByProcHierarchy() {
+std::map<std::string, std::list<std::string>> FTDCWorkspace::_metricsByProcHierarchy() {
     std::map<std::string, std::list<std::string>> hml;
     for (auto& [pmId, pm] : _pmMap) {
         std::list<std::string> l;
@@ -209,9 +209,9 @@ std::map<std::string, std::list<std::string>> FTDCWorkspace::metricsByProcHierar
     return hml;
 }
 
-std::map<std::string, std::list<std::string>> FTDCWorkspace::metricsByHostHierarchy() {
+std::map<std::string, std::list<std::string>> FTDCWorkspace::_metricsByHostHierarchy() {
     std::map<std::string, std::list<std::string>> r;
-    std::map<std::string, std::list<std::string>> pmVsL = metricsByProcHierarchy();
+    std::map<std::string, std::list<std::string>> pmVsL = _metricsByProcHierarchy();
     std::map<std::string, std::map<std::string, std::list<std::string>>> hm;
     for (auto& [pmid_str, pkl] : pmVsL) {
         std::string hp = pmid_str.substr(0, pmid_str.find_last_of(':')); //extract out the hostport substr
@@ -230,7 +230,7 @@ std::map<std::string, std::list<std::string>> FTDCWorkspace::metricsByHostHierar
 
 std::vector<std::string> FTDCWorkspace::keys() {
     std::vector<std::string> v;
-    auto ml = metricsByProcHierarchy();
+    auto ml = _metricsByProcHierarchy();
     auto sl = approximate_seq_merge(ml); //std::list<std::tuple<std::string PARENTLABEL, std::string METRIC>>
 
     //"start" is a compulsory first metric that will appear once for each process' metrics. Insert once
@@ -339,8 +339,8 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
 
 FTDCMetricsSubset
 FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimespan timespan, uint32_t sampleResolution) {
-    auto pi_ts = timeseries(keys, timespan, sampleResolution);
-    auto hml = metricsByHostHierarchy();
+
+    auto hml = _metricsByHostHierarchy();
 
     if (!hml.size()) {
         //Have to return something - so return just the timestamp metric row.
@@ -352,23 +352,63 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
 
     auto sl = approximate_seq_merge(hml); //std::list<std::tuple<std::string HOST, std::string METRIC>>
 
-    std::vector<std::string> merged_keys;
+    //Merged keys with hostport the key is present in added as suffix to each
+    std::vector<std::string> mkwh;
     //"start" is a compulsory first metric that will appear once for each process' metrics. Insert once
     //  and skip the duplicates.
     assert(std::get<1>(sl.front) == "start");
-    merged_keys.push_back("start");  
+    mkwh.push_back("start");
 
     for (auto tpl : sl) {
         auto k = std::get<1>(tpl);
         auto hp = std::get<0>(tpl);
+        auto ha_keyname = k + "/" + hp;
         if (k != "start") {
-            merged_keys.push_back(k + "/" + hp);
+            mkwh.push_back(ha_keyname);
         }
     }
 
-    FTDCMetricsSubset mms(merged_keys, timespan, sampleResolution);
-    //MAIN TODO iterate pi_ts again, copy metric values from each FTDCMetricsSubset to this new
-    //  FTDCMetricsSubset that is the superset of them, both in time range and key set.
+    //The FTDCMetricsSubset that will be used to hold the full result
+    FTDCMetricsSubset mms(mkwh, timespan, sampleResolution);
+
+    //Extract the FTDCMetricsSubset for each FTDCProcess from their files
+    std::map<FTDCProcessId, FTDCMetricsSubset> pi_ts = timeseries(keys, timespan, sampleResolution);
+
+    bool start_ts_filled = false;
+    //Set the bsonType in the final result's keynames-and-types
+    for (auto& [pmId, ms] : pi_ts) {
+        auto source_rowlen = ms.metrics.size() / ms.keys().size(); //TODO this is awkward to be calculating it instead of using a FTDCMetricsSubset method
+        for (auto k : ms.keys()) {
+            auto ha_keyname = k == "start" ? k : k + "/" + pmId.hostport;
+            if (k != "start" || !start_ts_filled) {
+                mms.setBsonType(ha_keyname, ms.bsonType(k));
+                auto source_start_ptr = ms.metrics.begin() + ms.cellOffset(ms.keyRow(k), 0);
+                auto dest_rowno = mms.keyRow(ha_keyname);
+                if (dest_rowno == 0 && k != "start") {
+                    //Unknown key in mms, even though present in current ms.
+                    //TODO Not sure how this can happen yet. Using lastBSONRefDoc for key lists?
+                    //  Filling mms's keys by a square cross product of hostport x all known keys?
+std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.hostport << "[" << pmId.pid << "] " <<
+"had \"" << ha_keyname << "\" but there is no such key in mms\n";
+                    continue;
+                }
+                auto dest_start_ptr = mms.metrics.begin() + mms.cellOffset(dest_rowno, 0);
+                std::copy(source_start_ptr, source_start_ptr + source_rowlen, dest_start_ptr);
+                if (k == "start") {
+                    start_ts_filled = true;
+                }
+//                 if (k == "serverStatus.uptime") {
+// std::cout << "\"serverStatus.uptime\" ms.keyRow(k) = " << ms.keyRow(k) << ", ms.cellOffset(ms.keyRow(k), 0) = " << ms.cellOffset(ms.keyRow(k), 0) << "\n";
+// std::cout << "source_start_ptr + 0 = " << (*(source_start_ptr + 0)) << "\n";
+// std::cout << "source_start_ptr + 1 = " << (*(source_start_ptr + 1)) << "\n";
+// std::cout << "source_start_ptr + 2 = " << (*(source_start_ptr + 2)) << "\n";
+// std::cout << "\"serverStatus.uptime\" dest_rowno = " << dest_rowno << ", mms.cellOffset(dest_rowno, 0) = " << mms.cellOffset(dest_rowno, 0) << "\n";
+
+//                 }
+            }
+        }
+    }
+
     return mms;
 }
 
