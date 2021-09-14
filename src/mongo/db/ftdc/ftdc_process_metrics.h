@@ -125,8 +125,8 @@ public:
      * {"metric":
      *   {"__name__":"mongodb_ss_A_a","job":"mongodb","instance":"hostA:27018",
      *    "cl_role":"xxx","cl_id":"...","rs_nm":"rs1","rs_state":"1"},
-     *   values":[1,1,2,...,n'th value],
-     *   "timestamps":[1549891472010,1549891487724,1549891503438,...,n'th-epochms-timestamp]
+     *    "values":[1,1,2,...,n'th value],
+     *    "timestamps":[1549891472010,1549891487724,1549891503438,...,n'th-epochms-timestamp]
      * }
      * {"metric":
      *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018",
@@ -160,7 +160,7 @@ private:
     FTDCPMTimespan _tspan;
     uint32_t _stepMs;
 
-    size_t _rowLength; //end time = _start + (sampleLength * _stepMs)
+    size_t _rowLength; //end time = _start + (_rowLength * _stepMs)
 
     std::vector<FTDCMSKeyNameType> _kNT;
 
@@ -176,9 +176,10 @@ struct FTDCFileSpan {
 };
 
 /**
- * A struct representing the metrics found in one or more FTDC files for
- * one process instance of mongod or mongos i.e. will not run over to
- * include metrics generated after the process is restarted.
+ * A struct representing the metrics, plus metadata such as topology info,
+ * found in one or more FTDC files for *one* process instance of mongod or
+ * mongos. Repeating for emphasis - one process, without joining the metrics of
+ * processes of the same mongod by host:port id after restarts.
  *
  * Can be generated from one file, but intended to be merged with the same
  * from files before and after in time that have identical pid and
@@ -218,7 +219,7 @@ struct FTDCProcessMetrics {
     std::string clusterRole() const;
     Date_t firstSampleTs() const;
     Date_t estimateLastSampleTs() const;
-    std::map<std::string, BSONType> lastRefDocKeys();
+    std::vector<FTDCMSKeyNameType> lastRefDocKeys();
 
     Status merge(const FTDCProcessMetrics& pm);
     void mergeRefDocKeys(const BSONObj& _refDoc);

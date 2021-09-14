@@ -425,8 +425,8 @@ StatusWith<FTDCProcessMetrics> FTDCFileReader::extractProcessMetricsHeaders() {
  * tuple of: Ordinal it should be in the metrics array; BSONType; BSON
  * element's value cast to the common uint64_t type used in the metrics array.
  */
-std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(const BSONObj& doc, size_t& ordCounter) {
-    std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> keys;
+std::vector<std::tuple<std::string, size_t, BSONType, uint64_t>> _flattenedBSONDoc(const BSONObj& doc, size_t& ordCounter) {
+    std::vector<std::tuple<std::string, size_t, BSONType, uint64_t>> v;
     BSONObjIterator itDoc(doc);
     while (itDoc.more()) {
         const BSONElement elem = itDoc.next();
@@ -434,8 +434,9 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
             case Object:
             case Array: {
                 auto childKeys = _flattenedBSONDoc(elem.Obj(), ordCounter);
-                for (auto const& [ck, tpl] : childKeys) {
-                    keys[elem.fieldName() + std::string(".") + ck] = tpl;
+                for (auto tpl : childKeys) {
+                    v.push_back(std::make_tuple(elem.fieldName() + std::string(".") + std::get<0>(tpl),
+				    std::get<1>(tpl), std::get<2>(tpl), std::get<3>(tpl)));
                 }
             } break;
 
@@ -446,15 +447,15 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
             case NumberInt:
             case NumberLong:
             case NumberDecimal:
-                keys[elem.fieldName()] = std::make_tuple(ordCounter++, elem.type(), elem.numberLong());
+                v.push_back(std::make_tuple(elem.fieldName(), ordCounter++, elem.type(), elem.numberLong()));
                 break;
 
             case Bool:
-                keys[elem.fieldName()] = std::make_tuple(ordCounter++, elem.type(), static_cast<uint64_t>(elem.Bool()));
+                v.push_back(std::make_tuple(elem.fieldName(), ordCounter++, elem.type(), static_cast<uint64_t>(elem.Bool())));
                 break;
 
             case Date:
-                keys[elem.fieldName()] = std::make_tuple(ordCounter++, elem.type(), static_cast<uint64_t>(elem.Date().toMillisSinceEpoch()));
+                v.push_back(std::make_tuple(elem.fieldName(), ordCounter++, elem.type(), static_cast<uint64_t>(elem.Date().toMillisSinceEpoch())));
                 break;
 
             case bsonTimestamp:
@@ -472,7 +473,7 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
                  * more in this block to move past the second metric row for the
                  * timestamp increment metric.
                  */
-                keys[elem.fieldName()] = std::make_tuple(ordCounter++, elem.type(), static_cast<uint64_t>(elem.timestamp().getSecs()));
+                v.push_back(std::make_tuple(elem.fieldName(), ordCounter++, elem.type(), static_cast<uint64_t>(elem.timestamp().getSecs())));
                 ordCounter++;
                 break;
 
@@ -483,10 +484,10 @@ std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> _flattenedBSONDoc(
                 break;
         }
     }
-    return keys;
+    return v;
 }
 
-std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> FTDCFileReader::flattenedBSONDoc(const BSONObj& doc) {
+std::vector<std::tuple<std::string, size_t, BSONType, uint64_t>> FTDCFileReader::flattenedBSONDoc(const BSONObj& doc) {
    size_t ctr = 0;
    return _flattenedBSONDoc(doc, ctr);
 }
@@ -604,13 +605,18 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
 //for (auto fbdItr = fbdMap.begin(); fbdItr != fbdMap.end(); fbdItr++) {
 //std::cout << fbdItr->first << ": " << typeName(std::get<1>(fbdItr->second)) << " at ord " << std::get<0>(fbdItr->second) << "\n";
 //}
-
+            
             for (auto const& k : mr.keys()) {
-                 auto mrkElem = fbdMap.find(k);
+                 auto mrkElem = fbdMap.begin();
+                 for (; mrkElem != fbdMap.end(); mrkElem++) {
+                     if (std::get<0>(*mrkElem) == k) {
+                         break;
+                     }
+                 }
                  if (mrkElem != fbdMap.end()) {
-                     auto refDocOrd = std::get<0>(mrkElem->second);
+                     auto refDocOrd = std::get<1>(*mrkElem);
                      eR[refDocOrd] = mr.keyRow(k);
-                     auto bt = std::get<1>(mrkElem->second);
+                     auto bt = std::get<2>(*mrkElem);
                      /**
                       * All four numerics types (see BSONElement::isNumber())
                       * are serialized as long long int in
@@ -629,7 +635,7 @@ Status FTDCFileReader::extractTimeseries(FTDCMetricsSubset& mr) {
                          std::cerr << "field " << k << " changed from " << typeName(mr.bsonType(k)) << " to " << typeName(bt) << " at metric chunk " << dtId << "\n";
                          invariant(mr.bsonType(k) == bt);
                      }
-                     uint64RefDocVals[refDocOrd] = std::get<2>(mrkElem->second);
+                     uint64RefDocVals[refDocOrd] = std::get<3>(*mrkElem);
                  }
             }
 

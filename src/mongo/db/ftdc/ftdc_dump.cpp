@@ -1,4 +1,5 @@
 #include "mongo/platform/basic.h"
+#include <assert.h>
 
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
@@ -34,6 +35,7 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         ("metrics-list", "Print list of all metrics in these FTDC files")
         ("json-ws-summary", "Prints a single JSON object with aggregate timespan, topology info and file list")
         ("json-metrics-list", "Prints a single JSON array of all metric names found in the input files")
+        ("bdato-jsonlines-timeseries", "Print jsonlines {metric_name: \"metric_name/hostport\", values:[...]}.")
         ;
 
     po::options_description export_optsd("Export options");
@@ -181,6 +183,31 @@ void outputProcessMetadataDocs(FTDCWorkspace & ws, bool json) {
     std::cout << (json ? "]" : "");
 }
 
+std::vector<std::string> extractionKeyList(FTDCWorkspace& ws, po::variables_map& vm) {
+    std::vector<std::string> ekl;
+    if (vm.count("metrics-filter")) {
+        std::ifstream mif(vm["metrics-filter"].as<std::string>());
+        if (!mif) {
+            std::cerr << "Error: couldn't open --metrics-filter file " << vm["metrics-filter"].as<std::string>() << "\n";
+            _exit(1);
+        }
+        std::string s;
+        while (std::getline(mif, s)) {
+            //if (s.trim() != "") {
+                ekl.push_back(s);
+            //}
+        }
+        if (ekl.size() == 0) {
+            std::cerr << "The --metrics-filter file " << vm["metrics-filter"].as<std::string>() << " didn't have any lines in it. Exiting.\n";
+            _exit(1);
+        }
+    } else {
+        auto ks = ws.keys();
+        ekl.assign(ks.begin(), ks.end());
+    }
+    return ekl;
+}
+
 void outputMetricList(FTDCWorkspace & ws, bool json) {
     auto ks = ws.keys();
     auto mitr = ks.begin();
@@ -223,6 +250,17 @@ int main(int argc, char* argv[], char** envp) {
 
     auto tspan = ws.boundaryTimespan();
 
+    Date_t ts_limit_start =  tspan.first;
+    if (vm.count("ts-start")) {
+        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-start"].as<std::string>()); //pre-validated in init_cmdline_opts()
+        ts_limit_start = sWdt.getValue();
+    }
+    Date_t ts_limit_end = tspan.last;
+    if (vm.count("ts-end")) {
+        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-end"].as<std::string>()); //pre-validated in init_cmdline_opts()
+        ts_limit_end = sWdt.getValue();
+    }
+
     //If a json result is requested output that one JSON string and exit
     if (vm.count("json-ws-summary")) {
         std::cout << "{\"time_range\": ";
@@ -250,6 +288,28 @@ int main(int argc, char* argv[], char** envp) {
         _exit(0);
     }
 
+    if (vm.count("bdato-jsonlines-timeseries")) {
+        auto ekl = extractionKeyList(ws, vm);
+        auto mms = ws.hnakMergedTimeseries(ekl, {ts_limit_start, ts_limit_end},
+            vm["resolution"].as<float>() * 1000/*ms*/);
+        auto keys = mms.keys();
+        assert(keys[0] == "start"); //Always expecting the "start" timestamp value in the first row
+        std::cout << "{\"metric\":\"start\"," << 
+            "\"values\":[" << 9999 << "]}\n";
+        for (auto k : keys) {
+            if (k == "start") {
+                continue;
+            }
+            auto dlmpos = k.find_last_of('/');
+            assert(dlmpos != string::npos && dlmpos != 0);
+            auto hp = k.substr(dlmpos + 1);
+            k.resize(dlmpos);
+            std::cout << "{\"metric\":\"" << k << "\",\"host\":\"" << hp << "\"," << 
+                "\"values\":[" << 9999 << "]}\n";
+        }
+        _exit(0);
+    }
+
     outputAggregateTimespan(tspan, false);
 
     if (vm["print-topology"].as<bool>()) {
@@ -264,38 +324,7 @@ int main(int argc, char* argv[], char** envp) {
         outputMetricList(ws, false);
     }
 
-    Date_t ts_limit_start =  tspan.first;
-    if (vm.count("ts-start")) {
-        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-start"].as<std::string>()); //pre-validated in init_cmdline_opts()
-        ts_limit_start = sWdt.getValue();
-    }
-    Date_t ts_limit_end = tspan.last;
-    if (vm.count("ts-end")) {
-        StatusWith<Date_t> sWdt = dateFromISOString(vm["ts-end"].as<std::string>()); //pre-validated in init_cmdline_opts()
-        ts_limit_end = sWdt.getValue();
-    }
-
-    std::vector<std::string> ekl; //Extraction metric key list
-    if (vm.count("metrics-filter")) {
-        std::ifstream mif(vm["metrics-filter"].as<std::string>());
-        if (!mif) {
-            std::cerr << "Error: couldn't open --metrics-filter file " << vm["metrics-filter"].as<std::string>() << "\n";
-            _exit(1);
-        }
-        std::string s;
-        while (std::getline(mif, s)) {
-            //if (s.trim() != "") {
-                ekl.push_back(s);
-            //}
-        }
-        if (ekl.size() == 0) {
-            std::cerr << "The --metrics-filter file " << vm["metrics-filter"].as<std::string>() << " didn't have any lines in it. Exiting.\n";
-            _exit(1);
-        }
-    } else {
-        auto ks =  ws.keys();
-        ekl.assign(ks.begin(), ks.end());
-    }
+    auto ekl = extractionKeyList(ws, vm);
 
     auto omc = vm.count("bson-timeseries") + vm.count("csv-timeseries") +
                vm.count("pandas-csv-timeseries") + vm.count("vm-jsonlines-timeseries");

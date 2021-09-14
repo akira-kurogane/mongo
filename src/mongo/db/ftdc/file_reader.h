@@ -90,15 +90,14 @@ public:
     Status extractTimeseries(FTDCMetricsSubset& mr);
 
     /**
-     * Changes a BSON document to a map of flattened keyname vs a tuple of
-     * other properties about each key's value. Eg. 
+     * Changes a BSON document to a vector of a tuple of flattened keyname
+     * ordinal position (as iterated in the document), BSON type and value
+     * (cast as uint64_t to be the same as the metrics when compressed).
+     * 'Flattening' key names changes them as shown below:
      *   { "A": { "p": 1, "q": 1, "r": { "x": 1 } } }
-     * has [ "A.p", "A.q", "A.r.x" ] as flattened key names.
-     * It also includes the ordinal position as iterated in the document, the
-     * BSON type and the value. The value is cast as uint64_t to be the same
-     * as the metrics when compressed.
+     *   --> [ "A.p", "A.q", "A.r.x" ]
      */
-    static std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> 
+    static std::vector<std::tuple<std::string, size_t, BSONType, uint64_t>> 
 	    flattenedBSONDoc(const BSONObj& doc);
 
 private:

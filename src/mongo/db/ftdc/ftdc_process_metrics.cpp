@@ -439,14 +439,17 @@ Date_t FTDCProcessMetrics::estimateLastSampleTs() const {
     return filespans.rbegin()->second.timespan.last;
 }
 
-std::map<std::string, BSONType> FTDCProcessMetrics::lastRefDocKeys() {
-   std::map<std::string, std::tuple<size_t, BSONType, uint64_t>> x =
+std::vector<FTDCMSKeyNameType> FTDCProcessMetrics::lastRefDocKeys() {
+   std::vector<std::tuple<std::string, size_t, BSONType, uint64_t>> x =
            FTDCFileReader::flattenedBSONDoc(lastRefDoc);
-   std::map<std::string, BSONType> m;
+   std::vector<FTDCMSKeyNameType> v;
    for (auto itr = x.begin(); itr != x.end(); itr++) {
-       m.insert({itr->first, std::get<1>(itr->second)});
+       FTDCMSKeyNameType knt;
+       knt.keyName = std::get<0>(*itr);
+       knt.bsonType = std::get<2>(*itr);
+       v.push_back(knt);
    }
-   return m;
+   return v;
 }
 
 //Unit test: FTDCProcessMetrics a.merge(b) should create the same doc as b.merge(a);
