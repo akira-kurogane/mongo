@@ -1,3 +1,6 @@
+/tmp
+/debug_text
+/junk
 /build
 /src/mongo/db/modules
 /.jsdbshell

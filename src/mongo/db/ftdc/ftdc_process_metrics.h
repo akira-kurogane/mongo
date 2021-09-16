@@ -83,7 +83,9 @@ public:
 
     std::string rowKeyName(size_t rowOrd) { return _kNT[rowOrd].keyName; }
     size_t keyRow(std::string kn) {
-        assert(_keyRows.find(kn) != _keyRows.end());
+        //TODO fix any exisiting code that violates this
+        //TODO throw an exception here. uassert(), or uassertStatusOKWithContext(), instead of fassert or massert
+        //massert(9999, ("key " + kn + " not found").c_str(), _keyRows.find(kn) != _keyRows.end());
         return _keyRows[kn];
     }
 

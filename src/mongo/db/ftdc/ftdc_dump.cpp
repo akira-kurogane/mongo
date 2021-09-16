@@ -313,6 +313,7 @@ int main(int argc, char* argv[], char** envp) {
             std::cout << "{\"metric\":\"" << k << "\",\"host\":\"" << hp << "\"," << 
                 "\"values\":[" << FTDCMetricsStreamJSONFormatter(mrref) << "]}\n";
         }
+        std::cout << std::flush;
         _exit(0);
     }
 

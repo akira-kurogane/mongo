@@ -372,7 +372,6 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
     FTDCMetricsSubset mms(mkwh, timespan, sampleResolution);
 
     //Extract the FTDCMetricsSubset for each FTDCProcess from their files
-std::cout << "About to call FTDCWorkSpace::timeseries()\n";
     std::map<FTDCProcessId, FTDCMetricsSubset> pi_ts = timeseries(keys, timespan, sampleResolution);
 
     bool start_ts_filled = false;
