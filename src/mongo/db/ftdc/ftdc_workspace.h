@@ -93,8 +93,6 @@ public:
     FTDCMetricsSubset hnakMergedTimeseries(std::vector<std::string>& keys,
                     FTDCPMTimespan timespan, uint32_t sampleResolution = 1000);
 
-    //static printJSONMetricValsArray(std::vector<std::uint64_t>& v, BSONType bt);
-
 private:
     // Map of all FTDCProcessMetrics
     std::map<FTDCProcessId, FTDCProcessMetrics> _pmMap;
@@ -116,5 +114,21 @@ private:
     // Add ProcessMetric object to _pmMap, and also into _rs by topology
     Status _addFTDCProcessMetrics(FTDCProcessMetrics& pm);
 };
+
+/**
+ * Used this way with a FTDCMetricsRange reference:
+ *    std::cout << "..." << FTDCMetricsStreamJSONFormatter(ftdcMR) << "..."
+ * Outputs the array of unint64_t values in the FTDCMetricsRange's range as
+ * the valid JSON representation delimited with commas.
+ */
+class FTDCMetricsStreamJSONFormatter {
+public:
+    FTDCMetricsStreamJSONFormatter(FTDCMetricsRange& mrref) : _mrref(mrref) {}
+    std::ostream& operator()(std::ostream& os) const;
+private:
+    FTDCMetricsRange& _mrref;
+};
+
+std::ostream& operator<<(std::ostream& os, FTDCMetricsStreamJSONFormatter fmtr);
 
 }  // namespace mongo

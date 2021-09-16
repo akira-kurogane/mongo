@@ -412,4 +412,38 @@ std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.host
     return mms;
 }
 
+std::ostream& FTDCMetricsStreamJSONFormatter::operator()(std::ostream& os) const {
+    for (auto itr = _mrref.begin(); itr < _mrref.end(); itr++) {
+            auto val = *itr;
+            switch (_mrref.bsonType) {
+                case NumberDouble:
+                case NumberInt:
+                case NumberLong:
+                    os<< std::to_string(static_cast<long long int>(val));
+                    break;
+                case Bool:
+                    os << (val ? "true" : "false");
+                    break;
+                case Date:
+                    os << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(val))) << "\"";
+                    break;
+                case bsonTimestamp:
+                    os << std::to_string(static_cast<long long int>(val));
+                    break;
+                case Undefined:
+                    os << "null";
+                    break;
+                default:
+                    MONGO_UNREACHABLE;
+                    break;
+            }
+        os << (itr + 1 < _mrref.end() ? "," : "");
+    }
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, FTDCMetricsStreamJSONFormatter fmtr) {
+    return fmtr(os);
+}
+
 } // namespace mongo
