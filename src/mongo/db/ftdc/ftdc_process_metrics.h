@@ -42,6 +42,15 @@ struct FTDCMSKeyNameType {
     //TODO add a COUNTER, GAUGE, HISTOGRAM timeseries type here too
 };
 
+struct FTDCMetricsRange {
+    BSONType bsonType;
+    std::vector<std::uint64_t>::iterator beginItr;
+    std::vector<std::uint64_t>::iterator endItr;
+
+    std::vector<std::uint64_t>::iterator begin() { return beginItr; }
+    std::vector<std::uint64_t>::iterator end() { return endItr; }
+};
+
 /**
  * A subset of the metrics, optionally downsampled to lower resolution
  * - Subset of metrics by dot-concatenated key list
@@ -152,6 +161,15 @@ public:
     std::vector<std::uint64_t> nullsRow() {
         std::vector<std::uint64_t> r(_rowLength, 7777777777);
         return r;
+    }
+
+    FTDCMetricsRange metricsRowRef(size_t i) {
+        return {_kNT[i].bsonType, metrics.begin() + cellOffset(i, 0), 
+                    metrics.begin() + cellOffset(i, 0) + _rowLength};
+    }
+
+    FTDCMetricsRange metricsRowRef(std::string keyName) {
+        return metricsRowRef(keyRow(keyName));
     }
 
     size_t cellOffset(size_t row, size_t col) { return row * _rowLength + col; }

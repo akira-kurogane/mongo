@@ -297,11 +297,10 @@ int main(int argc, char* argv[], char** envp) {
         //  "start" is the exception - it's a common value that applies to the results
         //  from all hosts.
         auto keys = mms.keys();
-        assert(keys[0] == "start"); //Always expecting the "start" timestamp value in the first row
-        auto vv = mms.metricsRow("start");
-        std::cout << "{\"metric\":\"start\",\"host\":\"\",\"values\":[";
-        std::copy(vv.begin(), vv.end(), std::ostream_iterator<std::uint64_t>(std::cout, ","));
-        std::cout << "]}\n";
+        assert(keys[0] == "start"); //Always require the "start" timestamp value in the first row
+        auto mrref = mms.metricsRowRef("start");
+        std::cout << "{\"metric\":\"start\",\"host\":\"\",\"values\":[" << 
+            FTDCMetricsStreamJSONFormatter(mrref) << "]}\n";
         for (auto kwh : keys) {
             if (kwh == "start") {
                 continue;
@@ -310,11 +309,9 @@ int main(int argc, char* argv[], char** envp) {
             assert(dlmpos != string::npos && dlmpos != 0);
             auto hp = kwh.substr(dlmpos + 1);
             auto k = kwh.substr(0, dlmpos);
-            auto vv = mms.metricsRow(kwh);
+            auto mrref = mms.metricsRowRef(kwh);
             std::cout << "{\"metric\":\"" << k << "\",\"host\":\"" << hp << "\"," << 
-                "\"values\":[";
-            std::copy(vv.begin(), vv.end(), std::ostream_iterator<std::uint64_t>(std::cout, ","));
-            std::cout << "]}\n";
+                "\"values\":[" << FTDCMetricsStreamJSONFormatter(mrref) << "]}\n";
         }
         _exit(0);
     }

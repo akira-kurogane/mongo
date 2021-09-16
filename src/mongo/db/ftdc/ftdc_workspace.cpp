@@ -358,7 +358,6 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
     //  and skip the duplicates.
     assert(std::get<1>(sl.front) == "start");
     mkwh.push_back("start");
-
     for (auto tpl : sl) {
         auto k = std::get<1>(tpl);
         auto hp = std::get<0>(tpl);
@@ -368,32 +367,34 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
         }
     }
 
-    //The FTDCMetricsSubset that will be used to hold the full result
+    //Initialize, with empty values and still-unset BSON types, the 
+    //  FTDCMetricsSubset object that this function will return
     FTDCMetricsSubset mms(mkwh, timespan, sampleResolution);
 
     //Extract the FTDCMetricsSubset for each FTDCProcess from their files
+std::cout << "About to call FTDCWorkSpace::timeseries()\n";
     std::map<FTDCProcessId, FTDCMetricsSubset> pi_ts = timeseries(keys, timespan, sampleResolution);
 
     bool start_ts_filled = false;
     //Set the bsonType in the final result's keynames-and-types
     for (auto& [pmId, ms] : pi_ts) {
-        auto source_rowlen = ms.metrics.size() / ms.keys().size(); //TODO this is awkward to be calculating it instead of using a FTDCMetricsSubset method
         for (auto k : ms.keys()) {
+            auto mrref = ms.metricsRowRef(k);
             auto ha_keyname = k == "start" ? k : k + "/" + pmId.hostport;
             if (k != "start" || !start_ts_filled) {
-                mms.setBsonType(ha_keyname, ms.bsonType(k));
-                auto source_start_ptr = ms.metrics.begin() + ms.cellOffset(ms.keyRow(k), 0);
+                auto source_start_ptr = mrref.begin();
                 auto dest_rowno = mms.keyRow(ha_keyname);
                 if (dest_rowno == 0 && k != "start") {
                     //Unknown key in mms, even though present in current ms.
-                    //TODO Not sure how this can happen yet. Using lastBSONRefDoc for key lists?
-                    //  Filling mms's keys by a square cross product of hostport x all known keys?
+                    //TODO Not sure how this can happen yet. Because using lastBSONRefDoc for key lists?
+                    //  Or because filled mms's keys by a square cross product of hostport x all known keys?
 std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.hostport << "[" << pmId.pid << "] " <<
 "had \"" << ha_keyname << "\" but there is no such key in mms\n";
                     continue;
                 }
+                mms.setBsonType(ha_keyname, mrref.bsonType);
                 auto dest_start_ptr = mms.metrics.begin() + mms.cellOffset(dest_rowno, 0);
-                std::copy(source_start_ptr, source_start_ptr + source_rowlen, dest_start_ptr);
+                std::copy(mrref.begin(), mrref.end(), dest_start_ptr);
                 if (k == "start") {
                     start_ts_filled = true;
                 }
@@ -415,27 +416,31 @@ std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.host
 std::ostream& FTDCMetricsStreamJSONFormatter::operator()(std::ostream& os) const {
     for (auto itr = _mrref.begin(); itr < _mrref.end(); itr++) {
             auto val = *itr;
-            switch (_mrref.bsonType) {
-                case NumberDouble:
-                case NumberInt:
-                case NumberLong:
-                    os<< std::to_string(static_cast<long long int>(val));
-                    break;
-                case Bool:
-                    os << (val ? "true" : "false");
-                    break;
-                case Date:
-                    os << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(val))) << "\"";
-                    break;
-                case bsonTimestamp:
-                    os << std::to_string(static_cast<long long int>(val));
-                    break;
-                case Undefined:
-                    os << "null";
-                    break;
-                default:
-                    MONGO_UNREACHABLE;
-                    break;
+            if (val == 7777777777) {
+                os << "null";
+            } else {
+                switch (_mrref.bsonType) {
+                    case NumberDouble:
+                    case NumberInt:
+                    case NumberLong:
+                        os<< std::to_string(static_cast<long long int>(val));
+                        break;
+                    case Bool:
+                        os << (val ? "true" : "false");
+                        break;
+                    case Date:
+                        os << "\"" << dateToISOStringUTC(Date_t::fromMillisSinceEpoch(static_cast<std::uint64_t>(val))) << "\"";
+                        break;
+                    case bsonTimestamp:
+                        os << std::to_string(static_cast<long long int>(val));
+                        break;
+                    case Undefined:
+                        os << "null";
+                        break;
+                    default:
+                        MONGO_UNREACHABLE;
+                        break;
+                }
             }
         os << (itr + 1 < _mrref.end() ? "," : "");
     }
