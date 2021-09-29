@@ -218,10 +218,19 @@ std::map<std::string, std::list<std::string>> FTDCWorkspace::_metricsByHostHiera
         hm[hp][pmid_str] = pkl;
     }
     for (auto& [h, pml] : hm) {
+        /**
+         * Different pid instances will repeat most metrics; but we are discarding pid in this step so we'll
+         * eliminate the duplicate metric names after approximate_seq_merge() produces results.
+         */
+        std::set<std::string> uniq_mn_set;
         auto sl = approximate_seq_merge(pml); //std::list<std::tuple<std::string PARENTLABEL, std::string METRIC>>
         std::list<std::string> new_l;
         for (auto tpl : sl) {
-            new_l.push_back(std::get<1>(tpl));
+            auto mn = std::get<1>(tpl);
+            if (uniq_mn_set.find(mn) == uniq_mn_set.end()) {
+                new_l.push_back(mn);
+                uniq_mn_set.insert(mn);
+            }
         }
         r[h] = new_l;
     }
@@ -403,7 +412,6 @@ std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.host
 // std::cout << "source_start_ptr + 1 = " << (*(source_start_ptr + 1)) << "\n";
 // std::cout << "source_start_ptr + 2 = " << (*(source_start_ptr + 2)) << "\n";
 // std::cout << "\"serverStatus.uptime\" dest_rowno = " << dest_rowno << ", mms.cellOffset(dest_rowno, 0) = " << mms.cellOffset(dest_rowno, 0) << "\n";
-
 //                 }
             }
         }
