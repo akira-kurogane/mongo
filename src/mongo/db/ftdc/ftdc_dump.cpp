@@ -217,7 +217,7 @@ void outputMetricList(FTDCWorkspace & ws, bool json) {
         if (json) {
             std::cout << (d ? "," : "") << "\"" << *mitr << "\"";
         } else {
-            std::cout << "  " << *mitr << "\n";
+            std::cout << *mitr << "\n";
         }
         d = true;
         mitr++;
