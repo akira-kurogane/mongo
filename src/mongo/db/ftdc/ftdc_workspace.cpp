@@ -1,5 +1,6 @@
 #include "mongo/platform/basic.h"
 #include <list>
+#include <set>
 
 // TODO use stdc++17 std::filesystem instead of boost if we update the build scripts
 #include <boost/filesystem.hpp>
@@ -349,6 +350,24 @@ std::map<FTDCProcessId, FTDCMetricsSubset> FTDCWorkspace::timeseries(
 FTDCMetricsSubset
 FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimespan timespan, uint32_t sampleResolution) {
 
+    /**
+     * Add "start" metric (i.e. timestamp of samples) if absent.
+     */
+    if (std::find(keys.begin(), keys.end(), "start") == keys.end()) {
+        keys.emplace_back("start");
+    }
+    /**
+     * Force "start" to be the first key to make it simple to find.
+     */
+    auto startKeyItr = std::find(keys.begin(), keys.end(), "start");
+    if (startKeyItr != keys.begin()) {
+        while (startKeyItr != keys.begin()) {
+            *startKeyItr-- = *(startKeyItr - 1);
+        }
+        keys[0] = "start";
+    }
+    assert(keys[0] == "start");
+
     auto hml = _metricsByHostHierarchy();
 
     if (!hml.size()) {
@@ -361,7 +380,9 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
 
     auto sl = approximate_seq_merge(hml); //std::list<std::tuple<std::string HOST, std::string METRIC>>
 
-    //Merged keys with hostport the key is present in added as suffix to each
+    // Copying keys into set container for quicker key confirmation.
+    std::set<std::string> fkm(keys.begin(), keys.end());
+    // "mwkh" = Merged keys with hostport.
     std::vector<std::string> mkwh;
     //"start" is a compulsory first metric that will appear once for each process' metrics. Insert once
     //  and skip the duplicates.
@@ -369,10 +390,12 @@ FTDCWorkspace::hnakMergedTimeseries(std::vector<std::string>& keys, FTDCPMTimesp
     mkwh.push_back("start");
     for (auto tpl : sl) {
         auto k = std::get<1>(tpl);
-        auto hp = std::get<0>(tpl);
-        auto ha_keyname = k + "/" + hp;
-        if (k != "start") {
-            mkwh.push_back(ha_keyname);
+        if (fkm.count(k)) {
+            auto hp = std::get<0>(tpl);
+            auto ha_keyname = k + "/" + hp;
+            if (k != "start") {
+                mkwh.push_back(ha_keyname);
+            }
         }
     }
 
@@ -406,13 +429,6 @@ std::cerr << "Suppressed hnakMergedTimeseries() bug: Iteration of " << pmId.host
                 if (k == "start") {
                     start_ts_filled = true;
                 }
-//                 if (k == "serverStatus.uptime") {
-// std::cout << "\"serverStatus.uptime\" ms.keyRow(k) = " << ms.keyRow(k) << ", ms.cellOffset(ms.keyRow(k), 0) = " << ms.cellOffset(ms.keyRow(k), 0) << "\n";
-// std::cout << "source_start_ptr + 0 = " << (*(source_start_ptr + 0)) << "\n";
-// std::cout << "source_start_ptr + 1 = " << (*(source_start_ptr + 1)) << "\n";
-// std::cout << "source_start_ptr + 2 = " << (*(source_start_ptr + 2)) << "\n";
-// std::cout << "\"serverStatus.uptime\" dest_rowno = " << dest_rowno << ", mms.cellOffset(dest_rowno, 0) = " << mms.cellOffset(dest_rowno, 0) << "\n";
-//                 }
             }
         }
     }
