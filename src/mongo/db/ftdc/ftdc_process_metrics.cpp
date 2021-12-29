@@ -138,7 +138,8 @@ BSONObj FTDCMetricsSubset::bsonMetrics() {
     return builder.obj();
 }
 
-void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+FTDCExportFileStats FTDCMetricsSubset::writeCSV(fs::path dirfp, FTDCProcessId pmId) {
+    FTDCExportFileStats fstatr;
     fs::path csvfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
     std::ofstream cf(csvfpath.c_str());
 
@@ -187,10 +188,12 @@ void FTDCMetricsSubset::writeCSV(boost::filesystem::path dirfp, FTDCProcessId pm
         }
         cf << "\n";
     }
-    std::cout << csvfpath << " created. It contains a matrix of " << _kNT.size() << " metrics by " << _rowLength << " time samples.\n";
+    fstatr.push_back({_rowLength, _kNT.size(), {csvfpath}});
+    return fstatr;
 }
 
-void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+FTDCExportFileStats FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId) {
+    FTDCExportFileStats fstatr;
     fs::path data_fpath(dirfp.string() + "/pandas_dataframe." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".csv");
     fs::path mpf_fpath = data_fpath;
     mpf_fpath.replace_extension(".mapping.csv");
@@ -251,11 +254,13 @@ void FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem::path dirfp, F
         }
     }
 
-    std::cout << "Created " << data_fpath << " and matching *.mapping.csv file. Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
+    fstatr.push_back({_rowLength, _kNT.size(), {data_fpath, mpf_fpath}});
+    return fstatr;
 }
 
-void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
+FTDCExportFileStats FTDCMetricsSubset::writeVMJsonLines(fs::path dirfp,
                 FTDCProcessId pmId, std::map<std::string, std::string> topologyLabels) {
+    FTDCExportFileStats fstatr;
     fs::path jfpath(dirfp.string() + "/ftdc_metrics." + pmId.hostport + ".pid" + std::to_string(pmId.pid) + ".victoriametrics.jsonlines");
     std::ofstream jf(jfpath.c_str());
 
@@ -405,7 +410,8 @@ void FTDCMetricsSubset::writeVMJsonLines(boost::filesystem::path dirfp,
 
     } //end for (auto rs_st_rg : rs_st_ranges)
 
-    std::cout << "Created " << jfpath << " Contains " << _rowLength << " samples of " << _kNT.size() << " metrics at " << (_stepMs/1000) << "s period.\n";
+    fstatr.push_back({_rowLength, _kNT.size(), {jfpath}});
+    return fstatr;
 }
 
 std::string FTDCProcessMetrics::rsName() const {

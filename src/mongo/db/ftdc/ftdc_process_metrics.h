@@ -52,6 +52,14 @@ struct FTDCMetricsRange {
 };
 
 /**
+ * Vector of tuples of sample count, metric count, vector of filepaths.
+ * Usually there is only one filepath, but Pandas CSV has a mapping
+ * CSV file as well as the main data one.
+ */
+using FTDCExportFileStats = std::vector<std::tuple<int, int, 
+                                std::vector<boost::filesystem::path>>>;
+
+/**
  * A subset of the metrics, optionally downsampled to lower resolution
  * - Subset of metrics by dot-concatenated key list
  * - To a fixed timespan
@@ -114,7 +122,7 @@ public:
      * "serverStatus.A.b",456,488,...
      * ...
      */
-    void writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
+    FTDCExportFileStats writeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
 
     /**
      * Write all metrics to a CSV file suitable for Pandas dataframe import
@@ -125,8 +133,7 @@ public:
      * As well as the data file with the above format a *.mapping.csv file
      * will be added alongside it.
      */
-    void writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
-
+    FTDCExportFileStats writePandasDataframeCSV(boost::filesystem::path dirfp, FTDCProcessId pmId);
 
     /**
      * Write all metrics to a jsonlines file suitable for VictorMetric's
@@ -143,7 +150,7 @@ public:
      *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018",
      *   .... } }
      */
-    void writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId,
+    FTDCExportFileStats writeVMJsonLines(boost::filesystem::path dirfp, FTDCProcessId pmId,
                     std::map<std::string, std::string> topologyLabels);
 
     /**
@@ -251,6 +258,8 @@ struct FTDCProcessMetrics {
      * tspan argument will be reduced to what overlaps with firstSampleTs()
      * - estimateLastSampleTs()
      * TODO: add timeshift-hack arg
+     * TODO: make sure to fill in the "start" values for samples that are erroneously
+     * requested for timespans that have no metrics in them.
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
                 FTDCPMTimespan tspan, uint32_t sampleResolution);

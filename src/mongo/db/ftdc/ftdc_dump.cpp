@@ -348,7 +348,9 @@ int main(int argc, char* argv[], char** envp) {
         if (odirpath.size() > 1 && odirpath[odirpath.size() - 1] == '/') {
             odirpath = odirpath.substr(0, odirpath.size() - 1);
         }
+
         for (auto& [pmId, ms] : fPmTs) {
+            FTDCExportFileStats fstatr;
             //std::cout << "\nExporting timeseries for " << pmId.hostport << "(" << pmId.pid << "): " << ms.timespan().first << " - " << ms.timespan().last << std::endl;
             if (vm.count("bson-timeseries")) {
                 auto b = ms.bsonMetrics();
@@ -360,16 +362,34 @@ int main(int argc, char* argv[], char** envp) {
                 //std::cout << b.jsonString(JsonStringFormat::Strict, 1);
             }
             if (vm.count("csv-timeseries")) {
-                ms.writeCSV(odirpath, pmId);
+                fstatr = ms.writeCSV(odirpath, pmId);
             }
             if (vm.count("pandas-csv-timeseries")) {
-                ms.writePandasDataframeCSV(odirpath, pmId);
+                fstatr = ms.writePandasDataframeCSV(odirpath, pmId);
             }
             if (vm.count("vm-jsonlines-timeseries")) {
                 auto tpl_lbls = ws.processMetrics(pmId).topologyLabels();
                 //TODO: optionally fill tpl_lbls["cl_id"] if user provides one?
-                ms.writeVMJsonLines(odirpath, pmId, tpl_lbls);
+                fstatr = ms.writeVMJsonLines(odirpath, pmId, tpl_lbls);
             }
+            if (!fstatr.empty()) {
+                for (auto tpl : fstatr) {
+                    auto sample_count = std::get<0>(tpl);
+                    auto metric_count = std::get<1>(tpl);
+                    auto fpaths = std::get<2>(tpl);
+                    std::string cs = "";
+                    if (fPmTs.size() > 1) {
+                        cs = " for process pid=" + std::to_string(pmId.pid);
+                    }
+                    std::cout << "Created export file(s)" << cs << ". Contains " <<
+                        sample_count << " samples of " << metric_count << " metrics." << std::endl;
+                    for (auto fpath : fpaths) {
+                        std::cout << "filepath: " << fpath << std::endl;
+                    }
+                }
+
+            }
+
 
         }
     }
