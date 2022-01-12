@@ -180,7 +180,7 @@ void outputProcessMetadataDocs(FTDCWorkspace & ws, bool json) {
             }
         }
     }
-    std::cout << (json ? "]" : "");
+    std::cout << (json ? "]" : "") << std::endl;
 }
 
 std::vector<std::string> extractionKeyList(FTDCWorkspace& ws, po::variables_map& vm) {
