@@ -188,7 +188,7 @@ FTDCExportFileStats FTDCMetricsSubset::writeCSV(fs::path dirfp, FTDCProcessId pm
         }
         cf << "\n";
     }
-    fstatr.push_back({_rowLength, _kNT.size(), {csvfpath}});
+    fstatr.push_back({int(_rowLength), int(_kNT.size()), {csvfpath}});
     return fstatr;
 }
 
@@ -254,7 +254,7 @@ FTDCExportFileStats FTDCMetricsSubset::writePandasDataframeCSV(boost::filesystem
         }
     }
 
-    fstatr.push_back({_rowLength, _kNT.size(), {data_fpath, mpf_fpath}});
+    fstatr.push_back({int(_rowLength), int(_kNT.size()), {data_fpath, mpf_fpath}});
     return fstatr;
 }
 
@@ -410,8 +410,105 @@ FTDCExportFileStats FTDCMetricsSubset::writeVMJsonLines(fs::path dirfp,
 
     } //end for (auto rs_st_rg : rs_st_ranges)
 
-    fstatr.push_back({_rowLength, _kNT.size(), {jfpath}});
+    fstatr.push_back({int(_rowLength), int(_kNT.size()), {jfpath}});
     return fstatr;
+}
+
+void FTDCMetricsSubset::outputLFSJsonLines(std::ostream& ostr, FTDCProcessId pmId,
+        std::map<std::string, std::string> extraLabels) {
+    
+    invariant(_rowLength * _kNT.size() == metrics.size());
+
+    std::set<std::string> mdc_keys_set;
+    for (auto x : _kNT) {
+        mdc_keys_set.insert(x.keyName);
+    }
+    std::string pm_constant_lbls = ",\"instance\":\""
+        + pmId.hostport + "\",\"pid\":\"" + std::to_string(pmId.pid) + "\"";
+    for (auto [k, v] : extraLabels) {
+        pm_constant_lbls += ",\"" + k + "\":\"" + v + "\"";
+    }
+
+    auto start_ts_v = metricsRow("start");
+    invariant(start_ts_v.size());
+    auto end_ts_v = metricsRow("end");
+    invariant(end_ts_v.size() == start_ts_v.size());
+    auto rs_ptr = metrics.begin(); //Row start pointer
+
+    for (auto x : _kNT) {
+        if (x.keyName != "start") { //we don't output the "start" timestamp as its own timeseries
+
+            auto nonulls_start_i = 0;
+
+            // TODO I suspect it's better to get rid of the stringstreams.
+            std::stringstream vals_ss;  // TODO write the 'metric: {...},' to ostr now, then output vals directly to ostr. (Not sure how to handle first or final comma; or metrics that have no samples in the current time span if that can happen, not that I think it does.) Apply this for vm-jsonlines-timeseries function too.
+            std::stringstream ts_ss;    // TODO remaking the ts_ss string everytime is uneccesarry. Make a complete one, index into it char positions for metrics that don't start for x samples. Apply this for vm-jsonlines-timeseries function too.
+
+            switch (x.bsonType) {
+                case NumberDouble:
+                case NumberInt:
+                case NumberLong:
+                case Bool:
+                case Date:
+                case bsonTimestamp:
+                    //A metric may not exist at the beginning of a process' timespan,
+                    //but once it is set it stays set until the end of the process' metrics.
+                    //So we scan past any contiguous null series at the start
+                    while (rs_ptr[nonulls_start_i] == 7777777777 && nonulls_start_i < _rowLength) {
+                        ++nonulls_start_i;
+                    }
+                    for (size_t i = nonulls_start_i; i < _rowLength; ++i) {
+                        //end_ts is being used to detect the samples line that are all null (except
+                        //start ts field which will be forced-filled in FTDCFileReader::extractTimeseries())
+                        if (end_ts_v[i] != 7777777777) {
+// Disabled De-dup logic      bool skip = false;
+// Disabled De-dup logic      if (i > nonulls_start_i && i < (_rowLength - 1)) {
+// Disabled De-dup logic          skip = (rs_ptr[i] == rs_ptr[i - 1]) && (rs_ptr[i] == rs_ptr[i + 1]);
+// Disabled De-dup logic      }
+////skip = false; //DEBUG
+// Disabled De-dup logic      if (!skip) {
+                                ts_ss << start_ts_v[i] << ",";
+                                vals_ss << rs_ptr[i] << ",";
+// Disabled De-dup logic      }
+                        }
+                    }
+                    break;
+
+                //Devnote: there will be a inconsistency between the units of Date and bsonTimestamp.
+                //I decided it to leave it as-is to be consistent with the source.
+                //The metric row for a bsonTimestamp being iterated here will be the .t component of
+                //the timestamp only. The .i member is not inside this uint64_t value.
+                //The .t component is epoch seconds, not milliseconds like the Date value representations.
+
+                case Undefined:
+                    //do no output
+                    break;
+
+                default:
+                    MONGO_UNREACHABLE;
+                    break;
+            }
+
+            if (ts_ss.str().size() > 0) {
+                vals_ss.seekp(-1, vals_ss.cur); //overwrite last "," with array end "]";
+                vals_ss << "]";
+                ts_ss.seekp(-1, ts_ss.cur); //overwrite last "," with array end "]";
+                ts_ss << "]";
+
+                std::string mdos = "{\"__name__\":\"" + x.keyName + "\"" +
+                        pm_constant_lbls + "}";
+
+                ostr << "{\"metric\":" << mdos << ",\"values\":[" << vals_ss.str() << ",\"timestamps\":[" << ts_ss.str() << "}\n";
+            }
+//else { std::cerr << "DEBUG: the timeseries for metric " << x.keyName << " had only null values in this sample period.\n"; }
+
+
+        } //End: if (x.keyName != "start")
+
+        rs_ptr += _rowLength;
+    }
+
+    ostr << std::flush;
 }
 
 std::string FTDCProcessMetrics::rsName() const {

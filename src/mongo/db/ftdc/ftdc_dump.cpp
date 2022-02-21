@@ -36,6 +36,8 @@ po::variables_map init_cmdline_opts(int argc, char* argv[], std::vector<fs::path
         ("json-ws-summary", "Prints a single JSON object with aggregate timespan, topology info and file list")
         ("json-metrics-list", "Prints a single JSON array of all metric names found in the input files")
         ("bdato-jsonlines-timeseries", "Print jsonlines {metric_name: \"metric_name/hostport\", values:[...]}.")
+        ("lfs-jsonlines-timeseries", "Print jsonlines suitable for victoriametrics /api/v1/import ingestion.")
+        ("extra-metric-labels", po::value<std::vector<std::string>>()->multitoken(), "Extra json key=value [, key=value] string pairs to add to lfs-jsonlines-timeseries output. (Note: use \"--\" to terminate multiple token parsing if just before the input filepath argument.)")
         ;
 
     po::options_description export_optsd("Export options");
@@ -314,6 +316,48 @@ int main(int argc, char* argv[], char** envp) {
                 "\"values\":[" << FTDCMetricsStreamJSONFormatter(mrref) << "]}\n";
         }
         std::cout << std::flush;
+        _exit(0);
+    }
+
+    if (vm.count("lfs-jsonlines-timeseries")) {
+        if (fps.size() != 1) {
+            std::cerr << "Mode --lfs-jsonlines-timeseries outputs data much larger than the source FTDC files so it forces one input file per execution.\n";
+            std::cerr << fps.size() << " file arguments found: \n";
+            for (auto fp : fps) {
+                std::cerr << "  " << fp << "\n";
+            }
+            std::cerr << std::endl;
+            _exit(1);
+        }
+        
+        auto ekl = extractionKeyList(ws, vm);
+
+        std::map<std::string, std::string> extraLabels;
+        if (!vm["extra-metric-labels"].empty()) {
+            for (auto kvstr : vm["extra-metric-labels"].as<std::vector<std::string>>()) {
+                size_t delimPos = kvstr.find('=');
+                if (delimPos == std::string::npos) {
+                    std::cerr << "Format error with the --extra-metric-labels value(s). Expected key=value syntax, for example:\n";
+                    std::cerr << "  <cmdline_arg>  -->  <JSON output change>\n";
+                    std::cerr << "  foo=bar        -->  {...,\"foo\":\"bar\"}\n";
+                    std::cerr << "  foo=bar x=y    -->  {...,\"foo\":\"bar\",\"x\":\"y\"}\n";
+                    std::cerr << "  \"foo=bar\"      -->  {...,\"foo\":\"bar\"}\n";
+                    std::cerr << "  \"foo=bar baz\"  -->  {...,\"foo\":\"bar baz\"}\n";
+                    _exit(1);
+                }
+                extraLabels[kvstr.substr(0, delimPos)] = kvstr.substr(delimPos + 1);
+            }
+        }
+        std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
+                        {ts_limit_start, ts_limit_end});
+        
+        for (auto& [pmId, ms] : fPmTs) {
+            ms.outputLFSJsonLines(std::cout, pmId, extraLabels);
+        }
+        
+        // labels: __name__, instance,
+        //         proc_instance (pid),
+        //         job, wsid, src_file_md5
         _exit(0);
     }
 

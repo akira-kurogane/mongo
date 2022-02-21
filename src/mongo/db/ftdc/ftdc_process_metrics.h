@@ -154,6 +154,25 @@ public:
                     std::map<std::string, std::string> topologyLabels);
 
     /**
+     * Write all metrics to a jsonlines file suitable for VictorMetric's
+     * /api/v1/import endpoint. New format for logfile-dot-support Feb 2022.
+     * 
+     * (Each metric will be one line only; The multiline format is just for this
+     * comment.)
+     * {"metric":
+     *   {"__name__":"serverStatus.wiredTiger.transactions.something of something",
+     *    "instance":"hostA:27018","pid":790438,
+     *    <other labels supplied by external argument>},
+     *  "values":[1,1,2,...,n'th value],
+     *  "timestamps":[1549891472010,1549891487724,1549891503438,...,n'th-epochms-timestamp]
+     * }
+     * {"metric":
+     *   {"__name__":"mongodb_ss_A_b","job":"mongodb","instance":"hostA:27018",
+     *   .... } }
+     */
+    void outputLFSJsonLines(std::ostream& ostr, FTDCProcessId pmId, std::map<std::string, std::string> extraLabels);
+
+    /**
      * Return a copy of one row of the metrics in a vector of base uint64_t type
      */
     std::vector<std::uint64_t> metricsRow(size_t i) {
@@ -262,7 +281,7 @@ struct FTDCProcessMetrics {
      * requested for timespans that have no metrics in them.
      */
     StatusWith<FTDCMetricsSubset> timeseries(std::vector<std::string>& keys, 
-                FTDCPMTimespan tspan, uint32_t sampleResolution);
+                FTDCPMTimespan tspan, uint32_t sampleResolution = 1000/*ms*/);
 
     /**
      * This produces a map that has the same keys, one exception aside, that
