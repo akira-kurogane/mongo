@@ -349,15 +349,13 @@ int main(int argc, char* argv[], char** envp) {
             }
         }
         std::map<FTDCProcessId, FTDCMetricsSubset> fPmTs = ws.timeseries(ekl,
-                        {ts_limit_start, ts_limit_end});
+                        {ts_limit_start, ts_limit_end},
+                        vm["resolution"].as<float>() * 1000/*ms*/);
         
         for (auto& [pmId, ms] : fPmTs) {
             ms.outputLFSJsonLines(std::cout, pmId, extraLabels);
         }
-        
-        // labels: __name__, instance,
-        //         proc_instance (pid),
-        //         job, wsid, src_file_md5
+
         _exit(0);
     }
 
