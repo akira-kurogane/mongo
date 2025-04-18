@@ -1,3 +1,26 @@
+My most recent (=Nov 2020) notes on building the ftdc_dump executable
+
+```sh
+sudo yum install git
+sudo yum install libcurl-devel gcc gcc-c++
+sudo yum install python-pip
+sudo pip install cheetah typing
+cd mongo/
+
+git remote add upstream https://github.com/mongodb/mongo.git
+git fetch upstream
+#Build upstream's 4.0.3 first because the ftdc_reader.h etc. files are chankged in branch ftdc_dump_40
+git checkout r4.0.3
+buildscripts/scons.py core -j 8 --disable-warnings-as-errors
+
+git checkout ftdc_dump_40
+buildscripts/scons.py build/opt/mongo/db/ftdc/ftdc_dump --disable-warnings-as-errors -j 6 2>&1 | grep -v '^Checking
+
+build/opt/mongo/db/ftdc/ftdc_dump ~/t/274363_netskope/20191122_data/diagnostic.data 2>/dev/null > /tmp/op_latencies.tsv
+```
+
+----
+
 MongoDB README
 
 This is a branch forked from MongoDB v4.0.3
